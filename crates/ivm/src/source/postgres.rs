@@ -322,7 +322,10 @@ impl PgSource {
                     }
                     let _ = nk;
                 }
-                self.push_upsert(table, row, unchanged, old_row)?;
+                // a key-only old tuple (a key change under REPLICA IDENTITY
+                // DEFAULT) has no values for unchanged TOAST columns: the
+                // engine fills them from the row stored under the old key
+                self.push_upsert(table, row, unchanged, if old_is_key { None } else { old_row })?;
             }
             LogicalMessage::Delete { relation_id, old, .. } => {
                 let Some(rm) = self.rels.get(&relation_id) else { return Ok(()) };

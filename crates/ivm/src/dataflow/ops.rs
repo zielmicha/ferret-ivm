@@ -255,7 +255,12 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
         stored.insert(key.to_vec(), found.clone());
         Ok(found)
     };
+    // The row the previous change deleted. A primary key change arrives as a
+    // delete of the old key directly followed by an upsert of the new row,
+    // whose unchanged (TOASTed) values are those of the old key's row.
+    let mut deleted: Option<Row> = None;
     for ch in changes {
+        let just_deleted = std::mem::take(&mut deleted);
         match ch {
             TableChange::Upsert { mut row, unchanged } => {
                 let kv: Vec<Datum> = pk.iter().map(|c| row[*c].clone()).collect();
@@ -268,7 +273,7 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
                     }
                 };
                 if !unchanged.is_empty() {
-                    if let Some(o) = &old {
+                    if let Some(o) = old.as_ref().or(just_deleted.as_ref()) {
                         for c in &unchanged {
                             row[*c] = o[*c].clone();
                         }
@@ -283,10 +288,13 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
             }
             TableChange::Delete { key: kv } => {
                 let key = layout.encode_prefix(&kv);
-                if !current.contains_key(&key) {
-                    order.push(key.clone());
-                    fetch(env, &key, &mut stored)?;
-                }
+                deleted = match current.get(&key) {
+                    Some(v) => v.clone(),
+                    None => {
+                        order.push(key.clone());
+                        fetch(env, &key, &mut stored)?
+                    }
+                };
                 current.insert(key, None);
             }
             TableChange::Insert { row } => {
