@@ -423,6 +423,62 @@ fn replica_identity_and_key_changes_are_detected() {
     all(&mut ivm, &mut up);
 }
 
+/// After a key change the re-snapshot starts by truncating the table, as
+/// deletes decoded with the old key could not be applied. The truncate is
+/// due when the table's first chunk starts, which can be long after the
+/// schema record: here the copy of another table (with a lower id, so it
+/// goes first) waits for a transaction that is decoded but stays invisible
+/// (it waits for a synchronous standby that never comes). The engine is
+/// restarted meanwhile. Applying the schema record used to reset the logged
+/// snapshot state without the truncate flag, so the restarted source copied
+/// the table over its old rows and a row deleted by the old key stayed.
+#[test]
+fn key_change_truncate_survives_a_restart() {
+    let mut up = Upstream::start_with(&["synchronous_standby_names = 'nobody'", "synchronous_commit = local"]);
+    up.exec("CREATE TABLE a (id int PRIMARY KEY, v int)");
+    up.exec("INSERT INTO a SELECT g, g FROM generate_series(1, 10) g");
+    up.exec("CREATE TABLE c (id int PRIMARY KEY)");
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, u int NOT NULL, x int)");
+    up.exec("INSERT INTO t SELECT g, -g, g FROM generate_series(1, 10) g");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("key-change-restart");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    for q in ["SELECT * FROM a ORDER BY id", "SELECT * FROM t ORDER BY id"] {
+        assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    }
+    // committed, decoded, but invisible while it waits for the standby (it
+    // keeps its locks meanwhile, hence a table of its own)
+    let mut writer = connect(&up.conninfo);
+    let pid = writer.query("SELECT pg_backend_pid()").unwrap().rows[0][0].clone().unwrap();
+    writer.simple_query("SET synchronous_commit = on").unwrap();
+    let blocked = std::thread::spawn(move || writer.simple_query("INSERT INTO c VALUES (100)").map(|_| ()));
+    eventually("the insert to wait for the standby", || {
+        up.rows(&format!("SELECT wait_event FROM pg_stat_activity WHERE pid = {pid}")) == ["SyncRep"]
+    });
+    // a changes shape: its copy (first, by id) waits for the invisible
+    // transaction. t's key changes after a delete by the old key, so its
+    // copy must start with a truncate. c's row makes the commit logged.
+    up.exec(
+        "BEGIN; ALTER TABLE a ADD COLUMN w int; UPDATE a SET w = 1 WHERE id = 2; DELETE FROM t WHERE id = 1; \
+         ALTER TABLE t DROP CONSTRAINT t_pkey, ADD PRIMARY KEY (u); INSERT INTO t VALUES (11, -11, 11); \
+         INSERT INTO c VALUES (1); COMMIT",
+    );
+    ivm.exec("SET read_mode = latest");
+    eventually("the transaction to be applied", || ivm.rows("SELECT id FROM c WHERE id = 1") == ["1"]);
+    // the truncate has not happened yet: the deleted row is still there
+    assert_eq!(ivm.rows("SELECT id, u FROM t WHERE id = 1"), ["1|-1"]);
+    ivm.shutdown();
+    up.exec(&format!("SELECT pg_cancel_backend({pid})"));
+    blocked.join().unwrap().expect("the insert commits");
+    let mut ivm = Ivm::start(&dir);
+    for q in ["SELECT * FROM t ORDER BY u", "SELECT * FROM a ORDER BY id", "SELECT * FROM c ORDER BY id"] {
+        assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q), "{q}");
+    }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A table the source cannot read (here: no SELECT privilege) does not stop
 /// the others: they are copied and streamed while it is retried, the error
 /// shows in the source's status, fresh reads of that table wait, and it is

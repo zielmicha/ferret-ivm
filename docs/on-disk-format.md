@@ -233,9 +233,11 @@ table 1000, `Delete`, key row with one value, int4 4.
 the table `ObjectId`, the new columns as a JSON array of `Column` (key
 columns `NOT NULL`), and the new key as column indexes (the replica
 identity's columns, as for `pk` above). Applying it also resets the table's
-entry in the source's stored state to `{"done": false, "boundary": null,
-"truncate": false}`, so that the table is copied again even if the engine
-restarts before the source logs progress.
+entry in the source's stored state to `{"done": false, "boundary": null}`,
+keeping its `truncate` flag (which the source's `Progress` record logged just
+before sets after a key change), so that the table is copied again, from an
+empty table after a key change, even if the engine restarts before the
+copy starts.
 
 **Tick** — `micros` is the wall clock in microseconds since the Unix epoch.
 The engine converts it to the PostgreSQL epoch (subtracting

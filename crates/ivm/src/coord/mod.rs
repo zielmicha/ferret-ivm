@@ -775,9 +775,12 @@ impl Engine {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
                 self.processed = gsn;
                 // The source snapshots the table again to fill in the new
-                // columns, and logs its reset state right after this record;
-                // a restart in between would take the snapshot as done and
-                // never redo it, so the record resets the state as well.
+                // columns. It logs its reset state (with the truncate a key
+                // change needs) just before this record; the record resets
+                // the state as well, keeping that truncate, so that a restart
+                // after it never takes the snapshot as done (records logged
+                // by earlier versions reset the state after the schema
+                // record).
                 if let Some(state) = self.source_states.get_mut(&source) {
                     *state = crate::source::postgres::snapshot_again(state, table);
                 }

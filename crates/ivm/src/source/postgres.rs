@@ -193,10 +193,13 @@ pub struct SourceState {
 }
 
 /// A source's logged `state` with the snapshot of `table` to be done again
-/// (as the source does on a schema change).
+/// (as the source does on a schema change). A pending truncate is kept: the
+/// source logs its reset state, with the truncate a key change needs, just
+/// before the schema record, and the table's copy may start long after it.
 pub fn snapshot_again(state: &str, table: ObjectId) -> String {
     let mut s: SourceState = serde_json::from_str(state).unwrap_or_default();
-    s.tables.insert(table, SnapState::default());
+    let truncate = s.tables.get(&table).is_some_and(|t| t.truncate);
+    s.tables.insert(table, SnapState { truncate, ..SnapState::default() });
     serde_json::to_string(&s).unwrap()
 }
 
@@ -1742,6 +1745,12 @@ mod tests {
             other => panic!("unexpected records {other:?}"),
         }
         assert_eq!(src.tables[&10].pk, [1]);
+        // the engine applies the schema record after the logged state: the
+        // truncate must survive it (a restart before the table's first chunk
+        // used to copy it over the rows deleted by the old key)
+        let LogRecord::Progress { state, .. } = &recs[0] else { unreachable!() };
+        let st: SourceState = serde_json::from_str(&snapshot_again(state, 10)).unwrap();
+        assert!(!st.tables[&10].done && st.tables[&10].truncate);
     }
 
     /// Changes decoded before a schema change in the same transaction are
