@@ -359,6 +359,7 @@ pub fn format_type(ty: &SqlType, typmod: i32) -> String {
             };
             format!("{base}({typmod}){suffix}")
         }
+        SqlType::Array(e) if typmod >= 0 => format!("{}[]", format_type(e, typmod)),
         _ => ty.name(),
     }
 }

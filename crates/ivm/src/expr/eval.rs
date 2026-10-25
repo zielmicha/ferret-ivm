@@ -27,25 +27,21 @@ impl Expr {
                         }
                         f(&a)
                     }
+                    // all arguments are evaluated before the strictness
+                    // check, as in PostgreSQL: their errors are raised even
+                    // when another argument is NULL
                     Imp::F2(f) => {
                         let a = c.args[0].eval(row)?;
-                        if def.strict && a.is_null() {
-                            return Ok(Datum::Null);
-                        }
                         let b = c.args[1].eval(row)?;
-                        if def.strict && b.is_null() {
+                        if def.strict && (a.is_null() || b.is_null()) {
                             return Ok(Datum::Null);
                         }
                         f(&a, &b)
                     }
                     Imp::FN(f) => {
-                        let mut args = Vec::with_capacity(c.args.len());
-                        for a in &c.args {
-                            let v = a.eval(row)?;
-                            if def.strict && v.is_null() {
-                                return Ok(Datum::Null);
-                            }
-                            args.push(v);
+                        let args = c.args.iter().map(|a| a.eval(row)).collect::<Result<Vec<_>>>()?;
+                        if def.strict && args.iter().any(|v| v.is_null()) {
+                            return Ok(Datum::Null);
                         }
                         f(&args)
                     }
@@ -226,18 +222,19 @@ impl Expr {
     }
 
     /// Fold constant subexpressions (no column refs, immutable functions).
+    ///
+    /// Like PostgreSQL's eval_const_expressions, parts that a constant makes
+    /// unreachable are dropped without being folded, so their errors do not
+    /// surface: CASE branches with a constant false condition (and anything
+    /// after a constant true one), COALESCE arguments after a non-null
+    /// constant, AND / OR arguments after a constant false / true.
     pub fn fold(self) -> Result<Expr> {
         let mut e = self;
-        for c in e.children_mut() {
-            let taken = std::mem::replace(c, Expr::Literal(Datum::Null, crate::types::SqlType::Unknown));
-            *c = taken.fold()?;
-        }
-        // simplify boolean connectives
         match e {
             Expr::And(v) => {
                 let mut out = Vec::new();
                 for x in v {
-                    match x {
+                    match x.fold()? {
                         Expr::Literal(Datum::Bool(true), _) => {}
                         Expr::Literal(Datum::Bool(false), _) => return Ok(Expr::bool(false)),
                         Expr::And(inner) => out.extend(inner),
@@ -253,7 +250,7 @@ impl Expr {
             Expr::Or(v) => {
                 let mut out = Vec::new();
                 for x in v {
-                    match x {
+                    match x.fold()? {
                         Expr::Literal(Datum::Bool(false), _) => {}
                         Expr::Literal(Datum::Bool(true), _) => return Ok(Expr::bool(true)),
                         Expr::Or(inner) => out.extend(inner),
@@ -267,28 +264,69 @@ impl Expr {
                 });
             }
             Expr::Case(mut c) => {
-                // drop constant-false branches; a constant-true branch ends the CASE
                 let mut whens = Vec::new();
+                let mut else_ = None;
                 for (w, t) in std::mem::take(&mut c.whens) {
-                    match &w {
-                        Expr::Literal(Datum::Bool(true), _) => {
-                            if whens.is_empty() {
-                                return Ok(t);
-                            }
-                            c.else_ = t;
+                    match w.fold()? {
+                        // a false or NULL condition: the branch is unreachable
+                        Expr::Literal(d, _) if !matches!(d, Datum::Bool(true)) => {}
+                        // a true condition ends the CASE
+                        Expr::Literal(..) => {
+                            else_ = Some(t.fold()?);
                             break;
                         }
-                        Expr::Literal(d, _) if !matches!(d, Datum::Bool(true)) => {}
-                        _ => whens.push((w, t)),
+                        w => whens.push((w, t.fold()?)),
                     }
                 }
+                let else_ = match else_ {
+                    Some(t) => t,
+                    None => c.else_.fold()?,
+                };
                 if whens.is_empty() {
-                    return Ok(c.else_);
+                    return Ok(else_);
                 }
                 c.whens = whens;
+                c.else_ = else_;
                 return Ok(Expr::Case(c));
             }
+            Expr::Coalesce(v, t) => {
+                let mut out = Vec::new();
+                for x in v {
+                    match x.fold()? {
+                        Expr::Literal(Datum::Null, _) => {}
+                        // later arguments are unreachable
+                        l @ Expr::Literal(..) => {
+                            out.push(l);
+                            break;
+                        }
+                        other => out.push(other),
+                    }
+                }
+                return Ok(match out.len() {
+                    0 => Expr::Literal(Datum::Null, t),
+                    1 if out[0].is_literal() => out.pop().unwrap(),
+                    _ => Expr::Coalesce(out, t),
+                });
+            }
             _ => {}
+        }
+        for c in e.children_mut() {
+            let taken = std::mem::replace(c, Expr::Literal(Datum::Null, crate::types::SqlType::Unknown));
+            *c = taken.fold()?;
+        }
+        // a strict function with a constant NULL argument is never called,
+        // whatever its other arguments and volatility (evaluate_function)
+        if let Expr::Call(c) = &e
+            && func_def(c.func).strict
+            && c.args.iter().any(|a| matches!(a, Expr::Literal(Datum::Null, _)))
+        {
+            return Ok(Expr::Literal(Datum::Null, c.ret.clone()));
+        }
+        // NULLIF with a NULL constant argument: they cannot be equal
+        if let Expr::NullIf(a, b) = &mut e
+            && (matches!(**a, Expr::Literal(Datum::Null, _)) || matches!(**b, Expr::Literal(Datum::Null, _)))
+        {
+            return Ok(std::mem::replace(&mut **a, Expr::Literal(Datum::Null, crate::types::SqlType::Unknown)));
         }
         let foldable = !matches!(
             e,

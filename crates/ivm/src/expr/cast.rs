@@ -41,8 +41,8 @@ pub fn cast_context(from: &SqlType, to: &SqlType) -> Option<CastContext> {
         (Oid, Int4 | Int8) => Assignment,
         (Int4, Bool) | (Bool, Int4) => Explicit,
         (Varchar | Bpchar | Name, Text) => Implicit,
-        (Text | Bpchar | Name, Varchar) => Implicit,
-        (Text | Varchar, Bpchar) => Assignment,
+        (Text | Bpchar, Varchar) => Implicit,
+        (Text | Varchar, Bpchar) => Implicit,
         (Text | Varchar | Bpchar, Name) => Implicit,
         (Date, Timestamp | TimestampTz) => Implicit,
         (Timestamp, TimestampTz) => Implicit,
@@ -173,6 +173,8 @@ fn convert(d: &Datum, to: &SqlType) -> Result<Datum> {
         }
         // strings
         (Datum::Text(s), T::Text | T::Varchar | T::Bpchar | T::Name) => Datum::Text(s.clone()),
+        // booltext(), unlike the output function, spells the words out
+        (Datum::Bool(b), T::Text | T::Varchar | T::Bpchar) => Datum::text(if *b { "true" } else { "false" }),
         (_, T::Text | T::Varchar | T::Bpchar | T::Name) => Datum::text_owned(format_datum(d)),
         (Datum::Text(s), _) => parse_datum(s, to, -1)?,
         // arrays
