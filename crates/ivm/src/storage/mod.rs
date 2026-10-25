@@ -1006,19 +1006,102 @@ impl Env {
 
     /// Collect all entries in a range (convenience for small ranges).
     pub fn scan(&mut self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Result<Vec<(Box<[u8]>, History)>> {
-        let mut c = self.cursor(tree, lo, hi);
         let mut out = Vec::new();
-        while let Some(x) = self.cursor_next(&mut c)? {
-            out.push(x);
-        }
+        self.for_each(tree, lo, hi, &mut |k, h| {
+            out.push((k.into(), h.clone()));
+            Ok(true)
+        })?;
         Ok(out)
     }
 
     /// Entries whose key starts with `prefix`.
     pub fn scan_prefix(&mut self, tree: TreeId, prefix: &[u8]) -> Result<Vec<(Box<[u8]>, History)>> {
-        match crate::types::encoding::prefix_successor(prefix) {
-            Some(succ) => self.scan(tree, Bound::Included(prefix), Bound::Excluded(&succ)),
-            None => self.scan(tree, Bound::Included(prefix), Bound::Unbounded),
+        let mut out = Vec::new();
+        self.for_each_prefix(tree, prefix, &mut |k, h| {
+            out.push((k.into(), h.clone()));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Call `f` with the entries in [lo, hi) in key order until it returns
+    /// false. Entries are visited where they are, without copying them.
+    pub fn for_each(
+        &mut self,
+        tree: TreeId,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        f: &mut dyn FnMut(&[u8], &History) -> Result<bool>,
+    ) -> Result<()> {
+        self.walk(tree, lo, &|k| below_hi(k, hi), f)
+    }
+
+    /// `for_each` over the entries whose key starts with `prefix`.
+    pub fn for_each_prefix(&mut self, tree: TreeId, prefix: &[u8], f: &mut dyn FnMut(&[u8], &History) -> Result<bool>) -> Result<()> {
+        self.walk(tree, Bound::Included(prefix), &|k| k.starts_with(prefix), f)
+    }
+
+    /// Visit entries from `lo` while `in_range` (true up to some key, false
+    /// after it) holds, one leaf at a time: each leaf is found from the root,
+    /// so nothing is pinned between leaves.
+    fn walk(
+        &mut self,
+        tree: TreeId,
+        lo: Bound<&[u8]>,
+        in_range: &dyn Fn(&[u8]) -> bool,
+        f: &mut dyn FnMut(&[u8], &History) -> Result<bool>,
+    ) -> Result<()> {
+        let mut resume: Option<Vec<u8>> = None;
+        loop {
+            let Some(mut id) = self.root_slot(tree)? else { return Ok(()) };
+            let lo = match &resume {
+                Some(v) => Bound::Included(v.as_slice()),
+                None => lo,
+            };
+            // the deepest internal node with a child after the path (slots
+            // stay put until maybe_evict runs at the end)
+            let mut next: Option<(u32, usize)> = None;
+            loop {
+                match self.node(id) {
+                    Node::Leaf(_) => break,
+                    Node::Internal(children) => {
+                        let idx = match lo {
+                            Bound::Unbounded => 0,
+                            Bound::Included(k) | Bound::Excluded(k) => route(children, k),
+                        };
+                        if idx + 1 < children.len() {
+                            next = Some((id, idx + 1));
+                        }
+                        id = self.load_child(id, idx)?;
+                    }
+                }
+            }
+            let Node::Leaf(entries) = self.node(id) else { unreachable!() };
+            let start = match lo {
+                Bound::Unbounded => 0,
+                Bound::Included(k) => entries.partition_point(|e| &*e.key < k),
+                Bound::Excluded(k) => entries.partition_point(|e| &*e.key <= k),
+            };
+            for e in &entries[start..] {
+                if !in_range(&e.key) || !f(&e.key, &e.hist)? {
+                    self.maybe_evict();
+                    return Ok(());
+                }
+            }
+            let sep = match next {
+                Some((pid, ci)) => match self.node(pid) {
+                    Node::Internal(ch) if in_range(&ch[ci].sep) => Some(ch[ci].sep.to_vec()),
+                    _ => None,
+                },
+                None => None,
+            };
+            match sep {
+                Some(s) => resume = Some(s),
+                None => {
+                    self.maybe_evict();
+                    return Ok(());
+                }
+            }
         }
     }
 

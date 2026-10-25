@@ -94,14 +94,14 @@ fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Res
     // group key values from the first live entry (exact representation)
     let mut kv: Vec<Datum> = Vec::with_capacity(ng);
     if ng > 0 {
-        let mut c = env.cursor(tree, lo, hib);
         let mut first = None;
-        while let Some((k, h)) = env.cursor_next(&mut c)? {
+        env.for_each(tree, lo, hib, &mut |k, h| {
             if h.total() > 0 {
-                first = Some(layout.decode_row(&k)?);
-                break;
+                first = Some(layout.decode_row(k)?);
+                return Ok(false);
             }
-        }
+            Ok(true)
+        })?;
         let Some(first) = first else { return Ok((Ok(None), None)) };
         for c in &p.group_key {
             kv.push(first[*c].clone());
@@ -111,13 +111,13 @@ fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Res
     let mut scanned: Option<Vec<(Row, i64)>> = None;
     if p.ordered() {
         let mut rows = Vec::new();
-        let mut c = env.cursor(tree, lo, hib);
-        while let Some((k, h)) = env.cursor_next(&mut c)? {
+        env.for_each(tree, lo, hib, &mut |k, h| {
             let w = h.total();
             if w > 0 {
-                rows.push((layout.decode_row(&k)?, w));
+                rows.push((layout.decode_row(k)?, w));
             }
-        }
+            Ok(true)
+        })?;
         scanned = Some(rows);
     }
     let mut row: Row = kv.clone();
@@ -332,18 +332,28 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
         }
         return Ok(());
     }
-    // enumerate groups in key order
+    // enumerate groups in key order, seeking past each group's entries
+    // instead of visiting them
     let mut prefixes: Vec<Vec<u8>> = Vec::new();
-    let mut c = env.cursor(tree, Bound::Unbounded, Bound::Unbounded);
-    while let Some((k, h)) = env.cursor_next(&mut c)? {
-        if h.total() <= 0 {
-            continue;
-        }
-        let row = layout.decode_row(&k)?;
-        let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
-        let prefix = layout.encode_prefix(&kv);
-        if prefixes.last() != Some(&prefix) {
-            prefixes.push(prefix);
+    let mut from: Option<Vec<u8>> = None;
+    loop {
+        let lo = match &from {
+            Some(f) => Bound::Included(f.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let mut next = None;
+        env.for_each(tree, lo, Bound::Unbounded, &mut |k, h| {
+            if h.total() <= 0 {
+                return Ok(true);
+            }
+            next = Some(k[..layout.prefix_len(k, ng)?].to_vec());
+            Ok(false)
+        })?;
+        let Some(prefix) = next else { break };
+        from = crate::types::encoding::prefix_successor(&prefix);
+        prefixes.push(prefix);
+        if from.is_none() {
+            break;
         }
     }
     let mut errors = p.errors.lock();

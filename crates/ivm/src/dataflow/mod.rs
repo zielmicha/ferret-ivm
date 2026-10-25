@@ -497,15 +497,15 @@ impl Graph {
     /// Rows of an arrangement with weights as of `at` (decoded).
     pub fn scan_arr(&self, env: &mut Env, arr: ArrId, at: ReadAt) -> Result<Delta> {
         let a = self.arr(arr);
-        let layout = a.layout.clone();
-        let mut out = Vec::new();
-        let mut c = env.cursor(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-        while let Some((k, h)) = env.cursor_next(&mut c)? {
+        let layout = &a.layout;
+        let mut out = Vec::with_capacity(env.tree_count(a.tree).clamp(0, 1 << 24) as usize);
+        env.for_each(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
             let w = h.weight(at);
             if w != 0 {
-                out.push((layout.decode_row(&k)?, w));
+                out.push((layout.decode_row(k)?, w));
             }
-        }
+            Ok(true)
+        })?;
         Ok(out)
     }
 
@@ -513,13 +513,15 @@ impl Graph {
     pub fn lookup(&self, env: &mut Env, arr: ArrId, key: &[crate::types::Datum], at: ReadAt) -> Result<Delta> {
         let a = self.arr(arr);
         let prefix = a.layout.encode_prefix(key);
+        let layout = &a.layout;
         let mut out = Vec::new();
-        for (k, h) in env.scan_prefix(a.tree, &prefix)? {
+        env.for_each_prefix(a.tree, &prefix, &mut |k, h| {
             let w = h.weight(at);
             if w != 0 {
-                out.push((a.layout.decode_row(&k)?, w));
+                out.push((layout.decode_row(k)?, w));
             }
-        }
+            Ok(true)
+        })?;
         Ok(out)
     }
 

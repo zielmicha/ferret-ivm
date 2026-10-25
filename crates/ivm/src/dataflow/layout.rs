@@ -207,6 +207,15 @@ impl Layout {
         Ok(out)
     }
 
+    /// Encode the key prefix made of the row columns `cols` (canonical).
+    pub fn encode_prefix_of(&self, row: &[Datum], cols: &[usize]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16);
+        for (c, spec) in cols.iter().zip(&self.specs) {
+            encoding::encode_key(&row[*c], *spec, &mut out);
+        }
+        out
+    }
+
     /// Encode a key prefix (the first `vals.len()` key columns, canonical).
     pub fn encode_prefix(&self, vals: &[Datum]) -> Vec<u8> {
         let mut out = Vec::with_capacity(16);
@@ -251,6 +260,16 @@ impl Layout {
             return Err(SqlError::corrupt("trailing bytes in arrangement entry"));
         }
         Ok(row)
+    }
+
+    /// Length of the canonical encoding of the first `n` key columns of an
+    /// entry (equal to `encode_prefix` of their values).
+    pub fn prefix_len(&self, buf: &[u8], n: usize) -> Result<usize> {
+        let mut pos = 0;
+        for (t, spec) in self.key_types[..n].iter().zip(&self.specs) {
+            pos += encoding::skip_key(buf.get(pos..).ok_or_else(|| SqlError::corrupt("truncated key"))?, t, *spec)?;
+        }
+        Ok(pos)
     }
 
     /// Canonical key bytes of an entry (prefix up to the end of the key).
