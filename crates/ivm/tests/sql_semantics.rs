@@ -116,3 +116,31 @@ fn outer_join_kept_for_any_all_over_empty_arrays() {
     assert_eq!(rows(&h, null_arr), Vec::<String>::new());
     running.shutdown();
 }
+
+#[test]
+fn untyped_literals_in_query_outputs_resolve_to_text() {
+    let running = start("unknown-outputs");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE d (id int PRIMARY KEY, day date)");
+    exec(&h, "CREATE VIEW vu AS SELECT 'abc' AS x, NULL AS n");
+    exec(&h, "CREATE MATERIALIZED VIEW mu AS SELECT 'abc' AS x FROM d");
+    for sql in [
+        "SELECT pg_typeof(x) FROM (SELECT 'abc' AS x) s",
+        "WITH c AS (SELECT 'abc' AS x) SELECT pg_typeof(x) FROM c",
+        "SELECT pg_typeof(x) FROM vu",
+        "SELECT pg_typeof(n) FROM vu",
+        "SELECT pg_typeof(x) FROM (VALUES ('a')) v(x)",
+    ] {
+        assert_eq!(rows(&h, sql), vec!["text"], "{sql}");
+    }
+    assert_eq!(column_types(&h, "SELECT 'abc', NULL"), vec!["text", "text"]);
+    assert_eq!(column_types(&h, "SELECT * FROM mu"), vec!["text"]);
+    // set operations still unify untyped branches with the others
+    assert_eq!(rows(&h, "SELECT '1' UNION SELECT 2 ORDER BY 1"), vec!["1", "2"]);
+    assert_eq!(column_types(&h, "SELECT '1' UNION SELECT 2"), vec!["integer"]);
+    assert_eq!(column_types(&h, "(SELECT '1') UNION ALL (SELECT 2)"), vec!["integer"]);
+    // and INSERT ... SELECT still converts untyped values to the column type
+    exec(&h, "INSERT INTO d SELECT 1, '2024-01-01'");
+    assert_eq!(rows(&h, "SELECT day FROM d"), vec!["2024-01-01"]);
+    running.shutdown();
+}

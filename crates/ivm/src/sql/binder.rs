@@ -66,6 +66,23 @@ impl BoundQuery {
     pub fn column_types(&self) -> Vec<ColumnType> {
         self.rel.schema().into_iter().take(self.visible).collect()
     }
+
+    /// Resolve untyped (unknown) result columns as text, as PostgreSQL does
+    /// for the outputs of a query, subquery, CTE or view (but not for the
+    /// branches of a set operation, which unify their types first).
+    pub fn resolve_unknowns(mut self, b: &mut Binder) -> Result<BoundQuery> {
+        let schema = self.rel.schema();
+        if !schema.iter().take(self.visible).any(|c| c.ty == SqlType::Unknown) {
+            return Ok(self);
+        }
+        let target: Vec<ColumnType> = schema
+            .iter()
+            .enumerate()
+            .map(|(i, c)| if i < self.visible && c.ty == SqlType::Unknown { ColumnType::new(SqlType::Text).nullable(c.nullable) } else { c.clone() })
+            .collect();
+        self.rel = b.coerce_rel(self.rel, &target, "SELECT")?;
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -216,7 +233,7 @@ impl<'a> Binder<'a> {
             let binding = if w.recursive && query_references(&cte.query, &name) {
                 self.bind_recursive_cte(&name, &alias_cols, &cte.query)?
             } else {
-                let bq = self.bind_query(&cte.query)?;
+                let bq = self.bind_query(&cte.query)?.resolve_unknowns(self)?;
                 let mut names = bq.names.clone();
                 names.truncate(bq.visible);
                 apply_alias_names(&mut names, &alias_cols, &name)?;
@@ -1245,6 +1262,7 @@ impl<'a> Binder<'a> {
     }
 
     fn derived(&mut self, bq: BoundQuery, alias: Option<&ast::TableAlias>) -> Result<(Rel, Scope)> {
+        let bq = bq.resolve_unknowns(self)?;
         let mut names = bq.names.clone();
         names.truncate(bq.visible);
         let rel = bq.into_rel();
@@ -1309,7 +1327,7 @@ impl<'a> Binder<'a> {
                 let mut sub = Binder::new(self.catalog);
                 sub.view_depth = self.view_depth + 1;
                 sub.next_rec_id = self.next_rec_id + 1000;
-                let bq = sub.bind_query(&stmt)?;
+                let bq = sub.bind_query(&stmt)?.resolve_unknowns(&mut sub)?;
                 self.next_rec_id = sub.next_rec_id;
                 let rel = bq.into_rel();
                 let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
