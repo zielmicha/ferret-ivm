@@ -144,6 +144,11 @@ pub struct Graph {
     pub recovery: RecoveryMap,
     /// Per-node delta-rate statistics (rows per tick, EWMA) for the planner.
     pub stats: FxHashMap<NodeId, NodeStats>,
+    /// Per-node activity counters for introspection (one update per node
+    /// per step, never per row).
+    pub counters: FxHashMap<NodeId, NodeCounters>,
+    /// Sum of all node counters ever recorded (monotonic).
+    pub step_totals: NodeCounters,
     /// Logical time of the current GSN (timestamptz microseconds), from the
     /// logged clock ticks.
     pub now: i64,
@@ -183,6 +188,19 @@ fn operator_errors(kind: &NodeKind) -> Option<&OpErrors> {
 pub struct NodeStats {
     pub ticks: u64,
     pub rows: u64,
+}
+
+/// Activity of a node since it was created.
+#[derive(Default, Clone, Copy, Debug, serde::Serialize)]
+pub struct NodeCounters {
+    /// Steps in which the node ran (it had input changes).
+    pub steps: u64,
+    /// Input delta rows (base table changes for table nodes).
+    pub in_rows: u64,
+    /// Output delta rows.
+    pub out_rows: u64,
+    /// Time spent running the operator and updating its arrangements.
+    pub nanos: u64,
 }
 
 impl Graph {
@@ -500,6 +518,7 @@ impl Graph {
         let node = self.nodes[id].take().unwrap();
         self.node_by_fp.remove(&node.fp);
         self.node_errors.remove(&id);
+        self.counters.remove(&id);
         self.topo_dirty = true;
         // arrangements used by this operator
         for a in operator_arrangements(&node.kind) {
@@ -645,9 +664,13 @@ impl Graph {
             if !node.hydrated {
                 continue;
             }
+            let (started, in_rows);
             let out = if let NodeKind::Table { .. } = node.kind {
                 match changes.remove(&id) {
-                    Some(ch) => ops::table_step(self, env, node, ch, gsn)?,
+                    Some(ch) => {
+                        (started, in_rows) = (std::time::Instant::now(), ch.len());
+                        ops::table_step(self, env, node, ch, gsn)?
+                    }
                     None => continue,
                 }
             } else {
@@ -657,19 +680,32 @@ impl Graph {
                 }
                 let empty = Output::default();
                 let inputs: Vec<&Output> = node.inputs.iter().map(|i| outputs.get(i).unwrap_or(&empty)).collect();
+                (started, in_rows) = (std::time::Instant::now(), inputs.iter().map(|o| o.data.len()).sum());
                 ops::step_node(self, env, node, &inputs, gsn, &outputs)?
             };
             if out.is_empty() {
+                self.count_step(id, in_rows, 0, started);
                 continue;
             }
             self.add_errors(id, &out.errs);
             self.apply_to_arrangements(env, id, &out.data, gsn)?;
+            self.count_step(id, in_rows, out.data.len(), started);
             let st = self.stats.entry(id).or_default();
             st.ticks += 1;
             st.rows += out.data.len() as u64;
             outputs.insert(id, out);
         }
         Ok(outputs)
+    }
+
+    fn count_step(&mut self, id: NodeId, in_rows: usize, out_rows: usize, started: std::time::Instant) {
+        let nanos = started.elapsed().as_nanos() as u64;
+        for c in [self.counters.entry(id).or_default(), &mut self.step_totals] {
+            c.steps += 1;
+            c.in_rows += in_rows as u64;
+            c.out_rows += out_rows as u64;
+            c.nanos += nanos;
+        }
     }
 
     fn apply_to_arrangements(&self, env: &mut Env, node: NodeId, delta: &Delta, gsn: Gsn) -> Result<()> {

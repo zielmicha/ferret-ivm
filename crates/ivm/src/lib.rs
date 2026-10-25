@@ -10,6 +10,7 @@ pub mod dataflow;
 pub mod error;
 pub mod exec;
 pub mod expr;
+pub mod http;
 pub mod log;
 pub mod server;
 pub mod sink;
