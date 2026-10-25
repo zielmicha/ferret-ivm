@@ -37,10 +37,8 @@ Where the implementation differs from the design:
   threads, but the dataflow is not partitioned across cores.
 - **Atomic checkpoints** of all indexes at one GSN instead of per-arrangement
   durable frontiers ([Recovery](recovery.md)).
-- **No persisted LSN→GSN mapping.** Each commit record carries its LSN, and
-  `AS OF AT LEAST LSN` waits for the per-source LSN frontiers; the engine
-  keeps an in-memory list of recent (source, LSN, GSN) triples
-  (`Engine::lsn_map`) that nothing reads.
+- **No LSN→GSN mapping.** Each commit record carries its LSN, and
+  `AS OF AT LEAST LSN` waits for the per-source LSN frontiers.
 - **Recursion by recomputation.** `WITH RECURSIVE` recomputes the fixpoint
   instead of using nested time ([Dataflow](dataflow.md#recursive)).
 - **Planning.** Join orders use equality edges, unique keys and exact index
@@ -224,9 +222,7 @@ Frontiers derived from it:
 
 Upstream LSNs are mapped to the GSN clock through the log: every source
 `Commit` record carries the upstream transaction's end LSN. The engine keeps
-the last logged LSN per source (checkpointed as the source's resume point)
-and an in-memory list of the last 100,000 (source, LSN, GSN) triples, which
-nothing reads at present.
+the last logged LSN per source (checkpointed as the source's resume point).
 
 Reads choose a GSN from these frontiers
 ([Reads](../user-guide/reads.md#read-points)): a fresh read takes the

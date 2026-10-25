@@ -156,8 +156,6 @@ pub struct Engine {
     pub(crate) handle: Option<EngineHandle>,
     pub(crate) source_handles: HashMap<ObjectId, crate::source::SourceHandle>,
     pub(crate) sink_handles: HashMap<ObjectId, crate::sink::SinkHandle>,
-    /// Recent (source, lsn, gsn) commits for "at least LSN" reads.
-    pub lsn_map: VecDeque<(ObjectId, u64, Gsn)>,
     /// Logical clock: the latest logged tick (timestamptz microseconds).
     pub clock: i64,
     /// Recent (gsn, clock) ticks, for now() in reads as of a past GSN.
@@ -308,7 +306,6 @@ pub fn start(cfg: Config) -> Result<Running> {
         handle: None,
         source_handles: HashMap::new(),
         sink_handles: HashMap::new(),
-        lsn_map: VecDeque::new(),
         clock: 0,
         ticks: VecDeque::new(),
     };
@@ -606,10 +603,6 @@ impl Engine {
                 } else {
                     let e = self.source_lsns.entry(source).or_insert(0);
                     *e = (*e).max(lsn);
-                    self.lsn_map.push_back((source, lsn, gsn));
-                    while self.lsn_map.len() > 100_000 {
-                        self.lsn_map.pop_front();
-                    }
                 }
             }
             LogRecord::Ddl { req, sql, extra } => {

@@ -915,7 +915,6 @@ impl Engine {
                 self.source_states.remove(&id);
                 // a dropped source no longer holds back reads waiting for an LSN
                 self.source_lsns.remove(&id);
-                self.lsn_map.retain(|(s, _, _)| *s != id);
                 self.shared.source_lsn.lock().remove(&id);
             }
             ObjectKind::Sink(_) => {

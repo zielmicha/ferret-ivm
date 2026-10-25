@@ -200,9 +200,6 @@ pub(crate) fn sql_mentions(sql: &str, name: &str) -> bool {
     lower.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).any(|w| w.trim_matches('"') == name)
 }
 
-/// System relations exposed to SQL (read-only).
-pub const SYSTEM_RELATIONS: &[&str] = &["ivm_catalog", "ivm_lsn_gsn", "ivm_frontiers"];
-
 impl BindCatalog for Catalog {
     fn definitions(&self, kind: &str) -> Vec<(u32, String)> {
         crate::sysrel::definitions(self, kind)
