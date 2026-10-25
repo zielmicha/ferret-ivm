@@ -458,3 +458,41 @@ fn join_input_errors_hydrate_like_steps() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Variances of int8 values: the sum of squares (up to 2^126 per value)
+/// overflowed its i128 accumulator, panicking the engine thread (debug
+/// builds) or wrapping around. Expected rows are PostgreSQL's.
+#[test]
+fn int8_variance_does_not_overflow() {
+    let dir = tmpdir("int8-variance");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE b (id int PRIMARY KEY, g int, x int8)");
+    exec(&h, "INSERT INTO b VALUES (1, 1, 9223372036854775807), (2, 1, 9223372036854775807), (3, 1, -9223372036854775807), (4, 2, 3037000499), (5, 2, 1)");
+    let grouped = "SELECT g, var_samp(x) AS a, stddev_pop(x) AS b, variance(x) AS c FROM b GROUP BY g";
+    let global = "SELECT var_pop(x) AS v FROM b";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW vg AS {grouped}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW va AS {global}"));
+    let want_g = [
+        "1|113427455640312821129862543712310001665|8695878550221854807|113427455640312821129862543712310001665",
+        "2|4611686012426124002|1518500249|4611686012426124002",
+    ];
+    assert_eq!(rows(&h, "SELECT * FROM vg ORDER BY g"), want_g);
+    assert_eq!(rows(&h, &format!("{grouped} ORDER BY g")), want_g);
+    assert_eq!(rows(&h, "SELECT * FROM va"), ["47639531366690474037008890079615688220"]);
+    assert_eq!(
+        rows(&h, "SELECT id, var_pop(x) OVER (PARTITION BY g ORDER BY id) FROM b ORDER BY id"),
+        ["1|0", "2|0", "3|75618303760208547419908362474873334444", "4|0", "5|2305843006213062001"]
+    );
+    exec(&h, "DELETE FROM b WHERE id = 2");
+    exec(&h, "INSERT INTO b VALUES (6, 2, -9223372036854775807)");
+    let want_g = [
+        "1|170141183460469231694793815568465002498|9223372036854775807|170141183460469231694793815568465002498",
+        "2|28356863919415333781411417455122884417|4347939275826755286|28356863919415333781411417455122884417",
+    ];
+    assert_eq!(rows(&h, "SELECT * FROM vg ORDER BY g"), want_g);
+    assert_eq!(rows(&h, &format!("{grouped} ORDER BY g")), want_g);
+    assert_eq!(rows(&h, "SELECT * FROM va"), ["47639531371172295715027125688135192780"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
