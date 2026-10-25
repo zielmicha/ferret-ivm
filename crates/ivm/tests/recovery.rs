@@ -267,3 +267,30 @@ fn views_sharing_a_dataflow_share_its_errors() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A view depends on the relations it reads, not on every object whose
+/// name it happens to contain (here a column named like a table): DROP used
+/// to refuse, and DROP ... CASCADE dropped the unrelated view.
+#[test]
+fn dependencies_are_the_relations_read() {
+    let dir = tmpdir("false-deps");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, total int)");
+    exec(&h, "CREATE TABLE total (id int PRIMARY KEY)");
+    exec(&h, "CREATE TABLE u (id int PRIMARY KEY)");
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT id, total FROM t");
+    exec(&h, "CREATE VIEW pv AS SELECT id FROM u");
+    exec(&h, "CREATE MATERIALIZED VIEW w AS SELECT count(*) AS n FROM pv");
+    exec(&h, "DROP TABLE total");
+    assert_eq!(rows(&h, "SELECT count(*) FROM v"), ["0"]);
+    // real dependencies, also through a plain view, still hold
+    assert!(try_exec(&h, "DROP TABLE u").is_err());
+    exec(&h, "DROP TABLE u CASCADE");
+    for gone in ["pv", "w"] {
+        assert!(try_exec(&h, &format!("SELECT * FROM {gone}")).is_err(), "{gone} should be gone");
+    }
+    assert_eq!(rows(&h, "SELECT count(*) FROM v"), ["0"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

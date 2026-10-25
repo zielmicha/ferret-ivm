@@ -600,11 +600,10 @@ impl Engine {
         let mut affected = std::collections::HashSet::from([changed]);
         // views (inlined into queries) over a changed object change with it
         loop {
-            let names: Vec<String> = affected.iter().filter_map(|id| self.catalog.get(*id).map(|o| o.name.clone())).collect();
             let more: Vec<ObjectId> = objects
                 .iter()
-                .filter(|o| matches!(o.kind, ObjectKind::View(_)) && !affected.contains(&o.id))
-                .filter(|o| matches!(&o.kind, ObjectKind::View(v) if names.iter().any(|n| crate::catalog::sql_mentions(&v.sql, n))))
+                .filter(|o| !affected.contains(&o.id))
+                .filter(|o| matches!(&o.kind, ObjectKind::View(v) if affected.iter().any(|a| self.catalog.query_reads(&v.sql, *a))))
                 .map(|o| o.id)
                 .collect();
             if more.is_empty() {
