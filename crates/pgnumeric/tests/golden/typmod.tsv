@@ -1,0 +1,636 @@
+typmod	0	10	2	ok	0.00
+typmod	0	10	-2	ok	0
+typmod	0	5	-3	ok	0
+typmod	0	3	7	ok	0.0000000
+typmod	0.0	38	10	ok	0.0000000000
+typmod	0.0	1000	-1000	ok	0
+typmod	0.0	10	0	ok	0
+typmod	0.0	1	-1	ok	0
+typmod	0.000	4	4	ok	0.0000
+typmod	0.000	20	10	ok	0.0000000000
+typmod	0.000	3	-5	ok	0
+typmod	0.000	2	5	ok	0.00000
+typmod	-0	1000	-1000	ok	0
+typmod	-0	3	-5	ok	0
+typmod	-0	1	1	ok	0.0
+typmod	-0	10	2	ok	0.00
+typmod	1	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	1	4	2	ok	1.00
+typmod	1	3	-5	ok	0
+typmod	1	38	10	ok	1.0000000000
+typmod	-1	3	0	ok	-1
+typmod	-1	10	-2	ok	0
+typmod	-1	10	2	ok	-1.00
+typmod	-1	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	2	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	2	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	2	10	2	ok	2.00
+typmod	2	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-2	5	-3	ok	0
+typmod	-2	4	2	ok	-2.00
+typmod	-2	6	3	ok	-2.000
+typmod	-2	3	-5	ok	0
+typmod	0.5	4	2	ok	0.50
+typmod	0.5	1	-1	ok	0
+typmod	0.5	1000	-1000	ok	0
+typmod	0.5	20	10	ok	0.5000000000
+typmod	-0.5	3	0	ok	-1
+typmod	-0.5	1	-1	ok	0
+typmod	-0.5	1	0	ok	-1
+typmod	-0.5	1000	-1000	ok	0
+typmod	1.5	4	2	ok	1.50
+typmod	1.5	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	1.5	10	2	ok	1.50
+typmod	1.5	20	10	ok	1.5000000000
+typmod	2.5	1	-1	ok	0
+typmod	2.5	1	0	ok	3
+typmod	2.5	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	2.5	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	9	1	0	ok	9
+typmod	9	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	9	2	1	ok	9.0
+typmod	9	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	10	6	3	ok	10.000
+typmod	10	38	10	ok	10.0000000000
+typmod	10	10	0	ok	10
+typmod	10	1000	0	ok	10
+typmod	99	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	99	5	-3	ok	0
+typmod	99	38	10	ok	99.0000000000
+typmod	99	3	-5	ok	0
+typmod	100	5	-3	ok	0
+typmod	100	10	2	ok	100.00
+typmod	100	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	100	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	9999	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	9999	20	10	ok	9999.0000000000
+typmod	9999	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	9999	3	-5	ok	0
+typmod	10000	3	-5	ok	0
+typmod	10000	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	10000	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	10000	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	10001	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	10001	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	10001	10	2	ok	10001.00
+typmod	10001	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	99999999	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	99999999	10	-2	ok	100000000
+typmod	99999999	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	99999999	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	100000000	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	100000000	20	10	ok	100000000.0000000000
+typmod	100000000	1000	-1000	ok	0
+typmod	100000000	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	0.0001	1	1	ok	0.0
+typmod	0.0001	1000	-1000	ok	0
+typmod	0.0001	38	10	ok	0.0001000000
+typmod	0.0001	4	4	ok	0.0001
+typmod	0.00001	2	1	ok	0.0
+typmod	0.00001	4	2	ok	0.00
+typmod	0.00001	10	0	ok	0
+typmod	0.00001	6	3	ok	0.000
+typmod	0.1	4	4	ok	0.1000
+typmod	0.1	15	15	ok	0.100000000000000
+typmod	0.1	20	10	ok	0.1000000000
+typmod	0.1	10	2	ok	0.10
+typmod	0.9	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	0.9	4	4	ok	0.9000
+typmod	0.9	6	3	ok	0.900
+typmod	0.9	20	10	ok	0.9000000000
+typmod	1.1	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	1.1	3	-5	ok	0
+typmod	1.1	10	2	ok	1.10
+typmod	1.1	20	10	ok	1.1000000000
+typmod	0.99999999	10	-2	ok	0
+typmod	0.99999999	5	-3	ok	0
+typmod	0.99999999	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	0.99999999	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	1.00000001	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	1.00000001	1	-1	ok	0
+typmod	1.00000001	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	1.00000001	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	3.14159265358979323846264338327950288	6	3	ok	3.142
+typmod	3.14159265358979323846264338327950288	10	2	ok	3.14
+typmod	3.14159265358979323846264338327950288	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	3.14159265358979323846264338327950288	2	1	ok	3.1
+typmod	-2.71828182845904523536	5	-3	ok	0
+typmod	-2.71828182845904523536	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-2.71828182845904523536	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-2.71828182845904523536	1	0	ok	-3
+typmod	123456789012345678901234567890	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	123456789012345678901234567890	1000	0	ok	123456789012345678901234567890
+typmod	123456789012345678901234567890	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	123456789012345678901234567890	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	0.000000000000000000000000000001	1	1	ok	0.0
+typmod	0.000000000000000000000000000001	20	10	ok	0.0000000000
+typmod	0.000000000000000000000000000001	3	-5	ok	0
+typmod	0.000000000000000000000000000001	4	2	ok	0.00
+typmod	9999999999999999999	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	9999999999999999999	3	-5	err	22003	numeric field overflow	A field with precision 3, scale -5 must round to an absolute value less than 10^8.
+typmod	9999999999999999999	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	9999999999999999999	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	9223372036854775807	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	9223372036854775807	10	-2	err	22003	numeric field overflow	A field with precision 10, scale -2 must round to an absolute value less than 10^12.
+typmod	9223372036854775807	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	9223372036854775807	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-9223372036854775808	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-9223372036854775808	1000	-1000	ok	0
+typmod	-9223372036854775808	10	-2	err	22003	numeric field overflow	A field with precision 10, scale -2 must round to an absolute value less than 10^12.
+typmod	-9223372036854775808	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	9223372036854775808	38	10	ok	9223372036854775808.0000000000
+typmod	9223372036854775808	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	9223372036854775808	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	9223372036854775808	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-9223372036854775809	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-9223372036854775809	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-9223372036854775809	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-9223372036854775809	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	2147483647	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	2147483647	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	2147483647	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	2147483647	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-2147483648	10	-2	ok	-2147483600
+typmod	-2147483648	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-2147483648	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-2147483648	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	2147483648	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	2147483648	20	10	ok	2147483648.0000000000
+typmod	2147483648	10	0	ok	2147483648
+typmod	2147483648	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	32767	1000	-1000	ok	0
+typmod	32767	10	-2	ok	32800
+typmod	32767	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	32767	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-32768	1000	-1000	ok	0
+typmod	-32768	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-32768	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	-32768	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	32768	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	32768	3	-5	ok	0
+typmod	32768	1000	-1000	ok	0
+typmod	32768	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	1e100	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	1e100	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	1e100	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	1e100	10	-2	err	22003	numeric field overflow	A field with precision 10, scale -2 must round to an absolute value less than 10^12.
+typmod	-1e-100	4	4	ok	0.0000
+typmod	-1e-100	1	1	ok	0.0
+typmod	-1e-100	5	-3	ok	0
+typmod	-1e-100	3	7	ok	0.0000000
+typmod	1.5e-20	3	-5	ok	0
+typmod	1.5e-20	10	2	ok	0.00
+typmod	1.5e-20	2	5	ok	0.00000
+typmod	1.5e-20	1000	-1000	ok	0
+typmod	NaN	2	1	ok	NaN
+typmod	NaN	38	10	ok	NaN
+typmod	NaN	1	3	ok	NaN
+typmod	NaN	5	-3	ok	NaN
+typmod	Infinity	10	-2	err	22003	numeric field overflow	A field with precision 10, scale -2 cannot hold an infinite value.
+typmod	Infinity	1000	-1000	err	22003	numeric field overflow	A field with precision 1000, scale -1000 cannot hold an infinite value.
+typmod	Infinity	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 cannot hold an infinite value.
+typmod	Infinity	10	0	err	22003	numeric field overflow	A field with precision 10, scale 0 cannot hold an infinite value.
+typmod	-Infinity	38	10	err	22003	numeric field overflow	A field with precision 38, scale 10 cannot hold an infinite value.
+typmod	-Infinity	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 cannot hold an infinite value.
+typmod	-Infinity	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 cannot hold an infinite value.
+typmod	-Infinity	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 cannot hold an infinite value.
+typmod	6610.0770	20	10	ok	6610.0770000000
+typmod	6610.0770	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	6610.0770	10	-2	ok	6600
+typmod	6610.0770	1000	-1000	ok	0
+typmod	751877787085.0006	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	751877787085.0006	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	751877787085.0006	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	751877787085.0006	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	700902064298.000745	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	700902064298.000745	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	700902064298.000745	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	700902064298.000745	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	777.00000000000420	3	-5	ok	0
+typmod	777.00000000000420	20	10	ok	777.0000000000
+typmod	777.00000000000420	10	0	ok	777
+typmod	777.00000000000420	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	-7129894.000075556	10	-2	ok	-7129900
+typmod	-7129894.000075556	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-7129894.000075556	3	-5	ok	-7100000
+typmod	-7129894.000075556	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	958346054370.676108085906	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	958346054370.676108085906	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	958346054370.676108085906	10	0	err	22003	numeric field overflow	A field with precision 10, scale 0 must round to an absolute value less than 10^10.
+typmod	958346054370.676108085906	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	-643473.0000000000713	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-643473.0000000000713	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-643473.0000000000713	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-643473.0000000000713	5	-3	ok	-643000
+typmod	448437004352	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	448437004352	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	448437004352	10	-2	ok	448437004400
+typmod	448437004352	38	10	ok	448437004352.0000000000
+typmod	343873895766.948970088	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	343873895766.948970088	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	343873895766.948970088	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	343873895766.948970088	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	-246979294244.1136222	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	-246979294244.1136222	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	-246979294244.1136222	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	-246979294244.1136222	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	2.8757110181685e44	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	2.8757110181685e44	10	-2	err	22003	numeric field overflow	A field with precision 10, scale -2 must round to an absolute value less than 10^12.
+typmod	2.8757110181685e44	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	2.8757110181685e44	10	0	err	22003	numeric field overflow	A field with precision 10, scale 0 must round to an absolute value less than 10^10.
+typmod	-354031904375.0000000054	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-354031904375.0000000054	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	-354031904375.0000000054	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-354031904375.0000000054	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	-2.425944198e24	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	-2.425944198e24	38	10	ok	-2425944198000000000000000.0000000000
+typmod	-2.425944198e24	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	-2.425944198e24	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	79092458.343676220	10	-2	ok	79092500
+typmod	79092458.343676220	38	10	ok	79092458.3436762200
+typmod	79092458.343676220	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	79092458.343676220	10	0	ok	79092458
+typmod	-7453978.00000794	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	-7453978.00000794	10	0	ok	-7453978
+typmod	-7453978.00000794	3	-5	ok	-7500000
+typmod	-7453978.00000794	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	0.960402	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	0.960402	5	5	ok	0.96040
+typmod	0.960402	1000	0	ok	1
+typmod	0.960402	10	0	ok	1
+typmod	809220965912.086885	1000	0	ok	809220965912
+typmod	809220965912.086885	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	809220965912.086885	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	809220965912.086885	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	9.145356767666	1000	-1000	ok	0
+typmod	9.145356767666	1	-1	ok	10
+typmod	9.145356767666	2	1	ok	9.1
+typmod	9.145356767666	10	-2	ok	0
+typmod	-413276314859.0000463581776	10	0	err	22003	numeric field overflow	A field with precision 10, scale 0 must round to an absolute value less than 10^10.
+typmod	-413276314859.0000463581776	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-413276314859.0000463581776	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	-413276314859.0000463581776	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	-745714162246	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	-745714162246	10	0	err	22003	numeric field overflow	A field with precision 10, scale 0 must round to an absolute value less than 10^10.
+typmod	-745714162246	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-745714162246	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	-697588.197929928177	1000	0	ok	-697588
+typmod	-697588.197929928177	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-697588.197929928177	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-697588.197929928177	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-0.00000000244	6	3	ok	0.000
+typmod	-0.00000000244	3	-5	ok	0
+typmod	-0.00000000244	10	-2	ok	0
+typmod	-0.00000000244	1	1	ok	0.0
+typmod	-583143016305	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	-583143016305	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-583143016305	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	-583143016305	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	770098251485.906710247602	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	770098251485.906710247602	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	770098251485.906710247602	1000	-1000	ok	0
+typmod	770098251485.906710247602	1000	0	ok	770098251486
+typmod	-78998.4	20	10	ok	-78998.4000000000
+typmod	-78998.4	10	2	ok	-78998.40
+typmod	-78998.4	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	-78998.4	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-487035209173.7307123	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	-487035209173.7307123	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	-487035209173.7307123	1000	-1000	ok	0
+typmod	-487035209173.7307123	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	5.398701576379627498e-7	1	1	ok	0.0
+typmod	5.398701576379627498e-7	5	-3	ok	0
+typmod	5.398701576379627498e-7	1	0	ok	0
+typmod	5.398701576379627498e-7	2	1	ok	0.0
+typmod	652.0000074	1000	0	ok	652
+typmod	652.0000074	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	652.0000074	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	652.0000074	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	24432384.980976187057	20	10	ok	24432384.9809761871
+typmod	24432384.980976187057	1000	0	ok	24432385
+typmod	24432384.980976187057	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	24432384.980976187057	5	-3	ok	24432000
+typmod	2117.70650	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	2117.70650	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	2117.70650	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	2117.70650	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-25.730665502142	10	2	ok	-25.73
+typmod	-25.730665502142	20	10	ok	-25.7306655021
+typmod	-25.730665502142	6	3	ok	-25.731
+typmod	-25.730665502142	5	-3	ok	0
+typmod	-762.000000379740000	10	2	ok	-762.00
+typmod	-762.000000379740000	6	3	ok	-762.000
+typmod	-762.000000379740000	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	-762.000000379740000	5	-3	ok	-1000
+typmod	146262500854.00000000388	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	146262500854.00000000388	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	146262500854.00000000388	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	146262500854.00000000388	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	-668802347177.1834	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	-668802347177.1834	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-668802347177.1834	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	-668802347177.1834	1000	0	ok	-668802347177
+typmod	-452175426197.7019911	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-452175426197.7019911	10	-2	ok	-452175426200
+typmod	-452175426197.7019911	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	-452175426197.7019911	1000	-1000	ok	0
+typmod	-752168162154	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	-752168162154	1000	-1000	ok	0
+typmod	-752168162154	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	-752168162154	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	8560.0000095411812	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	8560.0000095411812	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	8560.0000095411812	10	-2	ok	8600
+typmod	8560.0000095411812	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	84.0000000000004014666907210000	10	2	ok	84.00
+typmod	84.0000000000004014666907210000	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	84.0000000000004014666907210000	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	84.0000000000004014666907210000	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	939626915586.623766723162	1000	-1000	ok	0
+typmod	939626915586.623766723162	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	939626915586.623766723162	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	939626915586.623766723162	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	127018.211917997132	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	127018.211917997132	1000	-1000	ok	0
+typmod	127018.211917997132	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	127018.211917997132	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	55108.2	10	-2	ok	55100
+typmod	55108.2	20	10	ok	55108.2000000000
+typmod	55108.2	5	-3	ok	55000
+typmod	55108.2	1000	-1000	ok	0
+typmod	0.000000000001208842894830	1	1	ok	0.0
+typmod	0.000000000001208842894830	4	2	ok	0.00
+typmod	0.000000000001208842894830	5	-3	ok	0
+typmod	0.000000000001208842894830	38	10	ok	0.0000000000
+typmod	616407469738.660097190000	1000	-1000	ok	0
+typmod	616407469738.660097190000	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	616407469738.660097190000	1000	0	ok	616407469739
+typmod	616407469738.660097190000	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	4.752271883896	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	4.752271883896	1000	0	ok	5
+typmod	4.752271883896	2	1	ok	4.8
+typmod	4.752271883896	10	2	ok	4.75
+typmod	-5978866	10	-2	ok	-5978900
+typmod	-5978866	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-5978866	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	-5978866	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	-0.936765043647	10	-2	ok	0
+typmod	-0.936765043647	6	3	ok	-0.937
+typmod	-0.936765043647	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	-0.936765043647	1000	1000	ok	-0.9367650436470000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+typmod	0	1	0	ok	0
+typmod	0	20	10	ok	0.0000000000
+typmod	0	3	-5	ok	0
+typmod	0	38	10	ok	0.0000000000
+typmod	924621704439.87908	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	924621704439.87908	10	-2	ok	924621704400
+typmod	924621704439.87908	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	924621704439.87908	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-1e-32	2	5	ok	0.00000
+typmod	-1e-32	1	1	ok	0.0
+typmod	-1e-32	1	-1	ok	0
+typmod	-1e-32	1000	0	ok	0
+typmod	-5.908192195246e42	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-5.908192195246e42	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	-5.908192195246e42	1000	0	ok	-5908192195246000000000000000000000000000000
+typmod	-5.908192195246e42	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	697948895043.580626356046	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	697948895043.580626356046	38	10	ok	697948895043.5806263560
+typmod	697948895043.580626356046	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	697948895043.580626356046	1000	0	ok	697948895044
+typmod	0	2	1	ok	0.0
+typmod	0	6	3	ok	0.000
+typmod	0	1	1	ok	0.0
+typmod	0	5	5	ok	0.00000
+typmod	4178034.00000000260859952	1000	0	ok	4178034
+typmod	4178034.00000000260859952	10	0	ok	4178034
+typmod	4178034.00000000260859952	10	2	ok	4178034.00
+typmod	4178034.00000000260859952	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	-82.000000000000624058537963	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	-82.000000000000624058537963	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-82.000000000000624058537963	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	-82.000000000000624058537963	1000	-1000	ok	0
+typmod	-399231053111.752	1000	-1000	ok	0
+typmod	-399231053111.752	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	-399231053111.752	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	-399231053111.752	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	410.815608052	20	10	ok	410.8156080520
+typmod	410.815608052	1000	0	ok	411
+typmod	410.815608052	10	2	ok	410.82
+typmod	410.815608052	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	19196	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	19196	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	19196	3	-5	ok	0
+typmod	19196	1000	0	ok	19196
+typmod	157072475569.5493413	3	-5	err	22003	numeric field overflow	A field with precision 3, scale -5 must round to an absolute value less than 10^8.
+typmod	157072475569.5493413	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	157072475569.5493413	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	157072475569.5493413	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-5.0000000000183674620973	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-5.0000000000183674620973	1000	-1000	ok	0
+typmod	-5.0000000000183674620973	20	10	ok	-5.0000000000
+typmod	-5.0000000000183674620973	5	-3	ok	0
+typmod	-4.00125	2	1	ok	-4.0
+typmod	-4.00125	1000	0	ok	-4
+typmod	-4.00125	10	-2	ok	0
+typmod	-4.00125	1	0	ok	-4
+typmod	60062438	20	10	ok	60062438.0000000000
+typmod	60062438	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	60062438	38	10	ok	60062438.0000000000
+typmod	60062438	1000	-1000	ok	0
+typmod	-976418425804.547	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	-976418425804.547	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-976418425804.547	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	-976418425804.547	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	403698269152.0006223657836850000	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	403698269152.0006223657836850000	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	403698269152.0006223657836850000	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	403698269152.0006223657836850000	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	-755375691414.237	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	-755375691414.237	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-755375691414.237	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-755375691414.237	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-526642.004263	10	-2	ok	-526600
+typmod	-526642.004263	1000	0	ok	-526642
+typmod	-526642.004263	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-526642.004263	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-0.004594267860230	1000	-1000	ok	0
+typmod	-0.004594267860230	10	2	ok	0.00
+typmod	-0.004594267860230	1	0	ok	0
+typmod	-0.004594267860230	4	2	ok	0.00
+typmod	896140117361.633714405009	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	896140117361.633714405009	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	896140117361.633714405009	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	896140117361.633714405009	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	1.05620785e-14	38	10	ok	0.0000000000
+typmod	1.05620785e-14	3	-5	ok	0
+typmod	1.05620785e-14	1000	-1000	ok	0
+typmod	1.05620785e-14	1	0	ok	0
+typmod	826600366.0000081270921203800	10	-2	ok	826600400
+typmod	826600366.0000081270921203800	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	826600366.0000081270921203800	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	826600366.0000081270921203800	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	638293045251.0000179549	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	638293045251.0000179549	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	638293045251.0000179549	1000	-1000	ok	0
+typmod	638293045251.0000179549	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	83583.230	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	83583.230	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	83583.230	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	83583.230	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	4	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	4	1	0	ok	4
+typmod	4	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	4	6	3	ok	4.000
+typmod	4.938595e-29	1000	-1000	ok	0
+typmod	4.938595e-29	5	5	ok	0.00000
+typmod	4.938595e-29	38	10	ok	0.0000000000
+typmod	4.938595e-29	1	1	ok	0.0
+typmod	66049720667.0000000000066595122054	10	-2	ok	66049720700
+typmod	66049720667.0000000000066595122054	1000	0	ok	66049720667
+typmod	66049720667.0000000000066595122054	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	66049720667.0000000000066595122054	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	-227221009281.031996480000	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-227221009281.031996480000	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	-227221009281.031996480000	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	-227221009281.031996480000	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	0.9223	1000	0	ok	1
+typmod	0.9223	10	0	ok	1
+typmod	0.9223	10	2	ok	0.92
+typmod	0.9223	1	0	ok	1
+typmod	-0.000000935095	20	10	ok	-0.0000009351
+typmod	-0.000000935095	3	7	ok	-0.0000009
+typmod	-0.000000935095	15	15	ok	-0.000000935095000
+typmod	-0.000000935095	5	5	ok	0.00000
+typmod	2185337.51982150756800000	38	10	ok	2185337.5198215076
+typmod	2185337.51982150756800000	1000	-1000	ok	0
+typmod	2185337.51982150756800000	20	10	ok	2185337.5198215076
+typmod	2185337.51982150756800000	10	2	ok	2185337.52
+typmod	991388700313.0076337	3	-5	err	22003	numeric field overflow	A field with precision 3, scale -5 must round to an absolute value less than 10^8.
+typmod	991388700313.0076337	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	991388700313.0076337	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	991388700313.0076337	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	6.5	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	6.5	38	10	ok	6.5000000000
+typmod	6.5	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	6.5	10	2	ok	6.50
+typmod	9389.70	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	9389.70	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	9389.70	3	-5	ok	0
+typmod	9389.70	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	37273626.0000000865353390	10	-2	ok	37273600
+typmod	37273626.0000000865353390	10	0	ok	37273626
+typmod	37273626.0000000865353390	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	37273626.0000000865353390	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	34549995843	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	34549995843	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	34549995843	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	34549995843	10	-2	ok	34549995800
+typmod	845518	3	-5	ok	800000
+typmod	845518	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	845518	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	845518	10	0	ok	845518
+typmod	95139422.277997906999	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	95139422.277997906999	4	2	err	22003	numeric field overflow	A field with precision 4, scale 2 must round to an absolute value less than 10^2.
+typmod	95139422.277997906999	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	95139422.277997906999	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	351688.374112777384	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	351688.374112777384	2	5	err	22003	numeric field overflow	A field with precision 2, scale 5 must round to an absolute value less than 10^-3.
+typmod	351688.374112777384	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	351688.374112777384	38	10	ok	351688.3741127774
+typmod	-868415898	10	-2	ok	-868415900
+typmod	-868415898	38	10	ok	-868415898.0000000000
+typmod	-868415898	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-868415898	3	-5	err	22003	numeric field overflow	A field with precision 3, scale -5 must round to an absolute value less than 10^8.
+typmod	5636611.00000000004301596	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	5636611.00000000004301596	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	5636611.00000000004301596	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	5636611.00000000004301596	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	240676.308532763442	10	-2	ok	240700
+typmod	240676.308532763442	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	240676.308532763442	10	2	ok	240676.31
+typmod	240676.308532763442	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	-692700.907349	1	1	err	22003	numeric field overflow	A field with precision 1, scale 1 must round to an absolute value less than 1.
+typmod	-692700.907349	15	15	err	22003	numeric field overflow	A field with precision 15, scale 15 must round to an absolute value less than 1.
+typmod	-692700.907349	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	-692700.907349	5	-3	ok	-693000
+typmod	120099576320.952	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	120099576320.952	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	120099576320.952	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	120099576320.952	3	-5	err	22003	numeric field overflow	A field with precision 3, scale -5 must round to an absolute value less than 10^8.
+typmod	5389897.82559	10	0	ok	5389898
+typmod	5389897.82559	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	5389897.82559	1000	-1000	ok	0
+typmod	5389897.82559	3	0	err	22003	numeric field overflow	A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+typmod	-0.7510991	15	15	ok	-0.751099100000000
+typmod	-0.7510991	10	2	ok	-0.75
+typmod	-0.7510991	38	10	ok	-0.7510991000
+typmod	-0.7510991	20	10	ok	-0.7510991000
+typmod	78.457	1000	-1000	ok	0
+typmod	78.457	38	10	ok	78.4570000000
+typmod	78.457	5	-3	ok	0
+typmod	78.457	10	2	ok	78.46
+typmod	-555811753612.516713	1000	0	ok	-555811753613
+typmod	-555811753612.516713	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-555811753612.516713	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-555811753612.516713	3	-5	err	22003	numeric field overflow	A field with precision 3, scale -5 must round to an absolute value less than 10^8.
+typmod	21384468.677965951911	4	4	err	22003	numeric field overflow	A field with precision 4, scale 4 must round to an absolute value less than 1.
+typmod	21384468.677965951911	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	21384468.677965951911	10	-2	ok	21384500
+typmod	21384468.677965951911	10	0	ok	21384469
+typmod	1.875168e40	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	1.875168e40	20	10	err	22003	numeric field overflow	A field with precision 20, scale 10 must round to an absolute value less than 10^10.
+typmod	1.875168e40	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	1.875168e40	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	2.891862114586e56	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	2.891862114586e56	10	2	err	22003	numeric field overflow	A field with precision 10, scale 2 must round to an absolute value less than 10^8.
+typmod	2.891862114586e56	3	7	err	22003	numeric field overflow	A field with precision 3, scale 7 must round to an absolute value less than 10^-4.
+typmod	2.891862114586e56	3	-5	err	22003	numeric field overflow	A field with precision 3, scale -5 must round to an absolute value less than 10^8.
+typmod	36191719.0142	5	5	err	22003	numeric field overflow	A field with precision 5, scale 5 must round to an absolute value less than 1.
+typmod	36191719.0142	10	2	ok	36191719.01
+typmod	36191719.0142	6	3	err	22003	numeric field overflow	A field with precision 6, scale 3 must round to an absolute value less than 10^3.
+typmod	36191719.0142	38	10	ok	36191719.0142000000
+typmod	-3423375.425278602826	1	-1	err	22003	numeric field overflow	A field with precision 1, scale -1 must round to an absolute value less than 10^2.
+typmod	-3423375.425278602826	2	1	err	22003	numeric field overflow	A field with precision 2, scale 1 must round to an absolute value less than 10^1.
+typmod	-3423375.425278602826	1	3	err	22003	numeric field overflow	A field with precision 1, scale 3 must round to an absolute value less than 10^-2.
+typmod	-3423375.425278602826	10	0	ok	-3423375
+typmod	-459274472230.07	1000	0	ok	-459274472230
+typmod	-459274472230.07	1000	1000	err	22003	numeric field overflow	A field with precision 1000, scale 1000 must round to an absolute value less than 1.
+typmod	-459274472230.07	1000	-1000	ok	0
+typmod	-459274472230.07	38	10	ok	-459274472230.0700000000
+typmod	123.456	5	2	ok	123.46
+typmod	999.995	5	2	err	22003	numeric field overflow	A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+typmod	999.994	5	2	ok	999.99
+typmod	-999.995	5	2	err	22003	numeric field overflow	A field with precision 5, scale 2 must round to an absolute value less than 10^3.
+typmod	0.0001	1	0	ok	0
+typmod	0.5	1	0	ok	1
+typmod	9.5	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	99	1	0	err	22003	numeric field overflow	A field with precision 1, scale 0 must round to an absolute value less than 10^1.
+typmod	0.001	2	3	ok	0.001
+typmod	0.0099	2	3	ok	0.010
+typmod	0.0995	2	3	err	22003	numeric field overflow	A field with precision 2, scale 3 must round to an absolute value less than 10^-1.
+typmod	0.09949	2	3	ok	0.099
+typmod	12345	5	-2	ok	12300
+typmod	12349999	5	-3	ok	12350000
+typmod	12350000	5	-3	ok	12350000
+typmod	99999999	5	-3	err	22003	numeric field overflow	A field with precision 5, scale -3 must round to an absolute value less than 10^8.
+typmod	150	1	-2	ok	200
+typmod	149.99	1	-2	ok	100
+typmod	950	1	-2	err	22003	numeric field overflow	A field with precision 1, scale -2 must round to an absolute value less than 10^3.
+typmod	NaN	5	2	ok	NaN
+typmod	Infinity	5	2	err	22003	numeric field overflow	A field with precision 5, scale 2 cannot hold an infinite value.
+typmod	-Infinity	1000	0	err	22003	numeric field overflow	A field with precision 1000, scale 0 cannot hold an infinite value.
+typmod	0	1	0	ok	0
+typmod	0.000000	3	2	ok	0.00
+typmod	1e-20	5	5	ok	0.00000
+typmod	123	0	0	err	22023	NUMERIC precision 0 must be between 1 and 1000	
+typmod	123	1001	0	err	22023	NUMERIC precision 1001 must be between 1 and 1000	
+typmod	123	10	1001	err	22023	NUMERIC scale 1001 must be between -1000 and 1000	
+typmod	123	10	-1001	err	22023	NUMERIC scale -1001 must be between -1000 and 1000	
+typmod	123	-1	0	err	22023	NUMERIC precision -1 must be between 1 and 1000	
+typmod	1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000	1000	0	ok	1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+typmod	10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000	1000	0	err	22003	numeric field overflow	A field with precision 1000, scale 0 must round to an absolute value less than 10^1000.
+typmod	0.00001	3	7	ok	0.0000100
+typmod	1e-5	1	5	ok	0.00001
+typmod	5e-6	1	5	ok	0.00001
+typmod	4e-6	1	5	ok	0.00000

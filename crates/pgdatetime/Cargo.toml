@@ -1,0 +1,9 @@
+[package]
+name = "pgdatetime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false }
+chrono-tz = "0.10.4"

@@ -1,0 +1,25 @@
+[package]
+name = "ivm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+pgnumeric = { path = "../pgnumeric" }
+pgdatetime = { path = "../pgdatetime" }
+pgproto = { path = "../pgproto" }
+pgfuncs = { path = "../pgfuncs" }
+sqlparser = "0.63.0"
+crc32fast = "1.5.3"
+smallvec = "1.16.4"
+rustc-hash = "2.1.3"
+parking_lot = "0.13.0"
+crossbeam-channel = "0.5.17"
+log = "0.4.34"
+env_logger = "0.11.11"
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+num-bigint = "0.5.1"
+num-traits = "0.2.19"
+num-integer = "0.1.47"

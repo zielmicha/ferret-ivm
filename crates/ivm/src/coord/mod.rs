@@ -1,0 +1,693 @@
+//! The coordinator: the engine thread owning storage, dataflow and catalog,
+//! fed by the sequencer with durable log records in GSN order.
+
+pub mod api;
+pub mod ddl;
+mod dml;
+mod read;
+pub mod seq;
+
+use crate::catalog::{Catalog, ObjectKind};
+use crate::dataflow::{ArrId, ErrDelta, Graph, NodeId, Output, TableChange};
+use crate::error::{codes, Result, SqlError};
+use crate::log::{LogRecord, LogWriter};
+use crate::sql::plan::ObjectId;
+use crate::storage::{Env, EnvOptions, Gsn, TreeId};
+use api::*;
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use rustc_hash::FxHashMap;
+use seq::{SeqMsg, Sequencer};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub data_dir: PathBuf,
+    pub cache_bytes: usize,
+    pub checkpoint_interval: Duration,
+    /// fsync the input log on every commit batch.
+    pub sync: bool,
+    /// GSNs of history kept readable with AS OF.
+    pub retention_gsns: u64,
+    /// Interval of logged clock ticks (the time now() refers to).
+    pub tick: Option<Duration>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            data_dir: PathBuf::from("ivm-data"),
+            cache_bytes: 1 << 30,
+            checkpoint_interval: Duration::from_secs(10),
+            sync: true,
+            retention_gsns: 1000,
+            tick: Some(Duration::from_secs(1)),
+        }
+    }
+}
+
+pub enum EngineMsg {
+    Durable(Vec<(Gsn, LogRecord)>),
+    Request(Request),
+    /// A source frontier advanced: re-check parked reads.
+    Wake,
+    Shutdown,
+}
+
+/// Runtime state of a materialized view.
+pub struct ViewRt {
+    pub node: NodeId,
+    /// Arrangement used for reads.
+    pub arr: ArrId,
+    pub errors: BTreeMap<(String, String), i64>,
+}
+
+#[derive(Default)]
+pub struct Runtime {
+    pub tables: HashMap<ObjectId, NodeId>,
+    pub views: HashMap<ObjectId, ViewRt>,
+    pub indexes: HashMap<ObjectId, ArrId>,
+}
+
+pub(crate) struct Subscription {
+    pub node: NodeId,
+    pub tx: Sender<SubEvent>,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Nodes pinned for this subscription (ad hoc queries).
+    pub pinned: Option<NodeId>,
+    pub progress: bool,
+}
+
+/// A read waiting for the engine to reach a GSN.
+pub(crate) struct Parked {
+    pub wait: Wait,
+    pub req: Request,
+}
+
+/// What a parked read waits for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wait {
+    /// The engine to process this GSN.
+    Gsn(Gsn),
+    /// Every source frontier to pass the read's LSN.
+    Lsn,
+    /// The initial snapshots of the tables it reads (rechecked on wake).
+    Snapshot,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct AppState {
+    pub catalog: Catalog,
+    pub trees: Vec<(Vec<u8>, TreeId)>,
+    pub view_errors: Vec<(ObjectId, Vec<((String, String), i64)>)>,
+    pub source_states: Vec<(ObjectId, String)>,
+    #[serde(default)]
+    pub source_lsns: Vec<(ObjectId, u64)>,
+    pub next_req: u64,
+    /// Logical clock (timestamptz microseconds) at the checkpoint.
+    #[serde(default)]
+    pub clock: i64,
+}
+
+pub struct Engine {
+    pub cfg: Config,
+    pub env: Env,
+    pub graph: Graph,
+    pub catalog: Catalog,
+    pub rt: Runtime,
+    pub processed: Gsn,
+    pub seq: Sender<SeqMsg>,
+    pub shared: Arc<Shared>,
+    pending: HashMap<u64, Sender<Result<ExecResult>>>,
+    pub(crate) parked: Vec<Parked>,
+    pub(crate) subs: Vec<Subscription>,
+    pub(crate) next_req: u64,
+    dml_inflight: Option<u64>,
+    dml_queue: VecDeque<Request>,
+    /// Command tags of DML waiting to be applied.
+    pub(crate) dml_counts: HashMap<u64, String>,
+    /// Requests to run after the current message.
+    deferred: Vec<Request>,
+    last_checkpoint: Instant,
+    records_since_checkpoint: u64,
+    pub(crate) replaying: bool,
+    /// Bumped by source progress and DDL: parked reads waiting for initial
+    /// snapshots are re-run when it moves.
+    pub(crate) snap_epoch: u64,
+    pub(crate) snap_epoch_seen: u64,
+    /// (epoch, replicated tables still loading their initial snapshot)
+    pub(crate) loading: (u64, std::collections::HashSet<ObjectId>),
+    /// Per-source progress state (opaque JSON owned by the source).
+    pub source_states: HashMap<ObjectId, String>,
+    /// LSN of the last logged commit per source (resume point).
+    pub source_lsns: HashMap<ObjectId, u64>,
+    pub(crate) handle: Option<EngineHandle>,
+    pub(crate) source_handles: HashMap<ObjectId, crate::source::SourceHandle>,
+    pub(crate) sink_handles: HashMap<ObjectId, crate::sink::SinkHandle>,
+    /// Recent (source, lsn, gsn) commits for "at least LSN" reads.
+    pub lsn_map: VecDeque<(ObjectId, u64, Gsn)>,
+    /// Logical clock: the latest logged tick (timestamptz microseconds).
+    pub clock: i64,
+    /// Recent (gsn, clock) ticks, for now() in reads as of a past GSN.
+    pub ticks: VecDeque<(Gsn, i64)>,
+}
+
+/// Handle used by sessions and sources.
+#[derive(Clone)]
+pub struct EngineHandle {
+    pub tx: Sender<EngineMsg>,
+    pub seq: Sender<SeqMsg>,
+    pub shared: Arc<Shared>,
+}
+
+impl EngineHandle {
+    /// Record a source's LSN frontier; wakes reads waiting for it.
+    pub fn advance_frontier(&self, source: u64, lsn: u64) {
+        let mut m = self.shared.source_lsn.lock();
+        let e = m.entry(source).or_insert(0);
+        if lsn > *e {
+            *e = lsn;
+            drop(m);
+            if self.shared.lsn_waiters.load(Ordering::Acquire) {
+                let _ = self.tx.send(EngineMsg::Wake);
+            }
+        }
+    }
+
+    pub fn execute(&self, stmt: crate::sql::parser::Statement, params: Vec<crate::sql::ParamSlot>, vars: SessionVars, extra: String) -> Result<ExecResult> {
+        let (tx, rx) = bounded(1);
+        self.tx
+            .send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params, vars, extra, reply: tx }))
+            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
+        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?
+    }
+
+    pub fn describe(
+        &self,
+        stmt: crate::sql::parser::Statement,
+        params: Vec<crate::sql::ParamSlot>,
+    ) -> Result<(Vec<ResultColumn>, Vec<crate::types::SqlType>)> {
+        let (tx, rx) = bounded(1);
+        self.tx
+            .send(EngineMsg::Request(Request::Describe { stmt: Box::new(stmt), params, reply: tx }))
+            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
+        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?
+    }
+
+    pub fn checkpoint(&self) -> Result<Gsn> {
+        let (tx, rx) = bounded(1);
+        self.tx
+            .send(EngineMsg::Request(Request::Checkpoint { reply: tx }))
+            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
+        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?
+    }
+
+    /// Append a record and wait until it is durable; returns its GSN.
+    pub fn log(&self, rec: LogRecord) -> Result<Gsn> {
+        let rx = self.log_async(rec)?;
+        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))
+    }
+
+    /// Append a record without waiting; the receiver yields its GSN once durable.
+    pub fn log_async(&self, rec: LogRecord) -> Result<Receiver<Gsn>> {
+        let (tx, rx) = bounded(1);
+        self.seq
+            .send(SeqMsg::Append { rec, ack: Some(tx) })
+            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))?;
+        Ok(rx)
+    }
+
+    pub fn shutdown(&self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        let _ = self.tx.send(EngineMsg::Shutdown);
+    }
+}
+
+pub struct Running {
+    pub handle: EngineHandle,
+    pub threads: Vec<JoinHandle<()>>,
+    /// Exclusive lock on the data directory.
+    _lock: std::fs::File,
+}
+
+impl Running {
+    pub fn shutdown(self) {
+        self.handle.shutdown();
+        for t in self.threads {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Open (recovering if needed) and start the engine threads.
+pub fn start(cfg: Config) -> Result<Running> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    // one engine per data directory: held until the process exits
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(cfg.data_dir.join("LOCK"))?;
+    if lock.try_lock().is_err() {
+        return Err(SqlError::new(
+            codes::OBJECT_IN_USE,
+            format!("data directory {} is in use by another ivm process", cfg.data_dir.display()),
+        ));
+    }
+    let shared = Arc::new(Shared::default());
+    let (etx, erx) = unbounded::<EngineMsg>();
+    let (stx, srx) = unbounded::<SeqMsg>();
+    let writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
+    let last_logged = writer.last_gsn();
+    shared.durable_gsn.store(last_logged, Ordering::Release);
+    let (env, recovered) = Env::open(
+        &cfg.data_dir.join("store"),
+        EnvOptions { cache_bytes: cfg.cache_bytes, ..Default::default() },
+    )?;
+    let mut engine = Engine {
+        cfg: cfg.clone(),
+        env,
+        graph: Graph::new(),
+        catalog: Catalog::new(),
+        rt: Runtime::default(),
+        processed: 0,
+        seq: stx.clone(),
+        shared: shared.clone(),
+        pending: HashMap::new(),
+        parked: Vec::new(),
+        subs: Vec::new(),
+        next_req: 1,
+        dml_inflight: None,
+        dml_queue: VecDeque::new(),
+        dml_counts: HashMap::new(),
+        deferred: Vec::new(),
+        last_checkpoint: Instant::now(),
+        records_since_checkpoint: 0,
+        replaying: true,
+        snap_epoch: 0,
+        snap_epoch_seen: 0,
+        loading: (0, std::collections::HashSet::new()),
+        source_states: HashMap::new(),
+        source_lsns: HashMap::new(),
+        handle: None,
+        source_handles: HashMap::new(),
+        sink_handles: HashMap::new(),
+        lsn_map: VecDeque::new(),
+        clock: 0,
+        ticks: VecDeque::new(),
+    };
+    engine.recover(recovered)?;
+    // replay the log after the checkpoint
+    let records = crate::log::read_from(&cfg.data_dir.join("log"), engine.processed)?;
+    if !records.is_empty() {
+        log::info!("replaying {} log records after gsn {}", records.len(), engine.processed);
+    }
+    for (gsn, rec) in records {
+        engine.apply_record(gsn, rec)?;
+    }
+    engine.replaying = false;
+    engine.shared.processed_gsn.store(engine.processed, Ordering::Release);
+    let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
+    engine.handle = Some(handle.clone());
+    engine.start_sources_and_sinks(&handle)?;
+    let seq = Sequencer { writer, rx: srx, engine: etx.clone(), shared: shared.clone(), tick: cfg.tick };
+    let t1 = std::thread::Builder::new().name("ivm-sequencer".into()).spawn(move || {
+        if let Err(e) = seq.run() {
+            log::error!("sequencer failed: {e}");
+        }
+    })?;
+    let h2 = handle.clone();
+    let t2 = std::thread::Builder::new().name("ivm-engine".into()).spawn(move || {
+        if let Err(e) = engine.run(erx, h2) {
+            log::error!("engine failed: {e}");
+        }
+    })?;
+    Ok(Running { handle, threads: vec![t1, t2], _lock: lock })
+}
+
+impl Engine {
+    fn recover(&mut self, recovered: Option<crate::storage::Recovered>) -> Result<()> {
+        let Some(rec) = recovered else { return Ok(()) };
+        let app: AppState = serde_json::from_slice(&rec.app)
+            .map_err(|e| SqlError::corrupt(format!("cannot decode checkpoint state: {e}")))?;
+        log::info!("recovering checkpoint at gsn {}", rec.gsn);
+        self.catalog = app.catalog;
+        self.next_req = app.next_req;
+        self.processed = rec.gsn;
+        self.graph.recovery = app.trees.into_iter().collect();
+        self.clock = app.clock;
+        self.graph.now = app.clock;
+        self.ticks.push_back((rec.gsn, app.clock));
+        self.source_states = app.source_states.into_iter().collect();
+        self.source_lsns = app.source_lsns.into_iter().collect();
+        let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
+        for obj in &objects {
+            match &obj.kind {
+                ObjectKind::Table(t) => self.table_rt(obj.id, t, true)?,
+                ObjectKind::MaterializedView(v) => self.create_view_rt(obj.id, &v.sql)?,
+                ObjectKind::Index(i) => self.create_index_rt(obj.id, i)?,
+                _ => {}
+            }
+        }
+        for (id, errs) in app.view_errors {
+            if let Some(v) = self.rt.views.get_mut(&id) {
+                v.errors = errs.into_iter().collect();
+            }
+        }
+        // anything that could not be matched to a recovered tree is rebuilt
+        // from the recovered state
+        self.graph.hydrate(&mut self.env, self.processed)?;
+        for t in self.env.unattached_trees() {
+            self.env.drop_tree(t)?;
+        }
+        self.graph.recovery.clear();
+        self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns));
+        Ok(())
+    }
+
+    fn run(mut self, rx: Receiver<EngineMsg>, handle: EngineHandle) -> Result<()> {
+        loop {
+            let msg = match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(m) => Some(m),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                Err(_) => break,
+            };
+            match msg {
+                Some(EngineMsg::Durable(batch)) => {
+                    for (gsn, rec) in batch {
+                        if let Err(e) = self.apply_record(gsn, rec) {
+                            log::error!("failed to apply gsn {gsn}: {e}");
+                            if e.code.starts_with("XX") || e.code.starts_with("58") {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    self.shared.processed_gsn.store(self.processed, Ordering::Release);
+                    self.wake_parked(&handle);
+                }
+                Some(EngineMsg::Request(req)) => self.handle_request(req, &handle),
+                Some(EngineMsg::Shutdown) => break,
+                Some(EngineMsg::Wake) | None => self.wake_parked(&handle),
+            }
+            while !self.deferred.is_empty() {
+                let reqs = std::mem::take(&mut self.deferred);
+                for r in reqs {
+                    self.handle_request(r, &handle);
+                }
+            }
+            self.maybe_checkpoint()?;
+            self.prune_subscriptions();
+        }
+        for (_, s) in self.source_handles.drain() {
+            s.stop();
+        }
+        for (_, s) in self.sink_handles.drain() {
+            s.stop();
+        }
+        let _ = self.seq.send(SeqMsg::Shutdown);
+        self.checkpoint()?;
+        Ok(())
+    }
+
+    pub(crate) fn alloc_req(&mut self) -> u64 {
+        let r = self.next_req;
+        self.next_req += 1;
+        r
+    }
+
+    /// Submit a record to the sequencer; `reply` is answered when it is applied.
+    pub(crate) fn submit(&mut self, rec: LogRecord, req: u64, reply: Sender<Result<ExecResult>>) {
+        self.pending.insert(req, reply);
+        if matches!(rec, LogRecord::Commit { source: 0, .. }) {
+            self.dml_inflight = Some(req);
+        }
+        if self.seq.send(SeqMsg::Append { rec, ack: None }).is_err()
+            && let Some(r) = self.pending.remove(&req)
+        {
+            let _ = r.send(Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
+        }
+    }
+
+    pub(crate) fn reply_pending(&mut self, req: u64, res: Result<ExecResult>) {
+        if let Some(r) = self.pending.remove(&req) {
+            let _ = r.send(res);
+        }
+        if self.dml_inflight == Some(req) {
+            self.dml_inflight = None;
+        }
+    }
+
+    fn handle_request(&mut self, req: Request, handle: &EngineHandle) {
+        match req {
+            Request::Execute { ref stmt, .. } if self.is_dml(stmt) => {
+                if self.dml_inflight.is_some() {
+                    self.dml_queue.push_back(req);
+                } else {
+                    self.run_execute(req, handle);
+                }
+            }
+            Request::Checkpoint { reply } => {
+                let r = self.checkpoint().map(|_| self.processed);
+                let _ = reply.send(r);
+            }
+            Request::Log { rec } => {
+                let _ = self.seq.send(SeqMsg::Append { rec, ack: None });
+            }
+            other => self.run_execute(other, handle),
+        }
+    }
+
+    fn run_execute(&mut self, req: Request, handle: &EngineHandle) {
+        match req {
+            Request::Execute { stmt, params, vars, extra, reply } => {
+                match self.execute(*stmt, params, vars, extra, reply.clone(), handle) {
+                    Ok(Some(res)) => {
+                        let _ = reply.send(Ok(res));
+                    }
+                    Ok(None) => {} // deferred (submitted or parked)
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            Request::Describe { stmt, params, reply } => {
+                let _ = reply.send(self.describe(&stmt, params));
+            }
+            other => self.handle_request(other, handle),
+        }
+    }
+
+    /// Apply one durable record.
+    pub(crate) fn apply_record(&mut self, gsn: Gsn, rec: LogRecord) -> Result<()> {
+        if gsn <= self.processed {
+            return Ok(());
+        }
+        match rec {
+            LogRecord::Commit { source, lsn, changes } => {
+                let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
+                for (table, ch) in changes {
+                    if let Some(n) = self.rt.tables.get(&table) {
+                        by_node.entry(*n).or_default().push(ch);
+                    }
+                }
+                let outputs = self.graph.step(&mut self.env, gsn, by_node)?;
+                self.processed = gsn;
+                self.deliver(gsn, &outputs);
+                if source == 0 {
+                    // local DML: lsn carries the request id
+                    let n = self.dml_counts.remove(&lsn).unwrap_or_default();
+                    self.reply_pending(lsn, Ok(ExecResult::Command { tag: n }));
+                    self.drain_dml_queue();
+                } else {
+                    let e = self.source_lsns.entry(source).or_insert(0);
+                    *e = (*e).max(lsn);
+                    self.lsn_map.push_back((source, lsn, gsn));
+                    while self.lsn_map.len() > 100_000 {
+                        self.lsn_map.pop_front();
+                    }
+                }
+            }
+            LogRecord::Ddl { req, sql, extra } => {
+                let res = self.apply_ddl(gsn, &sql, &extra);
+                self.processed = gsn;
+                self.snap_epoch += 1;
+                if res.is_ok() {
+                    self.catalog.history.push((gsn, sql.clone()));
+                }
+                if let Err(e) = &res
+                    && self.replaying
+                {
+                    log::warn!("DDL at gsn {gsn} failed on replay: {e}");
+                }
+                self.reply_pending(req, res);
+                self.drain_dml_queue();
+            }
+            LogRecord::Progress { source, lsn: _, state } => {
+                self.processed = gsn;
+                self.source_states.insert(source, state);
+                self.snap_epoch += 1;
+            }
+            LogRecord::Schema { source: _, table, columns, pk } => {
+                let r = self.apply_schema_change(gsn, table, columns, pk);
+                self.processed = gsn;
+                if let Err(e) = r {
+                    log::error!("schema change for table {table} failed: {e}");
+                }
+            }
+            LogRecord::Tick { micros } => {
+                // monotonic even if the wall clock steps back
+                self.clock = self.clock.max(micros - 946_684_800_000_000);
+                self.graph.now = self.clock;
+                self.ticks.push_back((gsn, self.clock));
+                let frontier = self.env.frontier();
+                while self.ticks.len() > 1 && self.ticks[1].0 <= frontier {
+                    self.ticks.pop_front();
+                }
+                // temporal filters release the events that became due
+                let outputs = self.graph.step(&mut self.env, gsn, FxHashMap::default())?;
+                self.processed = gsn;
+                self.deliver(gsn, &outputs);
+            }
+        }
+        self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
+        self.records_since_checkpoint += 1;
+        Ok(())
+    }
+
+    fn drain_dml_queue(&mut self) {
+        // executed from the main loop via handle_request on the next message;
+        // here we only re-enqueue so ordering is preserved
+        if self.dml_inflight.is_none()
+            && let Some(req) = self.dml_queue.pop_front()
+        {
+            self.deferred.push(req);
+        }
+    }
+
+    /// The logical clock as of `gsn` (what now() returns in a read at `gsn`).
+    pub(crate) fn clock_at(&self, gsn: Gsn) -> i64 {
+        let i = self.ticks.partition_point(|(g, _)| *g <= gsn);
+        if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
+    }
+
+    /// Route outputs to views (errors) and subscriptions.
+    fn deliver(&mut self, gsn: Gsn, outputs: &FxHashMap<NodeId, Output>) {
+        for v in self.rt.views.values_mut() {
+            if let Some(o) = outputs.get(&v.node) {
+                merge_errors(&mut v.errors, &o.errs);
+            }
+        }
+        for s in self.subs.iter() {
+            if let Some(o) = outputs.get(&s.node) {
+                if !o.errs.is_empty() {
+                    let (code, msg) = o.errs[0].0.clone();
+                    let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+                }
+                if !o.data.is_empty() {
+                    let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
+                }
+            }
+            if s.progress {
+                let _ = s.tx.send(SubEvent::Progress { gsn });
+            }
+        }
+        for sink in self.sink_handles.values() {
+            if let Some(o) = outputs.get(&sink.node) {
+                sink.send(gsn, &o.data);
+            } else {
+                sink.progress(gsn);
+            }
+        }
+    }
+
+    fn prune_subscriptions(&mut self) {
+        let mut i = 0;
+        while i < self.subs.len() {
+            if self.subs[i].cancel.load(Ordering::Acquire) {
+                let s = self.subs.swap_remove(i);
+                if let Some(n) = s.pinned {
+                    let _ = self.graph.release_node(&mut self.env, n);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn maybe_checkpoint(&mut self) -> Result<()> {
+        if self.records_since_checkpoint == 0 {
+            return Ok(());
+        }
+        let dirty = self.env.dirty_bytes();
+        if self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.cfg.cache_bytes / 2 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint(&mut self) -> Result<()> {
+        let app = AppState {
+            catalog: self.catalog.clone(),
+            trees: self.graph.arrangement_trees().into_iter().collect(),
+            view_errors: self.rt.views.iter().map(|(id, v)| (*id, v.errors.clone().into_iter().collect())).collect(),
+            source_states: self.source_states.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            source_lsns: self.source_lsns.iter().map(|(k, v)| (*k, *v)).collect(),
+            next_req: self.next_req,
+            clock: self.clock,
+        };
+        let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
+        self.env.checkpoint(self.processed, &bytes)?;
+        self.env.gc(1000)?;
+        let keep_from = self.processed.saturating_sub(self.cfg.retention_gsns);
+        let _ = self.seq.send(SeqMsg::Truncate(keep_from));
+        self.last_checkpoint = Instant::now();
+        self.records_since_checkpoint = 0;
+        Ok(())
+    }
+
+    fn start_sources_and_sinks(&mut self, handle: &EngineHandle) -> Result<()> {
+        let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
+        for obj in objects {
+            match &obj.kind {
+                ObjectKind::Source(def) => {
+                    let state = self.source_states.get(&obj.id).cloned().unwrap_or_default();
+                    let tables = self.source_tables(obj.id);
+                    let resume = self.source_lsns.get(&obj.id).copied().unwrap_or(0);
+                    let h = crate::source::start(obj.id, obj.name.clone(), def.clone(), tables, state, resume, handle.clone())?;
+                    self.source_handles.insert(obj.id, h);
+                }
+                ObjectKind::Sink(def) => self.start_sink(obj.id, &obj.name, def, handle)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Tables belonging to a source: (table id, upstream schema, name, columns, pk).
+    pub(crate) fn source_tables(&self, source: ObjectId) -> Vec<crate::source::SourceTable> {
+        self.catalog
+            .objects
+            .values()
+            .filter_map(|o| match &o.kind {
+                ObjectKind::Table(t) if t.source == Some(source) => Some(crate::source::SourceTable {
+                    id: o.id,
+                    upstream: t.upstream.clone().unwrap_or_default(),
+                    columns: t.columns.clone(),
+                    pk: t.pk.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &ErrDelta) {
+    for (e, w) in errs {
+        let v = map.entry(e.clone()).or_default();
+        *v += w;
+        if *v == 0 {
+            map.remove(e);
+        }
+    }
+}

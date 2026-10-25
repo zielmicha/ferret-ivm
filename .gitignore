@@ -1,0 +1,6 @@
+# build output (also inside worktrees)
+target/
+# git worktrees used for parallel work, kept inside the repo
+/.worktrees/
+# scratch space for test runs and benchmarks
+.scratch/
