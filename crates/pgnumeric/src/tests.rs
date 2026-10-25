@@ -197,6 +197,9 @@ fn unbounded_arithmetic_beyond_the_range() {
     assert!(big.add(&big).is_err());
     let sum = big.add_unbounded(&big);
     assert_eq!(sum.checked().unwrap_err().message, "value overflows numeric format");
+    // (formatted like any value)
+    let text = sum.to_string();
+    assert!(text.starts_with("18") && text.len() == 131073, "{} digits", text.len());
     // exact: back in range when the term is removed again
     assert_eq!(sum.sub_unbounded(&big).checked().unwrap(), big);
     let sq = Numeric::parse("1e100000").unwrap();
