@@ -306,6 +306,40 @@ fn keyless_tables_resnapshot_without_duplicates() {
     assert_eq!(up.rows(q), ["1|x|5", "1|x|5", "3|z|6"]);
 }
 
+/// A table whose replica identity is a unique index other than the primary
+/// key is keyed by that index's columns, which are all that deletes and key
+/// changes carry of the old row: they used to be silently lost. A table with
+/// such an index but no primary key used to be refused.
+#[test]
+fn replica_identity_index_is_the_key() {
+    let (mut up, mut ivm, _dir) = setup(
+        "ri-index",
+        &[
+            "CREATE TABLE t (id int PRIMARY KEY, u text NOT NULL, a int)",
+            "CREATE UNIQUE INDEX t_u ON t (u)",
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX t_u",
+            "INSERT INTO t SELECT g, 'u' || g, g FROM generate_series(1, 5) g",
+            "CREATE TABLE n (u int NOT NULL, v int NOT NULL, a int)",
+            "CREATE UNIQUE INDEX n_vu ON n (v, u)",
+            "ALTER TABLE n REPLICA IDENTITY USING INDEX n_vu",
+            "INSERT INTO n SELECT g, -g, g FROM generate_series(1, 5) g",
+        ],
+    );
+    let (qt, qn) = ("SELECT * FROM t ORDER BY id", "SELECT * FROM n ORDER BY u");
+    assert_eq!(caught_up(&mut ivm, &mut up, qt), up.rows(qt));
+    assert_eq!(caught_up(&mut ivm, &mut up, qn), up.rows(qn));
+    up.exec("DELETE FROM t WHERE id = 1");
+    up.exec("UPDATE t SET u = 'x' WHERE id = 2"); // the identity changes
+    up.exec("UPDATE t SET id = 30 WHERE id = 3"); // only the primary key changes
+    up.exec("UPDATE t SET a = 0 WHERE id = 4");
+    up.exec("DELETE FROM n WHERE u = 1");
+    up.exec("UPDATE n SET v = 20 WHERE u = 2");
+    up.exec("UPDATE n SET a = 0 WHERE u = 3");
+    assert_eq!(caught_up(&mut ivm, &mut up, qt), ["2|x|2", "4|u4|0", "5|u5|5", "30|u3|3"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, qn), up.rows(qn));
+    assert_eq!(up.rows(qn), ["2|20|2", "3|-3|0", "4|-4|4", "5|-5|5"]);
+}
+
 /// Text in a SQL_ASCII database is not checked for any encoding, so values
 /// that are not UTF-8 could reach the source (where they used to become '',
 /// or U+FFFD in snapshots). Such upstreams are rejected.

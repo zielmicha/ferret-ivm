@@ -31,7 +31,7 @@ the client.
 | Error | Fix |
 |---|---|
 | `publication "x" does not exist` | create the publication, or fix the name (it is case-sensitive) |
-| `table "s.t" has no primary key and REPLICA IDENTITY is not FULL` | add a primary key, `ALTER TABLE s.t REPLICA IDENTITY FULL`, or exclude the table with `FOR TABLES (...)` |
+| `table "s.t" has no primary key and REPLICA IDENTITY is not FULL` | add a primary key, `ALTER TABLE s.t REPLICA IDENTITY USING INDEX <unique index>` or `... REPLICA IDENTITY FULL`, or exclude the table with `FOR TABLES (...)` |
 | `relation "t" already exists` | another object (possibly a table of another source) has the same name; rename it or use separate publications |
 | `upstream table "s.t" has the same name as source "t"` | choose another source name |
 | connection errors, `sslmode=require is not supported` | the engine connects without TLS ([connection strings](sources.md#connection-strings)) |
@@ -180,9 +180,10 @@ that are gone ([cleanup](sources.md#cleaning-up-upstream-slots)).
   `C.UTF-8` collation); `COLLATE` only accepts `C`, `default`, `ucs_basic`,
   `pg_c_utf8` and `C.UTF-8`.
 - `AS OF` reads use the current catalog.
-- Upstream: PostgreSQL 14+, tables need a primary key or
-  `REPLICA IDENTITY FULL`; publication row filters and column lists are not
-  supported; unknown types replicate as text.
+- Upstream: PostgreSQL 14+, not `SQL_ASCII`; tables need a primary key,
+  `REPLICA IDENTITY USING INDEX` or `REPLICA IDENTITY FULL`; publication row
+  filters and column lists are not supported; unknown types replicate as
+  text.
 
 ### DDL and DML
 
@@ -250,7 +251,6 @@ Problems found while writing and checking this documentation (at commit
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| `REPLICA IDENTITY USING INDEX` (an index other than the primary key) is accepted | upstream deletes and primary-key changes are silently lost | use `DEFAULT` or `FULL` |
 | Upstream primary-key or replica-identity changes are not detected | afterwards upstream deletes are silently lost | re-create the source |
 | Deletes during a re-snapshot after a schema change are skipped | rows deleted upstream right after a schema change stay in the replica | re-create the source after the change if it matters |
 | The decision to re-snapshot after a schema change is not logged until the first chunk completes | until then fresh reads do not wait and show NULL in new columns; a restart in that window forgets the re-snapshot for good | check new columns after such changes; re-create the source |

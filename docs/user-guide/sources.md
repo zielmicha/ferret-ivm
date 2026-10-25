@@ -49,31 +49,34 @@ excludes.
 
 ### Primary keys and replica identity
 
-Every replicated table needs either
+Every replicated table needs a key by which the WAL identifies the old row
+of updates and deletes:
 
-- a **primary key** — the replica identity should stay `DEFAULT` (`FULL` also
-  works); before-images for updates and deletes come from the engine's stored
-  copy of the row, not from the WAL, and the old key the WAL carries for
-  deletes and key changes is the primary key; or
+- a **primary key**, with the replica identity `DEFAULT` (`FULL` and
+  `NOTHING` also work); before-images for updates and deletes come from the
+  engine's stored copy of the row, not from the WAL, and the old key the WAL
+  carries for deletes and key changes is the primary key; or
+- **`REPLICA IDENTITY USING INDEX`** — the table (with or without a primary
+  key) is keyed by the index's columns, because they are all that deletes
+  and key changes carry of the old row (PostgreSQL requires the index to be
+  unique, not partial and on `NOT NULL` columns); or
 - **`REPLICA IDENTITY FULL`** without a primary key — the table is then
   replicated as a multiset (duplicates allowed), and updates/deletes are
   matched on all columns. (A `FULL` table that has a primary key is keyed by
   the primary key.)
 
-A table with neither is refused when the source is created:
+A table with none of these is refused when the source is created:
 
 ```
 ERROR:  table "public.nokey" has no primary key and REPLICA IDENTITY is not FULL
 ```
 
 The check covers every table of the publication (after the `FOR TABLES`
-filter), so one unsuitable table makes `CREATE SOURCE` fail. A table with a
-primary key is accepted whatever its replica identity, but with
-`REPLICA IDENTITY USING INDEX` on an index other than the primary key, the
-WAL identifies deleted rows (and the old row of a key change) by that index's
-columns, the engine cannot find the row, and **the delete is silently lost**.
-(With `NOTHING`, PostgreSQL itself rejects updates and deletes of a table
-that is published for them.)
+filter), so one unsuitable table makes `CREATE SOURCE` fail. (With
+`NOTHING`, PostgreSQL itself rejects updates and deletes of a table that is
+published for them.) Changes of the replica identity or of the primary key
+after the source was created are handled as described in
+[Upstream schema changes](#upstream-schema-changes).
 
 ### Privileges
 
@@ -153,12 +156,13 @@ What happens:
    connects to the upstream, checks that the publication exists
    (`publication "x" does not exist` otherwise), and reads for every table of
    the publication its columns (name, type OID, typmod, `NOT NULL`), its
-   primary key columns in key order, and its replica identity.
+   key columns in key order (those of the replica identity index, else of
+   the primary key), and its replica identity.
    `FOR TABLES (...)` keeps only tables whose name matches an entry, either
    as `table` or as `schema.table`; entries that match nothing are silently
    ignored.
 2. **Validation**: no other object may be called like the source; every
-   table needs a primary key or `REPLICA IDENTITY FULL`; table names must not
+   table needs a key or `REPLICA IDENTITY FULL`; table names must not
    collide with existing objects or with each other (the engine has one
    namespace, see below).
 3. **Logging**: the statement and the discovered schemas (as JSON) are

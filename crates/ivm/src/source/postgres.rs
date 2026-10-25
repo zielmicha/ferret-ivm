@@ -134,16 +134,27 @@ pub fn discover(conninfo: &str, publication: &str, only: Option<&[String]>) -> R
             let (ty, typmod) = map_type(toid, tm);
             columns.push(Column::new(cname, ColumnType { ty, typmod, nullable: !notnull }));
         }
-        let pkr = c.query(&format!(
-            "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-             WHERE i.indrelid = {oid} AND i.indisprimary ORDER BY array_position(i.indkey::int2[], a.attnum)"
+        // The key: the columns of the replica identity index (REPLICA
+        // IDENTITY USING INDEX), which are all that deletes and key changes
+        // carry of the old row; else the primary key. (With DEFAULT the
+        // identity is the primary key; FULL sends whole old rows.)
+        let keys = c.query(&format!(
+            "SELECT i.indisprimary, i.indisreplident, a.attname \
+             FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+             WHERE i.indrelid = {oid} AND (i.indisprimary OR i.indisreplident) \
+             ORDER BY i.indexrelid, array_position(i.indkey::int2[], a.attnum)"
         ))?;
-        let pk: Vec<usize> = pkr
-            .rows
-            .iter()
-            .filter_map(|r| r[0].as_ref())
-            .filter_map(|n| columns.iter().position(|c| &c.name == n))
-            .collect();
+        let key_of = |flag: usize| -> Vec<usize> {
+            keys.rows
+                .iter()
+                .filter(|r| r[flag].as_deref() == Some("t"))
+                .filter_map(|r| r[2].as_ref())
+                .filter_map(|n| columns.iter().position(|c| &c.name == n))
+                .collect()
+        };
+        let identity = if ident == "i" { key_of(1) } else { vec![] };
+        // (an identity index that was dropped leaves REPLICA IDENTITY NOTHING)
+        let pk = if identity.is_empty() { key_of(0) } else { identity };
         out.push(DiscoveredTable { schema, name, columns, pk, replica_identity_full: ident == "f" });
     }
     Ok(out)
