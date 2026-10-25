@@ -7,6 +7,7 @@ use pgproto::testutil::{ClusterOptions, TempCluster};
 use pgproto::{Client, Config as PgConfig};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
@@ -100,7 +101,22 @@ impl Upstream {
 /// upstream so far (including initial snapshots).
 fn caught_up(ivm: &mut Ivm, up: &mut Upstream, query: &str) -> Vec<String> {
     let lsn = up.lsn();
+    // fail (with the sources' status) rather than wait forever
+    let t0 = Instant::now();
+    loop {
+        let sources = ivm.rows("SHOW SOURCES");
+        if sources.iter().all(|s| parse_lsn(s.split('|').nth(4).unwrap()) >= parse_lsn(&lsn)) {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "timed out waiting for LSN {lsn}: {sources:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     ivm.rows(&format!("{query} AS OF AT LEAST LSN '{lsn}'"))
+}
+
+fn parse_lsn(s: &str) -> u64 {
+    let (hi, lo) = s.split_once('/').unwrap();
+    (u64::from_str_radix(hi, 16).unwrap() << 32) | u64::from_str_radix(lo, 16).unwrap()
 }
 
 fn setup(name: &str, ddl: &[&str]) -> (Upstream, Ivm, PathBuf) {
@@ -183,4 +199,30 @@ fn star_views_take_the_new_table_shape() {
     up.exec("ALTER TABLE t ADD COLUMN c int DEFAULT 5");
     up.exec("INSERT INTO t VALUES (3, 30, 6)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM v ORDER BY id"), ["1|10|5", "2|20|5", "3|30|6"]);
+}
+
+/// Tables keyed by upstream types replicated as text (enum, inet) are
+/// snapshotted in chunks ordered like the engine's keys (the chunk query
+/// used to apply COLLATE to them and fail, stalling the whole source).
+#[test]
+fn text_replicated_keys_snapshot_in_chunks() {
+    let (mut up, mut ivm, _dir) = setup(
+        "enum",
+        &[
+            "CREATE TYPE color AS ENUM ('red', 'green', 'blue')",
+            "CREATE TABLE e (c color, n int, a int, PRIMARY KEY (c, n))",
+            "INSERT INTO e SELECT (ARRAY['red', 'green', 'blue']::color[])[1 + g % 3], g, g FROM generate_series(1, 25000) g",
+            "CREATE TABLE i (addr inet PRIMARY KEY, a int)",
+            "INSERT INTO i SELECT ('10.0.' || (g / 250) || '.' || (g % 250))::inet, g FROM generate_series(1, 12000) g",
+            "CREATE TABLE vc (k varchar(10) PRIMARY KEY, a int)",
+            "INSERT INTO vc SELECT 'k' || g, g FROM generate_series(1, 11000) g",
+        ],
+    );
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM e"), ["25000|312512500"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM i"), ["12000|72006000"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM vc"), ["11000|60505500"]);
+    up.exec("UPDATE e SET a = 0 WHERE c = 'blue' AND n = 2");
+    up.exec("DELETE FROM i WHERE addr = '10.0.0.1'");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM e"), ["25000|312512498"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM i"), ["11999|72005999"]);
 }

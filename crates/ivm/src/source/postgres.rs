@@ -615,13 +615,18 @@ impl PgSource {
                 }
             }
         } else {
+            // Chunks must be ordered as the engine orders keys (memcmp of
+            // the key encoding). For string columns that is the byte order
+            // of the text: compare as text in the C collation. Upstream
+            // types replicated as text (enums, inet, ...) compare as their
+            // text too, and they do not take a collation themselves.
             let pk_cols: Vec<String> = t
                 .pk
                 .iter()
                 .map(|c| {
                     let col = &t.columns[*c];
                     if col.ty.ty.is_string() {
-                        format!("{} COLLATE \"C\"", qident(&col.name))
+                        format!("{}::text COLLATE \"C\"", qident(&col.name))
                     } else {
                         qident(&col.name)
                     }
@@ -637,7 +642,8 @@ impl PgSource {
                             let col = &t.columns[*c];
                             let ty = crate::types::format_type(&col.ty.ty, col.ty.typmod);
                             if col.ty.ty.is_string() {
-                                format!("{}::{ty} COLLATE \"C\"", qlit(v))
+                                // compared as the column is: via its own type to text
+                                format!("{}::{ty}::text COLLATE \"C\"", qlit(v))
                             } else {
                                 format!("{}::{ty}", qlit(v))
                             }
