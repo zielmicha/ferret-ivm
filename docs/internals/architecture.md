@@ -60,7 +60,7 @@ Where the implementation differs from the design:
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
 | `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, requests a shutdown |
-| slot-drop helpers | | short-lived; drop a replication slot after `DROP SOURCE`, once the source thread has stopped |
+| slot-drop helpers | | drop a replication slot after `DROP SOURCE`, retrying (also while the stopping source's session still holds it) until it is dropped |
 
 There is exactly one engine thread: all dataflow maintenance, all index
 reads and writes, and all query execution happen on it. Everything that
@@ -191,7 +191,7 @@ handles:
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
-| `Wake` | a source frontier moved: re-check reads waiting for an LSN |
+| `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
 | `Shutdown` | ask sources and sinks to stop, stop the sequencer, take a final checkpoint, wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
