@@ -213,8 +213,7 @@ impl Engine {
             AsOf::Default | AsOf::Fresh => self.shared.durable(),
             AsOf::AtLeastLsn(l) => {
                 let lsn = parse_lsn(l)?;
-                let frontiers = self.shared.source_lsn.lock().clone();
-                if frontiers.is_empty() || frontiers.values().any(|f| *f < lsn) {
+                if !self.lsn_reached(l, lsn)? {
                     self.shared.lsn_waiters.store(true, Ordering::Release);
                     self.shared.want_keepalive.store(true, Ordering::Release);
                     self.parked.push(Parked {
@@ -302,24 +301,44 @@ impl Engine {
         Ok(Some(ExecResult::Query { columns, rows: out }))
     }
 
+    /// Has every source's LSN frontier reached `lsn` (written `text`)? A
+    /// source that has not reported a frontier yet (it is snapshotting or
+    /// has not connected) has not. An error without any source: the LSN is
+    /// a position in a source's upstream WAL, so nothing could ever reach
+    /// it, and reading at once could not show the commit the client waits
+    /// for (read-your-writes).
+    pub(crate) fn lsn_reached(&self, text: &str, lsn: u64) -> Result<bool> {
+        let sources: Vec<ObjectId> =
+            self.catalog.objects.values().filter(|o| matches!(o.kind, ObjectKind::Source(_))).map(|o| o.id).collect();
+        if sources.is_empty() {
+            return Err(SqlError::new(
+                codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                format!("AS OF AT LEAST LSN '{text}' cannot be satisfied: there is no source"),
+            )
+            .with_hint("The LSN is a position in the WAL of a source's upstream server; create the source first."));
+        }
+        let frontiers = self.shared.source_lsn.lock();
+        Ok(sources.iter().all(|s| frontiers.get(s).is_some_and(|f| *f >= lsn)))
+    }
+
     /// Re-run parked reads whose GSN (or LSN) condition is now satisfied.
     pub(crate) fn wake_parked(&mut self, _handle: &EngineHandle) {
         if self.parked.is_empty() {
             return;
         }
-        let frontiers = self.shared.source_lsn.lock().clone();
         // snapshot progress or catalog changes since reads were parked
         let snapshots_changed = self.snap_epoch != self.snap_epoch_seen;
         self.snap_epoch_seen = self.snap_epoch;
         let mut still = Vec::new();
         for p in std::mem::take(&mut self.parked) {
             let ready = match p.wait {
+                // (re-run on an error: it fails then, e.g. when the last
+                // source was dropped)
                 Wait::Lsn => match &p.req {
                     Request::Execute { stmt, .. } => match &**stmt {
-                        Statement::Select { as_of: AsOf::AtLeastLsn(l), .. } => match parse_lsn(l) {
-                            Ok(lsn) => !frontiers.is_empty() && frontiers.values().all(|f| *f >= lsn),
-                            Err(_) => true,
-                        },
+                        Statement::Select { as_of: AsOf::AtLeastLsn(l), .. } => {
+                            parse_lsn(l).and_then(|lsn| self.lsn_reached(l, lsn)).unwrap_or(true)
+                        }
                         _ => true,
                     },
                     _ => true,

@@ -10,8 +10,8 @@
   logged). `SHOW SOURCES` shows `snapshotting <schema>.<table>`. Use
   `SET read_mode = latest` or `AS OF LATEST` to read the partial state.
 - **`AS OF AT LEAST LSN`.** The read waits until every source's frontier
-  passes the LSN. It waits forever if there is no source at all, and as long
-  as any source is snapshotting, disconnected (`error: ...`) or behind.
+  passes the LSN: as long as any source is snapshotting, disconnected
+  (`error: ...`) or behind. Without any source it fails at once.
 - **`AS OF <gsn>` in the future** waits until the engine reaches that GSN.
 - **`SUBSCRIBE` in psql** never prints anything: psql waits for the end of
   the result. Use `COPY (SUBSCRIBE ...) TO STDOUT`.
@@ -254,7 +254,6 @@ Problems found while writing and checking this documentation (at commit
 | Problem | Effect | Workaround |
 |---|---|---|
 | Only `SUBSCRIBE` can be cancelled | reads waiting for a snapshot, an LSN or a GSN wait forever if the condition never holds | disconnect |
-| `AS OF AT LEAST LSN` without sources | waits forever | do not use it without sources |
 | `DROP SINK` of a sink that is retrying its connection | the engine thread waits for the sink, possibly for a long time | stop and restart the engine; the drop is replayed |
 | A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
 | A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |

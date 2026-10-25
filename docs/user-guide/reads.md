@@ -115,9 +115,13 @@ advances even when no data flows. Because all sources are compared, this
 form is meant for sources that replicate from the same PostgreSQL cluster.
 
 A source's frontier does not advance while any of its tables is loading an
-initial snapshot, nor while the source is stuck in an error. If the engine
-has **no sources at all**, such a read waits until a source exists and
-reaches the LSN; a dropped source no longer holds reads back. Waiting reads
+initial snapshot, nor while the source is stuck in an error; a source that
+has not reported a frontier yet holds reads back too. A dropped source no
+longer holds reads back. If the engine has **no sources at all**, the read
+fails at once with SQLSTATE `55000` (`AS OF AT LEAST LSN '...' cannot be
+satisfied: there is no source`), also a waiting read when the last source
+is dropped: the LSN is a position in an upstream's WAL, so a read without
+sources could not show the commit it waits for. Waiting reads
 cannot be cancelled (only `SUBSCRIBE` can); a client that disconnects is
 freed, but the read stays parked in the engine until its condition holds.
 
