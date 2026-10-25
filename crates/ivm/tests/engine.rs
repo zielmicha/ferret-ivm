@@ -8,7 +8,7 @@ use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
 use ivm::log::LogRecord;
 use ivm::types::text::format_datum;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
@@ -17,8 +17,8 @@ fn tmpdir(name: &str) -> PathBuf {
     d
 }
 
-fn start(dir: &PathBuf) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+fn start(dir: &Path) -> coord::Running {
+    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
     coord::start(cfg).expect("engine starts")
 }
 
@@ -311,7 +311,7 @@ fn distinct_on_infinite_intervals() {
     let q = "SELECT DISTINCT ON (iv) iv, id FROM t ORDER BY iv, id";
     exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
     let want = ["-infinity|3", "1 mon|4", "infinity|1", "|6"];
-    assert_eq!(rows(&h, &format!("{q}")), want);
+    assert_eq!(rows(&h, q), want);
     assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), want);
     exec(&h, "DELETE FROM t WHERE id IN (1, 4)");
     assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), ["-infinity|3", "30 days|5", "infinity|2", "|6"]);

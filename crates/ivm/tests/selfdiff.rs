@@ -103,8 +103,7 @@ fn query(h: &EngineHandle, sql: &str, trim_numeric: bool) -> Rows {
                     let s = format_datum(d);
                     match c.ty {
                         SqlType::Float4 | SqlType::Float8 => match s.parse::<f64>() {
-                            Ok(f) if f == 0.0 => "0".into(),
-                            Ok(f) => format!("{f:.9e}"),
+                            Ok(f) => if f == 0.0 { "0".into() } else { format!("{f:.9e}") },
                             Err(_) => s,
                         },
                         SqlType::Numeric if trim_numeric && s.contains('.') => {
