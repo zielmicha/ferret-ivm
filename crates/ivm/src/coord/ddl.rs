@@ -828,9 +828,14 @@ impl Engine {
 
     fn drop_with_dependents(&mut self, id: ObjectId, cascade: bool) -> Result<()> {
         let deps = self.catalog.dependents(id);
-        if !deps.is_empty() && !cascade {
+        // as in PostgreSQL, a relation's indexes go with it: only views,
+        // sinks and a source's tables need CASCADE
+        let blocking = deps.iter().find(|d| !matches!(self.catalog.get(**d).map(|o| &o.kind), Some(ObjectKind::Index(_))));
+        if let Some(&first) = blocking
+            && !cascade
+        {
             let obj = self.catalog.get(id).unwrap();
-            let dep = self.catalog.get(deps[0]).unwrap();
+            let dep = self.catalog.get(first).unwrap();
             return Err(SqlError::new(
                 codes::DEPENDENT_OBJECTS_STILL_EXIST,
                 format!("cannot drop {} {} because other objects depend on it", obj.kind.name(), obj.name),

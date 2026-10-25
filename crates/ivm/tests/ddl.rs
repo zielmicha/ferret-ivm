@@ -158,3 +158,32 @@ fn sink_keys_are_validated() {
     assert_eq!(e.rows("SELECT count(*) FROM ivm.catalog_history"), ["2"]);
     e.shutdown();
 }
+
+/// A relation's secondary indexes are dropped with it, without CASCADE (as
+/// in PostgreSQL); views and sinks still need CASCADE.
+#[test]
+fn dropping_a_relation_drops_its_indexes() {
+    let e = Engine::start("drop-indexes");
+    e.exec("CREATE TABLE t (a int PRIMARY KEY, b int)");
+    e.exec("INSERT INTO t VALUES (1, 10), (2, 20)");
+    e.exec("CREATE INDEX t_b ON t (b)");
+    e.exec("CREATE MATERIALIZED VIEW m AS SELECT a, b * 2 AS c FROM t");
+    e.exec("CREATE INDEX m_c ON m (c)");
+    let arrangements = e.rows("SHOW ARRANGEMENTS").len();
+    // the view, not the (older) index, is what holds the table back
+    let stmt = ivm::sql::parse_statement("DROP TABLE t").unwrap();
+    let er = e.h.execute(stmt, vec![], SessionVars::default(), String::new()).unwrap_err();
+    assert_eq!((er.code.as_str(), er.detail.as_deref()), ("2BP01", Some("materialized view m depends on table t")));
+    e.exec("DROP MATERIALIZED VIEW m");
+    assert_eq!(e.rows("SHOW INDEXES"), ["t_b|t|[1]"]);
+    assert!(e.rows("SHOW ARRANGEMENTS").len() < arrangements);
+    e.exec("DROP TABLE t");
+    assert_eq!(e.rows("SHOW INDEXES"), Vec::<String>::new());
+    assert_eq!(e.rows("SHOW ARRANGEMENTS"), Vec::<String>::new());
+    // the names are free again, also after a restart
+    let e = e.restart();
+    assert_eq!(e.rows("SELECT count(*) FROM ivm.objects"), ["0"]);
+    e.exec("CREATE TABLE t (a int PRIMARY KEY, b int)");
+    e.exec("CREATE INDEX t_b ON t (b)");
+    e.shutdown();
+}
