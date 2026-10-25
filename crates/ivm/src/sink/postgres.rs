@@ -25,6 +25,12 @@ use std::time::{Duration, Instant};
 /// a target that is that far needs no resynchronization.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Delay before retrying after a failed connection or write: doubles from
+/// the minimum up to the maximum while attempts keep failing, and is reset
+/// by a write that succeeds (or a connection, while no write has failed).
+const RETRY_MIN: Duration = Duration::from_millis(100);
+const RETRY_MAX: Duration = Duration::from_secs(10);
+
 fn lit(d: &Datum, c: &Column) -> String {
     if d.is_null() {
         return "NULL".into();
@@ -233,7 +239,12 @@ pub fn run(
     // made every restart rewrite the target: the restarted engine's snapshot
     // is always later (clock ticks, other tables).
     let mut seen: Gsn = snapshot_gsn;
-    let mut backoff = Duration::from_millis(100);
+    let mut backoff = RETRY_MIN;
+    // The error of the last attempt to write to the target (a batch, or the
+    // progress row), with the progress that write was to commit: set until a
+    // write succeeds, so that a target that keeps rejecting a batch shows the
+    // error (reconnecting proves nothing), and retries keep backing off.
+    let mut failure: Option<(String, Gsn)> = None;
     let mut last_flush = Instant::now();
     let mut last_progress = Instant::now();
     // Wait out a backoff, still taking messages: changes are kept for later
@@ -257,16 +268,13 @@ pub fn run(
     loop {
         if writer.is_none() {
             match Writer::connect(&name, &def, &columns) {
-                Ok(w) => {
-                    writer = Some(w);
-                    backoff = Duration::from_millis(100);
-                }
+                Ok(w) => writer = Some(w),
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
                     if !wait(backoff, applied, &mut pending, &mut seen) {
                         return;
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                    backoff = (backoff * 2).min(RETRY_MAX);
                     continue;
                 }
             }
@@ -285,7 +293,19 @@ pub fn run(
                 Ok(c) => {
                     applied = Some(c);
                     pending.retain(|(g, _)| *g > c);
-                    *status.lock() = format!("running (gsn {c})");
+                    if failure.as_ref().is_some_and(|(_, g)| c >= *g) {
+                        // the write landed: what failed was the
+                        // acknowledgement of its commit
+                        failure = None;
+                    }
+                    match &failure {
+                        // the write still has to be retried
+                        Some((f, _)) => *status.lock() = format!("error: {f}"),
+                        None => {
+                            *status.lock() = format!("running (gsn {c})");
+                            backoff = RETRY_MIN;
+                        }
+                    }
                 }
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
@@ -293,6 +313,7 @@ pub fn run(
                     if !wait(backoff, applied, &mut pending, &mut seen) {
                         return;
                     }
+                    backoff = (backoff * 2).min(RETRY_MAX);
                     continue;
                 }
             }
@@ -314,35 +335,48 @@ pub fn run(
         };
         let w = writer.as_mut().unwrap();
         let rows: usize = pending.iter().map(|(_, d)| d.len()).sum();
-        if !pending.is_empty() && (stop || rows > 1000 || last_flush.elapsed() > Duration::from_millis(100)) {
-            match w.apply(&pending, seen) {
-                Ok(()) => {
-                    *status.lock() = format!("running (gsn {seen})");
-                    applied = Some(seen);
-                    pending.clear();
-                    last_flush = Instant::now();
-                    last_progress = Instant::now();
-                }
-                Err(e) => {
-                    *status.lock() = format!("error: {e}");
-                    writer = None;
-                    // the batch stays pending; after reconnecting, the
-                    // committed progress tells whether it already landed
-                }
+        let written = if !pending.is_empty() && (stop || rows > 1000 || last_flush.elapsed() > Duration::from_millis(100)) {
+            let r = w.apply(&pending, seen);
+            if r.is_ok() {
+                applied = Some(seen);
+                pending.clear();
+                last_flush = Instant::now();
+                last_progress = Instant::now();
             }
+            Some(r)
         } else if pending.is_empty() && applied.is_some_and(|a| a < seen) && (stop || last_progress.elapsed() >= PROGRESS_INTERVAL) {
             // nothing changed since: the target is current as of `seen`
-            match w.save_progress(seen) {
-                Ok(()) => {
-                    *status.lock() = format!("running (gsn {seen})");
-                    applied = Some(seen);
-                }
-                Err(e) => {
-                    *status.lock() = format!("error: {e}");
-                    writer = None;
-                }
-            }
             last_progress = Instant::now();
+            let r = w.save_progress(seen);
+            if r.is_ok() {
+                applied = Some(seen);
+            }
+            Some(r)
+        } else {
+            None
+        };
+        match written {
+            Some(Ok(())) => {
+                *status.lock() = format!("running (gsn {seen})");
+                failure = None;
+                backoff = RETRY_MIN;
+            }
+            Some(Err(e)) => {
+                // A batch stays pending; after reconnecting, the committed
+                // progress tells whether it already landed. A target that
+                // rejects it (a constraint, a value that does not convert)
+                // keeps doing so: retry with a growing delay.
+                log::warn!("sink {name}: writing to the target failed: {e}; retrying in {} ms", backoff.as_millis());
+                *status.lock() = format!("error: {e}");
+                failure = Some((e.to_string(), seen));
+                writer = None;
+                if stop || !wait(backoff, applied, &mut pending, &mut seen) {
+                    return;
+                }
+                backoff = (backoff * 2).min(RETRY_MAX);
+                continue;
+            }
+            None => {}
         }
         if stop {
             return;

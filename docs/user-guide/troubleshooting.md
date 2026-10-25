@@ -131,8 +131,10 @@ upstream).
 ### A sink shows `error: ...` or stops advancing
 
 The sink reconnects by itself and keeps the changes it has not written
-yet. Check the role's privileges on the target schema and tables, and that
-an existing target table matches the relation's columns
+yet, retrying after 100 ms, then with a delay doubling up to 10 s while its
+attempts keep failing; the status shows the error until a write succeeds.
+Check the role's privileges on the target schema and tables, and that an
+existing target table matches the relation's columns
 ([requirements](sinks.md#requirements-on-the-target)):
 
 - `error: column "c" of relation "t" does not exist` after an upstream
@@ -140,10 +142,13 @@ an existing target table matches the relation's columns
   sink never alters its target; add the columns to the target table (or
   drop the table, which the sink then creates again)
   ([Sinks](sinks.md#schema-changes-and-replacements)).
-- `running (gsn n)` with `n` no longer following `SHOW GSN`: a batch keeps
-  failing on the target, for example on duplicate `KEY` values (the KEY
-  columns must be unique in the relation); the target server's log shows the
-  failing statement.
+- an error of the target's own (`duplicate key value violates unique
+  constraint`, `ON CONFLICT DO UPDATE command cannot affect row a second
+  time`, `violates check constraint`, a value that does not convert): the
+  target rejects a batch, and keeps doing so until the target is fixed —
+  its constraints or column types, or duplicate `KEY` values (the KEY
+  columns must be unique in the relation; a batch already pending keeps its
+  duplicates, so re-create the sink after fixing the data, see below).
 - `error: broken: <reason>`: the sink reads a broken view
   ([Recovery](operations.md#recovery)).
 
@@ -332,7 +337,6 @@ test, with workarounds.
 | Primary-key changes of a `REPLICA IDENTITY FULL` or `NOTHING` table are not detected (their Relation messages do not show the key) | the table stays keyed by the old key; if those columns stop being unique, rows with the same old key are merged | re-create the source after such a change |
 | An upstream whose WAL positions went backwards (restored from a backup, or replaced by another cluster under the same connection string) | transactions up to the source's last logged LSN are skipped as already replicated | drop and re-create the source |
 | A sink never alters its target table | after the relation gained columns (an upstream schema change, a re-planned view), the sink fails until the target has them | add the columns to the target, or drop the target table |
-| A sink batch that the target rejects on a working connection (duplicate `KEY` values, a value that does not convert) is retried about every 100 ms without a growing delay | the sink reconnects in a tight loop; `SHOW SINKS` mostly shows `running (gsn n)` with `n` no longer advancing | check that the sinks' GSNs follow `SHOW GSN`; fix the data or the `KEY` |
 
 ### Resources
 

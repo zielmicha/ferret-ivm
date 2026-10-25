@@ -994,6 +994,51 @@ fn sink_keeps_changes_while_its_target_is_unreachable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A batch that the target rejects on a working connection (here: a CHECK
+/// constraint of the target table) is retried with a growing delay, and the
+/// sink's status shows the error until a batch succeeds. It used to be
+/// retried about every 100 ms, the status flipping back to `running` after
+/// every reconnect.
+#[test]
+fn rejected_sink_batches_back_off_and_keep_the_error() {
+    let mut up = Upstream::start();
+    // every attempt to insert into the target counts (sequences are not
+    // transactional, so rolled back attempts count too)
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int CHECK (v < 100))");
+    up.exec("CREATE SEQUENCE attempts");
+    up.exec(
+        "CREATE FUNCTION count_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('attempts'); RETURN NEW; END $$",
+    );
+    up.exec("CREATE TRIGGER count_attempts BEFORE INSERT ON target FOR EACH ROW EXECUTE FUNCTION count_attempt()");
+    let dir = tmpdir("sink-rejected");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    eventually("the sink to run", || status(&mut ivm).starts_with("running"));
+    ivm.exec("INSERT INTO t VALUES (1, 100)");
+    eventually("the batch to fail", || status(&mut ivm).starts_with("error"));
+    let attempts = |up: &mut Upstream| -> i64 { up.rows("SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM attempts")[0].parse().unwrap() };
+    let first = attempts(&mut up);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        let s = status(&mut ivm);
+        assert!(s.starts_with("error: ") && s.contains("violates check constraint"), "status while the batch keeps failing: {s}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 100 ms, doubling: about five attempts in three seconds (there were 20-30)
+    let retried = attempts(&mut up) - first;
+    assert!((1..=8).contains(&retried), "{retried} attempts in 3 s");
+    // once the target accepts the batch, the sink runs again
+    up.exec("ALTER TABLE target DROP CONSTRAINT target_v_check");
+    eventually("the batch to land", || up.rows("SELECT id, v FROM target") == ["1|100"]);
+    eventually("the sink to run again", || status(&mut ivm).starts_with("running"));
+    ivm.exec("INSERT INTO t VALUES (2, 5)");
+    eventually("the next change", || up.rows("SELECT count(*) FROM target") == ["2"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Tests driving the engine through its API (`EngineHandle::execute`)
 /// rather than the wire protocol.
 mod api {
