@@ -140,8 +140,17 @@ fn range_bound(rs: &[&Row], ro: &RangeOffsets, p: &Peers, i: usize, offset: &Dat
     };
     let target = match f(&cur, offset) {
         Ok(t) => t,
-        // out of range: the bound is beyond every value
-        Err(_) => return if start { lo as i64 } else { hi as i64 - 1 },
+        // out of range: as in PostgreSQL's in_range functions, the bound lies
+        // beyond every value in the offset's direction (before all of them
+        // for PRECEDING, after all of them for FOLLOWING)
+        Err(_) => {
+            return match (start, preceding) {
+                (true, true) => lo as i64,
+                (true, false) => hi as i64,
+                (false, true) => lo as i64 - 1,
+                (false, false) => hi as i64 - 1,
+            };
+        }
     };
     let before = |v: &Datum, strict: bool| {
         let c = v.sql_cmp(&target);
@@ -259,7 +268,11 @@ fn compute_func(rs: &[&Row], f: &WinSpec, p: &Peers) -> Result<Vec<Datum>> {
                     WindowFunc::FirstValue => (s < e).then(|| rs[s][f.args[0]].clone()),
                     WindowFunc::LastValue => (s < e).then(|| rs[e - 1][f.args[0]].clone()),
                     _ => {
-                        let k = rs[i][f.args[1]].as_i64().unwrap_or(0);
+                        // a NULL position yields NULL (as in PostgreSQL)
+                        let Some(k) = rs[i][f.args[1]].as_i64() else {
+                            out.push(Datum::Null);
+                            continue;
+                        };
                         if k <= 0 {
                             return Err(SqlError::new("22016", "argument of nth_value must be greater than zero"));
                         }

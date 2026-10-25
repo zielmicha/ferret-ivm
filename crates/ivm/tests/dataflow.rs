@@ -68,3 +68,35 @@ fn window_frames_past_the_partition_end() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A RANGE offset bound that overflows the ORDER BY type lies beyond every
+/// value in the offset's direction (PostgreSQL's in_range semantics), and
+/// nth_value with a NULL position is NULL. Expected rows are PostgreSQL's.
+#[test]
+fn window_range_offsets_that_overflow() {
+    let dir = tmpdir("range-overflow");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE w (id int PRIMARY KEY, v int)");
+    exec(&h, "INSERT INTO w VALUES (1, 1), (2, 2), (3, 2147483647), (4, -2147483648)");
+    let q = "SELECT id, sum(v::int8) OVER (ORDER BY v RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS a, \
+             sum(v::int8) OVER (ORDER BY v RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING) AS b, \
+             count(*) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING) AS c, \
+             count(*) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS d, \
+             count(*) OVER (ORDER BY v DESC RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS e, \
+             count(*) OVER (ORDER BY v RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS f, \
+             count(*) OVER (ORDER BY v NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS g, \
+             nth_value(v, CASE WHEN id = 1 THEN NULL ELSE 1 END) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS h \
+             FROM w";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW r AS {q}"));
+    let want = ["1|2||3|3|2|2|1|", "2||1|3|3|2|1|2|1", "3|||1|4|1|0|3|1", "4|||4|1|1|3|0|1"];
+    assert_eq!(rows(&h, &format!("{q} ORDER BY id")), want);
+    assert_eq!(rows(&h, "SELECT * FROM r ORDER BY id"), want);
+    // NULL ordering values: past the last non-null value comes the NULL row
+    exec(&h, "INSERT INTO w VALUES (5, NULL)");
+    let want = ["1|2||4|3|2|3|2|", "2||1|4|3|2|2|3|1", "3|||2|4|1|1|4|1", "4|||5|1|1|4|1|1", "5|||1|5|1|1|1|1"];
+    assert_eq!(rows(&h, &format!("{q} ORDER BY id")), want);
+    assert_eq!(rows(&h, "SELECT * FROM r ORDER BY id"), want);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
