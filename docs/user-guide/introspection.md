@@ -179,7 +179,9 @@ versioned, so `AS OF` returns their current contents.
 
 Client tools discover schemas through `pg_catalog` and
 `information_schema`. The engine provides the relations those tools commonly
-read, computed from its catalog when a query is planned (`sysrel.rs`). Names
+read, computed from its catalog when a query is planned (`sysrel.rs`), so
+materialized views and `SUBSCRIBE` cannot read them
+([Maintained views](../sql/maintained-views.md#what-is-rejected)). Names
 starting with `pg_` resolve to `pg_catalog` without a schema prefix. Every
 object appears in schema `public`, owned by role `ivm`, in database `ivm`.
 

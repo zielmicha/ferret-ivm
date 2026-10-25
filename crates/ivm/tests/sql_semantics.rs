@@ -620,6 +620,45 @@ fn interval_type_modifiers_are_shown() {
     running.shutdown();
 }
 
+/// Maintained views cannot read the catalog: system relations, regclass
+/// casts and pg_get_viewdef() and the like are bound as constants from the
+/// catalog of the time. A materialized view over pg_class kept the catalog
+/// as it was when the view was created, and a restart, which plans the
+/// view again, changed its contents without any logged change.
+#[test]
+fn maintained_views_reject_catalog_reads() {
+    let running = start("catalog-reads");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    exec(&h, "INSERT INTO t VALUES (1)");
+    exec(&h, "CREATE VIEW catview AS SELECT relname FROM pg_class");
+    for (sql, what) in [
+        ("CREATE MATERIALIZED VIEW m AS SELECT relname FROM pg_class", "system relation \"pg_class\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT table_name FROM information_schema.tables", "system relation \"tables\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT name FROM ivm.objects", "system relation \"objects\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT * FROM catview", "system relation \"pg_class\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT id FROM t WHERE 't'::regclass::oid > 0", "a cast to regclass"),
+        ("CREATE MATERIALIZED VIEW m AS SELECT id::oid::regclass AS r FROM t", "a cast to regclass"),
+        ("CREATE MATERIALIZED VIEW m AS SELECT pg_get_viewdef(id::oid) AS d FROM t", "function pg_get_viewdef()"),
+        ("SUBSCRIBE (SELECT relname FROM pg_class)", "system relation \"pg_class\""),
+        ("SUBSCRIBE TO catview", "system relation \"pg_class\""),
+    ] {
+        let err = try_exec(&h, sql).unwrap_err();
+        assert_eq!(err, format!("{what} is not allowed in a materialized view"), "{sql}");
+    }
+    // constants that do not depend on the catalog are fine
+    exec(&h, "CREATE MATERIALIZED VIEW ok AS SELECT id, 'integer'::regtype::oid AS ty, 'public'::regnamespace::oid AS ns, version() AS v FROM t");
+    assert_eq!(rows(&h, "SELECT id, ty, ns FROM ok"), vec!["1|23|2200"]);
+    // virtual views and ad hoc queries read the catalog as it is
+    assert!(rows(&h, "SELECT relname FROM catview").contains(&"ok".to_string()));
+    // a replacement that would make a materialized view read it is refused
+    exec(&h, "CREATE VIEW v AS SELECT id FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM v");
+    let err = try_exec(&h, "CREATE OR REPLACE VIEW v AS SELECT oid::int AS id FROM pg_class").unwrap_err();
+    assert!(err.contains("materialized view \"mv\" would no longer be valid: system relation \"pg_class\""), "{err}");
+    running.shutdown();
+}
+
 #[test]
 fn current_setting_reports_server_settings() {
     let running = start("current-setting");

@@ -98,6 +98,10 @@ stayed connected for 10 s.
   [Maintained views](../sql/maintained-views.md).
 - `now() is only supported in temporal filters of maintained views` — see
   [Temporal filters](temporal-filters-and-errors.md#accepted-forms).
+- `system relation "pg_class" is not allowed in a materialized view` (also
+  casts to `regclass` and `pg_get_viewdef()`) — maintained views cannot
+  read the catalog; use a virtual view
+  ([Maintained views](../sql/maintained-views.md)).
 - `... is not supported` (SQLSTATE `0A000`) — a construct the engine does
   not implement; see [Queries](../sql/queries.md).
 - `cannot replace view "v": index "i" depends on its columns`,

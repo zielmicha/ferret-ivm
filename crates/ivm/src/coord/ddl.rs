@@ -565,6 +565,7 @@ impl Engine {
         };
         if cv.materialized {
             check_deterministic(&bq.rel)?;
+            check_catalog_reads(&bq)?;
         }
         self.check_broken(&bq.rel)?;
         let mut names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
@@ -689,7 +690,10 @@ impl Engine {
             {
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
                 // (it inlines the views it reads: they must keep it deterministic)
-                if let Err(e) = crate::sql::plan_stored_query(&cat, &q).and_then(|bq| check_deterministic(&bq.rel)) {
+                if let Err(e) = crate::sql::plan_stored_query(&cat, &q).and_then(|bq| {
+                    check_deterministic(&bq.rel)?;
+                    check_catalog_reads(&bq)
+                }) {
                     return refuse(format!("materialized view \"{}\" would no longer be valid: {}", o.name, e.message));
                 }
             }
@@ -1233,6 +1237,19 @@ fn object_type_name(t: ast::ObjectType) -> &'static str {
         ast::ObjectType::Index => "index",
         _ => "object",
     }
+}
+
+/// Reject reads of the catalog in maintained views: system relations,
+/// regclass casts and functions such as pg_get_viewdef() are bound as
+/// constants from the catalog of the time. A view would not follow the
+/// catalog's changes (no log record changes it), and planning it again (a
+/// restart does) would change it.
+pub(crate) fn check_catalog_reads(bq: &crate::sql::BoundQuery) -> Result<()> {
+    if let Some(what) = &bq.catalog_reads {
+        return Err(SqlError::new(codes::FEATURE_NOT_SUPPORTED, format!("{what} is not allowed in a materialized view"))
+            .with_detail("Maintained views must be deterministic: their state is a pure function of the input log, which does not hold the catalog's contents."));
+    }
+    Ok(())
 }
 
 /// Reject non-deterministic functions in maintained views.

@@ -44,6 +44,7 @@ fn plan_query_unguarded(catalog: &dyn Catalog, q: &sqlparser::ast::Query, params
     let mut b = Binder::new(catalog).with_params(params);
     b.stored_definition = stored;
     let mut bq = b.bind_query(q)?.resolve_unknowns(&mut b)?;
+    bq.catalog_reads = b.catalog_reads.take();
     let rel = std::mem::replace(&mut bq.rel, Rel::unit());
     let rel = decorrelate::decorrelate(rel)?;
     bq.rel = optimize::optimize(rel)?;

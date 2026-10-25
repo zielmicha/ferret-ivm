@@ -59,7 +59,19 @@ decorrelated subqueries — is checked (`check_deterministic` in
    HINT:  Use a top-level WHERE condition comparing a column expression with now() (optionally plus or minus a constant interval).
    ```
 
-Virtual views and ad hoc queries are not checked; they may use any function.
+3. **Reads of the catalog.** System relations (`pg_catalog.*`,
+   `information_schema.*`, `ivm.*`), casts to `regclass` (of names or OIDs)
+   and `pg_get_viewdef()`, `pg_get_indexdef()` and `pg_get_constraintdef()`
+   are bound as constants from the catalog when the query is planned: a
+   maintained view would not follow the catalog's changes (no log record
+   changes it), and planning it again — a restart does — would change its
+   contents. They are rejected (`system relation "pg_class" is not allowed
+   in a materialized view`, `a cast to regclass ...`, `function
+   pg_get_viewdef() ...`). Casts to `regtype` and `regnamespace` read fixed
+   OIDs and are allowed.
+
+Virtual views and ad hoc queries are not checked; they may use any function
+and read the catalog as it is when they run.
 A materialized view that reads a virtual view inlines its query, so the
 check covers it, and `CREATE OR REPLACE` of a view is rejected (SQLSTATE
 `2BP01`, `cannot replace view "v": materialized view "m" would no longer be

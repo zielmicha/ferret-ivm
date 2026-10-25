@@ -1138,6 +1138,14 @@ impl<'a> Binder<'a> {
     /// `CASE oid WHEN o1 THEN 'text1' ... END` over a catalog mapping; with
     /// `keep`, unknown OIDs print as numbers (as reg* types do).
     fn oid_lookup(&self, x: Expr, kind: &str, keep: bool) -> Expr {
+        // (types and schemas are fixed; relations and definitions are not)
+        match kind {
+            "regclass" => self.note_catalog_read("a cast to regclass"),
+            "viewdef" => self.note_catalog_read("function pg_get_viewdef()"),
+            "indexdef" => self.note_catalog_read("function pg_get_indexdef()"),
+            "constraintdef" => self.note_catalog_read("function pg_get_constraintdef()"),
+            _ => {}
+        }
         let whens: Vec<(Expr, Expr)> = self
             .catalog
             .definitions(kind)
@@ -1157,6 +1165,9 @@ impl<'a> Binder<'a> {
     /// The OID named by the input of a reg* type (regclassin etc.): a
     /// possibly schema-qualified, possibly quoted name.
     fn reg_name_oid(&self, kind: &str, input: &str) -> Result<u32> {
+        if kind == "regclass" {
+            self.note_catalog_read("a cast to regclass");
+        }
         let defs = self.catalog.definitions(kind);
         let find = |n: &str| defs.iter().find(|(_, d)| d == n).map(|(o, _)| *o);
         if kind == "regtype" {

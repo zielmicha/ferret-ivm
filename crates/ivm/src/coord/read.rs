@@ -429,6 +429,7 @@ impl Engine {
             SubscribeTarget::Query(q, _) => {
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
+                super::ddl::check_catalog_reads(&bq)?;
                 self.check_broken(&bq.rel)?;
                 // what it reads: the relations of the plan, and the views
                 // (inlined in it) it reads them through
