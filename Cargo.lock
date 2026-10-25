@@ -460,6 +460,7 @@ dependencies = [
  "pgfuncs",
  "pgnumeric",
  "pgproto",
+ "proptest",
  "rustc-hash",
  "serde",
  "serde_json",

@@ -1,25 +1,27 @@
-//! Property tests of value encodings over random values of every SQL type
-//! (NULLs, NaN in several bit patterns, infinities, -0.0, numerics in several
-//! scales, intervals with equal spans but different fields, jsonb with
-//! numbers of different scales, multi-dimensional arrays with non-default
-//! lower bounds and NULL elements):
-//! - the key encoding orders like `Datum::sql_cmp` in every direction and
-//!   NULL placement, also as composite keys; it is prefix-free;
-//! - canonical decoding re-encodes to the same bytes, and with the fidelity
-//!   suffix restores the exact value; key plus suffix tell two values apart
-//!   exactly when `exact_cmp` does;
-//! - the row codec, text I/O and binary send/receive round trip exactly.
+//! Property tests (proptest) of value encodings over values of every SQL
+//! type: NULLs, NaNs in several bit patterns, infinities, -0.0, numerics in
+//! several scales, intervals with equal spans but different fields, jsonb
+//! with numbers in several scales, multi-dimensional arrays with non-default
+//! lower bounds and NULL elements.
+//! - The key encoding orders like `Datum::sql_cmp` in every direction and
+//!   NULL placement, also in composite keys, and is prefix-free.
+//! - Canonical decoding re-encodes to the same bytes; with the fidelity
+//!   suffix it restores the exact value; key plus suffix tell two values
+//!   apart exactly when `exact_cmp` does.
+//! - The row codec, text I/O and binary send/receive round trip exactly.
 //!
-//! `IVM_TEST_SEED=N cargo test -p ivm types::tests` reproduces a seed.
-//! Long variant: `cargo test -p ivm --release types::tests -- --ignored`.
+//! Failures shrink to a minimal case and are recorded under
+//! `proptest-regressions/`. `PROPTEST_CASES=N` runs N cases per property
+//! instead of 4096; `PROPTEST_RNG_SEED=N` fixes the seed.
 
 use super::codec::{decode_datum, decode_row, encode_datum, encode_row};
 use super::datum::{exact_cmp, ArrayValue, Datum};
 use super::encoding::*;
 use super::text::{format_datum, parse_datum, recv_datum, send_datum};
 use super::SqlType;
-use crate::testkit::{run_seeds, seeds, Rng};
 use pgdatetime::Interval;
+use proptest::prelude::*;
+use proptest::sample::select;
 use std::cmp::Ordering;
 
 const SCALARS: &[SqlType] = &[
@@ -43,33 +45,31 @@ const SCALARS: &[SqlType] = &[
     SqlType::Jsonb,
 ];
 
-fn gen_type(rng: &mut Rng) -> SqlType {
-    let t = rng.pick(SCALARS).clone();
-    if rng.chance(25) { SqlType::Array(Box::new(t)) } else { t }
+// ---------------------------------------------------------------------------
+// strategies
+
+fn arb_type() -> impl Strategy<Value = SqlType> {
+    let scalar = select(SCALARS.to_vec());
+    prop_oneof![3 => scalar.clone(), 1 => scalar.prop_map(|t| SqlType::Array(Box::new(t)))]
 }
 
-fn gen_numeric(rng: &mut Rng) -> pgnumeric::Numeric {
-    let s = match rng.below(12) {
-        0 => ["NaN", "Infinity", "-Infinity"][rng.index(3)].to_string(),
-        1 => format!("{}0.{}", ["", "-"][rng.index(2)], "0".repeat(rng.index(6))),
-        2 => format!("{}e{}", rng.range(1, 999), rng.range(-40, 40)),
-        _ => {
-            let int: String = (0..rng.index(22)).map(|_| char::from(b'0' + rng.below(10) as u8)).collect();
-            let frac: String = (0..rng.index(22)).map(|_| char::from(b'0' + rng.below(10) as u8)).collect();
-            let sign = if rng.chance(40) { "-" } else { "" };
-            match (int.is_empty(), frac.is_empty()) {
-                (true, true) => "0".to_string(),
-                (false, true) => format!("{sign}{int}"),
-                (_, false) => format!("{sign}{int}.{frac}"),
-            }
-        }
-    };
-    pgnumeric::Numeric::parse(&s).unwrap_or_else(|e| panic!("numeric {s}: {e}"))
+fn numeric(s: &str) -> Datum {
+    Datum::numeric(pgnumeric::Numeric::parse(s).unwrap_or_else(|e| panic!("numeric {s}: {e}")))
 }
 
-fn gen_f64(rng: &mut Rng) -> f64 {
-    match rng.below(4) {
-        0 => *rng.pick(&[
+fn arb_numeric() -> impl Strategy<Value = Datum> {
+    prop_oneof![
+        1 => select(vec!["NaN", "Infinity", "-Infinity"]).prop_map(numeric),
+        1 => (any::<bool>(), 0..6usize).prop_map(|(neg, z)| numeric(&format!("{}0.{}", if neg { "-" } else { "" }, "0".repeat(z)))),
+        1 => (1..1000u32, -40..40i32).prop_map(|(m, e)| numeric(&format!("{m}e{e}"))),
+        6 => ("-?[0-9]{1,20}", proptest::option::of("[0-9]{1,20}"))
+            .prop_map(|(i, f)| numeric(&match f { Some(f) => format!("{i}.{f}"), None => i })),
+    ]
+}
+
+fn arb_f64() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        select(vec![
             f64::NAN,
             -f64::NAN,
             f64::from_bits(0x7FF0_0000_0000_0001), // signalling NaN payload
@@ -86,131 +86,124 @@ fn gen_f64(rng: &mut Rng) -> f64 {
             -2.25,
             0.1,
         ]),
-        1 => f64::from_bits(rng.next()),
-        _ => rng.range(-1000, 1000) as f64 / *rng.pick(&[1.0, 4.0, 10.0, 3.0]),
-    }
+        any::<u64>().prop_map(f64::from_bits),
+        (-1000..1000i64, select(vec![1.0, 4.0, 10.0, 3.0])).prop_map(|(a, b)| a as f64 / b),
+    ]
 }
 
 /// JSON text: numbers in several scales, strings with escapes, nesting.
-fn gen_json(rng: &mut Rng, depth: u32) -> String {
-    let scalar = |rng: &mut Rng| -> String {
-        match rng.below(4) {
-            0 => rng.pick(&["0", "-0", "1", "1.0", "1.50", "-2", "1e2", "1E-2", "0.000", "-0.5", "123456789012345678901234567890"]).to_string(),
-            1 => rng.pick(&[r#""""#, r#""a""#, r#""b""#, r#""é""#, r#""a\nb""#, r#""\"q\"""#, r#""é""#]).to_string(),
-            2 => rng.pick(&["true", "false"]).to_string(),
-            _ => "null".to_string(),
-        }
-    };
-    if depth >= 3 || rng.chance(50) {
-        return scalar(rng);
-    }
-    let n = rng.index(4);
-    if rng.chance(50) {
-        let items: Vec<String> = (0..n).map(|_| gen_json(rng, depth + 1)).collect();
-        format!("[{}]", items.join(", "))
-    } else {
-        let items: Vec<String> = (0..n).map(|_| format!(r#""{}": {}"#, rng.pick(&["a", "b", "c", "aa", ""]), gen_json(rng, depth + 1))).collect();
-        format!("{{{}}}", items.join(", "))
-    }
+fn arb_json() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        select(vec!["0", "-0", "1", "1.0", "1.50", "-2", "1e2", "1E-2", "0.000", "-0.5", "123456789012345678901234567890"]),
+        select(vec![r#""""#, r#""a""#, r#""b""#, r#""é""#, r#""a\nb""#, r#""\"q\"""#, r#""é""#]),
+        select(vec!["true", "false", "null"]),
+    ]
+    .prop_map(str::to_string);
+    leaf.prop_recursive(3, 16, 4, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..4).prop_map(|v| format!("[{}]", v.join(", "))),
+            prop::collection::vec((select(vec!["a", "b", "c", "aa", ""]), inner), 0..4).prop_map(|v| {
+                let items: Vec<String> = v.into_iter().map(|(k, x)| format!(r#""{k}": {x}"#)).collect();
+                format!("{{{}}}", items.join(", "))
+            }),
+        ]
+    })
 }
 
-fn gen_scalar(rng: &mut Rng, ty: &SqlType) -> Datum {
+fn arb_interval() -> impl Strategy<Value = Interval> {
+    prop_oneof![
+        1 => select(vec![Interval::INFINITY, Interval::NEG_INFINITY]),
+        1 => (any::<i32>(), any::<i32>(), any::<i64>()).prop_map(|(m, d, us)| Interval { months: m >> 8, days: d >> 8, micros: us >> 12 }),
+        6 => (-30..30i32, -60..60i32, -5..5i64).prop_map(|(m, d, h)| Interval { months: m, days: d, micros: h * 3_600_000_000 }),
+    ]
+}
+
+fn arb_scalar(ty: &SqlType) -> BoxedStrategy<Datum> {
     match ty {
-        SqlType::Bool => Datum::Bool(rng.chance(50)),
-        SqlType::Int2 => Datum::Int2(if rng.chance(20) { *rng.pick(&[i16::MIN, i16::MAX, 0, -1]) } else { rng.next() as i16 }),
-        SqlType::Int4 => Datum::Int4(if rng.chance(20) { *rng.pick(&[i32::MIN, i32::MAX, 0, -1]) } else { rng.range(-100, 100) as i32 }),
-        SqlType::Int8 => Datum::Int8(if rng.chance(20) { *rng.pick(&[i64::MIN, i64::MAX, 0, -1]) } else { rng.next() as i64 >> rng.below(64) }),
-        SqlType::Oid => Datum::Oid(if rng.chance(20) { *rng.pick(&[0, u32::MAX]) } else { rng.next() as u32 }),
-        SqlType::Float4 => Datum::Float4(gen_f64(rng) as f32),
-        SqlType::Float8 => Datum::Float8(gen_f64(rng)),
-        SqlType::Numeric => Datum::numeric(gen_numeric(rng)),
-        SqlType::Text => {
-            let n = rng.index(6);
-            Datum::text_owned((0..n).map(|_| *rng.pick(&['a', 'b', 'Z', ' ', '~', 'é', 'ß', '😀', '\u{7f}', '\u{1}'])).collect())
-        }
-        SqlType::Bytea => Datum::bytea((0..rng.index(6)).map(|_| *rng.pick(&[0u8, 1, 0x7F, 0xFE, 0xFF, b'a'])).collect()),
-        SqlType::Date => Datum::Date(match rng.below(6) {
-            0 => *rng.pick(&[i32::MIN, i32::MAX]), // -infinity, infinity
-            1 => *rng.pick(&[-2_451_545, 2_145_031_947, 0, -1]),
-            _ => rng.range(-2_451_545, 2_145_031_947) as i32 >> rng.below(16),
-        }),
-        SqlType::Time => Datum::Time(if rng.chance(10) { 86_400_000_000 } else { rng.range(0, 86_399_999_999) }),
+        SqlType::Bool => any::<bool>().prop_map(Datum::Bool).boxed(),
+        SqlType::Int2 => any::<i16>().prop_map(Datum::Int2).boxed(),
+        SqlType::Int4 => prop_oneof![select(vec![i32::MIN, i32::MAX, 0, -1]), -100..100i32, any::<i32>()].prop_map(Datum::Int4).boxed(),
+        SqlType::Int8 => prop_oneof![select(vec![i64::MIN, i64::MAX, 0, -1]), -100..100i64, any::<i64>()].prop_map(Datum::Int8).boxed(),
+        SqlType::Oid => any::<u32>().prop_map(Datum::Oid).boxed(),
+        SqlType::Float4 => arb_f64().prop_map(|v| Datum::Float4(v as f32)).boxed(),
+        SqlType::Float8 => arb_f64().prop_map(Datum::Float8).boxed(),
+        SqlType::Numeric => arb_numeric().boxed(),
+        SqlType::Text => "[abZ ~éß😀\u{7f}\u{1}]{0,6}".prop_map(Datum::text_owned).boxed(),
+        SqlType::Bytea => prop::collection::vec(select(vec![0u8, 1, 0x7F, 0xFE, 0xFF, b'a']), 0..6).prop_map(Datum::bytea).boxed(),
+        // the valid range, -infinity and infinity
+        SqlType::Date => prop_oneof![select(vec![i32::MIN, i32::MAX, -2_451_545, 2_145_031_947, 0]), -2_451_545..2_145_031_948i32, -100_000..100_000i32]
+            .prop_map(Datum::Date)
+            .boxed(),
+        SqlType::Time => prop_oneof![Just(86_400_000_000i64), 0..86_400_000_000i64].prop_map(Datum::Time).boxed(),
         SqlType::Timestamp | SqlType::TimestampTz => {
-            let v = match rng.below(6) {
-                0 => *rng.pick(&[i64::MIN, i64::MAX]),
-                1 => *rng.pick(&[-211_813_488_000_000_000, 9_223_371_331_199_999_999, 0, -1]),
-                _ => rng.range(-211_813_488_000_000_000, 9_223_371_331_199_999_999) >> rng.below(40),
-            };
-            if *ty == SqlType::Timestamp { Datum::Timestamp(v) } else { Datum::TimestampTz(v) }
+            let tz = *ty == SqlType::TimestampTz;
+            prop_oneof![
+                select(vec![i64::MIN, i64::MAX, -211_813_488_000_000_000, 9_223_371_331_199_999_999, 0]),
+                -211_813_488_000_000_000..9_223_371_331_200_000_000i64,
+                -1_000_000_000_000..1_000_000_000_000i64,
+            ]
+            .prop_map(move |v| if tz { Datum::TimestampTz(v) } else { Datum::Timestamp(v) })
+            .boxed()
         }
-        SqlType::Interval => Datum::Interval(match rng.below(8) {
-            0 => *rng.pick(&[Interval::INFINITY, Interval::NEG_INFINITY]),
-            1 => Interval { months: rng.next() as i32 >> 8, days: rng.next() as i32 >> 8, micros: rng.next() as i64 >> 12 },
-            _ => Interval { months: rng.range(-30, 30) as i32, days: rng.range(-60, 60) as i32, micros: rng.range(-5, 5) * 3_600_000_000 },
-        }),
-        SqlType::Uuid => {
-            let mut u = [0u8; 16];
-            for b in u.iter_mut() {
-                *b = if rng.chance(30) { 0 } else { rng.next() as u8 };
-            }
-            Datum::Uuid(u)
-        }
-        SqlType::Json => Datum::Json(gen_json(rng, 0).into()),
-        SqlType::Jsonb => Datum::jsonb(pgfuncs::json::Jsonb::parse(&gen_json(rng, 0)).unwrap()),
+        SqlType::Interval => arb_interval().prop_map(Datum::Interval).boxed(),
+        SqlType::Uuid => any::<[u8; 16]>().prop_map(Datum::Uuid).boxed(),
+        SqlType::Json => arb_json().prop_map(|s| Datum::Json(s.into())).boxed(),
+        SqlType::Jsonb => arb_json().prop_map(|s| Datum::jsonb(pgfuncs::json::Jsonb::parse(&s).unwrap())).boxed(),
         other => unreachable!("{other:?}"),
     }
 }
 
-fn gen_array(rng: &mut Rng, elem: &SqlType) -> ArrayValue {
-    let lens: Vec<i32> = match rng.below(10) {
-        0 => vec![],
-        1..=5 => vec![rng.range(1, 4) as i32],
-        6..=8 => vec![rng.range(1, 3) as i32, rng.range(1, 3) as i32],
-        _ => vec![2, 1, rng.range(1, 2) as i32],
+fn arb_array(elem: SqlType) -> BoxedStrategy<Datum> {
+    let lens = prop_oneof![
+        1 => Just(vec![]),
+        5 => (1..=4i32).prop_map(|l| vec![l]),
+        3 => (1..=3i32, 1..=3i32).prop_map(|(a, b)| vec![a, b]),
+        1 => (1..=2i32).prop_map(|c| vec![2, 1, c]),
+    ];
+    lens.prop_flat_map(move |lens| {
+        let n = if lens.is_empty() { 0 } else { lens.iter().product::<i32>() as usize };
+        let bounds = prop::collection::vec(prop_oneof![4 => Just(1i32), 1 => -3..=5i32], lens.len());
+        let elems = prop::collection::vec(prop_oneof![1 => Just(Datum::Null), 6 => arb_scalar(&elem)], n);
+        let elem = elem.clone();
+        (Just(lens), bounds, elems).prop_map(move |(lens, bounds, elems)| {
+            let dims = bounds.into_iter().zip(lens).collect();
+            Datum::array(ArrayValue { elem_type: elem.clone(), dims, elems })
+        })
+    })
+    .boxed()
+}
+
+fn arb_value(ty: &SqlType) -> BoxedStrategy<Datum> {
+    let v = match ty {
+        SqlType::Array(e) => arb_array((**e).clone()),
+        t => arb_scalar(t),
     };
-    let dims: Vec<(i32, i32)> = lens.iter().map(|l| (if rng.chance(20) { rng.range(-3, 5) as i32 } else { 1 }, *l)).collect();
-    let n: i32 = if dims.is_empty() { 0 } else { lens.iter().product() };
-    let elems = (0..n).map(|_| if rng.chance(15) { Datum::Null } else { gen_scalar(rng, elem) }).collect();
-    ArrayValue { elem_type: elem.clone(), dims, elems }
+    prop_oneof![1 => Just(Datum::Null), 12 => v].boxed()
 }
 
-fn gen_value(rng: &mut Rng, ty: &SqlType) -> Datum {
-    if rng.chance(8) {
-        return Datum::Null;
-    }
-    match ty {
-        SqlType::Array(e) => Datum::array(gen_array(rng, e)),
-        t => gen_scalar(rng, t),
-    }
+fn arb_typed_value() -> impl Strategy<Value = (SqlType, Datum)> {
+    arb_type().prop_flat_map(|ty| (Just(ty.clone()), arb_value(&ty)))
 }
 
-/// Another value equal to `d` in a different representation, where the type
-/// has such (otherwise `d` itself).
-fn other_repr(rng: &mut Rng, d: &Datum) -> Datum {
-    match d {
-        Datum::Numeric(n) if !n.is_nan() && !n.is_infinite() => Datum::numeric(n.with_dscale(n.dscale() + 1 + rng.below(3) as u32)),
-        Datum::Float8(v) if *v == 0.0 => Datum::Float8(-v),
-        Datum::Float8(v) if v.is_nan() => Datum::Float8(f64::from_bits(v.to_bits() ^ (1 << 63))),
-        Datum::Float4(v) if *v == 0.0 => Datum::Float4(-v),
-        Datum::Interval(iv) if iv.months > i32::MIN + 1 && iv.months < i32::MAX && iv.days < i32::MAX - 30 && iv.days > i32::MIN => {
-            if rng.chance(50) {
-                Datum::Interval(Interval { months: iv.months - 1, days: iv.days + 30, micros: iv.micros })
-            } else if iv.micros < i64::MAX - 86_400_000_000 {
-                Datum::Interval(Interval { months: iv.months, days: iv.days - 1, micros: iv.micros + 86_400_000_000 })
-            } else {
-                d.clone()
-            }
-        }
-        Datum::Jsonb(j) => pgfuncs::json::Jsonb::parse(&rescale_json_numbers(&j.to_string())).map(Datum::jsonb).unwrap_or_else(|_| d.clone()),
-        Datum::Array(a) => {
-            let mut b = (**a).clone();
-            for e in b.elems.iter_mut() {
-                *e = other_repr(rng, e);
-            }
-            Datum::array(b)
-        }
-        _ => d.clone(),
-    }
+/// A type and two values: independent, or the second derived from the first
+/// (another representation of it, itself, or another array shape).
+fn arb_typed_pair() -> impl Strategy<Value = (SqlType, Datum, Datum)> {
+    arb_type().prop_flat_map(|ty| (Just(ty.clone()), arb_value(&ty), arb_value(&ty), 0..5u8)).prop_map(|(ty, a, b, how)| {
+        let b = match how {
+            0 | 1 => other_repr(&a, how == 0),
+            2 => a.clone(),
+            3 => match &a {
+                Datum::Array(x) if !x.dims.is_empty() => {
+                    let mut y = (**x).clone();
+                    y.dims[0].0 += 1;
+                    Datum::array(y)
+                }
+                _ => b,
+            },
+            _ => b,
+        };
+        (ty, a, b)
+    })
 }
 
 /// JSON text with every number in a larger scale ("1" -> "1.0", "1.5" -> "1.50").
@@ -251,28 +244,36 @@ fn rescale_json_numbers(text: &str) -> String {
     out
 }
 
-/// A pair of values of type `ty` that is often equal or close.
-fn gen_pair(rng: &mut Rng, ty: &SqlType, pool: &mut Vec<Datum>) -> (Datum, Datum) {
-    let a = if !pool.is_empty() && rng.chance(30) { pool[rng.index(pool.len())].clone() } else { gen_value(rng, ty) };
-    if pool.len() < 8 {
-        pool.push(a.clone());
-    }
-    let b = match rng.below(10) {
-        0..=2 => other_repr(rng, &a),
-        3..=4 if !pool.is_empty() => pool[rng.index(pool.len())].clone(),
-        5 => match &a {
-            // same elements, other shape
-            Datum::Array(x) if x.dims.len() == 1 && x.dims[0].1 >= 1 => {
-                let mut y = (**x).clone();
-                y.dims[0].0 += 1;
-                Datum::array(y)
+/// Another value equal to `d` in a different representation, where the type
+/// has such (otherwise `d` itself).
+fn other_repr(d: &Datum, alt: bool) -> Datum {
+    match d {
+        Datum::Numeric(n) if !n.is_nan() && !n.is_infinite() => Datum::numeric(n.with_dscale(n.dscale() + 1 + alt as u32)),
+        Datum::Float8(v) if *v == 0.0 => Datum::Float8(-v),
+        Datum::Float8(v) if v.is_nan() => Datum::Float8(f64::from_bits(v.to_bits() ^ (1 << 63))),
+        Datum::Float4(v) if *v == 0.0 => Datum::Float4(-v),
+        Datum::Interval(iv) if *iv != Interval::INFINITY && *iv != Interval::NEG_INFINITY => {
+            let shifted = if alt {
+                iv.months.checked_sub(1).zip(iv.days.checked_add(30)).map(|(m, d)| Interval { months: m, days: d, micros: iv.micros })
+            } else {
+                iv.days.checked_sub(1).zip(iv.micros.checked_add(86_400_000_000)).map(|(d, us)| Interval { months: iv.months, days: d, micros: us })
+            };
+            shifted.map(Datum::Interval).unwrap_or_else(|| d.clone())
+        }
+        Datum::Jsonb(j) => pgfuncs::json::Jsonb::parse(&rescale_json_numbers(&j.to_string())).map(Datum::jsonb).unwrap_or_else(|_| d.clone()),
+        Datum::Array(a) => {
+            let mut b = (**a).clone();
+            for e in b.elems.iter_mut() {
+                *e = other_repr(e, alt);
             }
-            _ => gen_value(rng, ty),
-        },
-        _ => gen_value(rng, ty),
-    };
-    (a, b)
+            Datum::array(b)
+        }
+        _ => d.clone(),
+    }
 }
+
+// ---------------------------------------------------------------------------
+// checks
 
 /// The order `encode_key` must produce under `spec`.
 fn spec_cmp(a: &Datum, b: &Datum, spec: SortSpec) -> Ordering {
@@ -337,118 +338,91 @@ const SPECS: [SortSpec; 4] = [
     SortSpec { desc: true, nulls_first: false },
 ];
 
-fn check_pair(ty: &SqlType, a: &Datum, b: &Datum) {
-    for spec in SPECS {
-        let (ea, eb) = (enc(a, spec), enc(b, spec));
-        assert_eq!(ea.cmp(&eb), spec_cmp(a, b, spec), "{ty:?} {spec:?}: order of {a:?} vs {b:?}");
-        // prefix-free: neither encoding is a proper prefix of the other
-        if ea != eb {
-            assert!(!ea.starts_with(&eb) && !eb.starts_with(&ea), "{ty:?} {spec:?}: {a:?} vs {b:?} not prefix-free");
-        }
-    }
-    let exact_eq = exact_cmp(&canonical_nans(a), &canonical_nans(b)) == Ordering::Equal && a.is_null() == b.is_null();
-    assert_eq!(identity(a, ty) == identity(b, ty), exact_eq, "{ty:?}: key identity of {a:?} vs {b:?}");
-}
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(crate::testkit::proptest_cases(4096)))]
 
-fn check_value(ty: &SqlType, d: &Datum) {
-    for spec in SPECS {
-        let e = enc(d, spec);
-        let mut padded = e.clone();
-        padded.extend_from_slice(&[0x00, 0xFF, 0x02, 0x01]);
-        let (back, n) = decode_key(&padded, ty, spec).unwrap_or_else(|err| panic!("{ty:?} {spec:?}: decoding {d:?}: {err}"));
-        assert_eq!(n, e.len(), "{ty:?} {spec:?}: decoded length of {d:?}");
-        assert_eq!(skip_key(&padded, ty, spec).unwrap(), e.len());
-        assert_eq!(enc(&back, spec), e, "{ty:?} {spec:?}: canonical re-encoding of {d:?} (decoded {back:?})");
-        assert_eq!(back.sql_cmp(d), Ordering::Equal, "{ty:?} {spec:?}: decoded {back:?} vs {d:?}");
-        if !d.is_null() && has_fidelity(ty) {
-            let mut f = Vec::new();
-            encode_fidelity(d, &mut f);
-            f.extend_from_slice(&[7, 7, 7]);
-            let mut exact = back.clone();
-            let used = apply_fidelity(&mut exact, &f).unwrap();
-            assert_eq!(used, f.len() - 3, "{ty:?}: fidelity length of {d:?}");
-            assert!(identical(&exact, &canonical_nans(d)), "{ty:?}: fidelity restores {exact:?}, not {d:?}");
-        } else if !d.is_null() {
-            assert!(identical(&back, &canonical_nans(d)), "{ty:?}: decoded {back:?}, not {d:?}");
+    #[test]
+    fn key_order_matches_sql_cmp((ty, a, b) in arb_typed_pair()) {
+        for spec in SPECS {
+            let (ea, eb) = (enc(&a, spec), enc(&b, spec));
+            prop_assert_eq!(ea.cmp(&eb), spec_cmp(&a, &b, spec), "{:?} {:?}", ty, spec);
+            if ea != eb {
+                prop_assert!(!ea.starts_with(&eb) && !eb.starts_with(&ea), "not prefix-free under {:?}", spec);
+            }
         }
+        let exact_eq = a.is_null() == b.is_null() && exact_cmp(&canonical_nans(&a), &canonical_nans(&b)) == Ordering::Equal;
+        prop_assert_eq!(identity(&a, &ty) == identity(&b, &ty), exact_eq, "key identity");
     }
-    // row codec: exact, NaN payloads included
-    let mut buf = Vec::new();
-    encode_datum(d, &mut buf);
-    let mut rd = &buf[..];
-    let back = decode_datum(&mut rd).unwrap();
-    assert!(rd.is_empty() && identical(&back, d), "{ty:?}: codec round trip of {d:?} gave {back:?}");
-    if d.is_null() {
-        return;
-    }
-    // text output then input
-    let text = format_datum(d);
-    let parsed = parse_datum(&text, ty, -1).unwrap_or_else(|e| panic!("{ty:?}: parsing {text:?} (from {d:?}): {e}"));
-    let text_exact = !matches!(d, Datum::Text(s) if s.contains('\0'));
-    if text_exact {
-        assert!(identical(&parsed, &canonical_nans(d)), "{ty:?}: text {text:?} of {d:?} parses as {parsed:?}");
-    }
-    // binary send then receive
-    if let Some(bytes) = send_datum(d, ty) {
-        let back = recv_datum(&bytes, ty).unwrap_or_else(|e| panic!("{ty:?}: receiving {d:?}: {e}"));
-        assert!(identical(&back, d), "{ty:?}: binary round trip of {d:?} gave {back:?}");
-    }
-}
 
-fn run(seed: u64, iterations: usize) {
-    let mut rng = Rng::new(seed);
-    for _ in 0..iterations {
-        let ty = gen_type(&mut rng);
-        let mut pool = Vec::new();
-        for _ in 0..8 {
-            let (a, b) = gen_pair(&mut rng, &ty, &mut pool);
-            check_value(&ty, &a);
-            check_pair(&ty, &a, &b);
+    #[test]
+    fn composite_keys_order_lexicographically((t1, a1, b1) in arb_typed_pair(), (t2, a2, b2) in arb_typed_pair(), s in 0..4usize) {
+        let (s1, s2) = (SPECS[s], SPECS[3 - s]);
+        let ka = [enc(&a1, s1), enc(&a2, s2)].concat();
+        let kb = [enc(&b1, s1), enc(&b2, s2)].concat();
+        prop_assert_eq!(ka.cmp(&kb), spec_cmp(&a1, &b1, s1).then(spec_cmp(&a2, &b2, s2)), "({:?}, {:?})", t1, t2);
+    }
+
+    #[test]
+    fn keys_decode_canonically_and_exactly((ty, d) in arb_typed_value()) {
+        for spec in SPECS {
+            let e = enc(&d, spec);
+            let padded = [&e[..], &[0x00, 0xFF, 0x02, 0x01]].concat();
+            let (back, n) = decode_key(&padded, &ty, spec).unwrap();
+            prop_assert_eq!(n, e.len(), "decoded length under {:?}", spec);
+            prop_assert_eq!(skip_key(&padded, &ty, spec).unwrap(), e.len());
+            prop_assert_eq!(enc(&back, spec), e, "canonical re-encoding of {:?} under {:?}", back, spec);
+            prop_assert_eq!(back.sql_cmp(&d), Ordering::Equal, "decoded {:?}", back);
+            if !d.is_null() && has_fidelity(&ty) {
+                let mut f = Vec::new();
+                encode_fidelity(&d, &mut f);
+                let mut exact = back.clone();
+                let used = apply_fidelity(&mut exact, &[&f[..], &[7, 7, 7]].concat()).unwrap();
+                prop_assert_eq!(used, f.len());
+                prop_assert!(identical(&exact, &canonical_nans(&d)), "fidelity restores {:?}", exact);
+            } else if !d.is_null() {
+                prop_assert!(identical(&back, &canonical_nans(&d)), "decoded {:?}", back);
+            }
         }
-        // composite keys order lexicographically
-        let ty2 = gen_type(&mut rng);
-        let (a1, b1) = gen_pair(&mut rng, &ty, &mut pool);
-        let mut pool2 = Vec::new();
-        let (a2, b2) = gen_pair(&mut rng, &ty2, &mut pool2);
-        for (s1, s2) in [(SPECS[0], SPECS[1]), (SPECS[2], SPECS[3])] {
-            let ka = [enc(&a1, s1), enc(&a2, s2)].concat();
-            let kb = [enc(&b1, s1), enc(&b2, s2)].concat();
-            let want = spec_cmp(&a1, &b1, s1).then(spec_cmp(&a2, &b2, s2));
-            assert_eq!(ka.cmp(&kb), want, "composite ({ty:?}, {ty2:?}): ({a1:?}, {a2:?}) vs ({b1:?}, {b2:?})");
+    }
+
+    #[test]
+    fn values_round_trip_through_codec_text_and_binary((ty, d) in arb_typed_value()) {
+        let mut buf = Vec::new();
+        encode_datum(&d, &mut buf);
+        let mut rd = &buf[..];
+        let back = decode_datum(&mut rd).unwrap();
+        prop_assert!(rd.is_empty() && identical(&back, &d), "codec gave {:?}", back);
+        if !d.is_null() {
+            let text = format_datum(&d);
+            let parsed = parse_datum(&text, &ty, -1).map_err(|e| TestCaseError::fail(format!("parsing {text:?}: {e}")))?;
+            prop_assert!(identical(&parsed, &canonical_nans(&d)), "text {:?} parses as {:?}", text, parsed);
+            if let Some(bytes) = send_datum(&d, &ty) {
+                let back = recv_datum(&bytes, &ty).map_err(|e| TestCaseError::fail(format!("receiving: {e}")))?;
+                prop_assert!(identical(&back, &d), "binary round trip gave {:?}", back);
+            }
         }
-        // rows of mixed types
-        let row: Vec<Datum> = (0..rng.index(6))
-            .map(|_| {
-                let t = gen_type(&mut rng);
-                gen_value(&mut rng, &t)
-            })
-            .collect();
+    }
+
+    #[test]
+    fn rows_round_trip(row in prop::collection::vec(arb_typed_value().prop_map(|(_, d)| d), 0..6)) {
         let mut buf = Vec::new();
         encode_row(&row, &mut buf);
         let mut rd = &buf[..];
         let back = decode_row(&mut rd).unwrap();
-        assert!(rd.is_empty() && back.len() == row.len() && row.iter().zip(&back).all(|(a, b)| identical(a, b)), "row {row:?}");
-        // prefix_successor bounds every extension of a prefix
-        let prefix: Vec<u8> = (0..rng.index(4)).map(|_| *rng.pick(&[0u8, 1, 0xFE, 0xFF])).collect();
+        prop_assert!(rd.is_empty() && back.len() == row.len() && row.iter().zip(&back).all(|(a, b)| identical(a, b)), "got {:?}", back);
+    }
+
+    #[test]
+    fn prefix_successor_bounds_every_extension(
+        prefix in prop::collection::vec(select(vec![0u8, 1, 0xFE, 0xFF]), 0..5),
+        ext in prop::collection::vec(select(vec![0u8, 0xFF]), 0..4),
+    ) {
         match prefix_successor(&prefix) {
-            None => assert!(prefix.iter().all(|b| *b == 0xFF)),
+            None => prop_assert!(prefix.iter().all(|b| *b == 0xFF)),
             Some(s) => {
-                assert!(s > prefix);
-                let mut ext = prefix.clone();
-                ext.extend((0..rng.index(4)).map(|_| *rng.pick(&[0u8, 0xFF])));
-                assert!(ext < s && !s.starts_with(&prefix), "successor {s:?} of {prefix:?}");
+                let extended = [&prefix[..], &ext[..]].concat();
+                prop_assert!(s > prefix && extended < s && !s.starts_with(&prefix), "successor {:?}", s);
             }
         }
     }
-}
-
-#[test]
-fn encodings_order_and_round_trip() {
-    run_seeds("encodings_order_and_round_trip", &seeds(&[1, 2], false), |seed| run(seed, 1500));
-}
-
-#[test]
-#[ignore = "long-running; see the module docs"]
-fn encodings_order_and_round_trip_long() {
-    run_seeds("encodings_order_and_round_trip_long", &seeds(&[], true), |seed| run(seed, 100_000));
 }

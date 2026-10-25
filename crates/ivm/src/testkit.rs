@@ -1,13 +1,10 @@
-//! Helpers for randomized tests: a small seedable PRNG, seed selection and
-//! scratch directories. Pure std, so the engine tests and ivm-difftest
-//! include this file by path as well.
+//! Helpers for randomized tests: a small seedable PRNG (for generators
+//! driven by a seed, such as the SQL generator, whose cases proptest picks),
+//! case counts and scratch directories. Pure std, so the engine tests and
+//! ivm-difftest include this file by path as well.
 //!
-//! Every randomized test runs a fixed list of seeds by default, so plain
-//! `cargo test` runs are reproducible. `IVM_TEST_SEED=N` runs only seed N,
-//! and a failing run prints its seed. The long variants (`#[ignore]`d tests)
-//! run `IVM_TEST_ITERATIONS` (default 20) fresh seeds. Scratch directories go
-//! to `IVM_TEST_TMP` (default: the system temp directory) and are kept when
-//! a test fails.
+//! Scratch directories go to `IVM_TEST_TMP` (default: the system temp
+//! directory) and are kept when a test fails.
 
 #![allow(dead_code)]
 
@@ -67,45 +64,9 @@ fn env_u64(name: &str) -> Option<u64> {
     Some(v.trim().parse().unwrap_or_else(|_| panic!("{name}={v} is not a number")))
 }
 
-/// Seeds for a randomized test: `IVM_TEST_SEED` if set; otherwise
-/// `defaults`, or for a long run `IVM_TEST_ITERATIONS` (default 20) fresh
-/// seeds.
-pub fn seeds(defaults: &[u64], long: bool) -> Vec<u64> {
-    if let Some(s) = env_u64("IVM_TEST_SEED") {
-        return vec![s];
-    }
-    if !long {
-        return defaults.to_vec();
-    }
-    let n = env_u64("IVM_TEST_ITERATIONS").unwrap_or(20);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
-    let mut r = Rng::new(now ^ (std::process::id() as u64) << 32);
-    // short seeds are easier to pass around
-    (0..n).map(|_| r.next() % 1_000_000_000).collect()
-}
-
-/// Run `f` for every seed; a panic is reported together with its seed.
-pub fn run_seeds(test: &str, seeds: &[u64], mut f: impl FnMut(u64)) {
-    for &seed in seeds {
-        if seeds.len() > 1 {
-            eprintln!("{test}: seed {seed}");
-        }
-        let _guard = SeedGuard { test, seed };
-        f(seed);
-    }
-}
-
-struct SeedGuard<'a> {
-    test: &'a str,
-    seed: u64,
-}
-
-impl Drop for SeedGuard<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            eprintln!("\n*** {} failed with seed {} (rerun with IVM_TEST_SEED={})\n", self.test, self.seed, self.seed);
-        }
-    }
+/// Cases per proptest property: `PROPTEST_CASES` if set, else `default`.
+pub fn proptest_cases(default: u32) -> u32 {
+    env_u64("PROPTEST_CASES").map(|n| n as u32).unwrap_or(default)
 }
 
 /// A fresh scratch directory, removed on drop unless the test is failing.
@@ -128,7 +89,11 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!("keeping {} for inspection", self.0.display());
+            // once: proptest's shrinking fails many cases in a row
+            static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("keeping {} for inspection", self.0.display());
+            }
         } else {
             let _ = std::fs::remove_dir_all(&self.0);
         }
