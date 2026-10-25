@@ -395,3 +395,29 @@ fn output_column_names_follow_postgresql() {
     );
     running.shutdown();
 }
+
+#[test]
+fn binder_name_resolution_corner_cases() {
+    let running = start("names");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // GROUP BY prefers this query's FROM columns, then output aliases, and
+    // only then outer columns (t1.b used to hide the alias b)
+    assert_eq!(
+        rows(&h, "SELECT id, (SELECT count(*) FROM (SELECT x + 1 AS b FROM t2 GROUP BY b) z) FROM t1 ORDER BY id"),
+        vec!["1|4", "2|4", "3|4", "4|4", "5|4"]
+    );
+    // an alias on a USING join names its merged column (used to be ambiguous)
+    assert_eq!(rows(&h, "SELECT j.id, j.a FROM (t1 JOIN t2 USING (id)) AS j ORDER BY 1 LIMIT 2"), vec!["1|1", "2|2"]);
+    assert_eq!(
+        column_names(&h, "SELECT j.* FROM (t1 JOIN t2 USING (id)) AS j"),
+        vec!["id", "a", "b", "c", "s", "d", "ts", "x", "y", "c", "s"]
+    );
+    assert_eq!(column_names(&h, "SELECT t1.* FROM t1 JOIN t2 USING (id)").len(), 7);
+    // WITH RECURSIVE without a self-reference (the CTE name only occurs as a
+    // column alias) used to be rejected
+    assert_eq!(rows(&h, "WITH RECURSIVE t AS (SELECT 1 AS t) SELECT * FROM t"), vec!["1"]);
+    assert_eq!(rows(&h, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r ORDER BY n"), vec!["1", "2", "3"]);
+    assert!(try_rows(&h, "WITH RECURSIVE r AS (SELECT * FROM r) SELECT * FROM r").is_err());
+    running.shutdown();
+}

@@ -230,7 +230,7 @@ impl<'a> Binder<'a> {
         for cte in &w.cte_tables {
             let name = ident(&cte.alias.name);
             let alias_cols: Vec<String> = cte.alias.columns.iter().map(|c| ident(&c.name)).collect();
-            let binding = if w.recursive && query_references(&cte.query, &name) {
+            let binding = if w.recursive && self.cte_refers_to_itself(&name, &cte.query) {
                 self.bind_recursive_cte(&name, &alias_cols, &cte.query)?
             } else {
                 let bq = self.bind_query(&cte.query)?.resolve_unknowns(self)?;
@@ -242,6 +242,25 @@ impl<'a> Binder<'a> {
             self.ctes.last_mut().unwrap().push((name, binding));
         }
         Ok(())
+    }
+
+    /// Whether a WITH RECURSIVE query refers to its own name: bind it with a
+    /// placeholder relation for that name and look for the placeholder (a
+    /// binding error means it was referenced too, e.g. by a column).
+    fn cte_refers_to_itself(&mut self, name: &str, q: &ast::Query) -> bool {
+        const PROBE: u64 = u64::MAX;
+        if !query_references(q, name) {
+            return false;
+        }
+        self.ctes.last_mut().unwrap().push((name.to_string(), CteBinding { rel: Rel::RecRef { id: PROBE, columns: vec![] }, names: vec![] }));
+        let saved = self.next_rec_id;
+        let probe = self.bind_query(q);
+        self.next_rec_id = saved;
+        self.ctes.last_mut().unwrap().pop();
+        match probe {
+            Ok(bq) => rel_uses_recref(&bq.rel, PROBE),
+            Err(_) => true,
+        }
     }
 
     fn bind_recursive_cte(&mut self, name: &str, alias_cols: &[String], q: &ast::Query) -> Result<CteBinding> {
@@ -1012,7 +1031,9 @@ impl<'a> Binder<'a> {
             }
             ast::Expr::Identifier(id) => {
                 let name = ident(id);
-                if scope.resolve(None, &name)?.is_none() && self.lookup_outer(None, &name)?.is_none() {
+                // a FROM column of this query wins over an output alias, but
+                // columns of outer queries do not (as in PostgreSQL)
+                if scope.resolve(None, &name)?.is_none() {
                     let hits: Vec<usize> = (0..names.len()).filter(|i| names[*i] == name).collect();
                     if !hits.is_empty() && same_exprs(sel, &hits) {
                         return Ok(sel[hits[0]].clone());
@@ -1240,9 +1261,11 @@ impl<'a> Binder<'a> {
             ast::TableFactor::NestedJoin { table_with_joins, alias } => {
                 let (rel, mut scope) = self.bind_table_with_joins(table_with_joins, None)?;
                 if let Some(a) = alias {
+                    // the alias names the join's output columns; the columns
+                    // merged by USING are no longer reachable at all
                     let t = ident(&a.name);
                     for it in scope.items.iter_mut() {
-                        it.table = Some(t.clone());
+                        it.table = if it.hidden { None } else { Some(t.clone()) };
                     }
                 }
                 Ok((rel, scope, false))
@@ -1503,7 +1526,21 @@ fn type_name_for_alias(dt: &ast::DataType) -> Option<String> {
     }
 }
 
-/// Does `q` reference relation `name` (for detecting recursive CTEs)?
+/// Whether `rel` (or a subquery in it) reads the recursive relation `id`.
+fn rel_uses_recref(rel: &Rel, id: u64) -> bool {
+    fn expr_uses(e: &Expr, id: u64) -> bool {
+        match e {
+            Expr::Subquery(s) => rel_uses_recref(&s.rel, id) || e.children().iter().any(|c| expr_uses(c, id)),
+            _ => e.children().iter().any(|c| expr_uses(c, id)),
+        }
+    }
+    matches!(rel, Rel::RecRef { id: r, .. } if *r == id)
+        || rel.exprs().iter().any(|e| expr_uses(e, id))
+        || rel.inputs().iter().any(|i| rel_uses_recref(i, id))
+}
+
+/// Could `q` reference relation `name` (a cheap textual pre-check for
+/// recursive CTEs)?
 fn query_references(q: &ast::Query, name: &str) -> bool {
     let s = q.to_string().to_lowercase();
     // conservative textual check on word boundaries
