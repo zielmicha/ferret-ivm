@@ -92,6 +92,14 @@ document.getElementById('theme-toggle').addEventListener('click', () => {
   applyTheme(next);
 });
 
+// on phones the navigation is a drawer: a tap outside closes it
+document.getElementById('main').addEventListener('click', () => {
+  const sb = document.getElementById('sidebar');
+  if (sb.classList.contains('open')) {
+    sb.classList.remove('open');
+    document.getElementById('nav-toggle').setAttribute('aria-expanded', 'false');
+  }
+});
 document.getElementById('nav-toggle').addEventListener('click', () => {
   const sb = document.getElementById('sidebar');
   const open = !sb.classList.contains('open');

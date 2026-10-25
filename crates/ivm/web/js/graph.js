@@ -27,8 +27,8 @@ export class DagView {
   /**
    * opts: {
    *   renderNode(node, g, size) - draw a node into the SVG group g,
-   *   onSelect(id|null), direction: 'LR'|'TB', nodesep, ranksep,
-   *   label(node) - accessible name
+   *   onSelect(id|null), direction: 'auto'|'LR'|'TB', nodesep, ranksep,
+   *   label(node) - accessible name, padBottom - pixels covered by overlays
    * }
    */
   constructor(container, opts) {
@@ -93,9 +93,30 @@ export class DagView {
     this.restyle();
   }
 
+  /**
+   * Lay out in the configured direction; 'auto' tries left-to-right and
+   * top-down (for graphs up to 400 nodes) and keeps the one that fits the
+   * view at the larger scale, preferring left-to-right unless top-down is
+   * clearly better.
+   */
   layout(nodes, edges) {
+    const dirs = this.opts.direction !== 'auto' ? [this.opts.direction] : nodes.length <= 400 ? ['LR', 'TB'] : ['LR'];
+    const { w, h } = this.viewSize();
+    let best = null;
+    for (const dir of dirs) {
+      const r = this.layoutDir(nodes, edges, dir);
+      const k = Math.min(w / r.bounds.w, h / r.bounds.h);
+      if (!best || k > best.k * 1.2) best = { ...r, k, dir };
+    }
+    this.nodes = best.nodes;
+    this.edges = best.edges;
+    this.bounds = best.bounds;
+    this.effectiveDirection = best.dir;
+  }
+
+  layoutDir(nodes, edges, dir) {
     const g = new window.dagre.graphlib.Graph();
-    g.setGraph({ rankdir: this.opts.direction, nodesep: this.opts.nodesep, ranksep: this.opts.ranksep, edgesep: 14, marginx: 24, marginy: 24 });
+    g.setGraph({ rankdir: dir, nodesep: this.opts.nodesep, ranksep: this.opts.ranksep, edgesep: 14, marginx: 24, marginy: 24 });
     g.setDefaultEdgeLabel(() => ({}));
     for (const n of nodes) g.setNode(String(n.id), { width: n.width, height: n.height });
     const seen = new Map();
@@ -108,14 +129,14 @@ export class DagView {
       if (g.hasNode(a) && g.hasNode(b)) g.setEdge(a, b);
     }
     window.dagre.layout(g);
-    this.nodes = new Map();
+    const placed = new Map();
     for (const n of nodes) {
       const p = g.node(String(n.id));
-      this.nodes.set(String(n.id), { data: n, x: p.x - n.width / 2, y: p.y - n.height / 2, w: n.width, h: n.height, el: null });
+      placed.set(String(n.id), { data: n, x: p.x - n.width / 2, y: p.y - n.height / 2, w: n.width, h: n.height, el: null });
     }
-    this.edges = g.edges().map((e) => ({ from: e.v, to: e.w, points: g.edge(e).points, count: seen.get(`${e.v}>${e.w}`) || 1, el: null }));
+    const routed = g.edges().map((e) => ({ from: e.v, to: e.w, points: g.edge(e).points, count: seen.get(`${e.v}>${e.w}`) || 1, el: null }));
     const gg = g.graph();
-    this.bounds = { w: gg.width || 1, h: gg.height || 1 };
+    return { nodes: placed, edges: routed, bounds: { w: gg.width || 1, h: gg.height || 1 } };
   }
 
   drawEdges() {
@@ -216,17 +237,18 @@ export class DagView {
   }
 
   /**
-   * Fit the graph into view. With `all` false, a graph that would shrink
-   * below readability is fitted along its long side's cross axis instead
-   * (a tall graph to the width, a wide one to the height) and panned.
+   * Fit the graph into view. With `all` false, a large graph that would
+   * shrink below readability is fitted along its long side's cross axis
+   * instead (a tall graph to the width, a wide one to the height) and panned.
    */
   fit(all = true) {
     if (!this.bounds) return;
-    const { w, h } = this.viewSize();
+    const { w } = this.viewSize();
+    const h = this.viewSize().h - (this.opts.padBottom || 0);
     const kw = (w - 16) / this.bounds.w;
     const kh = (h - 16) / this.bounds.h;
     const kAll = Math.max(MIN_K, Math.min(1.2, kw, kh));
-    if (all || kAll >= 0.45) {
+    if (all || kAll >= 0.45 || this.nodes.size <= 40) {
       this.t = { k: kAll, x: (w - this.bounds.w * kAll) / 2, y: (h - this.bounds.h * kAll) / 2 };
     } else if (kw >= kh) {
       const k = Math.max(kAll, Math.min(1, kw));
@@ -235,6 +257,24 @@ export class DagView {
       const k = Math.max(kAll, Math.min(1, kh));
       this.t = { k, x: 8, y: Math.max(8, (h - this.bounds.h * k) / 2) };
     }
+    this.apply();
+  }
+
+  /** Fit the given nodes into view (at most at natural size). */
+  fitTo(ids) {
+    const ns = [...ids].map((id) => this.nodes.get(String(id))).filter(Boolean);
+    if (!ns.length) {
+      this.fit(false);
+      return;
+    }
+    const x0 = Math.min(...ns.map((n) => n.x));
+    const y0 = Math.min(...ns.map((n) => n.y));
+    const x1 = Math.max(...ns.map((n) => n.x + n.w));
+    const y1 = Math.max(...ns.map((n) => n.y + n.h));
+    const { w } = this.viewSize();
+    const h = this.viewSize().h - (this.opts.padBottom || 0);
+    const k = Math.max(MIN_K, Math.min(1, (w - 48) / (x1 - x0), (h - 48) / (y1 - y0)));
+    this.t = { k, x: (w - (x1 - x0) * k) / 2 - x0 * k, y: (h - (y1 - y0) * k) / 2 - y0 * k };
     this.apply();
   }
 

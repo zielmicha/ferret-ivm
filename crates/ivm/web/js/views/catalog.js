@@ -265,6 +265,11 @@ export default {
 
     let catalogJson = '';
     let detailJson = '';
+    let structure = '';
+    // graphs are only rebuilt when objects or dependencies change, so live
+    // row counts do not reset their pan and zoom
+    const showsGraph = () => !selected || tab === 'lineage';
+    const structureOf = (objs) => objs.map((o) => `${o.id}:${o.name}:${o.kind}:${o.depends_on.join(',')}`).join('|');
     async function loadCatalog() {
       try {
         const next = await api.catalog();
@@ -274,6 +279,9 @@ export default {
         catalog = next;
         sub.textContent = `${fmt.plural(catalog.objects.length, 'object')} · as of GSN ${fmt.int(catalog.gsn)}`;
         drawList();
+        const st = structureOf(catalog.objects);
+        if (showsGraph() && st === structure && graph) return;
+        structure = st;
         drawDetail();
       } catch (e) {
         replace(right, errorBox(e.message));
@@ -289,8 +297,10 @@ export default {
         const json = JSON.stringify({ ...d, gsn: 0 });
         if (detailFor === name && json === detailJson) return;
         detailJson = json;
+        const first = detailFor !== name;
         detail = d;
         detailFor = name;
+        if (!first && tab === 'lineage' && graph) return;
         // object facts may be fresher than the list
         if (catalog) {
           const i = catalog.objects.findIndex((x) => x.name === name);

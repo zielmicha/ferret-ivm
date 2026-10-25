@@ -145,7 +145,7 @@ depends on every object its SQL mentions by name.
 ### Dataflow
 
 The operators of the running dataflow as a layered graph, laid out left to
-right or top down. Each operator shows its kind and id, the table or view it
+right or top down (by default whichever fits the view better). Each operator shows its kind and id, the table or view it
 is the root of, its parameters (filter, group key, join paths, limit, …), the
 records held in its arrangements and, while it is processing changes, its
 output rate. Colors follow the operator family (source, map/filter, join,
@@ -165,9 +165,11 @@ an operator by id, kind or name.
 
 Drag or scroll to pan, pinch or Ctrl + scroll to zoom; with the graph
 focused, `+`, `-`, `0` and the arrow keys work too, and operators can be
-reached with Tab and opened with Enter. "Fit" shows the whole graph; a graph
-too large to read when fitted opens fitted to its width instead. Graphs of
-more than 1,200 operators are only drawn per object.
+reached with Tab and opened with Enter. "Fit" shows the whole graph; a large
+graph too small to read when fitted opens fitted to its width instead, and in
+a dataflow of more than 80 operators choosing an object turns on "only its
+operators" (untick it to see them in context). Graphs of more than 1,200
+operators are only drawn per object.
 
 Clicking an operator opens the inspector: its full parameters (for a join,
 every input with its projection and each delta path with its lookups and

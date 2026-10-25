@@ -16,7 +16,7 @@ const NODE_W = 214;
 const NODE_H = 66;
 const BIG_GRAPH = 1200;
 
-let direction = 'LR';
+let direction = 'auto';
 
 function activityLabel(rate) {
   if (!rate) return null;
@@ -36,10 +36,12 @@ export default {
     let view = null;
     let error = null;
     let centerPending = params[0] === 'node';
+    let focusPending = params[0] === 'object';
 
     const sub = h('div.sub', 'Loading…');
     const objSelect = h('select.input', { 'aria-label': 'Highlight an object', onchange: (e) => selectObject(e.target.value || null) });
-    const onlyBox = h('input', { type: 'checkbox', onchange: (e) => { onlyObject = e.target.checked; drawGraph(true); } });
+    let onlyTouched = false;
+    const onlyBox = h('input', { type: 'checkbox', onchange: (e) => { onlyTouched = true; onlyObject = e.target.checked; drawGraph(true); } });
     const searchInput = h('input.input', {
       type: 'search', placeholder: 'Find node: id, kind or name', 'aria-label': 'Find node',
       onkeydown: (e) => { if (e.key === 'Enter') find(e.target.value); },
@@ -49,7 +51,7 @@ export default {
       h('label.row.small', { style: { gap: '6px' } }, onlyBox, 'only its operators'),
       h('div.search', { style: { width: '230px' } }, searchInput),
       h('div.spacer'),
-      segmented([{ value: 'LR', label: '→ left to right' }, { value: 'TB', label: '↓ top down' }], direction, (v) => {
+      segmented([{ value: 'auto', label: 'auto' }, { value: 'LR', label: '→ left to right' }, { value: 'TB', label: '↓ top down' }], direction, (v) => {
         direction = v;
         if (view) view.setDirection(v);
       }),
@@ -90,10 +92,30 @@ export default {
       }
     }
 
+    function highlighted() {
+      const oi = objectIndex();
+      return oi >= 0 ? df.nodes.filter((n) => n.users.includes(oi)).map((n) => n.id) : [];
+    }
+
+    /** In a large dataflow an object's operators are scattered: show only
+     * them, unless the user chose otherwise. */
+    function autoOnly() {
+      if (onlyTouched || !df) return;
+      onlyObject = !!selectedObject && df.nodes.length > 80;
+      onlyBox.checked = onlyObject;
+    }
+
     function selectObject(key) {
       selectedObject = key;
       objSelect.value = key || '';
-      drawGraph(onlyObject);
+      const before = onlyObject;
+      autoOnly();
+      drawGraph(onlyObject || before !== onlyObject);
+      // zoom to the object's operators (the whole graph when none is chosen)
+      if (view && !onlyObject) {
+        if (key) view.fitTo(highlighted());
+        else view.fit(false);
+      }
       drawInspector();
     }
 
@@ -215,7 +237,7 @@ export default {
       const edges = df.edges.filter(([a, b]) => ids.has(a) && ids.has(b)).map(([a, b]) => ({ from: a, to: b }));
       if (!view) {
         view = new DagView(canvasBox, {
-          direction, ariaLabel: 'dataflow graph', renderNode,
+          direction, ariaLabel: 'dataflow graph', renderNode, padBottom: 56,
           label: (n) => `${n.kind} node ${n.id}${n.label ? ', ' + n.label : ''}`,
           onSelect: (id) => selectNode(id),
         });
@@ -230,6 +252,12 @@ export default {
       if (centerPending && selectedNode !== null) {
         centerPending = false;
         view.centerOn(selectedNode);
+      } else if (focusPending && objectIndex() >= 0) {
+        focusPending = false;
+        const before = onlyObject;
+        autoOnly();
+        if (before !== onlyObject) drawGraph(true);
+        else if (!onlyObject) view.fitTo(highlighted());
       }
     }
 
@@ -399,7 +427,10 @@ export default {
         applyParams(p);
         if (p[0] === 'object') {
           objSelect.value = selectedObject || '';
-          drawGraph(onlyObject);
+          const before = onlyObject;
+          autoOnly();
+          drawGraph(onlyObject || before !== onlyObject);
+          if (view && !onlyObject) view.fitTo(highlighted());
           drawInspector();
         } else if (p[0] === 'node') {
           selectNode(selectedNode);
