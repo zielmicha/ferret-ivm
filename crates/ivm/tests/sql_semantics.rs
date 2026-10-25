@@ -516,3 +516,34 @@ fn current_setting_reports_server_settings() {
     assert!(try_rows(&h, "SELECT current_setting('nope')").unwrap_err().contains("unrecognized configuration parameter"));
     running.shutdown();
 }
+
+#[test]
+fn scalar_subquery_cardinality_errors_only_where_evaluated() {
+    let running = start("scalar-cardinality");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // PostgreSQL only evaluates the subquery where CASE (COALESCE) reaches
+    // it; ivm computed it for every row and failed for a = 2 (two rows)
+    assert_eq!(
+        rows(&h, "SELECT id, CASE WHEN a = 1 THEN (SELECT x FROM t2 WHERE t2.x = t1.a) END FROM t1 ORDER BY 1"),
+        vec!["1|1", "2|", "3|", "4|", "5|"]
+    );
+    assert_eq!(rows(&h, "SELECT CASE WHEN false THEN (SELECT x FROM t2) END, coalesce(1, (SELECT x FROM t2))"), vec!["|1"]);
+    // where the value is used, more than one row is still an error
+    for q in [
+        "SELECT id, (SELECT x FROM t2 WHERE t2.x = t1.a) FROM t1",
+        "SELECT (SELECT x FROM t2)",
+        "SELECT id FROM t1 WHERE a = (SELECT x FROM t2 WHERE t2.x = t1.a)",
+    ] {
+        assert!(try_rows(&h, q).unwrap_err().contains("more than one row"), "{q}");
+    }
+    assert_eq!(rows(&h, "SELECT id, (SELECT y FROM t2 WHERE t2.id = t1.id) FROM t1 ORDER BY 1"), vec!["1|100", "2|", "3|200", "4|300", "5|500"]);
+    // maintained: the error appears and disappears with the rows needing it
+    exec(&h, "CREATE MATERIALIZED VIEW g AS SELECT id, CASE WHEN a = 1 THEN (SELECT y FROM t2 WHERE t2.x = t1.a) END AS v FROM t1");
+    assert_eq!(rows(&h, "SELECT * FROM g ORDER BY id"), vec!["1|100", "2|", "3|", "4|", "5|"]);
+    exec(&h, "INSERT INTO t2 VALUES (6, 1, 600, NULL, NULL)");
+    assert!(try_rows(&h, "SELECT * FROM g").unwrap_err().contains("more than one row"));
+    exec(&h, "DELETE FROM t2 WHERE id = 6");
+    assert_eq!(rows(&h, "SELECT * FROM g ORDER BY id"), vec!["1|100", "2|", "3|", "4|", "5|"]);
+    running.shutdown();
+}

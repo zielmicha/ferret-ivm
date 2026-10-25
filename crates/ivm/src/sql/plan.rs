@@ -233,8 +233,9 @@ pub enum ApplyKind {
     Semi { lhs: Vec<Expr>, negated: bool, null_aware: bool },
     /// Append a boolean column: EXISTS / IN / op ANY|ALL with 3-valued logic.
     Mark { kind: SubqueryKind },
-    /// Append the single column of a scalar subquery (NULL when empty,
-    /// error when more than one row).
+    /// Append the single column of a scalar subquery (NULL when empty) and
+    /// the number of rows it produced: more than one is an error, raised
+    /// only where the value is used (so CASE can avoid it, as in PostgreSQL).
     Scalar,
     /// LATERAL join: append the right side's columns (cross/left).
     Lateral { left_outer: bool },
@@ -392,6 +393,7 @@ impl Rel {
                         let mut c = r[0].clone();
                         c.nullable = true;
                         s.push(c);
+                        s.push(ColumnType::new(SqlType::Int8));
                     }
                     ApplyKind::Lateral { left_outer } => {
                         let mut r = right.schema();
@@ -430,7 +432,8 @@ impl Rel {
                 left.arity()
                     + match kind {
                         ApplyKind::Semi { .. } => 0,
-                        ApplyKind::Mark { .. } | ApplyKind::Scalar => 1,
+                        ApplyKind::Mark { .. } => 1,
+                        ApplyKind::Scalar => 2,
                         ApplyKind::Lateral { .. } => right.arity(),
                     }
             }
