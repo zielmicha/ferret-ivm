@@ -288,3 +288,25 @@ fn legacy_definitions_with_placeholders() {
     assert_eq!(e.rows("SELECT a FROM lpv"), ["1"]);
     e.shutdown();
 }
+
+/// The catalog history keeps the most recent coord::MAX_HISTORY statements
+/// (it is part of every checkpoint, and grew without bound).
+#[test]
+fn the_catalog_history_is_bounded() {
+    let e = Engine::start("history-bound");
+    let max = ivm::coord::MAX_HISTORY;
+    // two statements each, past the trimming point
+    let last = (max + max / 10).div_ceil(2);
+    for i in 0..=last {
+        e.exec(&format!("CREATE TABLE t{i} (a int)"));
+        e.exec(&format!("DROP TABLE t{i}"));
+    }
+    let n: usize = e.rows("SELECT count(*) FROM ivm.catalog_history")[0].parse().unwrap();
+    assert!(n <= max + max / 10 && n >= max, "{n} statements");
+    let newest = e.rows("SELECT statement FROM ivm.catalog_history ORDER BY gsn DESC LIMIT 1");
+    assert_eq!(newest, [format!("DROP TABLE t{last}")]);
+    let e = e.restart();
+    let after: usize = e.rows("SELECT count(*) FROM ivm.catalog_history")[0].parse().unwrap();
+    assert_eq!(after, n);
+    e.shutdown();
+}

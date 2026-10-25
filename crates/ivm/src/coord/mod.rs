@@ -135,6 +135,10 @@ pub(crate) struct AppState {
     pub ticks: Vec<(Gsn, i64)>,
 }
 
+/// DDL statements kept in the catalog history (`ivm.catalog_history`), the
+/// most recent ones: the history is part of every checkpoint.
+pub const MAX_HISTORY: usize = 10_000;
+
 /// Most clock ticks kept in a checkpoint: a day of ticks at the default
 /// interval. now() in a read as of an older GSN (within a larger retention
 /// window) after a restart is the oldest kept tick's clock.
@@ -716,6 +720,11 @@ impl Engine {
                 self.snap_epoch += 1;
                 if res.is_ok() {
                     self.catalog.history.push((gsn, sql.clone()));
+                    // (every checkpoint saves it; trimmed in steps)
+                    if self.catalog.history.len() > MAX_HISTORY + MAX_HISTORY / 10 {
+                        let excess = self.catalog.history.len() - MAX_HISTORY;
+                        self.catalog.history.drain(..excess);
+                    }
                 }
                 if let Err(e) = &res
                     && self.replaying

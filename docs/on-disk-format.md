@@ -448,7 +448,7 @@ with `serde_json`):
 |---|---|
 | `catalog.objects` | map from object id (as a JSON string key) to `CatalogObject` |
 | `catalog.next_id` | next object id |
-| `catalog.history` | `[gsn, statement]` of every successfully applied DDL statement (`ivm.catalog_history`) |
+| `catalog.history` | `[gsn, statement]` of the successfully applied DDL statements (`ivm.catalog_history`): the most recent 10,000 (trimmed back to 10,000 when it reaches 11,000) |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view: its error records `[[sqlstate, message], count]` |
 | `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records) |

@@ -208,9 +208,9 @@ records also appears as a badge in the navigation.
 
 ### History
 
-Every DDL statement with the GSN it took effect at, newest first, filterable
-by text and by kind (create, drop, alter). The same history is queryable as
-`ivm.catalog_history`.
+Every DDL statement with the GSN it took effect at (the most recent 10,000),
+newest first, filterable by text and by kind (create, drop, alter). The same
+history is queryable as `ivm.catalog_history`.
 
 ### SQL console
 
