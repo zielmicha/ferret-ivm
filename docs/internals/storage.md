@@ -9,7 +9,8 @@ algorithms; byte formats are in [On-disk format](../on-disk-format.md).
 
 Files: `mod.rs` (trees, arena, reads, writes, eviction, checkpoint, GC),
 `node.rs` (node encoding), `history.rs`, `summary.rs`, `segment.rs`,
-`manifest.rs`, `tests.rs` (model tests).
+`manifest.rs`, `inspect.rs` (buffer-pool residency per tree, for the web UI),
+`tests.rs` (model tests).
 
 ## Trees
 
@@ -35,12 +36,14 @@ A child's separator is the lower bound of its key range (ignored for the
 first child); a key belongs to the last child whose separator is `<=` it.
 Nodes are split by size: the target is 16 KiB of estimated serialized size
 for leaves and for internal nodes. A node whose contents after an update
-exceed twice the target (a bulk load, hydration) is split into chunks
-filled to 90% of it, so that the next inserts do not split every node right
-away. When a leaf splits, the separator of each new chunk is the shortest
-prefix of its first key that is greater than the previous chunk's last key
-(suffix truncation). The first chunk keeps the node's place (and separator)
-in its parent.
+exceed the target is split into chunks of balanced size (internal nodes keep
+at least two children per chunk); when they exceed twice the target (a bulk
+load, hydration), the chunks are filled to 90% of it, so that the next
+inserts do not split every node right away. When a leaf splits, the
+separator of each new chunk is the shortest prefix of its first key that is
+greater than the previous chunk's last key (suffix truncation); a new
+internal node takes its first child's separator. The first chunk keeps the
+node's place (and separator) in its parent.
 
 Pointers are either `Disk(DiskLoc)` — segment id, offset and length of the
 node's frame in a segment file — or `Mem(slot)` — the node is loaded in the
@@ -50,7 +53,8 @@ arena.
 
 Loaded nodes live in `slots`. A slot holds the node, its disk location (if it
 has an up-to-date copy on disk), a dirty flag, its parent slot, its tree, the
-number of loaded children, a CLOCK reference bit, and its estimated size.
+number of loaded children, a CLOCK reference bit, its estimated size, and
+(for leaves) the number of in-place edits since it was last rebuilt.
 Accessing a child through a `Disk` pointer reads and decodes the frame,
 allocates a slot and replaces the pointer by `Mem(slot)`.
 
@@ -86,7 +90,10 @@ and then compacts: all changes at or before the **retention frontier** are
 merged into one change stamped with the latest of their GSNs (dropped if the
 sum is zero), and zero-weight changes are removed. An entry whose history
 becomes empty is deleted from its leaf. Reads at or after the frontier are
-exact; the engine refuses `AS OF` reads before it.
+exact; the engine refuses `AS OF` reads before it. (A tree's history also
+only starts when the dataflow filled it: an arrangement records the GSN it
+was hydrated at, its `since`, and `AS OF` reads of earlier GSNs do not use
+it; see [Dataflow](dataflow.md).)
 
 Compaction is lazy: it happens to an entry when the entry is updated, and to
 all entries of a leaf when the leaf is rebuilt (see below). Old versions of
@@ -140,7 +147,7 @@ subtree (`storage::Summary`): the sum of the current weights of its entries
 | `CountNonNull` | `Count(i64)` | weighted count of entries whose argument is not NULL |
 | `CountTrue`, `CountFalse` | `Count(i64)` | weighted count of entries whose boolean argument is true / false |
 | `SumInt`, `SumSqInt` | `SumInt(i128)` | weighted sum (of squares) of an integer argument |
-| `SumNumeric`, `SumSqNumeric` | `SumNumeric(NumSum)` | exact `numeric` sum |
+| `SumNumeric`, `SumSqNumeric` | `SumNumeric(NumSum)` | exact `numeric` sum (not limited to numeric's range) |
 | `SumFloat`, `SumSqFloat` | `SumFloat(FloatSum)` | exact float sum |
 | `Min`, `Max` | `Min(Option<Datum>)`, `Max(Option<Datum>)` | extreme value among entries with positive weight |
 
@@ -176,16 +183,25 @@ only.
 
 ### Exact sums
 
-- `SumInt` accumulates in `i128`, without overflow checks: sums of squares
-  of large `bigint` values (each square can approach 2^126) overflow — a
-  panic in debug builds, a wrapped, wrong result in release builds (a known
-  problem).
+- `SumInt` accumulates in `i128` without overflow checks. It holds sums of
+  integer arguments and the sums of squares of `smallint` and `integer`
+  arguments (each square below 2^62), which stay far within its range.
+  Variance and standard deviation of `bigint` arguments, whose squares
+  approach 2^126, sum the argument cast to `numeric` instead
+  (`SumNumeric` and `SumSqNumeric`).
 - `NumSum` (numeric) keeps the finite sum as a `Numeric`, the weighted
   counts of NaN, +Infinity and -Infinity terms apart (as PostgreSQL's
   aggregate state does), and a multiset of the finite terms' display scales.
   The value is NaN if any NaN (or both infinities) is present, else ±Infinity
   if present, else the finite sum at the largest display scale present.
-  Removing a term exactly restores the previous state, scale included.
+  Removing a term exactly restores the previous state, scale included. Like
+  PostgreSQL's numeric aggregate state, the finite sum is not limited to
+  numeric's range (unbounded `add_unbounded` / `sub_unbounded` /
+  `mul_unbounded` arithmetic): a sum over a subtree, or a sum of squares,
+  may exceed it, so maintaining a summary never fails. Only the aggregate
+  value read from it is range-checked (`Numeric::checked`); a group whose
+  sum lies beyond the range becomes an error record of that group, which is
+  retracted when the group is back in range.
 - `FloatSum` keeps the finite part as an integer multiple of 2^-1074 (the
   smallest subnormal double) in a big integer: each `x = m·2^e` adds
   `m·2^(e+1074)`. Addition is exact, associative and invertible; the value is
@@ -194,7 +210,8 @@ only.
   (truncated below the grid). `avg` divides the exact sum with 128 extra
   bits before rounding; variance is computed from the exact sums as
   `(N·Q − S²) / (N·(N−1))` (or `N²`). A finite sum whose rounded value
-  overflows fails with `value out of range: overflow`.
+  overflows (for `sum(real)`, overflows `real`) fails with
+  `value out of range: overflow`.
 
 ### How aggregates use summaries
 
@@ -227,7 +244,13 @@ On open, the last valid manifest record defines the state: the active
 segment is truncated to the recorded length, and segment files the record
 does not mention are deleted. Without a valid record, a store that may have
 had a checkpoint — a non-empty manifest, or no manifest but segment files
-with data — is refused instead, and nothing is modified.
+with data — is refused instead, and nothing is modified (an empty manifest,
+left by a crash during the very first checkpoint, opens as a new store).
+
+Creating the store directory, the manifest or a segment file is followed by
+an `fsync` of the directory that holds it, so that a crash cannot lose the
+directory entry of a file a checkpoint refers to; the manifest rewrite
+renames `MANIFEST.new` over `MANIFEST` and `fsync`s the directory too.
 
 ## Garbage collection
 

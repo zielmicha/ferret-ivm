@@ -18,12 +18,13 @@ Operators exchange **deltas**: `Vec<(Row, i64)>`, the change of a collection
 at one GSN. An update is a retraction (`-1` of the old row) plus an insertion
 (`+1` of the new one).
 
-Every operator **consolidates** its output delta before handing it on: rows
-are sorted by *exact identity* (`exact_row_cmp`, which distinguishes
+Every operator's output delta is **consolidated** before it is handed on:
+rows are sorted by *exact identity* (`exact_row_cmp`, which distinguishes
 representations such as `1.0` and `1.00`, `-0` and `0`, `'1 mon'` and
 `'30 days'`), equal rows are merged by adding their weights, and zero weights
-are dropped. Consequently no consumer — operator, subscriber or sink — ever
-sees a change that cancels within a GSN, and a GSN's changes appear
+are dropped (a keyed table's delta is consolidated by construction, see
+[Table](#table)). Consequently no consumer — operator, subscriber or sink —
+ever sees a change that cancels within a GSN, and a GSN's changes appear
 atomically.
 
 Alongside the data, every operator outputs **error records**
@@ -40,9 +41,13 @@ message) and flow to the consumers (see [Errors](#errors)).
   arrangements, and a `hydrated` flag;
 - **arrangements** (`Arrangement`): persistent indexes of a node's output —
   a storage tree plus a `Layout` (key expressions, sort order, per-node
-  summaries) — with a fingerprint, a reference count and a `hydrated` flag;
+  summaries) — with a fingerprint, a reference count, a `hydrated` flag and
+  `since`, the GSN from which its history is complete;
+- the **error records** in each node's contents (`node_errors`, read with
+  `Graph::errors_of`; see [Errors](#errors));
 - the logical clock `now`, per-node statistics (for `EXPLAIN MAINTENANCE`),
-  and, during recovery, the map of recovered trees by fingerprint.
+  per-node activity counters (for the web UI), and, during recovery, the
+  maps of recovered trees and their `since` by fingerprint.
 
 Node ids are assigned in creation order and a node is always created after
 its inputs, so **id order is a topological order**.
@@ -96,7 +101,8 @@ changes grouped by table node) and every `Tick` record (with no changes):
 3. Any other node runs if one of its inputs produced output at this GSN — or,
    for a temporal filter, if the clock moved since the previous step.
 4. The node's output delta is applied to **all of its arrangements at
-   `gsn`** before any consumer runs.
+   `gsn`** before any consumer runs, and its error records are added to the
+   node's accumulated ones.
 5. Consumers read arrangements through their (GSN, weight) histories either
    *before* the current GSN (`ReadAt::Before(gsn)`) or *after* it
    (`ReadAt::Latest`), so an operator can compute "old" and "new" results of
@@ -129,11 +135,11 @@ Kinds of arrangements:
 | Arrangement | Key | Summaries | Created by |
 |---|---|---|---|
 | primary index of a table | primary-key columns (all columns for a multiset table) | — | the table |
-| join lookup index | the join key expressions of that input | — | delta joins |
-| presence index | the semijoin key columns | — (count) | semijoins |
+| join lookup index | the input's columns equated with the other inputs (computed join keys are appended to the input as columns first, see [DeltaJoin](#deltajoin)) | — | delta joins |
+| presence index | all columns of the presence input (the semijoin key values) | — (count) | semijoins |
 | aggregation input | group columns (+ `ORDER BY` columns of an ordered aggregate) | the aggregates' needs | `Reduce` |
 | aggregation output | group columns | — | `Reduce` |
-| full index | all columns | — | `Distinct`, `SetOp`, `Recursive`, a view's read index |
+| full index | all columns | — | `Distinct`, `SetOp`, `Recursive` (its output, and source relations that have no arrangement), a view's read index |
 | top-k / window input | group/partition columns, then sort columns | — | `TopK`, `Window` |
 | temporal events | (time, kind) | — | `TemporalFilter` (private state) |
 | user index | `CREATE INDEX` columns | — | `CREATE INDEX` |
@@ -141,6 +147,15 @@ Kinds of arrangements:
 A materialized view is read through its *read arrangement*: the first
 arrangement of its root node if there is one (for example a `Reduce`'s
 output index), otherwise a full index added for the view.
+
+An arrangement's history is complete only from the GSN it was hydrated at
+(`Arrangement::since`; for a new table, its creation): its contents as of
+earlier GSNs were never stored. `Arrangement::covers(at)` tells whether a
+read can use it — `since <= g` for `AS OF g` — and reads in the past only use
+arrangements that cover them ([Planner](planner.md#batch-execution)). The
+value is saved in checkpoints with the tree (`AppState::arr_since`), so a
+recovered arrangement keeps its history; one rebuilt by hydration starts a
+new one.
 
 ## Operators
 
@@ -169,27 +184,33 @@ gets its stored row (a prefix lookup in the primary index, which does not
 yet contain this GSN) and its final state after all changes of the commit:
 
 - `Upsert(row, unchanged)` sets the key's row; columns listed in `unchanged`
-  (unchanged TOASTed values) are copied from the previous row;
+  (unchanged TOASTed values) are copied from the key's previous row (stored,
+  or set earlier in the commit). A key without a row takes them from the row
+  that the change just before deleted: a source sends a primary-key change
+  as a delete of the old key directly followed by the upsert of the new row.
+  Without either they become NULL (with a warning in the log);
 - `Delete(key)` removes it; `Insert`/`Remove` behave like upsert/delete;
 - `Truncate` removes every stored row and everything touched before it in
   the commit.
 
-The output is `−stored, +final` for each touched key, consolidated, so an
-upsert that does not change the row produces nothing. Because before-images
-come from the stored row, sources never need `REPLICA IDENTITY FULL` for
-tables with a key. For a multiset table (no key), `Insert`/`Upsert` add one
-instance, `Remove`/`Delete` remove one, and `Truncate` retracts the current
-contents plus everything added in the commit.
+The output is `−stored, +final` for each touched key whose row changed (by
+exact comparison), so an upsert that does not change the row produces
+nothing; rows of different keys always differ, so the delta needs no further
+consolidation. Because before-images come from the stored row, sources never
+need `REPLICA IDENTITY FULL` for tables with a key. For a multiset table (no
+key), `Insert`/`Upsert` add one instance, `Remove`/`Delete` remove one, and
+`Truncate` retracts the stored contents and discards the changes before it
+in the commit (changes after it are applied as usual).
 
 ### Mfp (map, filter, project)
 
 A sequence of `Map(expr)` (append a computed column) and `Filter(pred)`
 steps followed by a projection. Steps run in SQL order, so a `WHERE`
 condition guards the select list against errors. During lowering, filters,
-maps and projections are kept as a *pending* MFP and fused into the
-consuming operator (a join input, an arrangement key, ...); an `Mfp` node is
-only created where one is needed. An expression error on a row yields an
-error record with the row's weight instead of an output row.
+maps and projections are kept as a *pending* MFP: a join input applies it to
+the rows it receives and looks up; every other consumer gets an `Mfp` node
+(`materialize`). An expression error on a row yields an error record with
+the row's weight instead of an output row.
 
 ### Union, Negate, Constant, FlatMap
 
@@ -211,7 +232,14 @@ For every input *i* the plan has a **delta path**: filters that can be
 checked on *i*'s row alone, then a sequence of lookup steps, each binding one
 more input *j* through an arrangement of *j* keyed by the join keys between
 *j* and the inputs bound so far, followed by the residual conditions that
-became checkable.
+became checkable. Arrangement keys are always plain columns of the input's
+node: an input whose join key is computed (by its MFP, as in
+`JOIN (SELECT id, 100 / x AS q FROM b WHERE x <> 0) b2 ON a.v = b2.q`, or by
+the condition, as in `ON a.v = b.x + 1`) is first materialized as an `Mfp`
+node that applies its MFP, filters first, and appends the computed keys as
+columns. A key is therefore evaluated only on rows that pass the input's
+filters, and one that fails becomes an error record of that node instead of
+failing the step.
 
 At a GSN, for every input *i* whose node changed, *i*'s delta (after its MFP,
 consolidated — changes to columns the join does not use cancel here) is
@@ -227,10 +255,20 @@ extended along *i*'s path. Input *j* is read *after* the GSN if `j < i` and
 - A presence input contributes its key if the key's count (a range summary
   over the key prefix) is positive. Its count *before* the GSN is the current
   count minus the presence delta of this GSN. When a presence input is the
-  delta source, a key contributes `+1` or `−1` only when its presence flips.
+  delta source, a key contributes `+1` or `−1` only when its presence flips;
+  the rows such a path produces then get the presence input's columns
+  recomputed with the key expressions the other paths look it up with, so
+  that they carry the exact values (numeric scale, `-0`, ...) the other
+  paths derive and retract each other's rows correctly.
+- An *exact* presence input matches the whole entry encoding (values with
+  their fidelity suffix) instead of the canonical key, and lookups keyed by
+  its values keep only rows whose key values are identical (see *Semijoin*
+  below).
 - When all inputs are bound, the joined row goes to the output.
 - For hydration, the join drives the path of its smallest regular input
-  (by index size) over that input's snapshot.
+  (by index size) over that input's snapshot; the MFPs of the other regular
+  inputs are evaluated over their contents too, so that their expression
+  errors are counted once per row, as the steps count them.
 
 Lookup order is chosen per path by the planner ([Planner](planner.md#delta-join-planning)):
 the next input is the one with the most equality conditions to the bound
@@ -240,11 +278,15 @@ then smaller ones.
 Joins that the lowering produces from other constructs:
 
 - **Semijoin** (`EXISTS`, `IN`): `l` delta-joined with a presence input over
-  the distinct key values of `r`. If the condition is not a conjunction of
-  equalities between the two sides, the matching left rows are computed by
-  a full inner join, projected to the left columns, and made distinct; `l`
-  is then joined back to them on all its columns (`IS NOT DISTINCT FROM`),
-  which keeps `l`'s duplicate rows.
+  the distinct key values of `r` (conditions on one side only filter that
+  side). If the condition is not a conjunction of equalities between the two
+  sides, the matching left rows are computed by an inner join of `l` and `r`
+  with the whole condition and projected to the left columns; `l` is then
+  joined with an *exact* presence input over them on all its columns
+  (`IS NOT DISTINCT FROM`), which keeps `l`'s duplicate rows. Matching
+  exactly keeps left rows apart that are equal but differ in representation
+  (`1.0` and `1.00`), which the condition may tell apart; presence only
+  needs a positive count, so the matched rows need no `Distinct`.
 - **Antijoin** (`NOT EXISTS`, `NOT IN`): `Union(l, −semijoin(l, r))`.
 - **Outer joins**: `Union(inner join, antijoin padded with NULLs)` (one or
   two antijoins for `FULL`).
@@ -265,8 +307,8 @@ every subtree:
 | `min(x)`, `max(x)`, `any_value(x)` | min / max |
 | `bool_and(x)` | count of false, non-null count |
 | `bool_or(x)` | count of true, non-null count |
-| `stddev*`, `var*` | sum, sum of squares, non-null count |
-| `percentile_cont/disc` | non-null count (values located by rank) |
+| `stddev*`, `var*` | sum, sum of squares, non-null count (for `bigint`, `numeric` sums of the argument cast to `numeric`: squares of `bigint` values would overflow `i128` sums) |
+| `percentile_cont/disc` | non-null count (values located by rank); with `FILTER`, none (the group is scanned) |
 | `string_agg`, `array_agg`, `json(b)_agg`, `json(b)_object_agg`, `mode` | none (the group is scanned) |
 
 `FILTER (WHERE f)` is folded into the argument (`CASE WHEN f THEN x END`).
@@ -279,7 +321,10 @@ the new one from one **range summary** over the group's key range in the
 input index — O(log n) whatever the group size — with the group's key
 values taken from its first live entry (so the representation is that of the
 first entry in index order). Ordered aggregates additionally scan the group.
-If old and new rows differ (by exact comparison), `−old, +new` is emitted.
+Percentiles read the values at the required ranks with `Env::nth`; when the
+`ORDER BY` column sorts NULLs first (`DESC`, `NULLS FIRST`), they skip the
+group's NULL entries first. If old and new rows differ (by exact
+comparison), `−old, +new` is emitted.
 
 - **Group cache**: the summaries of up to 2^18 recently touched groups per
   `Reduce` are kept in memory. A small change to a large group is folded into
@@ -289,16 +334,21 @@ If old and new rows differ (by exact comparison), `−old, +new` is emitted.
   representation — the group is summarised from the index. Disabled for
   ordered aggregates and with `IVM_NO_GROUP_CACHE`.
 - **Errors**: if finalising a group fails (for example `sum(float8)`
-  overflows), the group's row is retracted and an error record emitted; the
-  group's error is remembered (in memory) so that it can be retracted when
-  the group computes again.
+  overflows, or a `numeric` sum leaves numeric's range), the group's row is
+  retracted and an error record emitted; the group's error is remembered in
+  the operator's error state (`ReducePlan::errors`, by group key prefix) so
+  that it is retracted when the group computes again. Checkpoints save that
+  state with the graph's error state, and hydration (which recomputes every
+  group, the global group of an aggregate without `GROUP BY` included)
+  rebuilds it.
 - **Exact arithmetic**: integer sums accumulate in `i128`; `numeric` sums in
-  a structure that counts NaN/±Infinity and display scales separately, so
-  that removing a value restores the exact previous result; float sums as a
-  big integer multiple of 2^-1074 (the smallest subnormal), so addition is
+  a structure that counts NaN/±Infinity and display scales separately and is
+  not limited to numeric's range (only the value read from it is checked),
+  so that removing a value restores the exact previous result; float sums as
+  a big integer multiple of 2^-1074 (the smallest subnormal), so addition is
   exact and associative and the result is rounded once. Variance and
-  standard deviation are computed from exact sums of squares. See
-  [Storage](storage.md#summaries).
+  standard deviation are computed from exact sums of squares. Maintaining a
+  summary therefore never fails on data. See [Storage](storage.md#summaries).
 
 ### Distinct
 
@@ -346,7 +396,12 @@ becomes an error record.
 every GSN at which an input changes, the operator recomputes the fixpoint and
 emits the difference to its previous output (which it keeps in an index of
 its own output). Correct, but the cost of a change is the cost of the whole
-recursive query; nested (iteration) time is not implemented.
+recursive query; nested (iteration) time is not implemented. An expression
+error during the evaluation (or reaching the iteration limit) means the
+query has no valid result: its rows are retracted and an error record is
+emitted, remembered in the operator's error state (`RecursivePlan::errors`,
+checkpointed like a `Reduce`'s) and retracted once an evaluation succeeds
+again.
 
 ### TemporalFilter
 
@@ -367,52 +422,75 @@ state, never from the sources**:
    operators with private state initialise it (the temporal filter computes
    its pending events from its input's snapshot).
 2. If the node has arrangements that are not hydrated, compute the node's
-   *snapshot* — its full contents — and write it into each of them at `gsn`:
-   its rows are encoded as the arrangement's entries, sorted by key and
-   applied in batches of 100,000 that each cover one key range (so a batch
-   rewrites only the leaves of its range). A snapshot (`ops::snapshot_node`)
-   is read from any hydrated arrangement of the node if there is one;
-   otherwise it is computed from the inputs' snapshots: a table from its
-   primary index, an `Mfp` by evaluating its input's snapshot, a join by
-   driving one path, a `Reduce` group by group from its input index (seeking
-   from one group's key prefix to the next), and so on. Snapshots of
-   row-wise operators (`Mfp`, `Union`, `Negate`, `FlatMap`, `DeltaJoin`,
-   `TemporalFilter`) are passed on unconsolidated: arrangements consolidate
-   entries as they apply them, and `Graph::snapshot` consolidates its
-   result.
-3. Error records found in snapshots are returned to the caller; the root
-   node's become the new view's initial error counts. A snapshot read from an
-   existing arrangement carries no error records, so errors of rows below any
-   arrangement inside the plan (or of a shared node that already existed)
-   are not counted at creation (a known problem).
+   *snapshot* — its full contents, rows and error records — and write its
+   rows into each of them at `gsn`: they are encoded as the arrangement's
+   entries, sorted by key and applied in batches of 100,000 that each cover
+   one key range (so a batch rewrites only the leaves of its range). The
+   arrangement's `since` becomes `gsn`. A snapshot (`ops::snapshot_node`)
+   is read from any hydrated arrangement of the node if there is one, with
+   the node's accumulated error records; otherwise it is computed from the
+   inputs' snapshots: a table from its primary index, an `Mfp` by evaluating
+   its input's snapshot, a join by driving one path, a `Reduce` group by
+   group from its input index (seeking from one group's key prefix to the
+   next, and rebuilding the operator's error state), and so on. Every
+   operator's snapshot includes its inputs' error records, as its steps
+   pass them on. Snapshots of row-wise operators (`Mfp`, `Union`, `Negate`,
+   `FlatMap`, `DeltaJoin`, `TemporalFilter`) are passed on unconsolidated:
+   arrangements consolidate entries as they apply them, and
+   `Graph::snapshot` consolidates its result.
+3. The error records of each hydrated node's snapshot become the node's
+   error records (`Graph::errors_of`). A new or replaced materialized view
+   takes its root's: when the root already existed (an identical view, or
+   a view over another materialized view), those are the records the node
+   has accumulated, so the view starts with the errors already present.
 4. Snapshots are cached only while a node still to be hydrated will read
    them, so large intermediate results are freed early.
 
 Hydration is the common path of `CREATE MATERIALIZED VIEW`, `CREATE INDEX`,
-`SUBSCRIBE (query)`, `CREATE OR REPLACE MATERIALIZED VIEW`, upstream schema
-changes, and recovery (for arrangements whose checkpointed tree could not be
+`SUBSCRIBE (query)`, `CREATE OR REPLACE MATERIALIZED VIEW` (and the
+re-planning of the views reading a replaced view), upstream schema changes,
+and recovery (for arrangements whose checkpointed tree could not be
 matched). After hydration the new nodes are stepped like all others from the
 next GSN on.
 
 ## Errors
 
 Error records are produced by `Mfp` and `FlatMap` (per row), `Reduce` (per
-group), `Window` (per partition), `TemporalFilter` (per row) and `DeltaJoin`
-(errors in the MFP of the delta's own input; errors in lookups and join
-conditions are dropped). They pass through every other operator. The engine
-keeps, for each materialized view, a map from (SQLSTATE, message) to count,
-updated from the root node's output at every step and saved in checkpoints;
-reads fail while any count is positive
-([Errors as data](../user-guide/temporal-filters-and-errors.md#errors-as-data)).
-Counts can become negative (a retraction of an error that was never counted)
-and then mask later errors.
+group), `Window` (per partition), `TemporalFilter` (per row), `Recursive`
+(per query) and `DeltaJoin` (errors in the MFP of the delta's own input; a
+looked-up row whose MFP fails is skipped, as that input's own path counts
+its error). They pass through every other operator. Errors in a join's
+residual conditions (those that are not equalities between two inputs) are
+not records: the condition counts as false, so the joined row is missing
+where PostgreSQL would fail.
 
-Errors raised inside `WITH RECURSIVE` evaluation are an error record of the
-query. Arrangement keys are plain columns (a join key computed by an input's
-MFP, such as `a.x + 1`, is materialized as a column of that input, whose MFP
-turns its errors into records), and summaries cannot fail: numeric sums are
-kept exactly beyond numeric's range (`NumSum`), and only the aggregate value
-read from them is checked (an error record of its group). An error that
-still escapes `Graph::step` would be a bug: the engine logs it, does not
-apply the record again (it may be half-applied), and fails the statement
-that wrote it.
+Three kinds of error state are kept:
+
+- per node, the error records in its contents (`Graph::node_errors`): the
+  sum of its output error deltas, set from its snapshot when it is
+  hydrated. For arranged nodes this is authoritative — their snapshots read
+  the arrangement, which holds rows only — and checkpoints save it by node
+  fingerprint (`AppState::errors.nodes`), so that views created over such a
+  node after a restart see its errors too;
+- per operator, the groups currently in error of `Reduce` and `Recursive`
+  (`AppState::errors.operators`, by node fingerprint), so that a group's
+  error is retracted when it recovers, also after a restart;
+- per materialized view, a map from (SQLSTATE, message) to count, taken
+  from its root when the view is created and updated from the root's output
+  at every step (`AppState::view_errors`). Reads fail while any count is
+  positive
+  ([Errors as data](../user-guide/temporal-filters-and-errors.md#errors-as-data)).
+
+Recovery restores the per-node and per-operator state by fingerprint after
+rebuilding the dataflow and before hydrating what it could not match.
+
+Arrangement keys are plain columns (a computed join key is materialized as
+a column of its input, see [DeltaJoin](#deltajoin)), and summaries cannot
+fail: numeric sums are kept exactly beyond numeric's range (`NumSum`), and
+only the aggregate value read from them is checked (an error record of its
+group). In aggregates, temporal filters and recursive queries, errors that
+are not caused by data — internal (`XX...`) and I/O (`58...`) errors — are
+not turned into records but fail the step, as storage errors do; the engine
+thread stops on such an error. Any other error that still escaped
+`Graph::step` would be a bug: the engine logs it, does not apply the record
+again (it may be half-applied), and fails the statement that wrote it.
