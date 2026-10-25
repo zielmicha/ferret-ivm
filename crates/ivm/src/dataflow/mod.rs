@@ -525,10 +525,12 @@ impl Graph {
         Ok(out)
     }
 
-    /// Full contents of a node as of the latest processed time.
+    /// Full contents of a node as of the latest processed time (consolidated).
     pub fn snapshot(&self, env: &mut Env, node: NodeId) -> Result<Output> {
         let mut cache = FxHashMap::default();
-        Ok(ops::owned(ops::snapshot_node(self, env, node, &mut cache)?))
+        let mut out = ops::owned(ops::snapshot_node(self, env, node, &mut cache)?);
+        consolidate(&mut out.data);
+        Ok(out)
     }
 
     /// The node's first hydrated arrangement, if any.
@@ -645,13 +647,17 @@ impl Graph {
                 };
                 for a in pending_arrs {
                     let arr = self.arr(a);
-                    // in batches, to bound the memory of encoded entries
-                    for batch in snap.data.chunks(100_000) {
-                        let mut ups = Vec::with_capacity(batch.len());
-                        for (row, w) in batch {
-                            ups.push((arr.layout.encode_row(row)?, *w));
-                        }
-                        env.apply(arr.tree, &mut ups, gsn)?;
+                    // Entries are applied in key order, in batches that each
+                    // cover a key range: unordered batches would each touch
+                    // (and rewrite) every leaf.
+                    let mut ups = Vec::with_capacity(snap.data.len());
+                    for (row, w) in &snap.data {
+                        ups.push((arr.layout.encode_row(row)?, *w));
+                    }
+                    ups.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+                    while !ups.is_empty() {
+                        let mut batch = ups.split_off(ups.len().saturating_sub(100_000));
+                        env.apply(arr.tree, &mut batch, gsn)?;
                     }
                     self.arrs[a].as_mut().unwrap().hydrated = true;
                 }

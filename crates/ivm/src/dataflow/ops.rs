@@ -90,7 +90,8 @@ pub fn owned(s: Arc<Output>) -> Output {
     Arc::try_unwrap(s).unwrap_or_else(|a| (*a).clone())
 }
 
-/// Full contents of a node (latest), computed from arrangements or inputs.
+/// Contents of a node (latest), computed from arrangements or inputs, as
+/// weighted rows that need not be consolidated (see [`Graph::snapshot`]).
 /// Only snapshots of nodes with several consumers are kept in `cache`; the
 /// rest are handed to their one reader and freed as soon as it is done.
 pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache) -> Result<Arc<Output>> {
@@ -186,7 +187,18 @@ pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache
             temporal::snapshot(g, p, input, &mut out);
         }
     }
-    consolidate(&mut out.data);
+    // Row-wise operators pass multiplicities through, and the rows of a
+    // snapshot are consolidated where that is needed: arrangements
+    // consolidate entries when they are applied, Graph::snapshot its result.
+    // (Sorting millions of hydrated rows at every level was a large part of
+    // creating a view.)
+    let row_wise = matches!(
+        node.kind,
+        NodeKind::Mfp { .. } | NodeKind::Union { .. } | NodeKind::Negate | NodeKind::FlatMap { .. } | NodeKind::Join(_) | NodeKind::Temporal(_)
+    );
+    if !row_wise {
+        consolidate(&mut out.data);
+    }
     consolidate_errs(&mut out.errs);
     let out = Arc::new(out);
     if node.refs > 1 {
