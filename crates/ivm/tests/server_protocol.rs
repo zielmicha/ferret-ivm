@@ -124,3 +124,112 @@ fn function_call_message_gets_error_and_ready() {
     assert_eq!(first_values(&c.query("SELECT 41 + 1")), vec!["42"]);
     running.shutdown();
 }
+
+fn cstr(s: &str) -> Vec<u8> {
+    let mut v = s.as_bytes().to_vec();
+    v.push(0);
+    v
+}
+
+impl Conn {
+    fn parse(&mut self, name: &str, sql: &str, types: &[u32]) {
+        let mut b = cstr(name);
+        b.extend(cstr(sql));
+        b.extend_from_slice(&(types.len() as i16).to_be_bytes());
+        for t in types {
+            b.extend_from_slice(&t.to_be_bytes());
+        }
+        self.send(b'P', &b);
+    }
+
+    /// Bind with all parameters in `format` (0 text, 1 binary), text results.
+    fn bind(&mut self, portal: &str, stmt: &str, params: &[Option<&[u8]>], format: i16) {
+        let mut b = cstr(portal);
+        b.extend(cstr(stmt));
+        b.extend_from_slice(&1i16.to_be_bytes());
+        b.extend_from_slice(&format.to_be_bytes());
+        b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for p in params {
+            match p {
+                None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(v) => {
+                    b.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    b.extend_from_slice(v);
+                }
+            }
+        }
+        b.extend_from_slice(&0i16.to_be_bytes());
+        self.send(b'B', &b);
+    }
+
+    fn describe_stmt(&mut self, name: &str) {
+        let mut b = vec![b'S'];
+        b.extend(cstr(name));
+        self.send(b'D', &b);
+    }
+
+    fn execute(&mut self, portal: &str, max_rows: i32) {
+        let mut b = cstr(portal);
+        b.extend_from_slice(&max_rows.to_be_bytes());
+        self.send(b'E', &b);
+    }
+
+    fn sync(&mut self) -> Vec<Msg> {
+        self.send(b'S', &[]);
+        self.until_ready()
+    }
+}
+
+/// Type OIDs of the ParameterDescription in `msgs`.
+fn param_oids(msgs: &[Msg]) -> Vec<u32> {
+    let (_, b) = msgs.iter().find(|m| m.0 == b't').expect("ParameterDescription");
+    let n = i16::from_be_bytes([b[0], b[1]]) as usize;
+    (0..n).map(|i| u32::from_be_bytes(b[2 + 4 * i..6 + 4 * i].try_into().unwrap())).collect()
+}
+
+/// The message text of the first ErrorResponse.
+fn error_message(msgs: &[Msg]) -> Option<String> {
+    let (_, b) = msgs.iter().find(|m| m.0 == b'E')?;
+    b.split(|c| *c == 0).find(|f| f.first() == Some(&b'M')).map(|f| String::from_utf8_lossy(&f[1..]).into_owned())
+}
+
+#[test]
+fn describe_infers_parameter_types() {
+    let (running, port) = start("paramtypes");
+    let mut c = Conn::connect(port);
+    c.query("CREATE TABLE t (id int PRIMARY KEY, a int, s text)");
+    c.query("INSERT INTO t VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 2, 'z')");
+    // types follow from the context of the first use, as in PostgreSQL
+    for (sql, want) in [
+        ("SELECT id FROM t WHERE a = $1", vec![23]),
+        ("SELECT $1::date + 1, $2 || 'x', $3 + 1, $4", vec![1082, 25, 23, 25]),
+        ("SELECT id FROM t ORDER BY id LIMIT $1", vec![20]),
+        ("SELECT id FROM t WHERE s LIKE $1 AND a IN ($2, 3)", vec![25, 23]),
+    ] {
+        c.parse("s", sql, &[]);
+        c.describe_stmt("s");
+        let msgs = c.sync();
+        assert_eq!(param_oids(&msgs), want, "{sql}: {:?}", tags(&msgs));
+    }
+    // binding after Describe used to bind the values as text: integer = text
+    c.parse("q", "SELECT id FROM t WHERE a = $1 ORDER BY id", &[]);
+    c.describe_stmt("q");
+    c.bind("", "q", &[Some(b"2")], 0);
+    c.execute("", 0);
+    let msgs = c.sync();
+    assert_eq!(first_values(&msgs), vec!["2", "3"], "{:?}", error_message(&msgs));
+    c.describe_stmt("q");
+    c.bind("", "q", &[Some(&2i32.to_be_bytes())], 1);
+    c.execute("", 0);
+    let msgs = c.sync();
+    assert_eq!(first_values(&msgs), vec!["2", "3"], "{:?}", error_message(&msgs));
+    // DML parameters are not inferred, but untyped values still bind
+    c.parse("u", "UPDATE t SET a = $1 WHERE id = $2", &[]);
+    c.describe_stmt("u");
+    c.bind("", "u", &[Some(b"5"), Some(b"1")], 0);
+    c.execute("", 0);
+    let msgs = c.sync();
+    assert_eq!(error_message(&msgs), None);
+    assert_eq!(first_values(&c.query("SELECT a FROM t WHERE id = 1")), vec!["5"]);
+    running.shutdown();
+}

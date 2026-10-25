@@ -414,7 +414,9 @@ impl Engine {
                     .zip(types)
                     .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
                     .collect();
-                let ptypes = b.params.iter().map(|p| if p.ty == SqlType::Unknown { SqlType::Text } else { p.ty.clone() }).collect();
+                // still unknown: the session describes them as text but
+                // keeps binding their values as untyped literals
+                let ptypes = b.params.iter().map(|p| p.ty.clone()).collect();
                 Ok((cols, ptypes))
             }
             Statement::Sql(s) => {
@@ -437,7 +439,7 @@ impl Engine {
                         i += 1;
                     }
                 }
-                let ptypes = (0..max).map(|k| params.get(k).map(|p| p.ty.clone()).filter(|t| *t != SqlType::Unknown).unwrap_or(SqlType::Text)).collect();
+                let ptypes = (0..max).map(|k| params.get(k).map(|p| p.ty.clone()).unwrap_or(SqlType::Unknown)).collect();
                 Ok((vec![], ptypes))
             }
             Statement::Show(_) | Statement::Explain { .. } => {

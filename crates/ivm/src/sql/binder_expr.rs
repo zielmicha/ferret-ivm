@@ -210,6 +210,20 @@ pub fn is_aggregate_name(n: &str) -> bool {
     AGGREGATES.contains(&n)
 }
 
+/// While a statement is described, a parameter of still unknown type binds
+/// as an unknown literal holding this marker and its index; the first
+/// context that coerces it determines its type, as in PostgreSQL. (A NUL
+/// character never occurs in a text value, so no literal collides.)
+const PARAM_MARK: &str = "\u{0}ivm-param:";
+
+fn param_marker(i: usize) -> Expr {
+    Expr::Literal(Datum::text_owned(format!("{PARAM_MARK}{i}")), SqlType::Unknown)
+}
+
+fn param_marker_index(s: &str) -> Option<usize> {
+    s.strip_prefix(PARAM_MARK)?.parse().ok()
+}
+
 impl<'a> Binder<'a> {
     fn types(ctx: &Ctx) -> Vec<ColumnType> {
         ctx.scope.types()
@@ -223,6 +237,15 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Record the type a parameter of unknown type was first coerced to.
+    fn note_param_type(&mut self, i: usize, t: &SqlType) {
+        if let Some(p) = self.params.get_mut(i)
+            && p.ty == SqlType::Unknown
+        {
+            p.ty = t.clone();
+        }
+    }
+
     /// Coerce `e` (of type `from`) to `to`.
     pub(crate) fn coerce(&mut self, e: Expr, from: &SqlType, to: &SqlType, cctx: CastContext, what: &str) -> Result<Expr> {
         if from == to || *to == SqlType::Unknown {
@@ -231,7 +254,13 @@ impl<'a> Binder<'a> {
         if *from == SqlType::Unknown {
             return Ok(match e {
                 Expr::Literal(Datum::Null, _) => Expr::Literal(Datum::Null, to.clone()),
-                Expr::Literal(Datum::Text(s), _) => Expr::Literal(parse_datum(&s, to, -1)?, to.clone()),
+                Expr::Literal(Datum::Text(s), _) => match param_marker_index(&s) {
+                    Some(i) => {
+                        self.note_param_type(i, to);
+                        Expr::Literal(Datum::Null, to.clone())
+                    }
+                    None => Expr::Literal(parse_datum(&s, to, -1)?, to.clone()),
+                },
                 other => Expr::Cast(Box::new(other), to.clone(), -1, false),
             });
         }
@@ -686,6 +715,7 @@ impl<'a> Binder<'a> {
     fn const_text(&mut self, e: &ast::Expr, ctx: &Ctx) -> Result<Option<String>> {
         let x = self.bind_expr(e, ctx)?.fold()?;
         match x {
+            Expr::Literal(Datum::Text(s), _) if param_marker_index(&s).is_some() => Ok(None),
             Expr::Literal(Datum::Text(s), _) => Ok(Some(s.to_string())),
             Expr::Literal(Datum::Null, _) => Ok(None),
             _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "a constant string is required"),
@@ -733,7 +763,13 @@ impl<'a> Binder<'a> {
     fn explicit_cast(&mut self, x: Expr, t: &SqlType, tm: i32, ctx: &Ctx) -> Result<Expr> {
         let xt = self.ty_of(&x, ctx);
         match x {
-            Expr::Literal(Datum::Text(s), SqlType::Unknown) => Ok(Expr::Literal(parse_datum(&s, t, tm)?, t.clone())),
+            Expr::Literal(Datum::Text(s), SqlType::Unknown) => match param_marker_index(&s) {
+                Some(i) => {
+                    self.note_param_type(i, t);
+                    Ok(Expr::Literal(Datum::Null, t.clone()))
+                }
+                None => Ok(Expr::Literal(parse_datum(&s, t, tm)?, t.clone())),
+            },
             Expr::Literal(Datum::Null, _) => Ok(Expr::Literal(Datum::Null, t.clone())),
             x => {
                 if xt == *t && tm < 0 {
@@ -818,6 +854,8 @@ impl<'a> Binder<'a> {
                 let slot = &self.params[n - 1];
                 match &slot.value {
                     Some(d) => Expr::Literal(d.clone(), slot.ty.clone()),
+                    // described without a value: its context gives the type
+                    None if slot.ty == SqlType::Unknown => param_marker(n - 1),
                     None => Expr::Literal(Datum::Null, slot.ty.clone()),
                 }
             }
