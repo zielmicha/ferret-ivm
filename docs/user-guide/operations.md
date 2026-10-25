@@ -183,10 +183,12 @@ GSN, see an older state until the log has caught up with the checkpoint. Use
 
 ## Stopping and restarting
 
-See [Stopping the server](getting-started.md#stopping-the-server). Because
-recovery replays the log, any way of stopping — stop file, `SIGTERM`,
-`SIGKILL`, a crash — loses no acknowledged change. Upstream WAL is retained
-in the slots while the engine is down.
+See [Stopping the server](getting-started.md#stopping-the-server): `SIGINT`,
+`SIGTERM` and the stop file take a final checkpoint, so the next start has
+no log to replay. Because recovery replays the log, any other way of
+stopping — a second signal, `SIGKILL`, a crash — loses no acknowledged
+change either. Upstream WAL is retained in the slots while the engine is
+down.
 
 ## What is safe to delete
 

@@ -285,11 +285,21 @@ pub struct Running {
 }
 
 impl Running {
+    /// Stop the engine after a final checkpoint and wait for its threads.
+    /// A failure (also a panic) is recorded in `Shared::failed`.
     pub fn shutdown(self) {
         self.handle.shutdown();
         for t in self.threads {
-            let _ = t.join();
+            if t.join().is_err() {
+                self.handle.shared.failed.store(true, Ordering::Release);
+            }
         }
+    }
+
+    /// Are the engine's threads still running (they stop on a shutdown
+    /// request, an error or a panic)?
+    pub fn alive(&self) -> bool {
+        self.threads.iter().all(|t| !t.is_finished())
     }
 }
 
@@ -376,9 +386,11 @@ pub fn start(cfg: Config) -> Result<Running> {
     engine.handle = Some(handle.clone());
     engine.start_sources_and_sinks(&handle)?;
     let seq = Sequencer { writer, rx: srx, engine: etx.clone(), shared: shared.clone(), tick: cfg.tick };
+    let seq_shared = shared.clone();
     let t1 = std::thread::Builder::new().name("ivm-sequencer".into()).spawn(move || {
         if let Err(e) = seq.run() {
             log::error!("sequencer failed: {e}");
+            seq_shared.failed.store(true, Ordering::Release);
         }
     })?;
     let h2 = handle.clone();
@@ -386,8 +398,10 @@ pub fn start(cfg: Config) -> Result<Running> {
     // to sql::parser::MAX_OPERATOR_CHAIN deep, bound expressions up to
     // sql::binder_expr::MAX_EXPR_DEPTH); reserved, not committed, memory
     let t2 = std::thread::Builder::new().name("ivm-engine".into()).stack_size(64 << 20).spawn(move || {
+        let shared = h2.shared.clone();
         if let Err(e) = engine.run(erx, h2) {
             log::error!("engine failed: {e}");
+            shared.failed.store(true, Ordering::Release);
         }
     })?;
     Ok(Running { handle, threads: vec![t1, t2], _lock: lock })

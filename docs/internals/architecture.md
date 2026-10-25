@@ -51,13 +51,15 @@ Where the implementation differs from the design:
 
 | Thread | Owns | Does |
 |---|---|---|
-| main | the listening socket | parses flags, runs recovery (`coord::start`), then accepts connections forever (`server::serve`) |
+| main | | parses flags, binds the listening socket, runs recovery (`coord::start`), starts the listener, then waits for a shutdown request (or for the engine to stop by itself) and shuts down after a final checkpoint |
+| `ivm-listener` | the listening socket | accepts connections (`server::serve_listener`) |
+| `ivm-signals` | | turns the first `SIGINT`/`SIGTERM` into a shutdown request; a second one exits the process at once |
 | `ivm-sequencer` | the input-log writer | assigns GSNs, appends and `fsync`s records in batches, generates clock ticks, acknowledges submitters, forwards durable records to the engine |
 | `ivm-engine` | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, takes checkpoints |
 | `ivm-session-<n>` (one per client) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
-| stop-file watcher | | polls for `.ivm-stop` every 500 ms; when it appears, requests a shutdown and exits the process at once, without waiting for the final checkpoint |
+| `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, requests a shutdown |
 | slot-drop helpers | | short-lived; drop a replication slot after `DROP SOURCE`, once the source thread has stopped |
 
 There is exactly one engine thread: all dataflow maintenance, all index
@@ -182,7 +184,7 @@ handles:
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
 | `Wake` | a source frontier moved: re-check reads waiting for an LSN |
-| `Shutdown` | stop sources and sinks, stop the sequencer, take a final checkpoint, exit (the stop-file path exits the process before this completes) |
+| `Shutdown` | ask sources and sinks to stop, stop the sequencer, take a final checkpoint, wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
 takes a checkpoint if one is due, and removes cancelled subscriptions.

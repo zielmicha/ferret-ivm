@@ -112,6 +112,9 @@ pub struct Shared {
     /// Upstream position and ingest counters per source (web UI).
     pub source_gauges: Mutex<HashMap<u64, Arc<crate::source::SourceGauges>>>,
     pub shutdown: AtomicBool,
+    /// The engine or the sequencer thread stopped with an error (including
+    /// a failed final checkpoint).
+    pub failed: AtomicBool,
 }
 
 impl Shared {

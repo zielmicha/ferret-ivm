@@ -79,12 +79,13 @@ Every flag is parsed in `crates/ivm/src/main.rs`; defaults come from
 | `-h`, `--help` | | Print usage and exit with status 2. |
 
 Any unknown flag, a missing value or an unparsable number also prints the
-usage text and exits with status 2. If the engine cannot start (for example
-the data directory is locked or recovery fails) it prints
-`ivm: failed to start: <reason>` and exits with status 1. The listen address
-is bound only after recovery: if that fails, the process prints
-`ivm: server error: <reason>` (for example `Address already in use`), shuts
-the engine down and exits with status **0**.
+usage text and exits with status 2. The listen address is bound before
+recovery: if that fails, the process prints `ivm: cannot listen on <addr>:
+<reason>` (for example `Address already in use`) and exits with status 1. If
+the engine cannot start (for example the data directory is locked or
+recovery fails) it prints `ivm: failed to start: <reason>` and exits with
+status 1; so does a web UI that cannot start, and a server whose engine stops
+because of an error.
 
 There is no configuration file. Two environment variables affect the server:
 
@@ -95,19 +96,17 @@ There is no configuration file. Two environment variables affect the server:
 
 ### Stopping the server
 
-The binary installs no signal handlers:
+Three ways request a graceful shutdown: `SIGINT` (Ctrl-C), `SIGTERM`, and a
+stop file — every 500 ms the process checks for a file named `.ivm-stop` in
+its **current working directory** (not the data directory) and deletes it
+when it appears. The server then stops sources and sinks, takes a final
+checkpoint, and exits with status 0 (status 1 if the checkpoint fails). A
+request during recovery takes effect once recovery has finished.
 
-- `SIGINT`/`SIGTERM` terminate the process immediately (default signal
-  disposition).
-- A stop file: every 500 ms the process checks for a file named `.ivm-stop`
-  in its **current working directory** (not the data directory). When it
-  appears, the file is deleted, a shutdown is requested, and the process
-  exits with status 0 right away.
-
-Neither path waits for a final checkpoint (the stop file requests one, but the
-process exits without waiting for it). This is safe: everything that was
-acknowledged is in the input log, and the next start replays the log written
-after the last checkpoint. See [Recovery](operations.md#recovery).
+A second signal exits at once (status 1), without the final checkpoint.
+This is safe, as is `SIGKILL` or a crash: everything that was acknowledged
+is in the input log, and the next start replays the log written after the
+last checkpoint. See [Recovery](operations.md#recovery).
 
 Only one process can use a data directory at a time; a second `ivm` on the
 same directory fails with

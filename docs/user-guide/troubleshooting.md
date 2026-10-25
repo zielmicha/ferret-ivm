@@ -254,7 +254,5 @@ Problems found while writing and checking this documentation (at commit
 | A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
 | A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
 | The source reconnect delay is never reset | after a few failures every reconnect waits 10 s | none |
-| A listen address that cannot be bound | the server exits with status 0 after recovery | check the log; do not rely on the exit status |
 | `SHOW read_mode` before `SET read_mode` | `unrecognized configuration parameter` | `SET read_mode = fresh` first |
 | `current_user`, `session_user`, `user`, `current_catalog` | `function ...() does not exist` | use a literal |
-| Stop file | no final checkpoint; the log is replayed on the next start (harmless) | none needed |
