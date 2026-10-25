@@ -566,8 +566,9 @@ impl Engine {
                 ObjectKind::Index(i) if i.on == old.id && !new_cols.is_some_and(|c| index_fits(&i.columns, old_cols, c)) => {
                     return refuse(format!("index \"{}\" depends on its columns", o.name));
                 }
-                ObjectKind::Sink(s) if s.from == old.id && new_cols.is_none() => {
-                    return refuse(format!("sink \"{}\" reads it", o.name));
+                ObjectKind::Sink(s) if s.from == old.id && !new_cols.is_some_and(|c| same_columns(c, old_cols)) => {
+                    // its target table has the view's columns
+                    return refuse(format!("sink \"{}\" reads its columns", o.name));
                 }
                 _ => {}
             }
@@ -719,11 +720,16 @@ impl Engine {
                 }
             }
         }
-        for sink in self.sink_handles.values_mut() {
-            if sink.node == old.node {
-                sink.node = new_node;
-                sink.send(gsn, &diff);
+        if same_columns(&def.columns, &old_cols) {
+            for sink in self.sink_handles.values_mut() {
+                if sink.node == old.node {
+                    sink.node = new_node;
+                    sink.send(gsn, &diff);
+                }
             }
+        } else {
+            // (re-planned after an upstream change) new rows, new columns
+            self.restart_sinks_on(old.node)?;
         }
         for a in old_index_arrs {
             self.graph.release_arr(&mut self.env, a)?;
@@ -936,7 +942,16 @@ impl Engine {
             }
         }
         // sinks from the table start over with the new columns
-        let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == old_node).map(|(id, _)| *id).collect();
+        self.restart_sinks_on(old_node)?;
+        self.replan_dependents(gsn, table)?;
+        self.graph.release_node(&mut self.env, old_node)?;
+        Ok(())
+    }
+
+    /// Restart the sinks reading dataflow node `node` (whose relation was
+    /// rebuilt with other columns) from their relation's current version.
+    fn restart_sinks_on(&mut self, node: NodeId) -> Result<()> {
+        let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == node).map(|(id, _)| *id).collect();
         for id in sinks {
             if let Some(h) = self.sink_handles.remove(&id) {
                 h.stop();
@@ -947,8 +962,6 @@ impl Engine {
                 self.start_sink(id, &o.name, sd, &handle)?;
             }
         }
-        self.replan_dependents(gsn, table)?;
-        self.graph.release_node(&mut self.env, old_node)?;
         Ok(())
     }
 
@@ -970,6 +983,11 @@ impl Engine {
         self.sink_handles.insert(id, h);
         Ok(())
     }
+}
+
+/// Same column names and types (as a sink's target table has them)?
+fn same_columns(a: &[Column], b: &[Column]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name && x.ty.ty == y.ty.ty && x.ty.typmod == y.ty.typmod)
 }
 
 /// Do index key columns (positions into `old`) denote the same columns in

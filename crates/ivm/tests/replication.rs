@@ -374,3 +374,26 @@ fn keyless_sink_with_json_columns() {
     up.exec("INSERT INTO t VALUES (4, '{\"b\": 2}')");
     eventually("retractions", || copy(&mut up) == up.client.query("SELECT j::text FROM t ORDER BY 1").unwrap().rows);
 }
+
+/// A sink's target table has its view's columns: a replacement changing
+/// them is rejected (the sink used to go on writing the new rows under the
+/// old column names); one keeping them is delivered.
+#[test]
+fn sinks_keep_their_columns_across_view_replacements() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, a int, b int)");
+    up.exec("INSERT INTO t VALUES (1, 10, 100)");
+    up.exec("CREATE PUBLICATION p FOR TABLE t");
+    let dir = tmpdir("sink-replace");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy' KEY (id)", up.conninfo));
+    let copy = |up: &mut Upstream| up.client.query("SELECT * FROM v_copy ORDER BY id").map(|r| r.rows).unwrap_or_default();
+    eventually("snapshot", || copy(&mut up).len() == 1);
+    assert!(ivm.client.simple_query("CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT id, b, a FROM t").is_err());
+    ivm.exec("CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT id, a + b AS a FROM t");
+    up.exec("INSERT INTO t VALUES (2, 20, 200)");
+    let want = vec![vec![Some("1".to_string()), Some("110".to_string())], vec![Some("2".to_string()), Some("220".to_string())]];
+    eventually("replacement delivered", || copy(&mut up) == want);
+}
