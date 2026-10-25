@@ -356,6 +356,10 @@ fn ltrim2(a: &Datum, b: &Datum) -> Result<Datum> {
 fn rtrim1(a: &Datum) -> Result<Datum> {
     Ok(txt(pgfuncs::text::rtrim(s(a), " ")))
 }
+/// text(bpchar): the cast from character(n), which drops trailing spaces.
+fn bpchar_text(a: &Datum) -> Result<Datum> {
+    Ok(txt(s(a).trim_end_matches(' ').to_string()))
+}
 fn rtrim2(a: &Datum, b: &Datum) -> Result<Datum> {
     Ok(txt(pgfuncs::text::rtrim(s(a), s(b))))
 }
@@ -1356,6 +1360,10 @@ pub fn register(b: &mut Builder) {
     }
     b.f1("length", T::Bytea, T::Int4, length);
     b.f1("octet_length", T::Text, T::Int4, octet_length);
+    // character(n) counts its padding in octet_length (length() does not:
+    // it applies to the value cast to text)
+    b.f1("octet_length", T::Bpchar, T::Int4, octet_length);
+    b.f1("text", T::Bpchar, T::Text, bpchar_text);
     b.f1("octet_length", T::Bytea, T::Int4, octet_length);
     b.f1("bit_length", T::Text, T::Int4, bit_length);
     b.f1("bit_length", T::Bytea, T::Int4, bit_length);

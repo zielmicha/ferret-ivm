@@ -224,6 +224,19 @@ fn param_marker_index(s: &str) -> Option<usize> {
     s.strip_prefix(PARAM_MARK)?.parse().ok()
 }
 
+/// A character(n) value as text: without its trailing spaces. This is the
+/// cast PostgreSQL applies (text(bpchar)), and how bpchar values compare.
+fn bpchar_to_text(e: Expr) -> Expr {
+    let func = resolve("text", &[SqlType::Bpchar]).expect("text(bpchar) is registered").func;
+    let literal = e.is_literal();
+    let call = Expr::Call(Box::new(crate::expr::Call { func, args: vec![e], ret: SqlType::Text }));
+    if literal { call.clone().fold().unwrap_or(call) } else { call }
+}
+
+fn is_comparison(op: &str) -> bool {
+    matches!(op, "=" | "<>" | "<" | "<=" | ">" | ">=")
+}
+
 impl<'a> Binder<'a> {
     fn types(ctx: &Ctx) -> Vec<ColumnType> {
         ctx.scope.types()
@@ -264,6 +277,10 @@ impl<'a> Binder<'a> {
                 other => Expr::Cast(Box::new(other), to.clone(), -1, false),
             });
         }
+        if *from == SqlType::Bpchar && matches!(to, SqlType::Text | SqlType::Varchar | SqlType::Name) {
+            let t = bpchar_to_text(e);
+            return Ok(if *to == SqlType::Text { t } else { fold_cast(Expr::Cast(Box::new(t), to.clone(), -1, cctx == CastContext::Explicit)) });
+        }
         match cast_context(from, to) {
             Some(c) if c <= cctx => Ok(fold_cast(Expr::Cast(Box::new(e), to.clone(), -1, cctx == CastContext::Explicit))),
             _ => match cctx {
@@ -283,6 +300,14 @@ impl<'a> Binder<'a> {
     /// Resolve and build a binary operator application.
     pub(crate) fn make_binary(&mut self, op: &str, l: Expr, lt: SqlType, r: Expr, rt: SqlType) -> Result<Expr> {
         let res = resolve(op, &[lt.clone(), rt.clone()])?;
+        if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] && is_comparison(op) {
+            // character(n) compares without trailing spaces: compare the
+            // values as text, so that equality is plain value equality (as
+            // joins, IN and decorrelation assume)
+            let l = self.coerce(l, &lt, &SqlType::Bpchar, CastContext::Implicit, op)?;
+            let r = self.coerce(r, &rt, &SqlType::Bpchar, CastContext::Implicit, op)?;
+            return self.make_binary(op, bpchar_to_text(l), SqlType::Text, bpchar_to_text(r), SqlType::Text);
+        }
         let l = self.coerce(l, &lt, &res.arg_types[0], CastContext::Implicit, op)?;
         let r = self.coerce(r, &rt, &res.arg_types[1], CastContext::Implicit, op)?;
         Ok(Expr::Call(Box::new(crate::expr::Call { func: res.func, args: vec![l, r], ret: res.ret })))
@@ -346,6 +371,7 @@ impl<'a> Binder<'a> {
                 let res = resolve("=", &[xt.clone(), yt.clone()])?;
                 let x = self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IS DISTINCT FROM")?;
                 let y = self.coerce(y, &yt, &res.arg_types[1], CastContext::Implicit, "IS DISTINCT FROM")?;
+                let (x, y) = if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] { (bpchar_to_text(x), bpchar_to_text(y)) } else { (x, y) };
                 Ok(Expr::IsDistinct(Box::new(x), Box::new(y), negated))
             }
             E::BinaryOp { left, op, right } => self.bind_binary(left, op, right, ctx),
@@ -386,10 +412,15 @@ impl<'a> Binder<'a> {
                 let t = common_type(&types, "IN")?;
                 // make sure "=" exists for the type
                 resolve("=", &[t.clone(), t.clone()])?;
-                let x = self.coerce(x, &types[0], &t, CastContext::Implicit, "IN")?;
+                let mut x = self.coerce(x, &types[0], &t, CastContext::Implicit, "IN")?;
                 let mut out = Vec::with_capacity(items.len());
                 for (i, it) in items.into_iter().enumerate() {
                     out.push(self.coerce(it, &types[i + 1], &t, CastContext::Implicit, "IN")?);
+                }
+                if t == SqlType::Bpchar {
+                    // compared without trailing spaces
+                    x = bpchar_to_text(x);
+                    out = out.into_iter().map(bpchar_to_text).collect();
                 }
                 Ok(Expr::InList(Box::new(x), out, *negated))
             }
@@ -413,10 +444,19 @@ impl<'a> Binder<'a> {
                 for (x, st) in lhs.into_iter().zip(&sub_types) {
                     let xt = self.ty_of(&x, ctx);
                     let res = resolve("=", &[xt.clone(), st.ty.clone()])?;
-                    ls.push(self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IN")?);
+                    let x = self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IN")?;
+                    // character(n) is compared as text without trailing spaces
+                    ls.push(if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] { bpchar_to_text(x) } else { x });
                     targets.push(ColumnType::new(res.arg_types[1].clone()));
                 }
-                let rel = self.coerce_rel(rel, &targets, "IN")?;
+                let mut rel = self.coerce_rel(rel, &targets, "IN")?;
+                if targets.iter().any(|t| t.ty == SqlType::Bpchar) {
+                    let text: Vec<ColumnType> = targets
+                        .iter()
+                        .map(|t| if t.ty == SqlType::Bpchar { ColumnType::new(SqlType::Text) } else { t.clone() })
+                        .collect();
+                    rel = self.coerce_rel(rel, &text, "IN")?;
+                }
                 let sq = Expr::Subquery(Box::new(SubqueryExpr { kind: SubqueryKind::In(ls), rel, ty: SqlType::Bool }));
                 Ok(if *negated { Expr::Not(Box::new(sq)) } else { sq })
             }
@@ -483,7 +523,12 @@ impl<'a> Binder<'a> {
                 let x = self.bind_expr(expr, ctx)?;
                 let p = self.bind_expr(pattern, ctx)?;
                 let xt = self.ty_of(&x, ctx);
-                let x = self.coerce(x, &xt, &SqlType::Text, CastContext::Implicit, "SIMILAR TO")?;
+                // character(n) matches with its padding, as with ~
+                let x = if xt == SqlType::Bpchar {
+                    Expr::Cast(Box::new(x), SqlType::Text, -1, false)
+                } else {
+                    self.coerce(x, &xt, &SqlType::Text, CastContext::Implicit, "SIMILAR TO")?
+                };
                 let escape = match escape_char {
                     Some(ec) => self.const_text(ec, ctx)?.and_then(|s| s.chars().next()),
                     None => Some('\\'),
@@ -736,7 +781,12 @@ impl<'a> Binder<'a> {
         let (xt, pt) = (self.ty_of(&x, ctx), self.ty_of(&p, ctx));
         let bytea = xt == SqlType::Bytea;
         let target = if bytea { SqlType::Bytea } else { SqlType::Text };
-        let x = self.coerce(x, &xt, &target, CastContext::Implicit, "LIKE")?;
+        // character(n) matches with its padding (bpcharlike)
+        let x = if xt == SqlType::Bpchar {
+            Expr::Cast(Box::new(x), SqlType::Text, -1, false)
+        } else {
+            self.coerce(x, &xt, &target, CastContext::Implicit, "LIKE")?
+        };
         let p = self.coerce(p, &pt, &target, CastContext::Implicit, "LIKE")?.fold()?;
         let escape = match escape {
             Some(ec) => match self.const_text(ec, ctx)? {
@@ -772,6 +822,12 @@ impl<'a> Binder<'a> {
             },
             Expr::Literal(Datum::Null, _) => Ok(Expr::Literal(Datum::Null, t.clone())),
             x => {
+                // character(n) to a string type drops the padding
+                let (x, xt) = if xt == SqlType::Bpchar && matches!(t, SqlType::Text | SqlType::Varchar | SqlType::Name) {
+                    (bpchar_to_text(x), SqlType::Text)
+                } else {
+                    (x, xt)
+                };
                 if xt == *t && tm < 0 {
                     return Ok(x);
                 }
@@ -984,6 +1040,16 @@ impl<'a> Binder<'a> {
                 let l = self.bind_expr(left, ctx)?;
                 let r = self.bind_expr(right, ctx)?;
                 let (lt, rt) = (self.ty_of(&l, ctx), self.ty_of(&r, ctx));
+                // || concatenates character(n) values as text (PostgreSQL
+                // resolves textcat / anytextcat / textanycat), i.e. unpadded
+                if name == "||" && (lt == SqlType::Bpchar || rt == SqlType::Bpchar) {
+                    let arrays = matches!(lt, SqlType::Array(_)) || matches!(rt, SqlType::Array(_));
+                    if !arrays {
+                        let (l, lt) = if lt == SqlType::Bpchar { (bpchar_to_text(l), SqlType::Text) } else { (l, lt) };
+                        let (r, rt) = if rt == SqlType::Bpchar { (bpchar_to_text(r), SqlType::Text) } else { (r, rt) };
+                        return self.make_binary(name, l, lt, r, rt);
+                    }
+                }
                 // text-key json operators with unknown literals
                 self.make_binary(name, l, lt, r, rt)
             }
@@ -1237,6 +1303,12 @@ impl<'a> Binder<'a> {
                 let mut it = bound.into_iter();
                 let a = self.coerce(it.next().unwrap(), &types[0], &res.arg_types[0], CastContext::Implicit, "NULLIF")?;
                 let b = self.coerce(it.next().unwrap(), &types[1], &res.arg_types[1], CastContext::Implicit, "NULLIF")?;
+                if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] {
+                    // compare without trailing spaces, return the padded value
+                    let eq = self.make_binary("=", a.clone(), SqlType::Bpchar, b, SqlType::Bpchar)?;
+                    let whens = vec![(eq, Expr::null(SqlType::Bpchar))];
+                    return Ok(Expr::Case(Box::new(CaseExpr { whens, else_: a, ty: SqlType::Bpchar })));
+                }
                 return Ok(Expr::NullIf(Box::new(a), Box::new(b)));
             }
             // definitions come from the catalog: inlined as OID mappings

@@ -739,10 +739,13 @@ pub fn register(b: &mut Builder) {
     b.op2p("||", P::T(T::Text), P::AnyNonArray, Ret::T(T::Text), textcat);
     b.op2p("||", P::AnyNonArray, P::T(T::Text), Ret::T(T::Text), textcat);
     b.op2("||", T::Bytea, T::Bytea, T::Bytea, byteacat);
-    b.op2("~", T::Text, T::Text, T::Bool, re_match);
-    b.op2("~*", T::Text, T::Text, T::Bool, re_imatch);
-    b.op2("!~", T::Text, T::Text, T::Bool, re_nmatch);
-    b.op2("!~*", T::Text, T::Text, T::Bool, re_nimatch);
+    // character(n) matches with its padding (bpcharregexeq etc.)
+    for t in [T::Text, T::Bpchar] {
+        b.op2("~", t.clone(), T::Text, T::Bool, re_match);
+        b.op2("~*", t.clone(), T::Text, T::Bool, re_imatch);
+        b.op2("!~", t.clone(), T::Text, T::Bool, re_nmatch);
+        b.op2("!~*", t, T::Text, T::Bool, re_nimatch);
+    }
 
     // date/time
     b.op2("+", T::Date, T::Int4, T::Date, date_pl_int);

@@ -282,3 +282,41 @@ fn decorrelated_subqueries_see_outer_values_exactly() {
     );
     running.shutdown();
 }
+
+#[test]
+fn character_n_compares_and_casts_without_padding() {
+    let running = start("bpchar");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (a int PRIMARY KEY, b text, d char(3))");
+    exec(&h, "INSERT INTO t VALUES (1, 'x', 'a'), (2, 'y', 'b '), (3, NULL, NULL)");
+    exec(&h, "CREATE TABLE c5 (k char(5) PRIMARY KEY, v int)");
+    exec(&h, "INSERT INTO c5 VALUES ('a', 1), ('b ', 2)");
+    // IN lists, IS DISTINCT FROM and NULLIF compared the padded values
+    assert_eq!(rows(&h, "SELECT a FROM t WHERE d IN ('a', 'b') ORDER BY a"), vec!["1", "2"]);
+    assert_eq!(
+        rows(&h, "SELECT a, d IN ('a', 'x'), d NOT IN ('b'), d IS DISTINCT FROM 'a', nullif(d, 'a') FROM t ORDER BY a"),
+        vec!["1|t|t|f|", "2|f|f|t|b  ", "3|||t|"]
+    );
+    // joins, IN and EXISTS between character(3) and character(5)
+    let want = vec!["1|1", "2|2"];
+    assert_eq!(rows(&h, "SELECT t.a, c5.v FROM t JOIN c5 ON t.d = c5.k ORDER BY 1"), want);
+    assert_eq!(rows(&h, "SELECT t.a, (SELECT v FROM c5 WHERE c5.k = t.d) FROM t ORDER BY 1"), vec!["1|1", "2|2", "3|"]);
+    assert_eq!(rows(&h, "SELECT a FROM t WHERE d IN (SELECT k FROM c5) ORDER BY 1"), vec!["1", "2"]);
+    assert_eq!(rows(&h, "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM c5 WHERE c5.k = t.d) ORDER BY 1"), vec!["1", "2"]);
+    exec(&h, "CREATE MATERIALIZED VIEW j AS SELECT t.a, c5.v FROM t JOIN c5 ON t.d = c5.k");
+    exec(&h, "INSERT INTO t VALUES (4, 'z', 'a')");
+    assert_eq!(rows(&h, "SELECT * FROM j ORDER BY a"), vec!["1|1", "2|2", "4|1"]);
+    // casts to text drop the padding (and so do functions taking text)
+    assert_eq!(
+        rows(&h, "SELECT d::text || '#', length(d), octet_length(d), d::varchar(2) || '#', upper(d), d || 1 FROM t WHERE a < 3 ORDER BY a"),
+        vec!["a#|1|3|a#|A|a1", "b#|1|3|b#|B|b1"]
+    );
+    // comparisons with text compare the unpadded value, with varchar as character
+    assert_eq!(rows(&h, "SELECT 'a'::char(3) = 'a'::varchar, 'a '::varchar = 'a'::char(3), 'a'::char(3) = 'a  '::text"), vec!["t|t|f"]);
+    // the common type of character and text is character
+    assert_eq!(rows(&h, "SELECT coalesce(d, b) || '#', pg_typeof(coalesce(d, b)) FROM t WHERE a < 3 ORDER BY a"), vec!["a#|character", "b#|character"]);
+    assert_eq!(column_types(&h, "SELECT 'a'::varchar UNION SELECT 'b'::text"), vec!["character varying"]);
+    // pattern matching sees the padding, as in PostgreSQL
+    assert_eq!(rows(&h, "SELECT 'a'::char(3) LIKE 'a', d ~ 'a  ', d SIMILAR TO 'a  ' FROM t WHERE a = 1"), vec!["f|t|t"]);
+    running.shutdown();
+}

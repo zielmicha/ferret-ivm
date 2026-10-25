@@ -1586,41 +1586,25 @@ fn replace_window_refs(e: Expr, base: usize) -> Expr {
     }
 }
 
-/// PostgreSQL select_common_type (simplified).
+/// PostgreSQL's select_common_type: unknown inputs are ignored (all unknown:
+/// text); every other input must be of the first one's type category; a
+/// later input's type replaces the candidate when the candidate is not the
+/// category's preferred type and converts to it implicitly, but not back.
 pub fn common_type(types: &[SqlType], context: &str) -> Result<SqlType> {
+    use crate::expr::cast::implicit_castable;
     let known: Vec<&SqlType> = types.iter().filter(|t| **t != SqlType::Unknown).collect();
     let Some(first) = known.first() else { return Ok(SqlType::Text) };
-    if known.iter().all(|t| t == first) {
-        return Ok((*first).clone());
+    let mut ptype = (*first).clone();
+    for t in &known[1..] {
+        if **t == ptype {
+            continue;
+        }
+        if t.category() != ptype.category() {
+            sql_bail!(codes::DATATYPE_MISMATCH, "{context} types {} and {} cannot be matched", ptype, t);
+        }
+        if !ptype.is_preferred() && implicit_castable(&ptype, t) && !implicit_castable(t, &ptype) {
+            ptype = (*t).clone();
+        }
     }
-    let rank_num = |t: &SqlType| match t {
-        SqlType::Int2 => Some(0),
-        SqlType::Int4 => Some(1),
-        SqlType::Int8 => Some(2),
-        SqlType::Numeric => Some(3),
-        SqlType::Float4 => Some(4),
-        SqlType::Float8 => Some(5),
-        _ => None,
-    };
-    if known.iter().all(|t| rank_num(t).is_some()) {
-        return Ok((*known.iter().max_by_key(|t| rank_num(t).unwrap()).unwrap()).clone());
-    }
-    if known.iter().all(|t| t.is_string()) {
-        return Ok(SqlType::Text);
-    }
-    let rank_dt = |t: &SqlType| match t {
-        SqlType::Date => Some(0),
-        SqlType::Timestamp => Some(1),
-        SqlType::TimestampTz => Some(2),
-        _ => None,
-    };
-    if known.iter().all(|t| rank_dt(t).is_some()) {
-        return Ok((*known.iter().max_by_key(|t| rank_dt(t).unwrap()).unwrap()).clone());
-    }
-    if let (SqlType::Array(_), true) = (first, known.iter().all(|t| matches!(t, SqlType::Array(_)))) {
-        let elems: Vec<SqlType> = known.iter().map(|t| t.elem().unwrap().clone()).collect();
-        return Ok(SqlType::Array(Box::new(common_type(&elems, context)?)));
-    }
-    let other = known.iter().find(|t| *t != first).unwrap();
-    sql_bail!(codes::DATATYPE_MISMATCH, "{context} types {} and {} cannot be matched", first, other)
+    Ok(ptype)
 }
