@@ -88,6 +88,9 @@ pub(crate) struct Subscription {
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
     pub progress: bool,
+    /// The relations it reads, also through views: it ends when one of
+    /// them is dropped.
+    pub reads: Vec<ObjectId>,
 }
 
 /// A read waiting for the engine to reach a GSN.
@@ -742,9 +745,14 @@ impl Engine {
         }
         for s in self.subs.iter() {
             if let Some(o) = outputs.get(&s.node) {
+                // a new error record ends the subscription, as it fails
+                // reads (a retracted one does not)
                 if !o.errs.is_empty() {
-                    let (code, msg) = o.errs[0].0.clone();
-                    let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+                    let mut errs = o.errs.clone();
+                    crate::dataflow::consolidate_errs(&mut errs);
+                    if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
+                        let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+                    }
                 }
                 if !o.data.is_empty() {
                     let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });

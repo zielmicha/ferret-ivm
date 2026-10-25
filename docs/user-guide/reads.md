@@ -286,17 +286,15 @@ A subscription runs until
 
 - the client cancels the query (for example Ctrl-C in psql), which ends it
   with `canceling statement due to user request` (SQLSTATE `57014`);
-- the client disconnects — noticed when the server next sends something
-  (a change, or a progress row with `PROGRESS`); until then the
-  subscription, and the private dataflow of a query subscription, stay
-  alive;
-- the subscribed materialized view is dropped
-  (`materialized view "x" was dropped`); a subscription to a dropped *table*
-  does not end, and keeps sending progress rows;
-- the subscribed relation's error records change: the subscription ends with
-  the error — also when an error record is *retracted*, that is when the
-  relation has just become readable again (a known problem). The initial
-  snapshot of a subscription leaves rows that fail out instead of failing;
+- the client disconnects (the session checks the connection every 200 ms);
+- a relation it reads — the subscribed table, view or materialized view,
+  a relation a subscribed view or query reads, directly or through views —
+  is dropped (`table "x" was dropped`, `view "x" was dropped`,
+  `materialized view "x" was dropped`, SQLSTATE `42P01`);
+- the subscribed relation gets an error record: the subscription ends with
+  the error (the retraction of an error record does not end it). The
+  initial snapshot of a subscription leaves rows that fail out instead of
+  failing;
 - the engine shuts down.
 
 If the subscribed materialized view is replaced with `CREATE OR REPLACE` by

@@ -94,3 +94,71 @@ fn at_least_lsn_without_sources() {
     assert_err(waiting.recv_timeout(Duration::from_secs(10)).expect("the read ends"), "55000", "there is no source");
     e.shutdown();
 }
+
+/// The events of a new subscription.
+fn subscribe(e: &Engine, sql: &str) -> Receiver<ivm::coord::api::SubEvent> {
+    match e.exec(sql) {
+        ExecResult::Subscribe { rx, .. } => rx,
+        other => panic!("{sql}: expected a subscription, got {other:?}"),
+    }
+}
+
+/// A subscription's events until `until` holds for one (or a timeout):
+/// data rows as "diff:row", errors as "error: message".
+fn events_until(rx: &Receiver<ivm::coord::api::SubEvent>, until: impl Fn(&str) -> bool) -> Vec<String> {
+    use ivm::coord::api::SubEvent;
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
+        let evs = match ev {
+            SubEvent::Data { rows, .. } => rows
+                .iter()
+                .map(|(r, w)| format!("{w}:{}", r.iter().map(ivm::types::text::format_datum).collect::<Vec<_>>().join("|")))
+                .collect(),
+            SubEvent::Progress { .. } => vec![],
+            SubEvent::Error(e) => vec![format!("error: {}", e.message)],
+        };
+        for ev in evs {
+            let done = until(&ev);
+            out.push(ev);
+            if done {
+                return out;
+            }
+        }
+    }
+    out.push("(timeout)".into());
+    out
+}
+
+/// A subscription ends with an error when a relation it reads is dropped
+/// (it used to wait forever for a table, a view or a query's relations),
+/// and goes on when an error record of its view is retracted (it used to
+/// end).
+#[test]
+fn subscription_lifecycle() {
+    let e = Engine::start("subscriptions");
+    e.exec("CREATE TABLE t (id int PRIMARY KEY, x int)");
+    e.exec("INSERT INTO t VALUES (1, 5), (2, 0)");
+    e.exec("CREATE MATERIALIZED VIEW v AS SELECT id, 10 / x AS q FROM t");
+    let rx = subscribe(&e, "SUBSCRIBE TO v");
+    e.exec("DELETE FROM t WHERE id = 2");
+    e.exec("INSERT INTO t VALUES (3, 1)");
+    assert_eq!(events_until(&rx, |ev| ev.starts_with("1:3|")), ["1:1|2", "1:3|10"]);
+    e.exec("INSERT INTO t VALUES (4, 0)");
+    assert_eq!(events_until(&rx, |ev| ev.starts_with("error")), ["error: division by zero"]);
+
+    e.exec("CREATE TABLE a (id int PRIMARY KEY)");
+    e.exec("CREATE VIEW av AS SELECT id FROM a");
+    e.exec("CREATE MATERIALIZED VIEW am AS SELECT id FROM a");
+    let subs: Vec<_> = ["SUBSCRIBE TO a", "SUBSCRIBE TO av", "SUBSCRIBE TO (SELECT count(*) FROM av)", "SUBSCRIBE TO am"]
+        .into_iter()
+        .map(|sql| subscribe(&e, sql))
+        .collect();
+    e.exec("DROP MATERIALIZED VIEW am");
+    assert_eq!(events_until(&subs[3], |ev| ev.starts_with("error")), ["error: materialized view \"am\" was dropped"]);
+    e.exec("DROP VIEW av");
+    assert_eq!(events_until(&subs[1], |ev| ev.starts_with("error")), ["error: view \"av\" was dropped"]);
+    assert_eq!(events_until(&subs[2], |ev| ev.starts_with("error")), ["1:0", "error: view \"av\" was dropped"]);
+    e.exec("DROP TABLE a");
+    assert_eq!(events_until(&subs[0], |ev| ev.starts_with("error")), ["error: table \"a\" was dropped"]);
+    e.shutdown();
+}

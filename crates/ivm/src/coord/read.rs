@@ -394,7 +394,7 @@ impl Engine {
     }
 
     fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
-        let (node, pinned, columns): (NodeId, Option<NodeId>, Vec<ResultColumn>) = match target {
+        let (node, pinned, columns, reads): (NodeId, Option<NodeId>, Vec<ResultColumn>, Vec<ObjectId>) = match target {
             SubscribeTarget::Name(name) => {
                 let Some(obj) = self.catalog.by_name(&name).cloned() else {
                     sql_bail!(codes::UNDEFINED_TABLE, "relation \"{name}\" does not exist");
@@ -405,12 +405,14 @@ impl Engine {
                 match &obj.kind {
                     ObjectKind::MaterializedView(v) => {
                         let rt = &self.rt.views[&obj.id];
-                        (rt.node, None, v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect())
+                        let cols = v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect();
+                        (rt.node, None, cols, vec![obj.id])
                     }
                     ObjectKind::Table(t) => (
                         self.rt.tables[&obj.id],
                         None,
                         t.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect(),
+                        vec![obj.id],
                     ),
                     ObjectKind::View(_) => {
                         // through the view (not its query): its column list
@@ -426,6 +428,20 @@ impl Engine {
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
                 self.check_broken(&bq.rel)?;
+                // what it reads: the relations of the plan, and the views
+                // (inlined in it) it reads them through
+                fn gets(r: &Rel, out: &mut Vec<ObjectId>) {
+                    if let Rel::Get { id, .. } = r {
+                        out.push(*id);
+                    }
+                    for i in r.inputs() {
+                        gets(i, out);
+                    }
+                }
+                let mut reads = self.catalog.references(&q.to_string()).unwrap_or_default();
+                gets(&bq.rel, &mut reads);
+                reads.sort_unstable();
+                reads.dedup();
                 let names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
                 let types: Vec<ColumnType> = bq.column_types();
                 let rel = bq.into_rel();
@@ -442,7 +458,7 @@ impl Engine {
                 self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
                 self.graph.hydrate(&mut self.env, self.processed)?;
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
-                (node, Some(node), cols)
+                (node, Some(node), cols, reads)
             }
         };
         let (tx, rx) = unbounded();
@@ -454,7 +470,7 @@ impl Engine {
             }
         }
         let _ = tx.send(SubEvent::Progress { gsn: self.processed });
-        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress });
+        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, reads });
         Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
     }
 

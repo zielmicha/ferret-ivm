@@ -974,6 +974,17 @@ impl Engine {
     pub(crate) fn drop_object(&mut self, id: ObjectId) -> Result<()> {
         let Some(obj) = self.catalog.remove(id) else { return Ok(()) };
         self.rt.broken.remove(&id);
+        // subscriptions reading it (directly, through views or in a query)
+        // end with an error
+        for s in self.subs.iter() {
+            if s.reads.contains(&id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                    codes::UNDEFINED_TABLE,
+                    format!("{} \"{}\" was dropped", obj.kind.name(), obj.name),
+                )));
+                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         match obj.kind {
             ObjectKind::Table(_) => {
                 if let Some(n) = self.rt.tables.remove(&id) {
@@ -982,15 +993,6 @@ impl Engine {
             }
             ObjectKind::MaterializedView(_) => {
                 if let Some(v) = self.rt.views.remove(&id) {
-                    for s in self.subs.iter() {
-                        if s.node == v.node {
-                            let _ = s.tx.send(SubEvent::Error(SqlError::new(
-                                codes::UNDEFINED_TABLE,
-                                format!("materialized view \"{}\" was dropped", obj.name),
-                            )));
-                            s.cancel.store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    }
                     self.graph.release_arr(&mut self.env, v.arr)?;
                     self.graph.release_node(&mut self.env, v.node)?;
                 }
@@ -1071,9 +1073,10 @@ impl Engine {
             self.graph.release_arr(&mut self.env, a)?;
         }
         self.graph.hydrate(&mut self.env, gsn)?;
-        // subscribers to the table were promised the old columns
+        // subscribers to the table were promised the old columns (and
+        // queries over it would go on reading the old version)
         for s in self.subs.iter() {
-            if s.node == old_node {
+            if s.reads.contains(&table) {
                 let _ = s.tx.send(SubEvent::Error(SqlError::new(
                     codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     format!("table \"{}\" changed its columns upstream", obj.name),
