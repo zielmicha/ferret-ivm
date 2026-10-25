@@ -233,3 +233,85 @@ fn describe_infers_parameter_types() {
     assert_eq!(first_values(&c.query("SELECT a FROM t WHERE id = 1")), vec!["5"]);
     running.shutdown();
 }
+
+/// CommandComplete tags in `msgs`.
+fn command_tags(msgs: &[Msg]) -> Vec<String> {
+    msgs.iter().filter(|m| m.0 == b'C').map(|(_, b)| String::from_utf8_lossy(&b[..b.len() - 1]).into_owned()).collect()
+}
+
+#[test]
+fn portals_follow_postgresql_execute_semantics() {
+    let (running, port) = start("portals");
+    let mut c = Conn::connect(port);
+    c.query("CREATE TABLE t (id int PRIMARY KEY)");
+    c.query("INSERT INTO t VALUES (1), (2), (3), (4), (5)");
+    // batches of two: suspended after each full batch; the count is per Execute
+    c.parse("", "SELECT id FROM t ORDER BY id", &[]);
+    c.bind("", "", &[], 0);
+    for _ in 0..3 {
+        c.execute("", 2);
+    }
+    let msgs = c.sync();
+    assert_eq!(tags(&msgs), "12DDsDDsDCZ");
+    assert_eq!(command_tags(&msgs), vec!["SELECT 1"]);
+    // exactly max_rows rows left: still suspended, then an empty completion
+    c.parse("", "SELECT id FROM t WHERE id <= 2 ORDER BY id", &[]);
+    c.bind("", "", &[], 0);
+    c.execute("", 2);
+    c.execute("", 2);
+    let msgs = c.sync();
+    assert_eq!(tags(&msgs), "12DDsCZ");
+    assert_eq!(command_tags(&msgs), vec!["SELECT 0"]);
+    // an exhausted portal can be executed again (used to fail: no such portal)
+    c.parse("", "SELECT 1", &[]);
+    c.bind("p", "", &[], 0);
+    c.execute("p", 0);
+    c.execute("p", 0);
+    let msgs = c.sync();
+    assert_eq!(command_tags(&msgs), vec!["SELECT 1", "SELECT 0"], "{:?}", error_message(&msgs));
+    // portals end with the (implicit) transaction
+    c.execute("p", 0);
+    let msgs = c.sync();
+    assert!(error_message(&msgs).unwrap_or_default().contains("does not exist"));
+    running.shutdown();
+}
+
+#[test]
+fn bind_checks_the_number_of_parameters() {
+    let (running, port) = start("bindcount");
+    let mut c = Conn::connect(port);
+    c.parse("s", "SELECT $1::int + $2::int", &[]);
+    c.bind("", "s", &[Some(b"1")], 0);
+    c.execute("", 0);
+    let msgs = c.sync();
+    // used to run with $2 silently NULL
+    assert_eq!(
+        error_message(&msgs).as_deref(),
+        Some("bind message supplies 1 parameters, but prepared statement \"s\" requires 2")
+    );
+    c.bind("", "s", &[Some(b"1"), Some(b"2"), Some(b"3")], 0);
+    c.execute("", 0);
+    assert!(error_message(&c.sync()).is_some());
+    c.bind("", "s", &[Some(b"1"), Some(b"2")], 0);
+    c.execute("", 0);
+    assert_eq!(first_values(&c.sync()), vec!["3"]);
+    running.shutdown();
+}
+
+#[test]
+fn untyped_literal_results_are_described_as_text() {
+    let (running, port) = start("unknowncols");
+    let mut c = Conn::connect(port);
+    let msgs = c.query("SELECT 'abc', NULL");
+    let (_, b) = msgs.iter().find(|m| m.0 == b'T').unwrap();
+    // two fields; the type OID follows the name, table oid and attribute number
+    let mut pos = 2;
+    let mut oids = Vec::new();
+    for _ in 0..2 {
+        pos += b[pos..].iter().position(|c| *c == 0).unwrap() + 1;
+        oids.push(u32::from_be_bytes(b[pos + 6..pos + 10].try_into().unwrap()));
+        pos += 18;
+    }
+    assert_eq!(oids, vec![25, 25]);
+    running.shutdown();
+}

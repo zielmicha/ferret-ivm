@@ -147,6 +147,32 @@ fn skip_lexical(b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+/// The highest parameter number ($n) used in a statement (0 if none).
+pub fn max_param_index(sql: &str) -> usize {
+    let b = sql.as_bytes();
+    let mut max = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
+        if b[i] == b'$' && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] >= 0x80)) {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if let Ok(n) = sql[i + 1..j].parse::<usize>() {
+                max = max.max(n);
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    max
+}
+
 /// Split a query string into statements at top-level semicolons.
 pub fn split_statements(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
@@ -780,6 +806,13 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(parse_statement("COPY (SUBSCRIBE (select 'İ' from t)) TO STDOUT").is_ok());
+    }
+
+    #[test]
+    fn param_count() {
+        assert_eq!(max_param_index("select $1, $12 + $3"), 12);
+        assert_eq!(max_param_index("select '$4', $$ $5 $$, $t$ $6 $t$, \"$7\", a$8 -- $9\n, $2"), 2);
+        assert_eq!(max_param_index("select 1"), 0);
     }
 
     #[test]

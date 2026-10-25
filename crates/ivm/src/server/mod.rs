@@ -63,14 +63,16 @@ struct Prepared {
     text: String,
     stmt: Statement,
     param_types: Vec<SqlType>,
+    /// Number of parameters a Bind must supply.
+    nparams: usize,
 }
 
 struct Portal {
     stmt: Statement,
     params: Vec<ParamSlot>,
     result_formats: Vec<i16>,
-    /// Remaining rows of a partially fetched result.
-    pending: Option<(Vec<ResultColumn>, std::vec::IntoIter<Row>, usize)>,
+    /// Remaining rows of a partially fetched (or exhausted) result.
+    pending: Option<(Vec<ResultColumn>, std::vec::IntoIter<Row>)>,
 }
 
 struct Session {
@@ -89,12 +91,14 @@ struct Session {
 }
 
 fn field(c: &ResultColumn, format: i16) -> FieldDescription {
+    // untyped literals in a result are text (PostgreSQL resolves them so)
+    let ty = if c.ty == SqlType::Unknown { &SqlType::Text } else { &c.ty };
     FieldDescription {
         name: c.name.clone(),
         table_oid: 0,
         column_attr: 0,
-        type_oid: c.ty.oid(),
-        type_size: c.ty.type_size(),
+        type_oid: ty.oid(),
+        type_size: ty.type_size(),
         type_modifier: c.typmod,
         format,
     }
@@ -272,7 +276,13 @@ impl Session {
                 }
                 FrontendMessage::Sync => {
                     skip_until_sync = false;
-                    self.portals.retain(|k, _| !k.is_empty());
+                    // portals end with the transaction (outside a transaction
+                    // block, with the implicit one Sync closes)
+                    if self.in_txn {
+                        self.portals.retain(|k, _| !k.is_empty());
+                    } else {
+                        self.portals.clear();
+                    }
                     let st = self.txn_status();
                     self.out.ready_for_query(st);
                     self.flush()?;
@@ -303,10 +313,12 @@ impl Session {
                 }
                 sqlparser::ast::Statement::Commit { .. } => {
                     self.in_txn = false;
+                    self.portals.clear();
                     Some(Ok(ExecResult::Command { tag: "COMMIT".into() }))
                 }
                 sqlparser::ast::Statement::Rollback { .. } => {
                     self.in_txn = false;
+                    self.portals.clear();
                     Some(Ok(ExecResult::Command { tag: "ROLLBACK".into() }))
                 }
                 sqlparser::ast::Statement::ShowVariable { variable } => {
@@ -603,8 +615,9 @@ impl Session {
         }
         let text = stmts.into_iter().next().unwrap_or_default();
         let stmt = parse_statement(&text)?;
-        let types = param_types.iter().map(|o| SqlType::from_oid(*o).unwrap_or(SqlType::Unknown)).collect();
-        self.prepared.insert(name.to_string(), Prepared { text, stmt, param_types: types });
+        let types: Vec<SqlType> = param_types.iter().map(|o| SqlType::from_oid(*o).unwrap_or(SqlType::Unknown)).collect();
+        let nparams = crate::sql::parser::max_param_index(&text).max(types.len());
+        self.prepared.insert(name.to_string(), Prepared { text, stmt, param_types: types, nparams });
         Ok(())
     }
 
@@ -613,6 +626,12 @@ impl Session {
             .prepared
             .get(stmt)
             .ok_or_else(|| SqlError::new(codes::INVALID_SQL_STATEMENT_NAME, format!("prepared statement \"{stmt}\" does not exist")))?;
+        if params.len() != p.nparams {
+            return Err(SqlError::new(
+                codes::PROTOCOL_VIOLATION,
+                format!("bind message supplies {} parameters, but prepared statement \"{stmt}\" requires {}", params.len(), p.nparams),
+            ));
+        }
         let mut slots = Vec::with_capacity(params.len());
         for (i, v) in params.iter().enumerate() {
             let ty = p.param_types.get(i).cloned().unwrap_or(SqlType::Unknown);
@@ -705,10 +724,7 @@ impl Session {
         if portal.pending.is_none() {
             let res = self.run_statement(portal.stmt.clone(), portal.params.clone())?;
             match res {
-                ExecResult::Query { columns, rows } => {
-                    let n = rows.len();
-                    portal.pending = Some((columns, rows.into_iter(), n));
-                }
+                ExecResult::Query { columns, rows } => portal.pending = Some((columns, rows.into_iter())),
                 other => {
                     self.send_result(other, &portal.result_formats, max_rows, false)?;
                     return Ok(());
@@ -716,7 +732,7 @@ impl Session {
             }
         }
         let formats = portal.result_formats.clone();
-        let (cols, iter, total) = portal.pending.as_mut().unwrap();
+        let (cols, iter) = portal.pending.as_mut().unwrap();
         let limit = if max_rows <= 0 { usize::MAX } else { max_rows as usize };
         let mut sent = 0;
         for r in iter.by_ref() {
@@ -739,13 +755,15 @@ impl Session {
                 break;
             }
         }
-        if sent >= limit && iter.len() > 0 {
+        // as in PostgreSQL: suspended whenever max_rows rows were sent, and
+        // the count is that of this Execute; an exhausted portal stays (until
+        // Close or the end of the transaction) and yields no more rows
+        if max_rows > 0 && sent == limit {
             self.out.portal_suspended();
-            self.portals.insert(name.to_string(), portal);
         } else {
-            let t = *total;
-            self.out.command_complete(&format!("SELECT {t}"));
+            self.out.command_complete(&format!("SELECT {sent}"));
         }
+        self.portals.insert(name.to_string(), portal);
         Ok(())
     }
 }
