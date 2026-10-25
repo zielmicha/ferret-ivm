@@ -254,9 +254,19 @@ impl Running {
 /// Open (recovering if needed) and start the engine threads.
 pub fn start(cfg: Config) -> Result<Running> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    // one engine per data directory: held until the process exits
+    // one engine per data directory: held until the process exits. Retried
+    // briefly: a process forked concurrently (e.g. a test spawning
+    // PostgreSQL) holds a copy of a just-released lock until it execs
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(cfg.data_dir.join("LOCK"))?;
-    if lock.try_lock().is_err() {
+    let mut locked = lock.try_lock().is_ok();
+    for _ in 0..40 {
+        if locked {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        locked = lock.try_lock().is_ok();
+    }
+    if !locked {
         return Err(SqlError::new(
             codes::OBJECT_IN_USE,
             format!("data directory {} is in use by another ivm process", cfg.data_dir.display()),

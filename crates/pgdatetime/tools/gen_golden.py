@@ -8,8 +8,8 @@ Each output line (tests/golden/<category>.tsv) is tab separated:
 where result is "OK <text>", "ERR <sqlstate> <message>" or "NULL".
 
 Requires a running server with the pgdt_eval() helper (created by this
-script) reachable via the psql command given in $PGDT_PSQL, e.g.
-    PGDT_PSQL="psql -h @pgdt54402 -p 54402 -U postgres"
+script) reachable via the psql command given in $PGDT_PSQL (required), e.g.
+    PGDT_PSQL="psql -h /path/to/socketdir -p 5432 -U postgres"
 """
 import itertools
 import os
@@ -21,7 +21,9 @@ sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("PGDT_GOLDEN_OUT", os.path.join(HERE, "..", "tests", "golden"))
-PSQL = shlex.split(os.environ.get("PGDT_PSQL", "psql -h @pgdt54402 -p 54402 -U postgres"))
+if not os.environ.get("PGDT_PSQL"):
+    sys.exit("set PGDT_PSQL to a psql command reaching a PostgreSQL 17 server (see the module docstring)")
+PSQL = shlex.split(os.environ["PGDT_PSQL"])
 
 EVAL_FN = r"""
 CREATE OR REPLACE FUNCTION pgdt_eval(tz text, expr text) RETURNS text LANGUAGE plpgsql AS $f$
