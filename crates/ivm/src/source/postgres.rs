@@ -188,6 +188,7 @@ struct PgSource {
     inflight: std::collections::VecDeque<(u64, Receiver<u64>)>,
     /// wal_end of a keepalive received while commits were in flight.
     pending_wal_end: u64,
+    gauges: Arc<super::SourceGauges>,
 }
 
 fn pk_bytes(row: &[Datum], pk: &[usize]) -> Vec<u8> {
@@ -398,6 +399,7 @@ impl PgSource {
                     progress = true;
                 }
                 if !txn.changes.is_empty() {
+                    self.gauges.commit(txn.changes.len());
                     let rec = LogRecord::Commit { source: self.id, lsn: end_lsn.0, changes: txn.changes };
                     // pipelined: the sequencer group-commits; durability is
                     // confirmed asynchronously before acknowledging the slot
@@ -730,6 +732,7 @@ pub fn run(
     status: Arc<Mutex<String>>,
 ) {
     let state: SourceState = serde_json::from_str(&state).unwrap_or_default();
+    let gauges = super::gauges(&engine.shared, id);
     let mut src = PgSource {
         id,
         def,
@@ -746,6 +749,7 @@ pub fn run(
         seq: 0,
         inflight: std::collections::VecDeque::new(),
         pending_wal_end: 0,
+        gauges,
     };
     let mut backoff = Duration::from_millis(200);
     loop {
@@ -820,6 +824,9 @@ fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
             }
         }
         let ev = stream.recv(Some(Duration::from_millis(100)))?;
+        if let Some(ReplicationEvent::XLogData { wal_end, server_time, .. } | ReplicationEvent::Keepalive { wal_end, server_time, .. }) = &ev {
+            src.gauges.upstream(wal_end.0, *server_time);
+        }
         src.drain_acks(false)?;
         match ev {
             Some(ReplicationEvent::XLogData { message, .. }) => src.handle_message(message)?,

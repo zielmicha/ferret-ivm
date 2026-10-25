@@ -4,6 +4,7 @@
 pub mod api;
 pub mod ddl;
 mod dml;
+pub mod inspect;
 mod read;
 pub mod seq;
 
@@ -461,6 +462,7 @@ impl Engine {
             Request::Log { rec } => {
                 let _ = self.seq.send(SeqMsg::Append { rec, ack: None });
             }
+            Request::Inspect(r) => self.inspect(r),
             other => self.run_execute(other, handle),
         }
     }
