@@ -830,7 +830,7 @@ Consequences of code changes for an existing data directory:
 | inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again |
 | semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
 | planner or lowering changes that produce different plans for the same SQL | as for fingerprint changes: the views are rebuilt |
-| catalog SQL that no longer binds (removed syntax or functions) | the engine fails to start while re-planning the view |
+| catalog SQL that no longer binds (removed syntax or functions) | the view (and what reads it) is marked broken at start-up: not maintained, reads of it fail with the reason; drop it or repair it with `CREATE OR REPLACE` ([Operations](user-guide/operations.md#recovery)) |
 
 An upgrade that changes any of the "incompatible" rows requires starting
 from an empty data directory (and re-creating sources, which re-snapshot the

@@ -134,7 +134,7 @@ All results are text columns, except `SHOW GSN`.
 |---|---|
 | `SHOW SOURCES` | `name`, `publication`, `slot`, `tables`, `lsn`, `status` ([Sources](sources.md#monitoring)) |
 | `SHOW TABLES` | `name`, `source` (source name or `(local)`), `rows` (sum of multiplicities in the primary index) |
-| `SHOW VIEWS` | `name`, `kind` (`materialized` or `virtual`), `rows` (materialized views: rows in the view's index), `errors` (number of distinct error records currently present) |
+| `SHOW VIEWS` | `name`, `kind` (`materialized` or `virtual`), `rows` (materialized views: rows in the view's index), `errors` (number of distinct error records currently present), `status` (materialized views: `ok`, or `broken: <reason>` for a view that is not maintained, see [Operations](operations.md#recovery)) |
 | `SHOW MATERIALIZED VIEWS` | same as `SHOW VIEWS`, materialized views only |
 | `SHOW INDEXES` | `name`, `on` (relation), `columns` (0-based column positions, e.g. `[2]`) |
 | `SHOW SINKS` | `name`, `from`, `table`, `status` ([Sinks](sinks.md#monitoring-and-drop-sink)) |

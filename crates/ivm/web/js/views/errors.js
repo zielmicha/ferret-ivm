@@ -1,5 +1,6 @@
 // Errors: error records held by views (reads of them fail until the
-// offending rows are gone), and sources or sinks in an error state.
+// offending rows are gone), sources or sinks in an error state, and broken
+// (unmaintained) views and indexes.
 
 import { api } from '../api.js';
 import { h, replace, card, errorBox, dataTable, empty, statusBadge, href } from '../dom.js';
@@ -20,7 +21,8 @@ export default {
         replace(body, errorBox(e.message));
         return;
       }
-      const n = d.views.length + d.sources.length + d.sinks.length;
+      const broken = d.broken || [];
+      const n = d.views.length + d.sources.length + d.sinks.length + broken.length;
       sub.textContent = `As of GSN ${fmt.int(d.gsn)} · ${n ? fmt.plural(n, 'problem') : 'no problems'}`;
       if (!n) {
         replace(body, card(null, empty('No errors', 'Every view reads cleanly and every source and sink is healthy.')));
@@ -43,6 +45,12 @@ export default {
       ], rows).el;
       if (d.sources.length) parts.push(card('Sources', statusTable(d.sources, 'Source'), { flush: true }));
       if (d.sinks.length) parts.push(card('Sinks', statusTable(d.sinks, 'Sink'), { flush: true }));
+      if (broken.length) {
+        parts.push(card('Broken views and indexes', dataTable([
+          { key: 'name', label: 'Object', render: (r) => h('a', { href: href('catalog', r.name) }, r.name) },
+          { key: 'status', label: 'Status', render: (r) => statusBadge(r.status) },
+        ], broken).el, { flush: true }));
+      }
       replace(body, ...parts);
     }, 5000);
     return { unmount: stop };

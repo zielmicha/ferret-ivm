@@ -81,18 +81,13 @@ re-create the view (see [Known problems](#known-problems)).
 
 ### The engine does not start
 
-See the [startup failure table](operations.md#recovery). Several problems
-leave the data directory unusable without restoring a backup, because the
+See the [startup failure table](operations.md#recovery). A materialized
+view that can no longer be planned does not stop the start: it is marked
+broken ([Recovery](operations.md#recovery)). Some problems still leave the
+data directory unusable without restoring a backup, because the
 checkpointed catalog or the log contains something that can no longer be
-planned or applied:
+applied:
 
-- a table with a quoted mixed-case name was dropped while views used it;
-- an upstream schema change removed or renamed a column a materialized view
-  uses, or a column an index on the replicated table uses;
-- `CREATE OR REPLACE` replaced a materialized view that has an index with a
-  version with fewer columns, replaced a materialized view that has an index
-  or a sink with a virtual view, or made a view read a relation created after
-  it (`relation "b" has no dataflow`);
 - a materialized view with a `DISTINCT` aggregate and `FILTER`, or with a
   negative `GROUPS` frame offset, crashed the engine (the statement is
   replayed and crashes again on every start);

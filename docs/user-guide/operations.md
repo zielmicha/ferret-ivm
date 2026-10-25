@@ -94,7 +94,11 @@ Every start is a recovery:
    dataflow from the catalog, and attach every index whose structure matches
    one in the checkpoint. A table whose primary index is not in the
    checkpoint stops the start (its rows exist nowhere else). Indexes that do
-   not match are rebuilt from the recovered ones.
+   not match are rebuilt from the recovered ones. A materialized view whose
+   stored definition can no longer be planned (code that became stricter,
+   or a catalog that drifted) does not stop the start: it is logged and
+   kept in the catalog as **broken**, together with the indexes on it, the
+   views reading it and the sinks reading it (which are not started).
 5. Replay the input-log records after the checkpoint's GSN.
 6. Restart sources (from their logged progress) and sinks (which
    resynchronise), start the sequencer and engine threads, and listen.
@@ -111,9 +115,16 @@ Startup failures and what they mean:
 | `cannot decode checkpoint state: ...` | the checkpoint was written by an incompatible version ([Compatibility](../on-disk-format.md#compatibility)) |
 | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | the table's primary index cannot be found by its structural fingerprint — usually an incompatible version |
 | `node checksum mismatch at ...`, `cannot open segment ...` | damaged or missing store files |
-| any planning error (`relation "x" does not exist`, `column "b" does not exist`) | a materialized view in the catalog can no longer be planned; see [Troubleshooting](troubleshooting.md#the-engine-does-not-start) |
-| `index target without dataflow`, `sink source without dataflow` | a materialized view with an index or a sink was replaced by a virtual view ([Known problems](troubleshooting.md#known-problems)) |
 | a panic (`thread 'main' panicked at ...`, `has overflowed its stack`) | a bug triggered by the catalog or the log, for example an index whose columns no longer exist after an upstream schema change or a `CREATE OR REPLACE`, or a `DISTINCT` aggregate with `FILTER` ([Known problems](troubleshooting.md#known-problems)) |
+
+A broken object is not maintained. Reading it, or anything reading it,
+fails with SQLSTATE `55000` and the reason (`materialized view "v" is broken:
+column "b" does not exist`); `SHOW VIEWS` (`status`), `SHOW SINKS` and the
+web UI (catalog and errors pages) show it. `DROP` removes it (with `CASCADE`,
+what depends on it), and `CREATE OR REPLACE MATERIALIZED VIEW` with a
+definition that plans repairs it: the view is built and hydrated again, the
+views reading it with it, its indexes are rebuilt and its sinks start. Every
+start tries to build broken views again.
 
 ## Checkpoints and garbage collection
 

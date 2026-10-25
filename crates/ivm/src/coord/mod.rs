@@ -73,6 +73,12 @@ pub struct Runtime {
     pub tables: HashMap<ObjectId, NodeId>,
     pub views: HashMap<ObjectId, ViewRt>,
     pub indexes: HashMap<ObjectId, ArrId>,
+    /// Catalog objects without a runtime, with the reason: materialized
+    /// views whose stored definition no longer plans at recovery (newer,
+    /// stricter code or catalog drift), indexes on them or whose columns
+    /// are gone, sinks reading them. They stay in the catalog: reads fail
+    /// with the reason, DROP removes them, CREATE OR REPLACE repairs a view.
+    pub broken: BTreeMap<ObjectId, String>,
 }
 
 pub(crate) struct Subscription {
@@ -372,12 +378,21 @@ impl Engine {
             }
         }
         // views and indexes after the views they read (id order is not a
-        // dependency order: CREATE OR REPLACE keeps a view's id)
+        // dependency order: CREATE OR REPLACE keeps a view's id). One that
+        // cannot be built (its stored definition no longer plans) is kept,
+        // marked broken, instead of keeping the engine from starting.
         for (obj, _) in self.dependency_order(&objects) {
-            match &obj.kind {
-                ObjectKind::MaterializedView(v) => self.create_view_rt(obj.id, &v.sql)?,
-                ObjectKind::Index(i) => self.create_index_rt(obj.id, i)?,
-                _ => {}
+            let r = match &obj.kind {
+                ObjectKind::MaterializedView(v) => self.create_view_rt(obj.id, &v.sql),
+                ObjectKind::Index(i) => self.create_index_rt(obj.id, i),
+                _ => continue,
+            };
+            if let Err(e) = r {
+                if e.code.starts_with("58") {
+                    return Err(e);
+                }
+                log::error!("{} {} is broken and not maintained: {}", obj.kind.name(), obj.name, e.message);
+                self.rt.broken.insert(obj.id, e.message);
             }
         }
         for (id, errs) in app.view_errors {
@@ -756,11 +771,52 @@ impl Engine {
                     let h = crate::source::start(obj.id, obj.name.clone(), def.clone(), tables, state, resume, handle.clone())?;
                     self.source_handles.insert(obj.id, h);
                 }
-                ObjectKind::Sink(def) => self.start_sink(obj.id, &obj.name, def, handle)?,
+                ObjectKind::Sink(def) => self.start_sink_or_mark_broken(obj.id, &obj.name, def, handle),
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// Start a sink of the catalog; one that cannot start (it reads a
+    /// broken view) is marked broken instead.
+    pub(crate) fn start_sink_or_mark_broken(&mut self, id: ObjectId, name: &str, def: &crate::catalog::SinkDef, handle: &EngineHandle) {
+        self.rt.broken.remove(&id);
+        if let Err(e) = self.start_sink(id, name, def, handle) {
+            log::error!("sink {name} is broken and not started: {}", e.message);
+            self.rt.broken.insert(id, e.message);
+        }
+    }
+
+    /// The error of using broken object `id`, if it is broken.
+    pub(crate) fn broken_error(&self, id: ObjectId) -> Option<SqlError> {
+        let reason = self.rt.broken.get(&id)?;
+        let what = self.catalog.get(id).map(|o| format!("{} \"{}\"", o.kind.name(), o.name)).unwrap_or_else(|| format!("object {id}"));
+        Some(
+            SqlError::new(codes::OBJECT_NOT_IN_PREREQUISITE_STATE, format!("{what} is broken: {reason}"))
+                .with_hint("Drop it, or replace a broken view with CREATE OR REPLACE MATERIALIZED VIEW."),
+        )
+    }
+
+    /// Fail if the plan reads a broken relation.
+    pub(crate) fn check_broken(&self, rel: &crate::sql::Rel) -> Result<()> {
+        if self.rt.broken.is_empty() {
+            return Ok(());
+        }
+        fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
+            if let crate::sql::Rel::Get { id, .. } = r {
+                out.push(*id);
+            }
+            for i in r.inputs() {
+                gets(i, out);
+            }
+        }
+        let mut ids = Vec::new();
+        gets(rel, &mut ids);
+        match ids.into_iter().find_map(|id| self.broken_error(id)) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Tables belonging to a source: (table id, upstream schema, name, columns, pk).

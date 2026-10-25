@@ -258,6 +258,7 @@ impl Engine {
             ReadAt::AsOf(target)
         };
         let mut bq = crate::sql::plan_query(&self.catalog, &query, params)?;
+        self.check_broken(&bq.rel)?;
         self.check_view_errors(&bq.rel)?;
         // now() is the logical clock as of the read, so reads are repeatable
         bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
@@ -348,6 +349,9 @@ impl Engine {
                 let Some(obj) = self.catalog.by_name(&name).cloned() else {
                     sql_bail!(codes::UNDEFINED_TABLE, "relation \"{name}\" does not exist");
                 };
+                if let Some(e) = self.broken_error(obj.id) {
+                    return Err(e);
+                }
                 match &obj.kind {
                     ObjectKind::MaterializedView(v) => {
                         let rt = &self.rt.views[&obj.id];
@@ -371,6 +375,7 @@ impl Engine {
             SubscribeTarget::Query(q, _) => {
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
+                self.check_broken(&bq.rel)?;
                 let names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
                 let types: Vec<ColumnType> = bq.column_types();
                 let rel = bq.into_rel();
@@ -498,19 +503,24 @@ impl Engine {
                 let mut rows = Vec::new();
                 for o in self.catalog.objects.values() {
                     match &o.kind {
-                        ObjectKind::MaterializedView(_) => {
-                            let v = &self.rt.views[&o.id];
-                            let n = self.env.tree_count(self.graph.arr(v.arr).tree);
-                            let errs = v.errors.values().filter(|w| **w > 0).count();
-                            rows.push(vec![o.name.clone(), "materialized".into(), n.to_string(), errs.to_string()]);
-                        }
+                        ObjectKind::MaterializedView(_) => match self.rt.views.get(&o.id) {
+                            Some(v) => {
+                                let n = self.env.tree_count(self.graph.arr(v.arr).tree);
+                                let errs = v.errors.values().filter(|w| **w > 0).count();
+                                rows.push(vec![o.name.clone(), "materialized".into(), n.to_string(), errs.to_string(), "ok".into()]);
+                            }
+                            None => {
+                                let reason = self.rt.broken.get(&o.id).cloned().unwrap_or_default();
+                                rows.push(vec![o.name.clone(), "materialized".into(), String::new(), String::new(), format!("broken: {reason}")]);
+                            }
+                        },
                         ObjectKind::View(_) if matches!(k, ShowKind::Views) => {
-                            rows.push(vec![o.name.clone(), "virtual".into(), String::new(), String::new()]);
+                            rows.push(vec![o.name.clone(), "virtual".into(), String::new(), String::new(), String::new()]);
                         }
                         _ => {}
                     }
                 }
-                text_rows(&["name", "kind", "rows", "errors"], rows)
+                text_rows(&["name", "kind", "rows", "errors", "status"], rows)
             }
             ShowKind::Indexes => {
                 let mut rows = Vec::new();
@@ -527,8 +537,7 @@ impl Engine {
                 for o in self.catalog.objects.values() {
                     if let ObjectKind::Sink(s) = &o.kind {
                         let from = self.catalog.get(s.from).map(|x| x.name.clone()).unwrap_or_default();
-                        let status = self.sink_handles.get(&o.id).map(|h| h.status()).unwrap_or_else(|| "stopped".into());
-                        rows.push(vec![o.name.clone(), from, s.table.clone(), status]);
+                        rows.push(vec![o.name.clone(), from, s.table.clone(), self.sink_status(o.id)]);
                     }
                 }
                 text_rows(&["name", "from", "table", "status"], rows)
@@ -655,6 +664,9 @@ impl Engine {
                 let Some(o) = self.catalog.by_name(&name).cloned() else {
                     sql_bail!(codes::UNDEFINED_TABLE, "relation \"{name}\" does not exist");
                 };
+                if let Some(e) = self.broken_error(o.id) {
+                    return Err(e);
+                }
                 let Some(v) = self.rt.views.get(&o.id) else {
                     sql_bail!(codes::WRONG_OBJECT_TYPE, "\"{name}\" is not a materialized view");
                 };

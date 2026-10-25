@@ -447,6 +447,8 @@ pub struct ErrorsInfo {
     pub views: Vec<ViewError>,
     pub sources: Vec<StatusBrief>,
     pub sinks: Vec<StatusBrief>,
+    /// Materialized views and indexes that are broken (not maintained).
+    pub broken: Vec<StatusBrief>,
 }
 
 #[derive(Serialize, Debug)]
@@ -752,8 +754,17 @@ impl Engine {
         self.source_handles.get(&id).map(|h| h.status()).unwrap_or_else(|| "stopped".into())
     }
 
-    fn sink_status(&self, id: ObjectId) -> String {
-        self.sink_handles.get(&id).map(|h| h.status()).unwrap_or_else(|| "stopped".into())
+    /// Status of a broken object (in the form of sources' and sinks' error
+    /// statuses).
+    fn broken_status(&self, id: ObjectId) -> Option<String> {
+        self.rt.broken.get(&id).map(|reason| format!("error: broken: {reason}"))
+    }
+
+    pub(crate) fn sink_status(&self, id: ObjectId) -> String {
+        match self.rt.broken.get(&id) {
+            Some(reason) => format!("error: broken: {reason}"),
+            None => self.sink_handles.get(&id).map(|h| h.status()).unwrap_or_else(|| "stopped".into()),
+        }
     }
 
     /// Rows of the arrangement backing a table, materialized view or index.
@@ -897,7 +908,7 @@ impl Engine {
                     _ => "local table".to_string(),
                 }),
             ),
-            ObjectKind::MaterializedView(v) | ObjectKind::View(v) => (col_info(&v.columns, &[]), None, None),
+            ObjectKind::MaterializedView(v) | ObjectKind::View(v) => (col_info(&v.columns, &[]), self.broken_status(o.id), None),
             ObjectKind::Index(i) => {
                 let target_cols: Vec<crate::types::Column> = match self.catalog.get(i.on).map(|x| &x.kind) {
                     Some(ObjectKind::Table(t)) => t.columns.clone(),
@@ -906,7 +917,7 @@ impl Engine {
                 };
                 let key: Vec<String> =
                     i.columns.iter().map(|c| target_cols.get(*c).map(|c| c.name.clone()).unwrap_or_else(|| format!("#{c}"))).collect();
-                (vec![], None, Some(format!("on {} ({})", name_of(i.on), key.join(", "))))
+                (vec![], self.broken_status(o.id), Some(format!("on {} ({})", name_of(i.on), key.join(", "))))
             }
             ObjectKind::Source(s) => (
                 vec![],
@@ -1529,6 +1540,9 @@ impl Engine {
         let rdeps = Self::reverse_deps(&deps);
         let object = self.object_info(&o, &deps, &rdeps);
         let mut problems = Vec::new();
+        if let Some(reason) = self.rt.broken.get(&o.id) {
+            problems.push(format!("broken: {reason}"));
+        }
         let mut plan = None;
         let mut dataflow = None;
         let mut maintenance = None;
@@ -1714,6 +1728,9 @@ impl Engine {
             views,
             sources: failing(|k| matches!(k, ObjectKind::Source(_)), &|id| self.source_status(id)),
             sinks: failing(|k| matches!(k, ObjectKind::Sink(_)), &|id| self.sink_status(id)),
+            broken: failing(|k| matches!(k, ObjectKind::MaterializedView(_) | ObjectKind::Index(_)), &|id| {
+                self.broken_status(id).unwrap_or_default()
+            }),
         }
     }
 }
