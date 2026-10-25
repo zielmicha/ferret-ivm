@@ -232,3 +232,24 @@ fn aggregates_of_outer_columns_are_rejected() {
     assert_eq!(rows(&h, "SELECT (SELECT count(*) FROM t2 WHERE t2.x = t1.a) FROM t1 ORDER BY id"), vec!["1", "2", "0", "2", "0"]);
     running.shutdown();
 }
+
+#[test]
+fn correlated_scalar_aggregates_keep_casts_of_outer_columns() {
+    let running = start("scalar-agg-casts");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    exec(&h, "CREATE TABLE ev (id int PRIMARY KEY, d date, s text)");
+    exec(&h, "INSERT INTO ev VALUES (1, '2024-01-01', '1'), (2, '2024-01-02', '2'), (3, '2024-01-02', '2')");
+    // the cast used to be stripped from t1.ts::date, so ts was compared with
+    // d as timestamps (0 matches for 10:00); t1.a::text failed to bind
+    let q = "SELECT id, (SELECT count(*) FROM ev WHERE ev.d = t1.ts::date), \
+             (SELECT count(*) FROM ev WHERE ev.s = t1.a::text), \
+             (SELECT max(ev.id) FROM ev WHERE ev.d = t1.d + 1) FROM t1 ORDER BY id";
+    let want = vec!["1|1|1|3", "2|1|2|", "3|2|0|", "4|0|2|3", "5|0|0|"];
+    assert_eq!(rows(&h, q), want);
+    exec(&h, &format!("CREATE MATERIALIZED VIEW cnt AS {}", q.replace(" ORDER BY id", "")));
+    assert_eq!(rows(&h, "SELECT * FROM cnt ORDER BY id"), want);
+    exec(&h, "INSERT INTO ev VALUES (4, '2024-01-03', '3')");
+    assert_eq!(rows(&h, "SELECT * FROM cnt ORDER BY id"), vec!["1|1|1|3", "2|1|2|4", "3|2|0|", "4|0|2|3", "5|1|1|"]);
+    running.shutdown();
+}

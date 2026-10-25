@@ -950,42 +950,43 @@ fn simple_scalar_agg(left: &Rel, right: &Rel) -> Result<Option<Rel>> {
     if base.has_outer_refs(1) || lifted.is_empty() {
         return Ok(None);
     }
-    // every lifted predicate must be `inner_expr = <outer column>`
-    let mut keys: Vec<(Expr, usize)> = Vec::new();
+    // every lifted predicate must be `inner_expr = outer_expr`, an equality
+    // between an expression over the subquery's rows and one over outer
+    // columns only; the subquery is grouped by the inner expressions and
+    // joined with the same equalities (operator and casts unchanged)
+    let mut keys: Vec<Expr> = Vec::new();
+    let mut eqs: Vec<(&crate::expr::Call, usize)> = Vec::new(); // (equality, argument that is the key)
+    let outer_only = |e: &Expr| e.has_outer() && e.column_set().is_empty() && !e.has_subquery();
     for p in &lifted {
         let Expr::Call(c) = p else { return Ok(None) };
         if crate::expr::func::func_def(c.func).name != "=" || c.args.len() != 2 {
             return Ok(None);
         }
-        let outer_col = |e: &Expr| -> Option<usize> {
-            match e {
-                Expr::Outer(1, col, _) => Some(*col),
-                Expr::Cast(inner, ..) => match &**inner {
-                    Expr::Outer(1, col, _) => Some(*col),
-                    _ => None,
-                },
-                _ => None,
-            }
-        };
         let (a, b) = (&c.args[0], &c.args[1]);
-        match (outer_col(a), outer_col(b)) {
-            (None, Some(oc)) if !a.has_outer() => keys.push((a.clone(), oc)),
-            (Some(oc), None) if !b.has_outer() => keys.push((b.clone(), oc)),
-            _ => return Ok(None),
-        }
+        let k = if outer_only(b) && !a.has_outer() {
+            0
+        } else if outer_only(a) && !b.has_outer() {
+            1
+        } else {
+            return Ok(None);
+        };
+        keys.push(c.args[k].clone());
+        eqs.push((c, k));
     }
     shift_outer_depth(&mut base, 1);
     let nb = base.arity();
     let nk = keys.len();
     let na = aggs.len();
-    let mapped = base.map(keys.iter().map(|(e, _)| e.clone()).collect());
+    let mapped = base.map(keys);
     let agg2 = Rel::Aggregate { input: Box::new(mapped), group: (nb..nb + nk).collect(), aggs: aggs.clone() };
     let nl = left.arity();
-    let lt = left.schema();
-    let a2t = agg2.schema();
     let mut on = Vec::new();
-    for (i, (_, oc)) in keys.iter().enumerate() {
-        on.push(sql_eq(Expr::Column(*oc), &lt[*oc].ty, Expr::Column(nl + i), &a2t[i].ty)?);
+    for (i, (c, k)) in eqs.iter().enumerate() {
+        let mut args = vec![Expr::Column(nl + i), to_join_cond(&c.args[1 - k], nl)];
+        if *k == 1 {
+            args.reverse();
+        }
+        on.push(Expr::Call(Box::new(crate::expr::Call { func: c.func, args, ret: c.ret.clone() })));
     }
     let j = Rel::Join { left: Box::new(left.clone()), right: Box::new(agg2), kind: JoinKind::Left, on };
     // aggregate values over the joined row (COUNT of no rows is 0)
