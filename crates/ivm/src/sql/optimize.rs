@@ -50,7 +50,9 @@ fn null_under(e: &Expr, lo: usize, hi: usize) -> bool {
         Expr::InList(x, _, _) => null_under(x, lo, hi),
         Expr::And(v) => v.iter().all(|x| null_under(x, lo, hi)),
         Expr::Or(v) => v.iter().all(|x| null_under(x, lo, hi)),
-        Expr::AnyAll { expr, .. } => null_under(expr, lo, hi),
+        // a NULL left operand still gives false (ANY) or true (ALL) when
+        // the array is empty, so only a NULL array guarantees NULL
+        Expr::AnyAll { array, .. } => null_under(array, lo, hi),
         _ => false,
     }
 }
