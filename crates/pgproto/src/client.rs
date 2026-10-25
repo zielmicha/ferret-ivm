@@ -425,6 +425,10 @@ impl SimpleQueryResult {
     }
 }
 
+/// The callback of [`Client::simple_query_rows`]: called with the columns of
+/// the statement and each of its data rows; an error ends the calls.
+pub type OnRow<'f> = dyn FnMut(&[Column], RowRef<'_>) -> std::result::Result<(), String> + 'f;
+
 /// A data row borrowed from the connection's buffer (see
 /// [`Client::simple_query_rows`]).
 pub struct RowRef<'a> {
@@ -949,7 +953,7 @@ impl Conn {
     fn simple_query_rows(
         &mut self,
         sql: &str,
-        on_row: &mut dyn FnMut(&[Column], RowRef<'_>) -> std::result::Result<(), String>,
+        on_row: &mut OnRow<'_>,
     ) -> Result<Vec<String>> {
         self.check()?;
         self.put_query(sql)?;
@@ -1413,7 +1417,7 @@ impl Client {
     pub fn simple_query_rows(
         &mut self,
         sql: &str,
-        on_row: &mut dyn FnMut(&[Column], RowRef<'_>) -> std::result::Result<(), String>,
+        on_row: &mut OnRow<'_>,
     ) -> Result<Vec<String>> {
         self.conn.simple_query_rows(sql, on_row)
     }

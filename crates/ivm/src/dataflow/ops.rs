@@ -313,10 +313,9 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
                 // every stored row and every row touched so far goes away
                 let all = g.scan_arr(env, *primary, ReadAt::Latest)?;
                 for (row, _) in all {
-                    let key = layout.encode_prefix_of(&row, pk);
-                    if !index.contains_key(&key) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = index.entry(layout.encode_prefix_of(&row, pk)) {
+                        e.insert(touched.len());
                         touched.push((Some(row), After::Absent));
-                        index.insert(key, touched.len() - 1);
                     }
                 }
                 for t in touched.iter_mut() {

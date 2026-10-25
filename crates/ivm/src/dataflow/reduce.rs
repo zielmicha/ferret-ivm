@@ -76,6 +76,9 @@ fn group_range(prefix: &[u8]) -> (Bound<&[u8]>, Option<Vec<u8>>) {
 
 type GroupResult = std::result::Result<Option<Row>, SqlError>;
 
+/// A group's summary and key values, as kept in the group cache.
+type GroupState = (Summary, Vec<Datum>);
+
 /// Compute the output row of one group (None if the group is empty), with
 /// the group's summary and key values for the cache.
 ///
@@ -89,7 +92,7 @@ fn compute_group(
     p: &ReducePlan,
     prefix: &[u8],
     exact_kv: Option<&[Datum]>,
-) -> Result<(GroupResult, Option<(Summary, Vec<Datum>)>)> {
+) -> Result<(GroupResult, Option<GroupState>)> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
     let tree = a.tree;

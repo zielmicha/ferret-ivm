@@ -258,7 +258,7 @@ impl<'a> ExecCtx<'a> {
         }
         let schema = &self.g.node(node).schema;
         // per arrangement: equality values on a key prefix, then bounds on the next key column
-        let mut best: Option<(usize, Vec<Datum>, Option<&Datum>, Option<(&Datum, bool)>)> = None;
+        let mut best: Option<IndexRange<'_>> = None;
         for &a in &self.g.node(node).arrangements {
             let arr = self.g.arr(a);
             // (an index built after the read's GSN lacks its history)
@@ -697,6 +697,10 @@ fn base_access(rel: &Rel) -> Option<BaseAccess> {
         _ => None,
     }
 }
+
+/// An arrangement with the values of the equalities on a prefix of its key,
+/// and the lower and upper bound (inclusive?) on the next key column.
+type IndexRange<'a> = (usize, Vec<Datum>, Option<&'a Datum>, Option<(&'a Datum, bool)>);
 
 /// A comparison of a column with a constant.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
