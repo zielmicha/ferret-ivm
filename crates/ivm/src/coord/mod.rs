@@ -119,6 +119,9 @@ pub(crate) struct AppState {
     /// GSN from which each tree's history is complete (by fingerprint).
     #[serde(default)]
     pub arr_since: Vec<(Vec<u8>, Gsn)>,
+    /// Replication slots of dropped sources still to be dropped.
+    #[serde(default)]
+    pub slot_drops: Vec<crate::source::SlotDrop>,
 }
 
 pub struct Engine {
@@ -313,6 +316,12 @@ pub fn start(cfg: Config) -> Result<Running> {
         ticks: VecDeque::new(),
     };
     engine.recover(recovered)?;
+    // Sinks start from the checkpoint's state and receive the replayed
+    // records like live ones: a target that is as far as the checkpoint
+    // (it is after a clean shutdown) resumes without being rewritten.
+    let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
+    engine.handle = Some(handle.clone());
+    engine.start_sinks(&handle)?;
     // replay the log after the checkpoint
     let records = crate::log::read_from(&cfg.data_dir.join("log"), engine.processed)?;
     if !records.is_empty() {
@@ -331,9 +340,9 @@ pub fn start(cfg: Config) -> Result<Running> {
     shared.durable_gsn.store(writer.last_gsn(), Ordering::Release);
     engine.replaying = false;
     engine.shared.processed_gsn.store(engine.processed, Ordering::Release);
-    let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
-    engine.handle = Some(handle.clone());
-    engine.start_sources_and_sinks(&handle)?;
+    engine.start_sources(&handle)?;
+    // slot drops left from before the restart (or replayed DROP SOURCEs)
+    crate::source::resume_slot_drops(&shared);
     let seq = Sequencer { writer, rx: srx, engine: etx.clone(), shared: shared.clone(), tick: cfg.tick };
     let t1 = std::thread::Builder::new().name("ivm-sequencer".into()).spawn(move || {
         if let Err(e) = seq.run() {
@@ -368,6 +377,7 @@ impl Engine {
         self.ticks.push_back((rec.gsn, app.clock));
         self.source_states = app.source_states.into_iter().collect();
         self.source_lsns = app.source_lsns.into_iter().collect();
+        self.shared.slot_drops.lock().extend(app.slot_drops);
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
         for obj in &objects {
             if let ObjectKind::Table(t) = &obj.kind {
@@ -498,6 +508,10 @@ impl Engine {
             s.stop();
         }
         for (_, s) in self.sink_handles.drain() {
+            // everything applied is delivered: the sink records it as its
+            // progress, matching the final checkpoint, so that the next
+            // start does not resynchronize it
+            s.progress(self.processed);
             s.stop();
         }
         let _ = self.seq.send(SeqMsg::Shutdown);
@@ -741,6 +755,7 @@ impl Engine {
             clock: self.clock,
             errors: self.graph.error_state(),
             arr_since: self.graph.arrangement_since().into_iter().collect(),
+            slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;
@@ -752,19 +767,27 @@ impl Engine {
         Ok(())
     }
 
-    fn start_sources_and_sinks(&mut self, handle: &EngineHandle) -> Result<()> {
+    fn start_sources(&mut self, handle: &EngineHandle) -> Result<()> {
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
         for obj in objects {
-            match &obj.kind {
-                ObjectKind::Source(def) => {
-                    let state = self.source_states.get(&obj.id).cloned().unwrap_or_default();
-                    let tables = self.source_tables(obj.id);
-                    let resume = self.source_lsns.get(&obj.id).copied().unwrap_or(0);
-                    let h = crate::source::start(obj.id, obj.name.clone(), def.clone(), tables, state, resume, handle.clone())?;
-                    self.source_handles.insert(obj.id, h);
-                }
-                ObjectKind::Sink(def) => self.start_sink(obj.id, &obj.name, def, handle)?,
-                _ => {}
+            if let ObjectKind::Source(def) = &obj.kind {
+                let state = self.source_states.get(&obj.id).cloned().unwrap_or_default();
+                let tables = self.source_tables(obj.id);
+                let resume = self.source_lsns.get(&obj.id).copied().unwrap_or(0);
+                let h = crate::source::start(obj.id, obj.name.clone(), def.clone(), tables, state, resume, handle.clone())?;
+                self.source_handles.insert(obj.id, h);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the sinks of the catalog (before the log is replayed; sinks
+    /// created by replayed records start when those are applied).
+    fn start_sinks(&mut self, handle: &EngineHandle) -> Result<()> {
+        let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
+        for obj in objects {
+            if let ObjectKind::Sink(def) = &obj.kind {
+                self.start_sink(obj.id, &obj.name, def, handle)?;
             }
         }
         Ok(())

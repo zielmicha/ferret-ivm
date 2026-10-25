@@ -68,9 +68,15 @@ pub fn statement_sql(stmt: &Statement) -> String {
 }
 
 /// A valid replication slot name unique to this source object, so that a
-/// re-created source never shares a slot that is still being dropped.
-fn default_slot_name(source: &str, id: ObjectId) -> String {
-    let suffix = format!("_{id}");
+/// re-created source never shares a slot that is still being dropped, and
+/// to the data directory (`instance`), so that engines with similar catalogs
+/// replicating the same database do not share one either. (Sources logged
+/// by versions without the instance id keep names without it.)
+fn default_slot_name(source: &str, id: ObjectId, instance: Option<&str>) -> String {
+    let suffix = match instance {
+        Some(i) => format!("_{i}_{id}"),
+        None => format!("_{id}"),
+    };
     let mut base: String = source
         .chars()
         .map(|c| c.to_ascii_lowercase())
@@ -82,6 +88,22 @@ fn default_slot_name(source: &str, id: ObjectId) -> String {
 
 fn parse_discovered(extra: &str) -> Result<Vec<DiscoveredTable>> {
     serde_json::from_str(extra).map_err(|e| SqlError::internal(format!("bad source discovery record: {e}")))
+}
+
+/// What a CREATE SOURCE record logs besides its statement: the discovered
+/// tables and the data directory's id for the default slot name. (Older
+/// records hold just the tables.)
+#[derive(Serialize, Deserialize)]
+struct SourceExtra {
+    tables: Vec<DiscoveredTable>,
+    instance: Option<String>,
+}
+
+fn parse_source_extra(extra: &str) -> Result<SourceExtra> {
+    match serde_json::from_str::<SourceExtra>(extra) {
+        Ok(x) => Ok(x),
+        Err(_) => Ok(SourceExtra { tables: parse_discovered(extra)?, instance: None }),
+    }
 }
 
 fn quote(s: &str) -> String {
@@ -112,7 +134,7 @@ impl Engine {
     }
 
     /// Validate a DDL statement against the current catalog and log it.
-    pub(crate) fn submit_ddl(&mut self, stmt: &Statement, extra: String, reply: Sender<Result<ExecResult>>) -> Result<Option<ExecResult>> {
+    pub(crate) fn submit_ddl(&mut self, stmt: &Statement, mut extra: String, reply: Sender<Result<ExecResult>>) -> Result<Option<ExecResult>> {
         // dry run: plan views to report errors before logging
         if let Statement::Sql(s) = stmt {
             match &**s {
@@ -147,7 +169,12 @@ impl Engine {
                 if self.catalog.by_name(name).is_some() {
                     sql_bail!(codes::DUPLICATE_OBJECT, "source \"{name}\" already exists");
                 }
-                self.check_source_tables(name, &parse_discovered(&extra)?)?;
+                let tables = parse_discovered(&extra)?;
+                self.check_source_tables(name, &tables)?;
+                // the data directory's id goes into the record, so that
+                // replay names the slot the same way
+                let instance = self.catalog.instance_id.get_or_insert_with(|| format!("{:08x}", crate::source::random_u64() as u32)).clone();
+                extra = serde_json::to_string(&SourceExtra { tables, instance: Some(instance) }).map_err(|e| SqlError::internal(e.to_string()))?;
             }
             Statement::AlterSourceRefresh { name } => {
                 let Some(src) = self.catalog.by_name(name) else {
@@ -229,10 +256,15 @@ impl Engine {
                     sql_bail!(codes::DUPLICATE_OBJECT, "source \"{name}\" already exists");
                 }
                 // validate everything before touching the catalog
-                let discovered = parse_discovered(extra)?;
+                let SourceExtra { tables: discovered, instance } = parse_source_extra(extra)?;
                 self.check_source_tables(&name, &discovered)?;
+                if self.catalog.instance_id.is_none() {
+                    self.catalog.instance_id = instance.clone();
+                }
                 let id = self.catalog.alloc_id();
-                let slot = slot.unwrap_or_else(|| default_slot_name(&name, id));
+                let slot = slot.unwrap_or_else(|| default_slot_name(&name, id, instance.as_deref()));
+                // a dropped source's slot by the same name is this source's now
+                crate::source::cancel_slot_drop(&self.shared, &slot);
                 let def = SourceDef { conninfo, publication, slot, tables };
                 self.catalog.insert(CatalogObject {
                     id,
@@ -302,9 +334,8 @@ impl Engine {
                     created_gsn: gsn,
                     create_sql: sql.to_string(),
                 });
-                if !self.replaying
-                    && let Some(h) = self.handle.clone()
-                {
+                // (also while replaying: sinks receive replayed records)
+                if let Some(h) = self.handle.clone() {
                     self.start_sink(id, &name, &def, &h)?;
                 }
                 Ok(ExecResult::Command { tag: "CREATE SINK".into() })
@@ -833,9 +864,9 @@ impl Engine {
                 if let Some(h) = self.source_handles.remove(&id) {
                     h.stop();
                 }
-                if !self.replaying {
-                    crate::source::drop_slot_async(def.conninfo.clone(), def.slot.clone());
-                }
+                // recorded also when replaying: the drop may not have
+                // succeeded before the restart (it is retried after it)
+                crate::source::drop_slot_async(&self.shared, def.conninfo.clone(), def.slot.clone(), !self.replaying);
                 self.source_states.remove(&id);
                 // a dropped source no longer holds back reads waiting for an LSN
                 self.source_lsns.remove(&id);
@@ -1083,4 +1114,33 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
         }
     }
     Ok(TableDef { columns, pk, source: None, upstream: None, version: 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_slot_names() {
+        assert_eq!(default_slot_name("pg", 1000, Some("3f9a1c2e")), "ivm_pg_3f9a1c2e_1000");
+        // sources logged by older versions keep their names
+        assert_eq!(default_slot_name("Second-Src", 1011, None), "ivm_second_src_1011");
+        let long = default_slot_name(&"x".repeat(100), 1000, Some("3f9a1c2e"));
+        assert_eq!(long.len(), 63);
+        assert!(long.ends_with("_3f9a1c2e_1000"), "{long}");
+    }
+
+    /// CREATE SOURCE records carry the data directory's id; older ones are
+    /// just the discovered tables.
+    #[test]
+    fn source_extra_formats() {
+        let t = DiscoveredTable { schema: "public".into(), name: "t".into(), columns: vec![], pk: vec![], replica_identity_full: true };
+        let old = serde_json::to_string(&vec![t.clone()]).unwrap();
+        let x = parse_source_extra(&old).unwrap();
+        assert_eq!((x.tables.len(), x.instance), (1, None));
+        let new = serde_json::to_string(&SourceExtra { tables: vec![t], instance: Some("ab".into()) }).unwrap();
+        let x = parse_source_extra(&new).unwrap();
+        assert_eq!((x.tables.len(), x.instance.as_deref()), (1, Some("ab")));
+        assert!(parse_source_extra("{").is_err());
+    }
 }

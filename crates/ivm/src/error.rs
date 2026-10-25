@@ -103,6 +103,7 @@ pub mod codes {
     pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
     pub const DIVISION_BY_ZERO: &str = "22012";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
+    pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
     pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
     pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
