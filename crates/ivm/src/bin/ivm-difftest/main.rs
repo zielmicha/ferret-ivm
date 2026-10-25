@@ -289,13 +289,12 @@ fn main() {
             continue; // invalid in PostgreSQL too
         }
         let name = format!("v{}", views.len());
+        if verbose {
+            // (before creating it: a view whose hydration hangs is the last one printed)
+            println!("{name}: {q}");
+        }
         match ivm.execute(&format!("CREATE MATERIALIZED VIEW {name} AS {q}")) {
-            Ok(_) => {
-                if verbose {
-                    println!("{name}: {q}");
-                }
-                views.push((name, q))
-            }
+            Ok(_) => views.push((name, q)),
             Err(e) => {
                 unsupported += 1;
                 println!("unsupported: {} :: {q}", e.message);
@@ -312,11 +311,11 @@ fn main() {
             continue;
         }
         let name = format!("vv{k}");
+        if verbose {
+            println!("{name}: {ivm_q}");
+        }
         match ivm.execute(&format!("CREATE MATERIALIZED VIEW {name} AS {ivm_q}")) {
             Ok(_) => {
-                if verbose {
-                    println!("{name}: {ivm_q}");
-                }
                 reads.insert(name.clone(), src_name.clone());
                 views.push((name, q))
             }
