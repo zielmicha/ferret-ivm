@@ -748,6 +748,20 @@ impl Harness {
                     _ => [&(garbage.len() as u32).to_le_bytes()[..], &[1, 2, 3, 4], &garbage].concat(),
                 };
                 append(&self.dir.join("MANIFEST"), &tail);
+                if !self.ckpt.durable {
+                    // No checkpoint was ever committed, so the manifest holds
+                    // nothing but the torn record: a manifest with contents
+                    // and no valid record is refused, every file left as it
+                    // was. The documented remedy for a crash during the first
+                    // checkpoint is to remove the store and rebuild it from
+                    // the input log, which recover() below does.
+                    self.event("crash: torn first manifest record");
+                    let before = std::fs::read(self.dir.join("MANIFEST")).unwrap();
+                    let err = Env::open(&self.dir, self.opts.clone()).err().expect("a manifest without a valid record is refused");
+                    assert_eq!(err.code, crate::error::codes::DATA_CORRUPTED, "{}", err.message);
+                    assert_eq!(std::fs::read(self.dir.join("MANIFEST")).unwrap(), before, "the refused manifest was modified");
+                    std::fs::remove_dir_all(&self.dir).unwrap();
+                }
             }
             2 => {
                 self.event("crash: segment garbage");
