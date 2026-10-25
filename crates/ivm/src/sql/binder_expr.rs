@@ -162,6 +162,19 @@ pub(crate) fn reg_kind(dt: &ast::DataType) -> Option<String> {
     }
 }
 
+/// A reg* cast (`x::regclass`, `CAST(x AS regtype)`, ...): its kind and
+/// the cast expression.
+fn reg_cast(e: &ast::Expr) -> Option<(String, &ast::Expr)> {
+    let mut e = e;
+    while let ast::Expr::Nested(inner) = e {
+        e = inner;
+    }
+    match e {
+        ast::Expr::Cast { expr, data_type, .. } => reg_kind(data_type).map(|k| (k, &**expr)),
+        _ => None,
+    }
+}
+
 fn binop_name(op: &ast::BinaryOperator) -> Option<&'static str> {
     use ast::BinaryOperator as B;
     Some(match op {
@@ -438,7 +451,12 @@ impl<'a> Binder<'a> {
             }
             E::IsDistinctFrom(a, b) | E::IsNotDistinctFrom(a, b) => {
                 let negated = matches!(e, E::IsNotDistinctFrom(..));
-                let (x, y) = (self.bind_expr(a, ctx)?, self.bind_expr(b, ctx)?);
+                let (x, y) = if reg_cast(a).is_some() || reg_cast(b).is_some() {
+                    // reg* values compare as OIDs
+                    (self.bind_reg_operand(a, None, ctx)?, self.bind_reg_operand(b, None, ctx)?)
+                } else {
+                    (self.bind_expr(a, ctx)?, self.bind_expr(b, ctx)?)
+                };
                 let (xt, yt) = (self.ty_of(&x, ctx), self.ty_of(&y, ctx));
                 // validate comparability through "="
                 let res = resolve("=", &[xt.clone(), yt.clone()])?;
@@ -475,11 +493,32 @@ impl<'a> Binder<'a> {
                 Ok(if *negated { Expr::Not(Box::new(any)) } else { any })
             }
             E::InList { expr, list, negated } => {
-                let x = self.bind_expr(expr, ctx)?;
-                let mut items = Vec::with_capacity(list.len());
-                for i in list {
-                    items.push(self.bind_expr(i, ctx)?);
-                }
+                let reg = std::iter::once(&**expr).chain(list.iter()).find_map(reg_cast).map(|(k, _)| k);
+                let (x, items) = match &reg {
+                    Some(kind) => {
+                        // reg* values compare as OIDs; when every other item
+                        // is a reg* value or an untyped literal, the common
+                        // type is the reg* type, which reads the literals as
+                        // names (else it is oid)
+                        let is_literal = |e: &ast::Expr| matches!(e, E::Value(v) if matches!(v.value, ast::Value::SingleQuotedString(_)));
+                        let all_reg = std::iter::once(&**expr).chain(list.iter()).all(|e| reg_cast(e).is_some() || is_literal(e));
+                        let names = all_reg.then_some(kind.as_str());
+                        let x = self.bind_reg_operand(expr, names, ctx)?;
+                        let mut items = Vec::with_capacity(list.len());
+                        for i in list {
+                            items.push(self.bind_reg_operand(i, names, ctx)?);
+                        }
+                        (x, items)
+                    }
+                    None => {
+                        let x = self.bind_expr(expr, ctx)?;
+                        let mut items = Vec::with_capacity(list.len());
+                        for i in list {
+                            items.push(self.bind_expr(i, ctx)?);
+                        }
+                        (x, items)
+                    }
+                };
                 let mut types = vec![self.ty_of(&x, ctx)];
                 types.extend(items.iter().map(|i| self.ty_of(i, ctx)));
                 let t = common_type(&types, "IN")?;
@@ -1099,6 +1138,14 @@ impl<'a> Binder<'a> {
     /// `CASE oid WHEN o1 THEN 'text1' ... END` over a catalog mapping; with
     /// `keep`, unknown OIDs print as numbers (as reg* types do).
     fn oid_lookup(&self, x: Expr, kind: &str, keep: bool) -> Expr {
+        // (types and schemas are fixed; relations and definitions are not)
+        match kind {
+            "regclass" => self.note_catalog_read("a cast to regclass"),
+            "viewdef" => self.note_catalog_read("function pg_get_viewdef()"),
+            "indexdef" => self.note_catalog_read("function pg_get_indexdef()"),
+            "constraintdef" => self.note_catalog_read("function pg_get_constraintdef()"),
+            _ => {}
+        }
         let whens: Vec<(Expr, Expr)> = self
             .catalog
             .definitions(kind)
@@ -1118,6 +1165,9 @@ impl<'a> Binder<'a> {
     /// The OID named by the input of a reg* type (regclassin etc.): a
     /// possibly schema-qualified, possibly quoted name.
     fn reg_name_oid(&self, kind: &str, input: &str) -> Result<u32> {
+        if kind == "regclass" {
+            self.note_catalog_read("a cast to regclass");
+        }
         let defs = self.catalog.definitions(kind);
         let find = |n: &str| defs.iter().find(|(_, d)| d == n).map(|(o, _)| *o);
         if kind == "regtype" {
@@ -1163,6 +1213,30 @@ impl<'a> Binder<'a> {
             "regnamespace" => SqlError::new("3F000", format!("schema \"{name}\" does not exist")),
             _ => SqlError::new(codes::UNDEFINED_TABLE, format!("relation \"{input}\" does not exist")),
         })
+    }
+
+    /// An operand of a comparison involving a reg* value: a reg* cast binds
+    /// as the OID (not the name it prints as), and with `names` of a reg*
+    /// type, an untyped string literal is read as that type's input (as
+    /// PostgreSQL does when the comparison's common type is the reg* type);
+    /// anything else binds as usual.
+    fn bind_reg_operand(&mut self, e: &ast::Expr, names: Option<&str>, ctx: &Ctx) -> Result<Expr> {
+        if let Some((kind, inner)) = reg_cast(e) {
+            let x = self.bind_expr(inner, ctx)?;
+            if let Expr::Literal(Datum::Text(name), SqlType::Unknown | SqlType::Text) = &x
+                && name.trim().parse::<i64>().is_err()
+            {
+                return Ok(Expr::Literal(Datum::Oid(self.reg_name_oid(&kind, name)?), SqlType::Oid));
+            }
+            return self.explicit_cast(x, &SqlType::Oid, -1, ctx);
+        }
+        let x = self.bind_expr(e, ctx)?;
+        if let (Some(kind), Expr::Literal(Datum::Text(name), SqlType::Unknown)) = (names, &x)
+            && name.trim().parse::<i64>().is_err()
+        {
+            return Ok(Expr::Literal(Datum::Oid(self.reg_name_oid(kind, name)?), SqlType::Oid));
+        }
+        Ok(x)
     }
 
     /// (start, end|length) OVERLAPS (start, end|length).
@@ -1276,6 +1350,15 @@ impl<'a> Binder<'a> {
                 let r = self.bind_expr(right, ctx)?;
                 let (lt, rt) = (self.ty_of(&l, ctx), self.ty_of(&r, ctx));
                 self.make_binary(&name, l, lt, r, rt)
+            }
+            B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq if reg_cast(left).is_some() || reg_cast(right).is_some() => {
+                // reg* values compare as the OIDs they are (an OID cast to a
+                // reg* type is otherwise its name, as text)
+                let name = binop_name(op).unwrap();
+                let l = self.bind_reg_operand(left, None, ctx)?;
+                let r = self.bind_reg_operand(right, None, ctx)?;
+                let (lt, rt) = (self.ty_of(&l, ctx), self.ty_of(&r, ctx));
+                self.make_binary(name, l, lt, r, rt)
             }
             _ => {
                 let name = binop_name(op).ok_or_else(|| SqlError::unsupported(format!("operator {op} is not supported")))?;

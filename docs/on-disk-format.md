@@ -233,9 +233,11 @@ table 1000, `Delete`, key row with one value, int4 4.
 the table `ObjectId`, the new columns as a JSON array of `Column` (key
 columns `NOT NULL`), and the new key as column indexes (the replica
 identity's columns, as for `pk` above). Applying it also resets the table's
-entry in the source's stored state to `{"done": false, "boundary": null,
-"truncate": false}`, so that the table is copied again even if the engine
-restarts before the source logs progress.
+entry in the source's stored state to `{"done": false, "boundary": null}`,
+keeping its `truncate` flag (which the source's `Progress` record logged just
+before sets after a key change), so that the table is copied again, from an
+empty table after a key change, even if the engine restarts before the
+copy starts.
 
 **Tick** — `micros` is the wall clock in microseconds since the Unix epoch.
 The engine converts it to the PostgreSQL epoch (subtracting
@@ -922,6 +924,7 @@ Consequences of code changes for an existing data directory:
 | semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
 | planner or lowering changes that produce different plans for the same SQL | as for fingerprint changes: the views are rebuilt |
 | catalog SQL that no longer binds (removed syntax or functions, stricter checks) | the view (and what reads it) is marked broken at start-up: not maintained, reads of it fail with the reason; drop it or repair it with `CREATE OR REPLACE` ([Operations](user-guide/operations.md#recovery)). Stored view definitions are planned leniently: a parameter placeholder (`$1`) in a definition logged by an older version binds as NULL instead of failing |
+| stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
 Data directories written by earlier versions of the engine are compatible:
 the formats have only gained fields with defaults. New functions (registered

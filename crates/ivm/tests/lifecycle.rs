@@ -163,6 +163,42 @@ fn subscription_lifecycle() {
     e.shutdown();
 }
 
+/// A subscription to a query has a dataflow built on the current versions
+/// of the materialized views it reads: when one of them (directly, through
+/// a virtual view or through another materialized view) is replaced, the
+/// subscription ends. It used to go on with the view's old definition.
+/// A subscription to the view itself follows the replacement.
+#[test]
+fn query_subscriptions_end_when_a_view_they_read_is_replaced() {
+    let e = Engine::start("query-sub-replaced");
+    e.exec("CREATE TABLE t (id int PRIMARY KEY, x int)");
+    e.exec("INSERT INTO t VALUES (1, 1), (2, 2)");
+    e.exec("CREATE MATERIALIZED VIEW m AS SELECT id, x FROM t WHERE x > 0");
+    e.exec("CREATE MATERIALIZED VIEW m2 AS SELECT count(*) AS n FROM m");
+    e.exec("CREATE VIEW vm AS SELECT id FROM m");
+    let subs: Vec<_> = [
+        "SUBSCRIBE TO (SELECT id FROM m WHERE id < 10)",
+        "SUBSCRIBE TO (SELECT count(*) FROM vm)",
+        "SUBSCRIBE TO (SELECT n + 0 FROM m2)",
+        "SUBSCRIBE TO m",
+    ]
+    .into_iter()
+    .map(|sql| subscribe(&e, sql))
+    .collect();
+    e.exec("CREATE OR REPLACE MATERIALIZED VIEW m AS SELECT id, x FROM t WHERE x > 1");
+    for (i, rx) in subs[..3].iter().enumerate() {
+        let evs = events_until(rx, |ev| ev.starts_with("error"));
+        assert_eq!(evs.last().map(|s| s.as_str()), Some("error: materialized view \"m\" was replaced"), "subscription {i}: {evs:?}");
+    }
+    e.exec("INSERT INTO t VALUES (3, 3)");
+    assert_eq!(events_until(&subs[3], |ev| ev == "1:3|3"), ["1:1|1", "1:2|2", "-1:1|1", "1:3|3"]);
+    // a new subscription reads the new version
+    let rx = subscribe(&e, "SUBSCRIBE TO (SELECT id FROM m WHERE id < 10)");
+    e.exec("INSERT INTO t VALUES (4, 0), (5, 5)");
+    assert_eq!(events_until(&rx, |ev| ev == "1:5"), ["1:2", "1:3", "1:5"]);
+    e.shutdown();
+}
+
 /// A server that accepts connections and never answers: a sink or source
 /// connecting to it waits in its connection attempt (no connect_timeout).
 fn silent_server() -> u16 {

@@ -187,18 +187,59 @@ fn views_invalidated_upstream_are_dropped() {
     ivm.exec("CREATE MATERIALIZED VIEW vv AS SELECT count(*) FROM v");
     ivm.exec("CREATE INDEX vb ON v (b)");
     ivm.exec("CREATE MATERIALIZED VIEW ok AS SELECT id, a FROM t");
+    // virtual views over the view go with it (they used to stay, and their
+    // reads failed with `relation "v" does not exist`); those over others stay
+    ivm.exec("CREATE VIEW over_v AS SELECT id, b FROM v");
+    ivm.exec("CREATE VIEW over_over_v AS SELECT count(*) FROM over_v");
+    ivm.exec("CREATE MATERIALIZED VIEW m_over_v AS SELECT id FROM over_v");
+    ivm.exec("CREATE VIEW over_ok AS SELECT id FROM ok");
     up.exec("ALTER TABLE t DROP COLUMN b");
     up.exec("INSERT INTO t VALUES (2, 2)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), ["1|1", "2|2"]);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM ok ORDER BY id"), ["1|1", "2|2"]);
-    for gone in ["v", "vv"] {
-        assert!(ivm.client.query(&format!("SELECT * FROM {gone}")).is_err(), "{gone} should be gone");
+    for gone in ["v", "vv", "over_v", "over_over_v", "m_over_v"] {
+        let err = ivm.client.query(&format!("SELECT * FROM {gone}")).expect_err(gone);
+        assert_eq!(err.message, format!("relation \"{gone}\" does not exist"));
     }
+    let views: Vec<String> = ivm.rows("SHOW VIEWS").into_iter().map(|r| r.split('|').next().unwrap().to_string()).collect();
+    assert_eq!(views, ["ok", "over_ok"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM over_ok ORDER BY id"), ["1", "2"]);
     assert!(ivm.rows("SHOW INDEXES").is_empty());
     ivm.shutdown();
     let mut ivm = Ivm::start(&dir);
     up.exec("INSERT INTO t VALUES (3, 3)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM ok ORDER BY id"), ["1|1", "2|2", "3|3"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A subscription to a query over a materialized view ends when an
+/// upstream schema change of a table under the view re-plans the view: it
+/// used to stay open on the view's old version, which receives no more
+/// changes (it went on reporting progress). The view itself follows.
+#[test]
+fn query_subscriptions_end_when_a_table_under_a_view_changes() {
+    use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
+    let (mut up, mut ivm, dir) = setup("sub-under-view", &["CREATE TABLE t (id int PRIMARY KEY, a int)", "INSERT INTO t VALUES (1, 1)"]);
+    let _ = caught_up(&mut ivm, &mut up, "SELECT * FROM t");
+    ivm.exec("CREATE MATERIALIZED VIEW m AS SELECT id, a FROM t");
+    let h = ivm.running.as_ref().unwrap().handle.clone();
+    let stmt = ivm::sql::parse_statement("SUBSCRIBE TO (SELECT id, a FROM m) WITH (PROGRESS)").unwrap();
+    let ExecResult::Subscribe { rx, .. } = h.execute(stmt, vec![], SessionVars::default(), String::new()).unwrap() else {
+        panic!("expected a subscription")
+    };
+    up.exec("ALTER TABLE t ADD COLUMN b int");
+    up.exec("INSERT INTO t VALUES (2, 2, 2)");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM m ORDER BY id"), ["1|1", "2|2"]);
+    let t0 = Instant::now();
+    let error = loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(SubEvent::Error(e)) => break Some(e.message),
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) if t0.elapsed() < Duration::from_secs(10) => {}
+            _ => break None,
+        }
+    };
+    assert_eq!(error.as_deref(), Some("table \"t\" changed its columns upstream"));
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -421,6 +462,62 @@ fn replica_identity_and_key_changes_are_detected() {
     up.exec("DELETE FROM m WHERE a = 5");
     up.exec("INSERT INTO x VALUES (6, 6)");
     all(&mut ivm, &mut up);
+}
+
+/// After a key change the re-snapshot starts by truncating the table, as
+/// deletes decoded with the old key could not be applied. The truncate is
+/// due when the table's first chunk starts, which can be long after the
+/// schema record: here the copy of another table (with a lower id, so it
+/// goes first) waits for a transaction that is decoded but stays invisible
+/// (it waits for a synchronous standby that never comes). The engine is
+/// restarted meanwhile. Applying the schema record used to reset the logged
+/// snapshot state without the truncate flag, so the restarted source copied
+/// the table over its old rows and a row deleted by the old key stayed.
+#[test]
+fn key_change_truncate_survives_a_restart() {
+    let mut up = Upstream::start_with(&["synchronous_standby_names = 'nobody'", "synchronous_commit = local"]);
+    up.exec("CREATE TABLE a (id int PRIMARY KEY, v int)");
+    up.exec("INSERT INTO a SELECT g, g FROM generate_series(1, 10) g");
+    up.exec("CREATE TABLE c (id int PRIMARY KEY)");
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, u int NOT NULL, x int)");
+    up.exec("INSERT INTO t SELECT g, -g, g FROM generate_series(1, 10) g");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("key-change-restart");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    for q in ["SELECT * FROM a ORDER BY id", "SELECT * FROM t ORDER BY id"] {
+        assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    }
+    // committed, decoded, but invisible while it waits for the standby (it
+    // keeps its locks meanwhile, hence a table of its own)
+    let mut writer = connect(&up.conninfo);
+    let pid = writer.query("SELECT pg_backend_pid()").unwrap().rows[0][0].clone().unwrap();
+    writer.simple_query("SET synchronous_commit = on").unwrap();
+    let blocked = std::thread::spawn(move || writer.simple_query("INSERT INTO c VALUES (100)").map(|_| ()));
+    eventually("the insert to wait for the standby", || {
+        up.rows(&format!("SELECT wait_event FROM pg_stat_activity WHERE pid = {pid}")) == ["SyncRep"]
+    });
+    // a changes shape: its copy (first, by id) waits for the invisible
+    // transaction. t's key changes after a delete by the old key, so its
+    // copy must start with a truncate. c's row makes the commit logged.
+    up.exec(
+        "BEGIN; ALTER TABLE a ADD COLUMN w int; UPDATE a SET w = 1 WHERE id = 2; DELETE FROM t WHERE id = 1; \
+         ALTER TABLE t DROP CONSTRAINT t_pkey, ADD PRIMARY KEY (u); INSERT INTO t VALUES (11, -11, 11); \
+         INSERT INTO c VALUES (1); COMMIT",
+    );
+    ivm.exec("SET read_mode = latest");
+    eventually("the transaction to be applied", || ivm.rows("SELECT id FROM c WHERE id = 1") == ["1"]);
+    // the truncate has not happened yet: the deleted row is still there
+    assert_eq!(ivm.rows("SELECT id, u FROM t WHERE id = 1"), ["1|-1"]);
+    ivm.shutdown();
+    up.exec(&format!("SELECT pg_cancel_backend({pid})"));
+    blocked.join().unwrap().expect("the insert commits");
+    let mut ivm = Ivm::start(&dir);
+    for q in ["SELECT * FROM t ORDER BY u", "SELECT * FROM a ORDER BY id", "SELECT * FROM c ORDER BY id"] {
+        assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q), "{q}");
+    }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A table the source cannot read (here: no SELECT privilege) does not stop
@@ -903,6 +1000,98 @@ fn sink_keeps_changes_while_its_target_is_unreachable() {
     eventually("sink", || {
         later.query("SELECT count(*) FROM v_copy").map(|r| r.rows[0][0].clone()).ok().flatten() == Some("6".to_string())
     });
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch that the target rejects on a working connection (here: a CHECK
+/// constraint of the target table) is retried with a growing delay, and the
+/// sink's status shows the error until a batch succeeds. It used to be
+/// retried about every 100 ms, the status flipping back to `running` after
+/// every reconnect.
+#[test]
+fn rejected_sink_batches_back_off_and_keep_the_error() {
+    let mut up = Upstream::start();
+    // every attempt to insert into the target counts (sequences are not
+    // transactional, so rolled back attempts count too)
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int CHECK (v < 100))");
+    up.exec("CREATE SEQUENCE attempts");
+    up.exec(
+        "CREATE FUNCTION count_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('attempts'); RETURN NEW; END $$",
+    );
+    up.exec("CREATE TRIGGER count_attempts BEFORE INSERT ON target FOR EACH ROW EXECUTE FUNCTION count_attempt()");
+    let dir = tmpdir("sink-rejected");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    eventually("the sink to run", || status(&mut ivm).starts_with("running"));
+    ivm.exec("INSERT INTO t VALUES (1, 100)");
+    eventually("the batch to fail", || status(&mut ivm).starts_with("error"));
+    let attempts = |up: &mut Upstream| -> i64 { up.rows("SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM attempts")[0].parse().unwrap() };
+    let first = attempts(&mut up);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        let s = status(&mut ivm);
+        assert!(s.starts_with("error: ") && s.contains("violates check constraint"), "status while the batch keeps failing: {s}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 100 ms, doubling: about five attempts in three seconds (there were 20-30)
+    let retried = attempts(&mut up) - first;
+    assert!((1..=8).contains(&retried), "{retried} attempts in 3 s");
+    // once the target accepts the batch, the sink runs again
+    up.exec("ALTER TABLE target DROP CONSTRAINT target_v_check");
+    eventually("the batch to land", || up.rows("SELECT id, v FROM target") == ["1|100"]);
+    eventually("the sink to run again", || status(&mut ivm).starts_with("running"));
+    ivm.exec("INSERT INTO t VALUES (2, 5)");
+    eventually("the next change", || up.rows("SELECT count(*) FROM target") == ["2"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink thread can outlive its sink: here its batch waits for a lock in
+/// the target while the sink is dropped and created again under the same
+/// name, and the new sink resynchronises the target. The old batch used to
+/// land afterwards anyway, leaving a row the relation no longer has, and to
+/// move the progress row back to its older GSN. Writers of a sink now take
+/// turns on the progress row, and one whose progress is outdated cannot
+/// write.
+#[test]
+fn a_sink_thread_outliving_its_sink_cannot_undo_the_new_one() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int)");
+    let dir = tmpdir("sink-zombie");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    let create = format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo);
+    ivm.exec(&create);
+    ivm.exec("INSERT INTO t VALUES (1, 1)");
+    eventually("the first row", || up.rows("SELECT id, v FROM target") == ["1|1"]);
+    // the sink's next batch waits for a transaction inserting the same key
+    let mut blocker = connect(&up.conninfo);
+    blocker.simple_query("BEGIN; INSERT INTO target VALUES (2, 999)").unwrap();
+    ivm.exec("INSERT INTO t VALUES (2, 2)");
+    eventually("the batch to wait", || {
+        up.rows("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND application_name <> 'psql'") == ["1"]
+    });
+    // meanwhile the sink is replaced by a new one with the same name, after
+    // the row is gone from the relation
+    ivm.exec("DROP SINK sk");
+    ivm.exec("DELETE FROM t WHERE id = 2");
+    ivm.exec("INSERT INTO t VALUES (3, 3)");
+    let gsn: i64 = ivm.rows("SHOW GSN")[0].parse().unwrap();
+    ivm.exec(&create);
+    std::thread::sleep(Duration::from_millis(500));
+    blocker.simple_query("ROLLBACK").unwrap();
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    eventually("the new sink to run", || status(&mut ivm).starts_with("running"));
+    // give the old thread's batch every chance to land
+    std::thread::sleep(Duration::from_millis(500));
+    ivm.exec("INSERT INTO t VALUES (4, 4)");
+    eventually("the next row", || up.rows("SELECT count(*) FROM target WHERE id = 4") == ["1"]);
+    assert_eq!(up.rows("SELECT id, v FROM target ORDER BY id"), ["1|1", "3|3", "4|4"]);
+    let progress: i64 = up.rows("SELECT gsn FROM ivm_sink_progress WHERE sink = 'sk'")[0].parse().unwrap();
+    assert!(progress > gsn, "progress {progress} is behind the new sink's snapshot (after GSN {gsn})");
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }

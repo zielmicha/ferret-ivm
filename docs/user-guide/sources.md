@@ -210,6 +210,12 @@ Column types are mapped by upstream type OID (`map_type` in
 
 Values arrive in text format and are parsed with the engine's input
 functions (which follow PostgreSQL 17). Nullability comes from `attnotnull`.
+A streamed change with a value that cannot be converted fails its table,
+not the source: the table's changes in that transaction are dropped and it
+is copied again from an empty table (logged as `a change to table s.t
+cannot be applied: <message>; copying the table again, streaming the other
+tables`); while the value stays upstream, the copy fails too and is retried
+like that of an [unreadable table](#tables-added-to-or-removed-from-the-publication).
 
 ### Slots
 
@@ -377,8 +383,10 @@ different key — the source:
    their columns by name (an index whose column is gone is dropped, one that
    cannot be built is marked broken; both are logged); subscriptions that
    read the table — `SUBSCRIBE TO` the table, a virtual view over it, or a
-   query naming it — end with `table "t" changed its columns upstream`
-   (SQLSTATE `55000`); sinks from the table restart with the new columns
+   query reading it directly or through views (also through materialized
+   views, whose new versions their dataflows would not follow) — end with
+   `table "t" changed its columns upstream` (SQLSTATE `55000`); sinks from
+   the table restart with the new columns
    ([Sinks](sinks.md#schema-changes-and-replacements)); and the materialized
    views reading the table are re-planned (below);
 5. the source re-snapshots the table from the beginning, which fills the new
@@ -394,15 +402,17 @@ and receive the difference; if they change (a `SELECT *` view, say), its
 subscriptions end with `materialized view "v" changed its columns` and its
 sinks restart with the new columns. A view that no longer plans — it uses
 a dropped or renamed column, or an expression no longer fits a new type —
-is **dropped**, together with its indexes, its sinks and the materialized
-views reading it (logged as `materialized view v is dropped: it is no
-longer valid after a change to object <id>: <reason>`). A view that is
-already [broken](operations.md#recovery) is built again if it plans now,
-and stays broken otherwise. Replaying the log repeats all of this
-identically. Virtual views are not re-planned: they stay in the catalog,
-are expanded when read, and fail then if they no longer plan (a virtual
-view over a dropped materialized view fails with `relation "m" does not
-exist`); drop or replace them.
+is **dropped**, together with its indexes, its sinks, the virtual views
+reading it (directly or through other virtual views, as `DROP ... CASCADE`
+would; logged as `view w is dropped: it reads v, which is no longer valid`)
+and the materialized views reading it (logged as `materialized view v is
+dropped: it is no longer valid after a change to object <id>: <reason>`).
+A view that is already [broken](operations.md#recovery) is built again if
+it plans now, and stays broken otherwise. Replaying the log repeats all of
+this identically. Other virtual views are not re-planned: they stay in the
+catalog, are expanded when read, and fail then if they no longer plan (one
+that uses a dropped column fails with `column "c" does not exist`); drop or
+replace them.
 
 The key comes from the replica identity the Relation message describes: with
 `DEFAULT` the primary key's columns (the table becomes a keyless multiset if
@@ -426,14 +436,6 @@ dropped (see above). To keep such a view with its indexes and sinks,
 replace it before the upstream change by a definition that does not need
 the column.
 
-Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
-
-- A `SUBSCRIBE (query)` whose query reads a materialized view over the
-  table keeps reading the view's old version, which no longer receives
-  changes: the subscription stays open (and with `PROGRESS` keeps reporting
-  progress) but delivers no more changes. Restart such subscriptions after
-  a schema change (`SUBSCRIBE TO` the view itself is not affected).
-
 ### Tables added to or removed from the publication
 
 Tables added to the publication later are not picked up automatically; use
@@ -443,8 +445,10 @@ is complete; the replicated table and its contents stay until the source is
 dropped.
 
 If the source has to copy a table whose chunk query fails — the table was
-dropped upstream, the role lacks `SELECT` on it, a value does not parse, or
-any other error that leaves the connection usable — that table alone is
+dropped upstream, the role lacks `SELECT` on it, a value does not parse (a
+streamed change with such a value makes the table be copied again, see
+[type mapping](#type-mapping)), or any other error that leaves the connection
+usable — that table alone is
 retried, after 1 s, doubling up to 60 s, while the source copies its other
 tables and keeps streaming. `SHOW SOURCES` shows
 `error: cannot copy table <schema>.<table>: <message>; retrying every <n>s,

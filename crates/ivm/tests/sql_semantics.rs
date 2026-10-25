@@ -528,6 +528,137 @@ fn reg_types_accept_names() {
     running.shutdown();
 }
 
+/// reg* values compare as the OIDs they are, also an OID cast to a reg*
+/// type (which otherwise is its name, as text, so that it prints as one),
+/// as in PostgreSQL. `oid::regclass = 't1'::regclass` used to fail with
+/// "operator does not exist: text = oid".
+#[test]
+fn reg_values_compare_as_oids() {
+    let running = start("regcompare");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    let classes = rows(&h, "SELECT count(*) FROM pg_class").remove(0);
+    for (sql, want) in [
+        ("SELECT c.relname FROM pg_class c WHERE c.oid::regclass = 't1'::regclass", vec!["t1"]),
+        ("SELECT c.relname FROM pg_class c WHERE 't1'::regclass = (c.oid)::regclass", vec!["t1"]),
+        ("SELECT c.relname FROM pg_class c WHERE CAST(c.oid AS regclass) IN ('t1', 't2'::regclass) ORDER BY 1", vec!["t1", "t2"]),
+        ("SELECT c.relname FROM pg_class c WHERE c.oid::regclass IN ('t1', 't2') ORDER BY 1", vec!["t1", "t2"]),
+        ("SELECT c.relname FROM pg_class c WHERE c.oid::regclass IS NOT DISTINCT FROM 't2'::regclass", vec!["t2"]),
+        ("SELECT count(*) FROM pg_class c WHERE c.oid::regclass <> 't1'::regclass AND relname IN ('t1', 't2')", vec!["1"]),
+        ("SELECT count(*) FROM pg_class c WHERE c.oid::regclass = c.oid", vec![classes.as_str()]),
+        ("SELECT a.attname FROM pg_attribute a WHERE a.attrelid::regclass = 't2'::regclass AND a.attnum = 2", vec!["x"]),
+        ("SELECT t.typname FROM pg_type t WHERE t.oid::regtype = 'integer'::regtype", vec!["int4"]),
+        ("SELECT n.nspname FROM pg_namespace n WHERE n.oid::regnamespace = 'public'::regnamespace", vec!["public"]),
+        // they still print as names
+        ("SELECT c.oid::regclass, c.oid::regclass::text, 'x' || c.oid::regclass FROM pg_class c WHERE relname = 't1'", vec!["t1|t1|xt1"]),
+    ] {
+        assert_eq!(rows(&h, sql), want, "{sql}");
+    }
+    // as in PostgreSQL, the other side of = is an oid: an untyped literal is
+    // read as one (in IN, with only reg* values and literals, as a name)
+    let err = try_rows(&h, "SELECT c.relname FROM pg_class c WHERE c.oid::regclass = 't1'").unwrap_err();
+    assert!(err.contains("invalid input syntax for type oid"), "{err}");
+    running.shutdown();
+}
+
+/// A NULL key in json_object_agg and jsonb_object_agg fails as in
+/// PostgreSQL 17, whose two aggregates word the error differently (and with
+/// different SQLSTATEs); both used to say "field name must not be null"
+/// with 22004. A materialized view gets the same error record.
+#[test]
+fn object_aggregates_reject_null_keys_as_postgresql() {
+    let running = start("object-agg-null");
+    let h = running.handle.clone();
+    let error = |sql: &str| -> (String, String) {
+        let stmt = ivm::sql::parse_statement(sql).unwrap();
+        let e = h.execute(stmt, vec![], SessionVars::default(), String::new()).expect_err(sql);
+        (e.code, e.message)
+    };
+    let json = ("22004".to_string(), "null value not allowed for object key".to_string());
+    let jsonb = ("22023".to_string(), "field name must not be null".to_string());
+    assert_eq!(error("SELECT json_object_agg(k, v) FROM (VALUES ('a', 1), (NULL, 2)) s(k, v)"), json);
+    assert_eq!(error("SELECT jsonb_object_agg(k, v) FROM (VALUES ('a', 1), (NULL, 2)) s(k, v)"), jsonb);
+    exec(&h, "CREATE TABLE kv (id int PRIMARY KEY, k text, v int)");
+    exec(&h, "INSERT INTO kv VALUES (1, 'a', 1), (2, NULL, 2)");
+    exec(&h, "CREATE MATERIALIZED VIEW j AS SELECT json_object_agg(k, v) AS o FROM kv");
+    exec(&h, "CREATE MATERIALIZED VIEW jb AS SELECT jsonb_object_agg(k, v) AS o FROM kv");
+    assert_eq!(error("SELECT * FROM j"), json);
+    assert_eq!(error("SELECT * FROM jb"), jsonb);
+    running.shutdown();
+}
+
+/// Interval type modifiers show as in PostgreSQL: format_type (psql's \d,
+/// SHOW COLUMNS) used to print every interval column as `interval`, and
+/// information_schema reported the raw modifier as its precision.
+#[test]
+fn interval_type_modifiers_are_shown() {
+    let running = start("interval-typmods");
+    let h = running.handle.clone();
+    exec(
+        &h,
+        "CREATE TABLE it (a interval(3), b interval day, c interval day to second(2), d interval, \
+         e interval year to month, f interval second(1), g interval minute to second)",
+    );
+    // (checked against PostgreSQL 17)
+    assert_eq!(
+        rows(&h, "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'it'::regclass AND attnum > 0 ORDER BY attnum"),
+        vec![
+            "a|2147418115|interval(3)",
+            "b|589823|interval day",
+            "c|470286338|interval day to second(2)",
+            "d|-1|interval",
+            "e|458751|interval year to month",
+            "f|268435457|interval second(1)",
+            "g|402718719|interval minute to second",
+        ]
+    );
+    assert_eq!(
+        rows(&h, "SELECT column_name, datetime_precision, interval_type, interval_precision FROM information_schema.columns WHERE table_name = 'it' ORDER BY ordinal_position"),
+        vec!["a|3||", "b|6|DAY|", "c|2|DAY TO SECOND(2)|", "d|6||", "e|6|YEAR TO MONTH|", "f|1|SECOND(1)|", "g|6|MINUTE TO SECOND|"]
+    );
+    assert_eq!(rows(&h, "SHOW COLUMNS FROM it")[2], "c|interval day to second(2)|true|false");
+    running.shutdown();
+}
+
+/// Maintained views cannot read the catalog: system relations, regclass
+/// casts and pg_get_viewdef() and the like are bound as constants from the
+/// catalog of the time. A materialized view over pg_class kept the catalog
+/// as it was when the view was created, and a restart, which plans the
+/// view again, changed its contents without any logged change.
+#[test]
+fn maintained_views_reject_catalog_reads() {
+    let running = start("catalog-reads");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    exec(&h, "INSERT INTO t VALUES (1)");
+    exec(&h, "CREATE VIEW catview AS SELECT relname FROM pg_class");
+    for (sql, what) in [
+        ("CREATE MATERIALIZED VIEW m AS SELECT relname FROM pg_class", "system relation \"pg_class\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT table_name FROM information_schema.tables", "system relation \"tables\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT name FROM ivm.objects", "system relation \"objects\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT * FROM catview", "system relation \"pg_class\""),
+        ("CREATE MATERIALIZED VIEW m AS SELECT id FROM t WHERE 't'::regclass::oid > 0", "a cast to regclass"),
+        ("CREATE MATERIALIZED VIEW m AS SELECT id::oid::regclass AS r FROM t", "a cast to regclass"),
+        ("CREATE MATERIALIZED VIEW m AS SELECT pg_get_viewdef(id::oid) AS d FROM t", "function pg_get_viewdef()"),
+        ("SUBSCRIBE (SELECT relname FROM pg_class)", "system relation \"pg_class\""),
+        ("SUBSCRIBE TO catview", "system relation \"pg_class\""),
+    ] {
+        let err = try_exec(&h, sql).unwrap_err();
+        assert_eq!(err, format!("{what} is not allowed in a materialized view"), "{sql}");
+    }
+    // constants that do not depend on the catalog are fine
+    exec(&h, "CREATE MATERIALIZED VIEW ok AS SELECT id, 'integer'::regtype::oid AS ty, 'public'::regnamespace::oid AS ns, version() AS v FROM t");
+    assert_eq!(rows(&h, "SELECT id, ty, ns FROM ok"), vec!["1|23|2200"]);
+    // virtual views and ad hoc queries read the catalog as it is
+    assert!(rows(&h, "SELECT relname FROM catview").contains(&"ok".to_string()));
+    // a replacement that would make a materialized view read it is refused
+    exec(&h, "CREATE VIEW v AS SELECT id FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM v");
+    let err = try_exec(&h, "CREATE OR REPLACE VIEW v AS SELECT oid::int AS id FROM pg_class").unwrap_err();
+    assert!(err.contains("materialized view \"mv\" would no longer be valid: system relation \"pg_class\""), "{err}");
+    running.shutdown();
+}
+
 #[test]
 fn current_setting_reports_server_settings() {
     let running = start("current-setting");
@@ -537,6 +668,31 @@ fn current_setting_reports_server_settings() {
         vec!["170000|UTC|ISO, MDY|"]
     );
     assert!(try_rows(&h, "SELECT current_setting('nope')").unwrap_err().contains("unrecognized configuration parameter"));
+    running.shutdown();
+}
+
+/// pg_backend_pid() is the server's process id, which changes when it
+/// restarts: like the other functions whose value depends on the process or
+/// the session, materialized views reject it. It counted as immutable, so a
+/// view stored the id, and rows computed before and after a restart
+/// differed.
+#[test]
+fn process_dependent_functions_are_rejected_in_maintained_views() {
+    let running = start("backend-pid");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    assert_eq!(rows(&h, "SELECT pg_backend_pid() = pg_backend_pid(), pg_backend_pid() > 0"), vec!["t|t"]);
+    for sql in [
+        "CREATE MATERIALIZED VIEW v AS SELECT pg_backend_pid() AS pid",
+        "CREATE MATERIALIZED VIEW v AS SELECT id FROM t WHERE id <> pg_backend_pid()",
+        "SUBSCRIBE (SELECT id, pg_backend_pid() FROM t)",
+    ] {
+        let err = try_exec(&h, sql).unwrap_err();
+        assert!(err.contains("function pg_backend_pid() is not allowed in a materialized view"), "{sql}: {err}");
+    }
+    // virtual views may use it
+    exec(&h, "CREATE VIEW vv AS SELECT pg_backend_pid() > 0 AS ok");
+    assert_eq!(rows(&h, "SELECT ok FROM vv"), vec!["t"]);
     running.shutdown();
 }
 

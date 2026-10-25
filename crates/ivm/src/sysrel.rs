@@ -851,6 +851,8 @@ fn information_schema(cat: &Catalog, name: &str) -> Option<Rel> {
                 ("numeric_precision", T::Int4),
                 ("numeric_scale", T::Int4),
                 ("datetime_precision", T::Int4),
+                ("interval_type", T::Text),
+                ("interval_precision", T::Int4),
                 ("udt_catalog", T::Name),
                 ("udt_schema", T::Name),
                 ("udt_name", T::Name),
@@ -886,8 +888,18 @@ fn information_schema(cat: &Catalog, name: &str) -> Option<Rel> {
                         _ => NULL,
                     };
                     let dt_prec = match &c.ty.ty {
-                        T::Time | T::Timestamp | T::TimestampTz | T::Interval => i4(if c.ty.typmod >= 0 { c.ty.typmod } else { 6 }),
+                        T::Time | T::Timestamp | T::TimestampTz => i4(if c.ty.typmod >= 0 { c.ty.typmod } else { 6 }),
+                        T::Interval => i4(typmod::interval_precision(c.ty.typmod).unwrap_or(6)),
                         T::Date => i4(0),
+                        _ => NULL,
+                    };
+                    // as PostgreSQL: the fields, with the precision of the
+                    // last one if given
+                    let interval_type = match (&c.ty.ty, typmod::interval_fields(c.ty.typmod)) {
+                        (T::Interval, Some(f)) => match typmod::interval_precision(c.ty.typmod) {
+                            Some(p) if f.ends_with("second") => text(&format!("{}({p})", f.to_uppercase())),
+                            _ => text(&f.to_uppercase()),
+                        },
                         _ => NULL,
                     };
                     r.push(vec![
@@ -903,6 +915,8 @@ fn information_schema(cat: &Catalog, name: &str) -> Option<Rel> {
                         prec,
                         scale,
                         dt_prec,
+                        interval_type,
+                        NULL,
                         text("ivm"),
                         text("pg_catalog"),
                         text(&udt),

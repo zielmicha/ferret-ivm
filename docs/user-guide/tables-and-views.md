@@ -229,8 +229,10 @@ Otherwise:
   expand — are re-planned at the same GSN, in dependency order, so that they
   read the new definition, as a restart would plan them.
 - A subscription to a query (`SUBSCRIBE (query)`) that reads the replaced
-  materialized view keeps its own dataflow, built over the old version
-  (see [Known problems](troubleshooting.md#known-problems)).
+  materialized view — directly, through virtual views or through other
+  materialized views — has a dataflow built over the old version: it ends
+  with `materialized view "x" was replaced` (SQLSTATE `55000`); subscribe
+  again to read the new one.
 - Replacing a [broken](operations.md#recovery) materialized view with a
   definition that plans repairs it.
 

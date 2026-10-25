@@ -35,7 +35,8 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 | arrays | `type[]`, `type[n]` | | of every type above; multi-dimensional (up to 6), with lower bounds |
 
 Type modifiers (`numeric(10,2)`, `varchar(20)`, `timestamp(3)`,
-`interval(2)`, `interval day to second`) are kept on columns and applied on
+`interval(2)`, `interval day to second`) are kept on columns (and shown by
+`format_type`, `SHOW COLUMNS` and psql's `\d` as in PostgreSQL) and applied on
 input and on casts, including interval field restrictions (`INTERVAL '1 day
 2 hours' DAY` and `'1 day 2 hours'::interval day` are `1 day`). The modifier
 of an array type applies to every element (`'{abc}'::varchar(2)[]` is
@@ -49,12 +50,18 @@ compares with `oid` columns; unknown names fail with PostgreSQL's errors
 (`relation "x" does not exist`). The system catalogs have PostgreSQL 17's
 fixed OIDs (`'pg_class'::regclass` is 1259). An OID cast to one of these
 types gives the object's name as `text` (an OID that names nothing gives the
-number), and a select-list item that is a `reg*` cast prints the name and is
-named after the type, so `SELECT 'users'::regclass` shows `users`. Because
-such a cast of an OID is `text`, `oid_col::regclass = 'users'::regclass`
-fails (`operator does not exist: text = oid`); compare `oid_col =
-'users'::regclass` instead. `regproc`, `regrole`, `regprocedure` and
-`regoper` are plain `oid`s: names cannot be cast to them.
+number), so that it prints, concatenates and casts to `text` as the name,
+and a select-list item that is a `reg*` cast prints the name and is named
+after the type, so `SELECT 'users'::regclass` shows `users`. In comparisons
+(`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`, `IN`) a `reg*`
+cast is the OID, as in PostgreSQL: `oid_col::regclass = 'users'::regclass`
+compares OIDs. As in PostgreSQL, an untyped literal on the other side of
+such a comparison is read as an OID (`oid_col::regclass = 'users'` fails
+with `invalid input syntax for type oid`), except in an `IN` list of only
+`reg*` values and literals, where it is a name. Unlike PostgreSQL,
+`ORDER BY` and `GROUP BY` of an OID cast to a `reg*` type use the name, not
+the OID. `regproc`, `regrole`, `regprocedure` and `regoper` are plain
+`oid`s: names cannot be cast to them.
 
 Not supported: `time with time zone`, `money`, `bit`/`varbit`, `inet`,
 `cidr`, `macaddr`, enums, domains, composite and record types, ranges and
@@ -81,7 +88,9 @@ floats, `numeric` as PostgreSQL's base-10000 format, date/time types as
 days or microseconds since 2000-01-01, `interval` as microseconds, days and
 months, `uuid` as 16 bytes, `jsonb` and `jsonpath` as a version byte `1`
 followed by text, arrays with PostgreSQL's array header, and text types as
-UTF-8. `SUBSCRIBE` rows are always text.
+UTF-8. `SUBSCRIBE` rows follow the requested result formats too (the
+`gsn` and `diff` columns as `bigint`, `progressed` as `boolean`); its `COPY`
+form is always text.
 
 ## Casts
 

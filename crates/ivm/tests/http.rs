@@ -157,6 +157,46 @@ fn ids(v: &Value) -> BTreeSet<u64> {
     v.as_array().unwrap().iter().map(|x| x["id"].as_u64().unwrap()).collect()
 }
 
+/// The catalog's dependencies are the relations a view names, as the binder
+/// resolves them (the rule DROP uses; relations read through another view
+/// are that view's dependencies). They used to be found textually: a
+/// column alias named like a table made an edge, a quoted name with
+/// capitals made none.
+#[test]
+fn catalog_dependencies_are_the_relations_views_name() {
+    let f = Fixture::new("deps", None);
+    f.exec("CREATE TABLE orders (id int PRIMARY KEY, amount int)");
+    f.exec("CREATE TABLE total (id int PRIMARY KEY)");
+    f.exec("CREATE TABLE \"Mixed\" (id int PRIMARY KEY)");
+    f.exec("CREATE VIEW v1 AS SELECT o.id AS total FROM orders o");
+    f.exec("CREATE VIEW v2 AS SELECT * FROM \"Mixed\"");
+    f.exec("CREATE VIEW v3 AS SELECT total FROM v1");
+    f.exec("CREATE MATERIALIZED VIEW m AS SELECT count(*) AS n FROM v3 JOIN v2 ON v2.id = v3.total");
+    f.exec("CREATE INDEX m_n ON m (n)");
+    let cat = f.json("/api/catalog");
+    let objects = cat["objects"].as_array().unwrap();
+    let id_of: HashMap<&str, u64> = objects.iter().map(|o| (o["name"].as_str().unwrap(), o["id"].as_u64().unwrap())).collect();
+    let name_of: HashMap<u64, &str> = id_of.iter().map(|(n, i)| (*i, *n)).collect();
+    let names = |o: &Value, key: &str| -> BTreeSet<String> {
+        o[key].as_array().unwrap().iter().map(|d| name_of[&d.as_u64().unwrap()].to_string()).collect()
+    };
+    let deps: HashMap<&str, (BTreeSet<String>, BTreeSet<String>)> =
+        objects.iter().map(|o| (o["name"].as_str().unwrap(), (names(o, "depends_on"), names(o, "dependents")))).collect();
+    let set = |v: &[&str]| -> BTreeSet<String> { v.iter().map(|s| s.to_string()).collect() };
+    assert_eq!(deps["v1"].0, set(&["orders"]));
+    assert_eq!(deps["v2"].0, set(&["Mixed"]));
+    assert_eq!(deps["v3"].0, set(&["v1"]));
+    assert_eq!(deps["m"].0, set(&["v2", "v3"]));
+    assert_eq!(deps["m_n"].0, set(&["m"]));
+    assert_eq!(deps["total"].1, set(&[]));
+    assert_eq!(deps["orders"].1, set(&["v1"]));
+    assert_eq!(deps["Mixed"].1, set(&["v2"]));
+    assert_eq!(deps["m"].1, set(&["m_n"]));
+    // the object page agrees
+    let obj = f.json("/api/objects/v1");
+    assert_eq!(names(&obj["object"], "depends_on"), set(&["orders"]));
+}
+
 #[test]
 fn snapshots_match_the_engine_state() {
     let f = Fixture::new("state", None);

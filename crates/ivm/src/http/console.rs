@@ -107,7 +107,7 @@ async fn run(st: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<QueryRes
         let msg = EngineMsg::Request(Request::Execute {
             stmt: Box::new(stmt),
             params: vec![],
-            vars: SessionVars { read_mode: read_mode.into(), interrupts: Some(interrupts.clone()) },
+            vars: SessionVars { read_mode: read_mode.into(), interrupts: Some(interrupts.clone()), ..Default::default() },
             extra: String::new(),
             reply: tx,
         });

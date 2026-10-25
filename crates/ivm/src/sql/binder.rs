@@ -44,6 +44,10 @@ pub struct BoundQuery {
     pub offset: u64,
     /// FETCH ... WITH TIES: rows tied with the last one by ORDER BY are kept.
     pub with_ties: bool,
+    /// A construct that the query reads the catalog with (a system
+    /// relation, a regclass cast, pg_get_viewdef(), ...): bound as constants
+    /// from the catalog of the time. Set by `plan_query`.
+    pub catalog_reads: Option<String>,
 }
 
 impl BoundQuery {
@@ -165,6 +169,9 @@ pub struct Binder<'a> {
     pub(crate) expr_depth: usize,
     /// WINDOW clause of the SELECT being bound.
     pub(crate) named_windows: Vec<ast::NamedWindowDefinition>,
+    /// The first construct bound as constants from the catalog (see
+    /// `BoundQuery::catalog_reads`).
+    pub(crate) catalog_reads: std::cell::RefCell<Option<String>>,
 }
 
 pub(crate) fn ident(i: &ast::Ident) -> String {
@@ -201,6 +208,15 @@ impl<'a> Binder<'a> {
             stored_definition: false,
             expr_depth: 0,
             named_windows: Vec::new(),
+            catalog_reads: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Note a construct bound as constants from the catalog.
+    pub(crate) fn note_catalog_read(&self, what: &str) {
+        let mut c = self.catalog_reads.borrow_mut();
+        if c.is_none() {
+            *c = Some(what.to_string());
         }
     }
 
@@ -427,7 +443,7 @@ impl<'a> Binder<'a> {
                     order.push(SortKey { col, spec });
                 }
                 rel = rel.map(extra);
-                Ok(BoundQuery { rel, names, visible, order, limit, offset, with_ties: false })
+                Ok(BoundQuery { rel, names, visible, order, limit, offset, with_ties: false, catalog_reads: None })
             }
         }
     }
@@ -1029,7 +1045,7 @@ impl<'a> Binder<'a> {
                 rel = Rel::TopK { input: Box::new(rel), group: distinct_on, order: order.clone(), limit: Some(1), offset: 0, with_ties: false };
             }
         }
-        Ok(BoundQuery { rel, names: names_all, visible, order, limit, offset, with_ties: false })
+        Ok(BoundQuery { rel, names: names_all, visible, order, limit, offset, with_ties: false, catalog_reads: None })
     }
 
     /// Group-by item: output ordinal, output alias (if not an input column), or expression.
@@ -1346,7 +1362,8 @@ impl<'a> Binder<'a> {
                 let types: Vec<ColumnType> = columns.iter().map(|c| c.ty.clone()).collect();
                 Ok((Rel::Get { id, name: oname, columns: types.clone(), keys }, Scope::from_table(&tname, &names, &types)))
             }
-            CatalogRelation::Constant { columns, rows, .. } => {
+            CatalogRelation::Constant { name, columns, rows } => {
+                self.note_catalog_read(&format!("system relation \"{name}\""));
                 let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
                 apply_alias_names(&mut names, &alias_cols, &tname)?;
                 let types: Vec<ColumnType> = columns.iter().map(|c| c.ty.clone()).collect();
@@ -1367,6 +1384,9 @@ impl<'a> Binder<'a> {
                 sub.next_rec_id = self.next_rec_id + 1000;
                 let bq = sub.bind_query(&stmt)?.resolve_unknowns(&mut sub)?;
                 self.next_rec_id = sub.next_rec_id;
+                if let Some(c) = sub.catalog_reads.take() {
+                    self.note_catalog_read(&c);
+                }
                 let rel = bq.into_rel();
                 let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
                 apply_alias_names(&mut names, &alias_cols, &tname)?;

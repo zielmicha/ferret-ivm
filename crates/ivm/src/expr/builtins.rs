@@ -730,10 +730,38 @@ fn null_text(_: &[Datum]) -> Result<Datum> {
 fn owner_name(_: &Datum) -> Result<Datum> {
     Ok(Datum::text("ivm"))
 }
-/// current_setting(name [, missing_ok]): the server's fixed settings (as
-/// reported by SHOW and the startup ParameterStatus messages).
+thread_local! {
+    /// The settings of the session whose statement this thread is running
+    /// (see `with_session_settings`).
+    static SESSION_SETTINGS: std::cell::RefCell<Option<Arc<std::collections::BTreeMap<String, String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the settings of the session whose statement it runs, which
+/// current_setting() reports before the server's fixed settings. (Only
+/// expressions evaluated within `f` see them: current_setting() is stable,
+/// so it is never folded at planning, and maintained views reject it.)
+pub fn with_session_settings<R>(settings: Arc<std::collections::BTreeMap<String, String>>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Arc<std::collections::BTreeMap<String, String>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            SESSION_SETTINGS.with(|s| *s.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(SESSION_SETTINGS.with(|s| s.replace(Some(settings))));
+    f()
+}
+
+/// current_setting(name [, missing_ok]): the session's settings (values set
+/// with SET, and those it started with: application_name, read_mode, ...),
+/// else the server's fixed settings (as reported by SHOW and the startup
+/// ParameterStatus messages).
 fn current_setting(args: &[Datum]) -> Result<Datum> {
     let name = s(&args[0]).to_ascii_lowercase();
+    if let Some(v) = SESSION_SETTINGS.with(|st| st.borrow().as_ref().and_then(|m| m.get(&name).cloned())) {
+        return Ok(txt(v));
+    }
     let v = match name.as_str() {
         "server_version" => "17.0",
         "server_version_num" => "170000",
@@ -1638,7 +1666,10 @@ pub fn register(b: &mut Builder) {
         b.last().volatility = Volatility::Stable;
         b.last().can_return_null = true;
     }
+    // the process id changes when the server restarts (stable, as in
+    // PostgreSQL: maintained views must not store it)
     b.fnn("pg_backend_pid", vec![], T::Int4, backend_pid);
+    b.last().volatility = Volatility::Stable;
     b.fnn("pg_is_in_recovery", vec![], T::Bool, always_false);
     {
         // GROUPING(...): replaced by the binder after aggregation

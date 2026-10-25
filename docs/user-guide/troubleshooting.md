@@ -60,11 +60,13 @@ errors:
   ([Slots](sources.md#slots)).
 - authentication or permission errors: fix the role; the source picks the
   change up on its next attempt.
-- `cannot copy table s.t: relation "s.t" does not exist` or
-  `... permission denied for table t`: the table still has to be copied but
-  cannot be read. The source retries it (up to every 60 s) and streams the
-  other tables meanwhile; fix the privilege, or, if the table was dropped,
-  drop and re-create the source
+- `cannot copy table s.t: relation "s.t" does not exist`,
+  `... permission denied for table t` or the error of a value that does not
+  parse (after a streamed change with such a value, the table is copied
+  again): the table still has to be copied but cannot be read. The source
+  retries it (up to every 60 s) and streams the other tables meanwhile; fix
+  the privilege or the value, or, if the table was dropped, drop and
+  re-create the source
   ([Sources](sources.md#tables-added-to-or-removed-from-the-publication)).
 
 The reconnect delay doubles up to 10 s while sessions keep failing, and is
@@ -91,10 +93,15 @@ stayed connected for 10 s.
 ### A statement is rejected
 
 - `function f() is not allowed in a materialized view` — non-deterministic
-  functions (`random()`, `clock_timestamp()`, `gen_random_uuid()`); see
+  functions (`random()`, `clock_timestamp()`, `gen_random_uuid()`,
+  `current_setting()`, `pg_backend_pid()`); see
   [Maintained views](../sql/maintained-views.md).
 - `now() is only supported in temporal filters of maintained views` — see
   [Temporal filters](temporal-filters-and-errors.md#accepted-forms).
+- `system relation "pg_class" is not allowed in a materialized view` (also
+  casts to `regclass` and `pg_get_viewdef()`) — maintained views cannot
+  read the catalog; use a virtual view
+  ([Maintained views](../sql/maintained-views.md)).
 - `... is not supported` (SQLSTATE `0A000`) — a construct the engine does
   not implement; see [Queries](../sql/queries.md).
 - `cannot replace view "v": index "i" depends on its columns`,
@@ -130,8 +137,10 @@ upstream).
 ### A sink shows `error: ...` or stops advancing
 
 The sink reconnects by itself and keeps the changes it has not written
-yet. Check the role's privileges on the target schema and tables, and that
-an existing target table matches the relation's columns
+yet, retrying after 100 ms, then with a delay doubling up to 10 s while its
+attempts keep failing; the status shows the error until a write succeeds.
+Check the role's privileges on the target schema and tables, and that an
+existing target table matches the relation's columns
 ([requirements](sinks.md#requirements-on-the-target)):
 
 - `error: column "c" of relation "t" does not exist` after an upstream
@@ -139,10 +148,13 @@ an existing target table matches the relation's columns
   sink never alters its target; add the columns to the target table (or
   drop the table, which the sink then creates again)
   ([Sinks](sinks.md#schema-changes-and-replacements)).
-- `running (gsn n)` with `n` no longer following `SHOW GSN`: a batch keeps
-  failing on the target, for example on duplicate `KEY` values (the KEY
-  columns must be unique in the relation); the target server's log shows the
-  failing statement.
+- an error of the target's own (`duplicate key value violates unique
+  constraint`, `ON CONFLICT DO UPDATE command cannot affect row a second
+  time`, `violates check constraint`, a value that does not convert): the
+  target rejects a batch, and keeps doing so until the target is fixed —
+  its constraints or column types, or duplicate `KEY` values (the KEY
+  columns must be unique in the relation; a batch already pending keeps its
+  duplicates, so re-create the sink after fixing the data, see below).
 - `error: broken: <reason>`: the sink reads a broken view
   ([Recovery](operations.md#recovery)).
 
@@ -305,19 +317,14 @@ test, with workarounds.
 |---|---|---|
 | `character` (`bpchar`) values that differ only in trailing spaces — a `bpchar` without length, or `char(n)` columns of different lengths mixed — are distinct in primary keys, `GROUP BY`, `DISTINCT` and set operations (comparisons, joins and `IN` ignore the spaces, as in PostgreSQL) | `'x'` and `'x '` are two primary keys (PostgreSQL: a duplicate key) and two groups; `char(3) UNION char(5)` keeps `'ab '` and `'ab   '` apart | use `char(n)` of one length, or `rtrim()` / cast to `text` before grouping |
 | Errors in join conditions of maintained views — a non-equality condition, the non-equality part of a join condition (`ON a.id = b.id AND a.x / b.y > 1`), `WHERE` conditions the optimizer moves into a join, and such conditions of `EXISTS`/`IN` subqueries — count as "no match" | the joined row is missing (in an outer join: NULL-padded) and no error record is created, where PostgreSQL fails; the same query ad hoc fails | guard the expression (`CASE WHEN b.y <> 0 THEN ... END`, `NULLIF`) |
-| A `SUBSCRIBE (query)` keeps the dataflow it was built with | after a materialized view it reads is replaced with `CREATE OR REPLACE`, it goes on with the view's former definition; after an upstream schema change re-plans such a view, it receives no more changes (it stays open and reports progress). `SUBSCRIBE TO` the view itself is not affected | subscribe to the view itself, or subscribe again after such changes |
 | `real` compared with an integer or `numeric` value is compared in `real` (there are no cross-type comparison operators; arithmetic is done in `double precision`, as in PostgreSQL) | `0.1::real = 0.1` is true (PostgreSQL: false) | cast to `double precision` |
-| `pg_backend_pid()` counts as immutable, so materialized views accept it | the view stores the process id, which changes at every restart: rows computed before and after a restart differ, and a recomputed view would not match the maintained one | do not use it in materialized views |
-| An upstream change that drops a materialized view (it no longer plans) leaves the virtual views over it in the catalog | reads of such a virtual view fail with `relation "m" does not exist` | drop or replace the virtual view |
 | A string literal continued on the next line (`'foo'` newline `'bar'`) | in a select list the second literal becomes a column alias (`foo` in a column `bar`; PostgreSQL returns `foobar`), elsewhere a syntax error | use `\|\|` |
 
 ### SQL and protocol
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| An OID cast to `regclass`, `regtype` or `regnamespace` is a `text` value (the name) | `c.oid::regclass = 'orders'::regclass` fails with `operator does not exist: text = oid` | compare OIDs: `c.oid = 'orders'::regclass` |
-| `SUBSCRIBE` through the extended protocol with binary result formats | the row description announces binary columns but the rows are sent as text, so the client misreads them (psycopg 3: `unpack requires a buffer of 8 bytes`) | request text results for `SUBSCRIBE` |
-| Session settings: `RESET` (also `RESET ALL`) does not undo a `SET`; `set_config()` changes nothing; `current_setting()` reports the server's fixed settings | after `SET read_mode = latest; RESET read_mode` the session still reads `latest`; `current_setting()` ignores values changed with `SET` (and fails for `read_mode`), and its `application_name` is always empty | `SET` the value wanted; use `SHOW` |
+| `set_config()` changes nothing (it returns its value) | `SELECT set_config('read_mode', 'latest', false)` leaves the session's settings as they were | use `SET` |
 
 ### Time travel
 
@@ -334,16 +341,9 @@ test, with workarounds.
 | Primary-key changes of a `REPLICA IDENTITY FULL` or `NOTHING` table are not detected (their Relation messages do not show the key) | the table stays keyed by the old key; if those columns stop being unique, rows with the same old key are merged | re-create the source after such a change |
 | An upstream whose WAL positions went backwards (restored from a backup, or replaced by another cluster under the same connection string) | transactions up to the source's last logged LSN are skipped as already replicated | drop and re-create the source |
 | A sink never alters its target table | after the relation gained columns (an upstream schema change, a re-planned view), the sink fails until the target has them | add the columns to the target, or drop the target table |
-| A sink batch that the target rejects on a working connection (duplicate `KEY` values, a value that does not convert) is retried about every 100 ms without a growing delay | the sink reconnects in a tight loop; `SHOW SINKS` mostly shows `running (gsn n)` with `n` no longer advancing | check that the sinks' GSNs follow `SHOW GSN`; fix the data or the `KEY` |
 
 ### Resources
 
 | Problem | Effect | Workaround |
 |---|---|---|
 | Changes for subscriptions and sinks are queued in memory without a bound (the engine never waits for a client or a sink target) | a subscriber that reads slowly, or a sink whose target is unreachable for long (or whose batches keep failing), makes the server's memory grow | watch `SHOW SINKS`; drop a sink whose target is gone for long and create it again later (it resynchronises the target) |
-
-### Web UI
-
-| Problem | Effect | Workaround |
-|---|---|---|
-| The catalog's dependencies and lineage graphs are found textually (an object counts when its name occurs as a word in a view's SQL), not by the rule `DROP` uses | they can show dependencies that do not exist (a column or alias named like another object) and miss real ones (quoted names with capitals) | do not plan drops from the graphs; `DROP` without `CASCADE` refuses to drop an object that views or sinks depend on |

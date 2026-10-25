@@ -40,7 +40,8 @@ decorrelated subqueries — is checked (`check_deterministic` in
    |---|---|
    | `random()`, `gen_random_uuid()`, `clock_timestamp()`, `set_config()` | volatile |
    | `now()`, `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date` | stable (the clock) |
-   | `current_setting()` | stable |
+   | `current_setting()` | stable (the session) |
+   | `pg_backend_pid()` | stable (the process) |
 
    ```
    ERROR:  function random() is not allowed in a materialized view
@@ -58,7 +59,19 @@ decorrelated subqueries — is checked (`check_deterministic` in
    HINT:  Use a top-level WHERE condition comparing a column expression with now() (optionally plus or minus a constant interval).
    ```
 
-Virtual views and ad hoc queries are not checked; they may use any function.
+3. **Reads of the catalog.** System relations (`pg_catalog.*`,
+   `information_schema.*`, `ivm.*`), casts to `regclass` (of names or OIDs)
+   and `pg_get_viewdef()`, `pg_get_indexdef()` and `pg_get_constraintdef()`
+   are bound as constants from the catalog when the query is planned: a
+   maintained view would not follow the catalog's changes (no log record
+   changes it), and planning it again — a restart does — would change its
+   contents. They are rejected (`system relation "pg_class" is not allowed
+   in a materialized view`, `a cast to regclass ...`, `function
+   pg_get_viewdef() ...`). Casts to `regtype` and `regnamespace` read fixed
+   OIDs and are allowed.
+
+Virtual views and ad hoc queries are not checked; they may use any function
+and read the catalog as it is when they run.
 A materialized view that reads a virtual view inlines its query, so the
 check covers it, and `CREATE OR REPLACE` of a view is rejected (SQLSTATE
 `2BP01`, `cannot replace view "v": materialized view "m" would no longer be
@@ -66,13 +79,13 @@ valid: ...`) when a materialized view reading it would then no longer plan
 or would fail the check.
 
 All other functions are immutable — including those that are only stable in
-PostgreSQL because they depend on the session time zone, which is fixed to
-UTC here (`to_char(timestamptz, ...)`, `date_trunc(text, timestamptz)`,
-`timestamp` ↔ `timestamptz` casts), and the session-independent catalog
-helpers (`version()`, `current_user`, ...). One of them is not a constant:
-`pg_backend_pid()` returns the process id, which changes when the engine
-restarts, yet is accepted
-([Known problems](../user-guide/troubleshooting.md#known-problems)).
+PostgreSQL because they depend on session settings that are fixed here (the
+time zone is UTC: `to_char(timestamptz, ...)`, `date_trunc(text,
+timestamptz)`, `timestamp` ↔ `timestamptz` casts; `DateStyle` and
+`extra_float_digits` for the text of values in `concat`, `format` or
+`to_json`), and the catalog helpers for client tools, which return
+constants here (`version()`, `current_user`, `has_table_privilege`,
+`pg_relation_size`, `pg_is_in_recovery`, ...).
 
 ## What is pinned down instead
 

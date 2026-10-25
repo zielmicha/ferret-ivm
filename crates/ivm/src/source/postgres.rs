@@ -193,10 +193,13 @@ pub struct SourceState {
 }
 
 /// A source's logged `state` with the snapshot of `table` to be done again
-/// (as the source does on a schema change).
+/// (as the source does on a schema change). A pending truncate is kept: the
+/// source logs its reset state, with the truncate a key change needs, just
+/// before the schema record, and the table's copy may start long after it.
 pub fn snapshot_again(state: &str, table: ObjectId) -> String {
     let mut s: SourceState = serde_json::from_str(state).unwrap_or_default();
-    s.tables.insert(table, SnapState::default());
+    let truncate = s.tables.get(&table).is_some_and(|t| t.truncate);
+    s.tables.insert(table, SnapState { truncate, ..SnapState::default() });
     serde_json::to_string(&s).unwrap()
 }
 
@@ -400,16 +403,22 @@ impl PgSource {
             LogicalMessage::Insert { relation_id, new } => {
                 let Some(rm) = self.rels.get(&relation_id) else { return Ok(()) };
                 let table = rm.table;
-                let (row, unchanged) = self.convert(rm, &new)?;
+                let (row, unchanged) = match self.convert(rm, &new) {
+                    Ok(r) => r,
+                    Err(e) => return self.change_failed(table, e),
+                };
                 self.push_upsert(table, row, unchanged, None)?;
             }
             LogicalMessage::Update { relation_id, old, old_is_key, new } => {
                 let Some(rm) = self.rels.get(&relation_id) else { return Ok(()) };
                 let table = rm.table;
-                let (row, unchanged) = self.convert(rm, &new)?;
-                let old_row = match &old {
-                    Some(o) => Some(self.convert(self.rels.get(&relation_id).unwrap(), o)?.0),
-                    None => None,
+                let converted = self.convert(rm, &new).and_then(|(row, unchanged)| match &old {
+                    Some(o) => Ok((row, unchanged, Some(self.convert(rm, o)?.0))),
+                    None => Ok((row, unchanged, None)),
+                });
+                let (row, unchanged, old_row) = match converted {
+                    Ok(r) => r,
+                    Err(e) => return self.change_failed(table, e),
                 };
                 let pk = self.tables[&table].pk.clone();
                 if pk.is_empty() {
@@ -450,7 +459,10 @@ impl PgSource {
             LogicalMessage::Delete { relation_id, old, .. } => {
                 let Some(rm) = self.rels.get(&relation_id) else { return Ok(()) };
                 let table = rm.table;
-                let (row, _) = self.convert(rm, &old)?;
+                let row = match self.convert(rm, &old) {
+                    Ok((row, _)) => row,
+                    Err(e) => return self.change_failed(table, e),
+                };
                 let pk = self.tables[&table].pk.clone();
                 if pk.is_empty() {
                     self.push_multiset(table, TableChange::Remove { row });
@@ -566,6 +578,37 @@ impl PgSource {
             LogicalMessage::Origin { .. } | LogicalMessage::Type { .. } => {}
         }
         Ok(())
+    }
+
+    /// A streamed change to `table` has a value that cannot be converted:
+    /// the table fails, not the session. Ending the session would fail the
+    /// same message again in every new one, and stop every table. Instead
+    /// the table's changes in this transaction are dropped and it is copied
+    /// again, from an empty table (the lost change may have deleted rows):
+    /// like any table being copied, its changes are skipped and fresh reads
+    /// of it wait until it is copied, and a copy that fails (the value is
+    /// still there) is retried with a growing delay, shown in the status,
+    /// while the other tables are streamed. The reset is logged, so a
+    /// restart copies the table too.
+    fn change_failed(&mut self, table: ObjectId, e: SqlError) -> Result<()> {
+        let t = &self.tables[&table];
+        log::warn!(
+            "source {}: a change to table {}.{} cannot be applied: {e}; copying the table again, streaming the other tables",
+            self.id,
+            t.upstream.0,
+            t.upstream.1
+        );
+        let truncate = !t.pk.is_empty();
+        if let Some(txn) = &mut self.txn {
+            txn.changes.retain(|(c, _)| *c != table);
+        }
+        self.state.tables.insert(table, SnapState { truncate, ..Default::default() });
+        self.start_copying();
+        if self.chunk.as_ref().is_some_and(|c| c.table == table) {
+            self.chunk = None;
+        }
+        self.refresh_status();
+        self.log_progress(self.durable_lsn)
     }
 
     /// A change to a keyless table (REPLICA IDENTITY FULL). Until its
@@ -1742,6 +1785,12 @@ mod tests {
             other => panic!("unexpected records {other:?}"),
         }
         assert_eq!(src.tables[&10].pk, [1]);
+        // the engine applies the schema record after the logged state: the
+        // truncate must survive it (a restart before the table's first chunk
+        // used to copy it over the rows deleted by the old key)
+        let LogRecord::Progress { state, .. } = &recs[0] else { unreachable!() };
+        let st: SourceState = serde_json::from_str(&snapshot_again(state, 10)).unwrap();
+        assert!(!st.tables[&10].done && st.tables[&10].truncate);
     }
 
     /// Changes decoded before a schema change in the same transaction are
@@ -1798,26 +1847,57 @@ mod tests {
         assert!(replay(&log.lock()).is_empty());
     }
 
-    /// A text value that is not UTF-8 fails the change; it used to become ''.
+    /// A text value that is not UTF-8 fails the change (it used to become
+    /// ''): its table, not the session, which would fail again on the same
+    /// message in every new session, stopping every table. The table's
+    /// changes in the transaction are dropped and it is copied again, from
+    /// an empty table; the other tables' changes apply.
     #[test]
-    fn values_that_are_not_utf8_fail() {
+    fn values_that_do_not_convert_fail_their_table() {
         let mut t = table(&["id", "s"], vec![0]);
         t.columns[1] = Column::new("s", ColumnType::new(SqlType::Text));
-        let (mut src, _) = source(vec![t], done_state(10));
+        let u = SourceTable { id: 11, upstream: ("public".into(), "u".into()), columns: int_cols(&["id"]), pk: vec![0] };
+        let mut state = done_state(10);
+        state.tables.insert(11, SnapState { done: true, ..Default::default() });
+        let (mut src, log) = source(vec![t, u], state);
         src.handle_message(begin(5)).unwrap();
         let LogicalMessage::Relation(mut rel) = relation(&["id", "s"], 1) else { unreachable!() };
         rel.columns[1].type_oid = 25;
         src.handle_message(LogicalMessage::Relation(rel)).unwrap();
+        let LogicalMessage::Relation(mut rel_u) = relation(&["id"], 1) else { unreachable!() };
+        (rel_u.id, rel_u.name) = (REL + 1, "u".into());
+        src.handle_message(LogicalMessage::Relation(rel_u)).unwrap();
         let text = |id: &str, s: &[u8]| LogicalMessage::Insert {
             relation_id: REL,
             new: vec![TupleValue::Text(id.as_bytes().to_vec()), TupleValue::Text(s.to_vec())],
         };
+        let insert_u = |id: i32| LogicalMessage::Insert { relation_id: REL + 1, new: vec![TupleValue::Text(id.to_string().into_bytes())] };
         src.handle_message(text("1", "café".as_bytes())).unwrap();
+        src.handle_message(insert_u(5)).unwrap();
         // Latin-1 é
-        let bad = text("2", &[b'c', b'a', b'f', 0xe9]);
-        let err = src.handle_message(bad).unwrap_err();
-        assert_eq!(err.code, codes::CHARACTER_NOT_IN_REPERTOIRE);
-        assert!(err.message.contains("column \"s\" of public.t"), "{}", err.message);
+        src.handle_message(text("2", &[b'c', b'a', b'f', 0xe9])).unwrap();
+        src.handle_message(text("3", b"x")).unwrap();
+        src.handle_message(insert_u(6)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.drain_acks(true).unwrap();
+        let recs = log.lock();
+        match &recs[..] {
+            [LogRecord::Progress { state, .. }, LogRecord::Commit { changes, .. }] => {
+                let st: SourceState = serde_json::from_str(state).unwrap();
+                assert!(!st.tables[&10].done && st.tables[&10].truncate, "{st:?}");
+                assert!(st.tables[&11].done);
+                let ids: Vec<(ObjectId, i64)> = changes
+                    .iter()
+                    .map(|(t, c)| match c {
+                        TableChange::Upsert { row, .. } => (*t, row[0].as_i64().unwrap()),
+                        other => panic!("unexpected change {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(ids, [(11, 5), (11, 6)]);
+            }
+            other => panic!("unexpected records {other:?}"),
+        }
+        assert!(!src.state.tables[&10].done && src.state.tables[&10].truncate);
     }
 
     /// A change to a key beyond the chunks read so far is skipped, because a

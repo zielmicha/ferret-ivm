@@ -97,6 +97,8 @@ struct Session {
     /// (shared with the engine through `vars`).
     interrupts: Arc<Interrupts>,
     settings: HashMap<String, String>,
+    /// The settings the session started with: what RESET restores.
+    defaults: HashMap<String, String>,
     /// The statement being run is COPY (SUBSCRIBE ...) TO STDOUT.
     pending_copy: bool,
 }
@@ -112,6 +114,17 @@ fn field(c: &ResultColumn, format: i16) -> FieldDescription {
         type_size: ty.type_size(),
         type_modifier: c.typmod,
         format,
+    }
+}
+
+/// The format code of result column `i` given a Bind's result format codes:
+/// none means text for every column, one applies to every column, else one
+/// per column.
+fn result_format(formats: &[i16], i: usize) -> i16 {
+    match formats.len() {
+        0 => 0,
+        1 => formats[0],
+        _ => formats.get(i).copied().unwrap_or(0),
     }
 }
 
@@ -224,12 +237,13 @@ impl Session {
             reader,
             writer,
             out,
-            vars: SessionVars { read_mode: "fresh".into(), interrupts: Some(interrupts.clone()) },
+            vars: SessionVars { read_mode: "fresh".into(), interrupts: Some(interrupts.clone()), ..Default::default() },
             prepared: HashMap::new(),
             portals: HashMap::new(),
             in_txn: false,
             interrupts,
             settings: HashMap::new(),
+            defaults: HashMap::new(),
             pending_copy: false,
         };
         s.settings.insert("application_name".into(), app);
@@ -251,7 +265,60 @@ impl Session {
         for k in ["read_mode", "ivm.read_mode"] {
             s.settings.insert(k.into(), s.vars.read_mode.clone());
         }
+        s.defaults = s.settings.clone();
+        s.settings_changed();
         s.main_loop()
+    }
+
+    /// Hand the session's settings to the engine (for current_setting()).
+    fn settings_changed(&mut self) {
+        self.vars.settings = Arc::new(self.settings.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    }
+
+    /// RESET name (and SET name TO DEFAULT): back to the value the session
+    /// started with, or to the server's (no session value).
+    fn reset_setting(&mut self, name: &str) {
+        let before = self.settings.get(name).cloned();
+        match self.defaults.get(name) {
+            Some(v) => {
+                self.settings.insert(name.to_string(), v.clone());
+            }
+            None => {
+                self.settings.remove(name);
+            }
+        }
+        match name {
+            "read_mode" | "ivm.read_mode" => {
+                let v = self.defaults.get("read_mode").cloned().unwrap_or_else(|| "fresh".into());
+                self.vars.read_mode = v.clone();
+                for k in ["read_mode", "ivm.read_mode"] {
+                    self.settings.insert(k.into(), v.clone());
+                }
+            }
+            "application_name" if self.settings.get(name) != before.as_ref() => {
+                let v = self.settings.get(name).cloned().unwrap_or_default();
+                self.out.parameter_status("application_name", &v);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_reset(&mut self, reset: &sqlparser::ast::Reset) -> Result<ExecResult> {
+        use sqlparser::ast::Reset as R;
+        match reset {
+            R::ALL => {
+                let mut names: Vec<String> = self.settings.keys().chain(self.defaults.keys()).cloned().collect();
+                names.sort();
+                names.dedup();
+                for n in names {
+                    self.reset_setting(&n);
+                }
+            }
+            R::ConfigurationParameter(name) => self.reset_setting(&name.to_string().to_lowercase().replace(' ', "_")),
+            R::SessionAuthorization => {}
+        }
+        self.settings_changed();
+        Ok(ExecResult::Command { tag: "RESET".into() })
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -367,8 +434,7 @@ impl Session {
                     self.portals.clear();
                     Some(Ok(ExecResult::Command { tag: "ROLLBACK".into() }))
                 }
-                // settings are fixed or kept per session: nothing to reset
-                sqlparser::ast::Statement::Reset(_) => Some(Ok(ExecResult::Command { tag: "RESET".into() })),
+                sqlparser::ast::Statement::Reset(r) => Some(self.handle_reset(&r.reset)),
                 sqlparser::ast::Statement::ShowVariable { variable } => {
                     let name = variable.iter().map(|i| i.value.to_lowercase()).collect::<Vec<_>>().join("_");
                     self.settings.get(&name).map(|v| {
@@ -393,6 +459,14 @@ impl Session {
     fn handle_set(&mut self, set: &sqlparser::ast::Set) -> Result<ExecResult> {
         use sqlparser::ast::Set as S;
         let (name, value) = match set {
+            // SET name TO DEFAULT is RESET name
+            S::SingleAssignment { variable, values, .. }
+                if matches!(values.as_slice(), [sqlparser::ast::Expr::Identifier(i)] if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("default")) =>
+            {
+                self.reset_setting(&variable.to_string().to_lowercase().replace(' ', "_"));
+                self.settings_changed();
+                return Ok(ExecResult::Command { tag: "SET".into() });
+            }
             S::SingleAssignment { variable, values, .. } => {
                 let v = values.iter().map(|e| e.to_string().trim_matches('\'').to_string()).collect::<Vec<_>>().join(",");
                 (variable.to_string().to_lowercase(), v)
@@ -412,6 +486,7 @@ impl Session {
                 for k in ["read_mode", "ivm.read_mode"] {
                     self.settings.insert(k.into(), v.clone());
                 }
+                self.settings_changed();
                 return Ok(ExecResult::Command { tag: "SET".into() });
             }
             "timezone" | "time zone" => {
@@ -458,6 +533,7 @@ impl Session {
             self.out.parameter_status("application_name", &value);
         }
         self.settings.insert(name.replace(' ', "_"), value);
+        self.settings_changed();
         Ok(ExecResult::Command { tag: "SET".into() })
     }
 
@@ -550,13 +626,7 @@ impl Session {
                 Ok(true)
             }
             ExecResult::Query { columns, rows } => {
-                let fmt = |i: usize| -> i16 {
-                    match formats.len() {
-                        0 => 0,
-                        1 => formats[0],
-                        _ => formats.get(i).copied().unwrap_or(0),
-                    }
-                };
+                let fmt = |i: usize| result_format(formats, i);
                 if describe {
                     let fields: Vec<FieldDescription> = columns.iter().enumerate().map(|(i, c)| field(c, fmt(i))).collect();
                     self.out.row_description(&fields);
@@ -574,7 +644,7 @@ impl Session {
                 Ok(true)
             }
             ExecResult::Subscribe { columns, rx, cancel, progress } => {
-                let r = self.stream_subscription(&columns, rx, &cancel, progress, describe);
+                let r = self.stream_subscription(&columns, rx, &cancel, progress, formats, describe);
                 cancel.store(true, Ordering::Release);
                 match r {
                     Ok(()) => Ok(true),
@@ -588,12 +658,16 @@ impl Session {
         }
     }
 
+    /// Stream a subscription's rows: as DataRows in the portal's result
+    /// formats (text without a Bind, as for any statement), or as COPY data
+    /// in text format.
     fn stream_subscription(
         &mut self,
         columns: &[ResultColumn],
         rx: crossbeam_channel::Receiver<SubEvent>,
         _cancel: &Arc<AtomicBool>,
         progress: bool,
+        formats: &[i16],
         describe: bool,
     ) -> Result<()> {
         let copy = self.pending_copy;
@@ -603,10 +677,11 @@ impl Session {
         }
         cols.push(ResultColumn { name: "diff".into(), ty: SqlType::Int8, typmod: -1 });
         cols.extend(columns.iter().cloned());
+        let binary: Vec<bool> = (0..cols.len()).map(|i| !copy && result_format(formats, i) == 1).collect();
         if copy {
             self.out.copy_out_response(0, &vec![0i16; cols.len()]);
         } else if describe {
-            let fields: Vec<FieldDescription> = cols.iter().map(|c| field(c, 0)).collect();
+            let fields: Vec<FieldDescription> = cols.iter().enumerate().map(|(i, c)| field(c, binary[i] as i16)).collect();
             self.out.row_description(&fields);
         }
         self.flush()?;
@@ -638,20 +713,20 @@ impl Session {
             match ev {
                 SubEvent::Data { gsn, rows } => {
                     for (r, diff) in rows {
-                        let mut vals: Vec<Option<String>> = vec![Some(gsn.to_string())];
+                        let mut vals = vec![Datum::Int8(gsn as i64)];
                         if progress {
-                            vals.push(Some("f".into()));
+                            vals.push(Datum::Bool(false));
                         }
-                        vals.push(Some(diff.to_string()));
-                        vals.extend(r.iter().map(|d| if d.is_null() { None } else { Some(format_datum(d)) }));
-                        self.emit_sub_row(copy, &vals);
+                        vals.push(Datum::Int8(diff));
+                        vals.extend(r);
+                        self.emit_sub_row(copy, &cols, &binary, &vals);
                     }
                 }
                 SubEvent::Progress { gsn } => {
                     if progress {
-                        let mut vals: Vec<Option<String>> = vec![Some(gsn.to_string()), Some("t".into()), None];
-                        vals.extend(std::iter::repeat_n(None, ncols));
-                        self.emit_sub_row(copy, &vals);
+                        let mut vals = vec![Datum::Int8(gsn as i64), Datum::Bool(true), Datum::Null];
+                        vals.extend(std::iter::repeat_n(Datum::Null, ncols));
+                        self.emit_sub_row(copy, &cols, &binary, &vals);
                     }
                 }
                 SubEvent::Error(e) => {
@@ -667,17 +742,15 @@ impl Session {
         }
     }
 
-    fn emit_sub_row(&mut self, copy: bool, vals: &[Option<String>]) {
+    fn emit_sub_row(&mut self, copy: bool, cols: &[ResultColumn], binary: &[bool], vals: &[Datum]) {
         if copy {
-            let line = vals.iter().map(|v| match v {
-                None => "\\N".to_string(),
-                Some(s) => copy_escape(s),
-            });
+            let line = vals.iter().map(|d| if d.is_null() { "\\N".to_string() } else { copy_escape(&format_datum(d)) });
             let mut l = line.collect::<Vec<_>>().join("\t");
             l.push('\n');
             self.out.copy_data(l.as_bytes());
         } else {
-            let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref().map(|s| s.as_bytes())).collect();
+            let enc: Vec<Option<Vec<u8>>> = vals.iter().enumerate().map(|(i, d)| encode_value(d, &cols[i].ty, binary[i])).collect();
+            let refs: Vec<Option<&[u8]>> = enc.iter().map(|v| v.as_deref()).collect();
             self.out.data_row(&refs);
         }
     }
@@ -798,14 +871,7 @@ impl Session {
             let fields: Vec<FieldDescription> = cols
                 .iter()
                 .enumerate()
-                .map(|(i, c)| {
-                    let f = match formats.len() {
-                        0 => 0,
-                        1 => formats[0],
-                        _ => formats.get(i).copied().unwrap_or(0),
-                    };
-                    field(c, f)
-                })
+                .map(|(i, c)| field(c, result_format(&formats, i)))
                 .collect();
             self.out.row_description(&fields);
         }
@@ -836,14 +902,7 @@ impl Session {
             let vals: Vec<Option<Vec<u8>>> = r
                 .iter()
                 .enumerate()
-                .map(|(i, d)| {
-                    let f = match formats.len() {
-                        0 => 0,
-                        1 => formats[0],
-                        _ => formats.get(i).copied().unwrap_or(0),
-                    };
-                    encode_value(d, &cols[i].ty, f == 1)
-                })
+                .map(|(i, d)| encode_value(d, &cols[i].ty, result_format(&formats, i) == 1))
                 .collect();
             let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
             self.out.data_row(&refs);

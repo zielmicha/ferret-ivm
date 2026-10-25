@@ -164,8 +164,9 @@ Each source logs, through the input log, everything it needs to resume:
   key (`boundary`), and whether the next copy starts by truncating the table
   (`truncate`, see [Consequences](#consequences)), as JSON. Applying a
   `Schema` record also marks the table's snapshot to be done again in the
-  stored state, so that a restart before the re-snapshot logs progress of
-  its own still redoes it.
+  stored state (keeping its `truncate` flag), so that a restart before the
+  re-snapshot logs progress of its own still redoes it, from an empty table
+  after a key change.
 
 On start, the source thread streams from `max(resume LSN, durable LSN)`
 (`START_REPLICATION ... LOGICAL <lsn>`; the server starts at the slot's

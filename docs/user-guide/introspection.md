@@ -16,8 +16,11 @@ EXPLAIN MAINTENANCE [ FOR ] [ MATERIALIZED ] [ VIEW ] name
 `query` is anything starting with `SELECT`, `WITH`, `VALUES` or `(`.
 `DATAFLOW` and `MAINTENANCE` need the name of a materialized view; for a
 [broken](operations.md#recovery) one they fail with SQLSTATE `55000`
-(`materialized view "v" is broken: <reason>`). `EXPLAIN` of DML or DDL is
-not supported (anything else after `EXPLAIN` is taken as a view name).
+(`materialized view "v" is broken: <reason>`). `EXPLAIN` of DML or DDL,
+and `EXPLAIN` options (`ANALYZE`, `VERBOSE`, ...), are not supported:
+`EXPLAIN INSERT is not supported: EXPLAIN takes a query (SELECT, WITH,
+VALUES) or the name of a view` (SQLSTATE `0A000`). A single name after
+`EXPLAIN` is a view name.
 
 ### EXPLAIN [PLAN]: the logical plan
 
@@ -176,7 +179,9 @@ versioned, so `AS OF` returns their current contents.
 
 Client tools discover schemas through `pg_catalog` and
 `information_schema`. The engine provides the relations those tools commonly
-read, computed from its catalog when a query is planned (`sysrel.rs`). Names
+read, computed from its catalog when a query is planned (`sysrel.rs`), so
+materialized views and `SUBSCRIBE` cannot read them
+([Maintained views](../sql/maintained-views.md#what-is-rejected)). Names
 starting with `pg_` resolve to `pg_catalog` without a schema prefix. Every
 object appears in schema `public`, owned by role `ivm`, in database `ivm`.
 
@@ -199,7 +204,7 @@ object appears in schema `public`, owned by role `ivm`, in database `ivm`.
 | `information_schema.schemata` | `pg_catalog`, `public`, `information_schema` |
 | `information_schema.tables` | tables (`BASE TABLE`), views and materialized views (`VIEW`) |
 | `information_schema.views` | views and materialized views |
-| `information_schema.columns` | columns with types, precision, nullability |
+| `information_schema.columns` | columns with types, precision (also `interval_type` and the precision of `interval` columns), nullability |
 
 Only the listed columns exist; a query that selects another column of these
 relations fails with `column ... does not exist`. Other catalog relations
@@ -230,8 +235,8 @@ unknown names (`relation "x" does not exist`, `type "x" does not exist`,
 OID columns (`WHERE attrelid = 'orders'::regclass`); as a select-list item
 it prints the name, in a column named after the type (`regclass`). OIDs cast
 to these types print names (or the number, for an OID that names nothing),
-as `text`: compare OIDs, not reg* values (`c.oid::regclass =
-'orders'::regclass` fails with `operator does not exist: text = oid`).
+as `text`, and compare as OIDs, as in PostgreSQL (`c.oid::regclass =
+'orders'::regclass`; see [reg* casts](../sql/types.md)).
 `regproc`, `regrole`, `regprocedure` and `regoper` are plain aliases of
 `oid`: OIDs print as numbers and names are not accepted.
 

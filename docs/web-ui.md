@@ -156,11 +156,13 @@ object opens:
 - **Errors:** the view's error records with SQLSTATE, message and the number
   of rows producing each.
 
-Dependencies here are found textually: a view is shown as depending on
-every object whose name occurs as a word in its lowercased SQL. That is not
-the rule `DROP` uses (the relations the view actually reads), so the graphs
-can show an edge that does not exist (a column or alias named like another
-object) and miss one that does (a quoted name with capital letters).
+Dependencies follow the rule `DROP` uses: a view depends on the relations
+its query names, as the binder resolves them (`Catalog::direct_references`),
+an index on its relation, a sink on the relation it reads and a replicated
+table on its source. The relations a view reads through a virtual view are
+that view's dependencies, so the graphs reach them through it. Only a view
+whose definition no longer binds counts the relations whose names occur as
+words in its SQL.
 
 ### Dataflow
 
@@ -402,7 +404,7 @@ views), `status` the state of sources and sinks, and `error: broken:
 <reason>` for a broken materialized view or index (null otherwise),
 `detail` a one-line description (replication origin of a table, key of an
 index, target of a sink, publication and slot of a source). `depends_on` and
-`dependents` are found textually, as described under [Catalog](#catalog).
+`dependents` follow the rule described under [Catalog](#catalog).
 
 `/api/catalog/history?limit=N` returns `{"gsn", "total", "entries": [{"gsn",
 "action", "sql"}]}`, newest first; `action` is the statement's leading

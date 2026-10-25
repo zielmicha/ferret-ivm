@@ -96,13 +96,25 @@ transaction:
 
 ```sql
 BEGIN;
+SELECT gsn FROM ivm_sink_progress WHERE sink = '<name>' FOR UPDATE;
+-- (checked by the sink before it goes on, see below)
 -- for each GSN in order:
 --   one DELETE per removed row instance, then
 --   INSERTs of the added rows (500 rows per statement)
 INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('<name>', <last gsn delivered>)
-  ON CONFLICT (sink) DO UPDATE SET gsn = EXCLUDED.gsn;
+  ON CONFLICT (sink) DO UPDATE SET gsn = GREATEST(ivm_sink_progress.gsn, EXCLUDED.gsn);
 COMMIT;
 ```
+
+Every write — a flush, a progress update, a resynchronisation — first locks
+the sink's progress row, so that the writers of one sink take turns, and
+checks it: a flush or progress update goes on only if the row still holds
+the progress this thread last committed (or read), a resynchronisation only
+if the row is not after its snapshot GSN. Otherwise another writer has
+moved it — a newer sink of the same name, while this thread was stopping
+(see [DROP SINK](#monitoring-and-drop-sink)) — and the transaction is rolled
+back (`error: sink progress moved to gsn <n> by another writer`). The
+progress row itself never moves backwards.
 
 With `KEY`:
 
@@ -130,11 +142,13 @@ Values are written as typed literals, `'<text output>'::<type>`, or `NULL`.
 
 Each flush stores the data and the sink's progress GSN in the same
 transaction. If the transaction fails or its outcome is unknown, the thread
-reconnects (failed connection attempts are retried after 100 ms, doubling up
-to 10 s) and reads the progress row again: batches at or below the committed
-GSN are discarded, the rest are applied again. Changes that arrive meanwhile
-are kept. A batch is therefore applied exactly once while the engine keeps
-running.
+waits, reconnects and reads the progress row again: batches at or below the
+committed GSN are discarded, the rest are applied again. Changes that arrive
+meanwhile are kept. A batch is therefore applied exactly once while the
+engine keeps running. Failed connection attempts and failed writes are
+retried after 100 ms, then with a delay doubling up to 10 s while they keep
+failing (a batch the target rejects keeps failing until the target is
+fixed); a write that succeeds resets the delay.
 
 The progress row records the last GSN the engine delivered to the sink —
 a change, or a GSN at which the relation did not change (clock ticks,
@@ -209,7 +223,9 @@ removed from the view, so the sink deletes its row.
 `SHOW SINKS` shows `name`, `from` (the relation), `table` (the target as
 given), and `status`: `starting`, `running (gsn <n>)` (the GSN up to which
 the target is current, as committed in the progress row), `error: <message>`
-while reconnecting or retrying, `error: broken: <reason>` (the relation is a
+while it cannot connect or its writes fail (the error of the last attempt,
+shown until a write succeeds: reconnecting alone does not clear the error of
+a batch the target rejects), `error: broken: <reason>` (the relation is a
 broken materialized view; the sink is not started), or `stopped`.
 
 ```sql
@@ -224,10 +240,12 @@ drops the sink.
 
 The engine does not wait for the sink thread: the thread stops by itself as
 soon as it sees the request (a sink retrying its connection, or stuck in a
-connection attempt, can take a while). A sink thread that outlives its sink
-cannot undo the work of a new sink of the same name: it resumes from the
-progress row, which only moves forward. At shutdown the engine waits up to
-5 s for its sinks to stop.
+connection attempt or a long write, can take a while). A sink thread that
+outlives its sink cannot undo the work of a new sink of the same name: a
+write it has in progress holds the progress row's lock, so the new sink's
+resynchronisation waits for it and then rewrites the target, and a write it
+starts after the new sink wrote fails the progress check. At shutdown the
+engine waits up to 5 s for its sinks to stop.
 
 ## Known problems
 
@@ -236,10 +254,3 @@ See also [Troubleshooting](troubleshooting.md#known-problems).
 - The queue of changes from the engine to each sink is unbounded: while a
   sink cannot write (its target is down, or a batch keeps failing), the
   changes it has not written accumulate in memory.
-- A batch or resynchronisation that the target rejects on a working
-  connection (duplicate `KEY` values, a missing column, a value that does
-  not convert) is retried about every 50–100 ms, reconnecting each time,
-  without a growing delay. For a failing batch, `SHOW SINKS` shows
-  `running (gsn <n>)` most of the time, with `<n>` no longer advancing:
-  check that `<n>` follows `SHOW GSN`; the failing statement is in the
-  target server's log.

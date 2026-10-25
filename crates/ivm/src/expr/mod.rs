@@ -8,7 +8,7 @@ mod ops;
 
 pub use eval::EvalScratch;
 pub use func::{registry, FuncDef, FuncId, Volatility};
-pub use builtins::{jsonpath, path_context};
+pub use builtins::{jsonpath, path_context, with_session_settings};
 
 /// to_jsonb conversion of a datum.
 pub fn builtins_datum_to_jsonb(d: &Datum) -> crate::error::Result<pgfuncs::json::Jsonb> {

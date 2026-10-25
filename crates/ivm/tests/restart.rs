@@ -307,3 +307,39 @@ fn a_store_without_its_manifest_is_refused_untouched() {
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A materialized view that an earlier version accepted but the current
+/// rules reject (here: it calls pg_backend_pid(), which counts as stable
+/// now) keeps being maintained, and does not hold back replacements of
+/// views it does not read: CREATE OR REPLACE checked every materialized
+/// view, so every replacement failed with "materialized view "m" would no
+/// longer be valid". Those that read the replaced view are still checked.
+#[test]
+fn replacements_check_only_the_views_reading_the_replaced_one() {
+    let dir = tmpdir("replace-checks");
+    let e = Engine::start(&dir);
+    e.exec("CREATE TABLE t (a int PRIMARY KEY, b int)");
+    e.exec("INSERT INTO t VALUES (1, 10)");
+    e.exec("CREATE MATERIALIZED VIEW old AS SELECT a, 0 AS p FROM t");
+    e.exec("CREATE VIEW unrelated AS SELECT 1 AS x");
+    e.exec("CREATE VIEW vb AS SELECT a, b FROM t");
+    e.exec("CREATE MATERIALIZED VIEW reader AS SELECT a, b FROM vb");
+    e.exec("CHECKPOINT");
+    e.shutdown();
+    // as an earlier version would have stored it
+    break_view(&dir, "old", "SELECT a, pg_backend_pid() AS p FROM t");
+    let e = Engine::start(&dir);
+    assert_eq!(e.rows("SELECT a, p > 0 FROM old"), ["1|t"]);
+    e.exec("CREATE OR REPLACE VIEW unrelated AS SELECT 2 AS x");
+    assert_eq!(e.rows("SELECT x FROM unrelated"), ["2"]);
+    // a replacement that would make a reader non-deterministic is refused
+    let er = e.err("CREATE OR REPLACE VIEW vb AS SELECT a, b + pg_backend_pid() AS b FROM t");
+    assert_eq!(er.code, "2BP01", "{er}");
+    assert!(er.message.contains("materialized view \"reader\" would no longer be valid"), "{}", er.message);
+    e.exec("CREATE OR REPLACE VIEW vb AS SELECT a, b + 1 AS b FROM t");
+    assert_eq!(e.rows("SELECT a, b FROM reader"), ["1|11"]);
+    e.exec("INSERT INTO t VALUES (2, 20)");
+    assert_eq!(e.rows("SELECT a, p > 0 FROM old ORDER BY a"), ["1|t", "2|t"]);
+    e.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

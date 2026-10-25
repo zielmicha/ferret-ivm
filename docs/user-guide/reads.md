@@ -197,9 +197,11 @@ For the fixed settings, any other value (another time zone or encoding,
 `DateStyle = 'ISO, DMY'` or `German`, `IntervalStyle = iso_8601`,
 `bytea_output = escape`, `standard_conforming_strings = off`) fails with
 SQLSTATE `0A000` (`... is not supported`) rather than being accepted without
-effect. `SET TRANSACTION ...`, `RESET` (also `RESET ALL`), `DISCARD` and
-`DEALLOCATE` are accepted and change nothing; in particular `RESET` does not
-undo a `SET`.
+effect. `RESET name` (and `SET name TO DEFAULT`) restores the value the
+session started with — the `application_name` of the startup message,
+`read_mode = fresh`, the values `SHOW` reports below — or removes the
+session's value; `RESET ALL` does so for every setting. `SET TRANSACTION
+...`, `DISCARD` and `DEALLOCATE` are accepted and change nothing.
 
 `SHOW name` returns the value set in the session if there is one; otherwise
 the session or the engine answers for:
@@ -225,10 +227,12 @@ the session or the engine answers for:
 
 Any other name fails with `unrecognized configuration parameter` (SQLSTATE
 `42704`). `SHOW ALL` lists only `server_version`, `timezone` and
-`datestyle`. For clients that use them, `current_setting(name [,
-missing_ok])` returns the server's fixed settings (the values above, not
-values changed with `SET`, and not `read_mode`), and `set_config(name,
-value, is_local)` returns `value` without changing or checking anything.
+`datestyle`. `current_setting(name [, missing_ok])` returns the session's
+value — any name set with `SET` (custom names such as `myapp.user_id`
+included), `read_mode` and the other values the session starts with — and
+otherwise the server's fixed settings above; a virtual view calling it sees
+the settings of the session that reads it. `set_config(name, value,
+is_local)` returns `value` without changing or checking anything.
 
 ## SUBSCRIBE
 
@@ -298,12 +302,12 @@ Example (`COPY` form, `PROGRESS`):
 114	t	\N	\N	\N	\N
 ```
 
-Values are always sent in text format (the PostgreSQL output format of each
-type), even when a client asks for binary results. With the extended
-protocol the portal's row description still announces the requested binary
-format, so a client that asks for binary results misreads the rows: request
-text results for `SUBSCRIBE` (see
-[Known problems](troubleshooting.md#known-problems)).
+Values are sent in text format (the PostgreSQL output format of each
+type) unless the client asks for binary results: with the extended
+protocol, the rows follow the result formats of the `Bind` message (one
+for every column, or one per column, `gsn` and `diff` counting as `bigint`
+and `progressed` as `boolean`), as the portal's row description announces
+them ([binary format](../sql/types.md#binary-format)).
 
 ### COPY form
 
@@ -337,9 +341,15 @@ A subscription runs until
   modifiers), by `CREATE OR REPLACE` or when an upstream schema change
   re-plans it: `materialized view "x" changed its columns` (SQLSTATE
   `55000`);
-- a replicated table it reads (directly, or through virtual views) changes
-  its columns upstream: `table "x" changed its columns upstream` (SQLSTATE
+- a replicated table it reads changes its columns upstream — the
+  subscribed table, or a table that a subscribed virtual view or query
+  reads, directly or through views, materialized ones included (a
+  subscription to a materialized view itself follows its re-planning
+  instead, see below): `table "x" changed its columns upstream` (SQLSTATE
   `55000`);
+- a materialized view that its query reads (directly or through other
+  views) is replaced with `CREATE OR REPLACE` or re-planned:
+  `materialized view "x" was replaced` (SQLSTATE `55000`);
 - the subscribed relation or query gets a new error record: the
   subscription ends with the error (the retraction of an error record does
   not end it). The initial snapshot of a subscription leaves rows that fail
@@ -347,15 +357,12 @@ A subscription runs until
 - the engine shuts down.
 
 If the subscribed materialized view is replaced with `CREATE OR REPLACE` by
-a materialized view with the same columns, the subscription continues: it
+a materialized view with the same columns, or re-planned after an upstream
+schema change without changing its columns, the subscription continues: it
 receives the difference between the old and the new contents at the
-replacement's GSN. A subscription to a query, by contrast, keeps the
-dataflow it was built with: when a materialized view it reads is replaced,
-or re-planned after an upstream schema change of a table under it, the
-subscription goes on with the view's old version — which no longer
-receives changes at all if the table under it changed shape (see
-[Known problems](troubleshooting.md#known-problems)). Subscribe to the view
-itself, or subscribe again after such changes.
+replacement's GSN. A subscription to a query has a dataflow of its own,
+built over the current versions of the materialized views it reads, so it
+ends instead (see above); subscribe again after such changes.
 
 Changes are queued for each subscription without a bound; a client that
 reads more slowly than changes arrive makes the server's memory grow.

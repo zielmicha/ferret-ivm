@@ -565,6 +565,7 @@ impl Engine {
         };
         if cv.materialized {
             check_deterministic(&bq.rel)?;
+            check_catalog_reads(&bq)?;
         }
         self.check_broken(&bq.rel)?;
         let mut names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
@@ -679,14 +680,20 @@ impl Engine {
         let mut cat = self.catalog.clone();
         cat.insert(CatalogObject { kind: new.clone(), ..old.clone() });
         for o in self.catalog.objects.values() {
-            // (a broken view does not plan, whatever the replacement)
+            // (a broken view does not plan, whatever the replacement; a view
+            // that does not read the replaced one is not re-planned, and may
+            // predate rules that are stricter now)
             if let ObjectKind::MaterializedView(v) = &o.kind
                 && o.id != old.id
                 && !self.rt.broken.contains_key(&o.id)
+                && self.catalog.query_reads(&v.sql, old.id)
             {
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
                 // (it inlines the views it reads: they must keep it deterministic)
-                if let Err(e) = crate::sql::plan_stored_query(&cat, &q).and_then(|bq| check_deterministic(&bq.rel)) {
+                if let Err(e) = crate::sql::plan_stored_query(&cat, &q).and_then(|bq| {
+                    check_deterministic(&bq.rel)?;
+                    check_catalog_reads(&bq)
+                }) {
                     return refuse(format!("materialized view \"{}\" would no longer be valid: {}", o.name, e.message));
                 }
             }
@@ -740,8 +747,25 @@ impl Engine {
         Ok(())
     }
 
-    /// Drop a view with the indexes on it and the sinks reading it.
+    /// Drop a view that is no longer valid with the indexes on it, the sinks
+    /// reading it and the virtual views reading it (which no longer plan
+    /// either), with what depends on those, as DROP ... CASCADE would.
+    /// (Materialized views reading it are re-planned after it, and dropped
+    /// then.)
     fn drop_view_and_attachments(&mut self, id: ObjectId) -> Result<()> {
+        let name = self.catalog.get(id).map(|o| o.name.clone()).unwrap_or_default();
+        let views: Vec<ObjectId> = self
+            .catalog
+            .dependents(id)
+            .into_iter()
+            .filter(|d| matches!(self.catalog.get(*d).map(|o| &o.kind), Some(ObjectKind::View(_))))
+            .collect();
+        for v in views {
+            if let Some(o) = self.catalog.get(v) {
+                log::error!("view {} is dropped: it reads {name}, which is no longer valid", o.name);
+                self.drop_with_dependents(v, true)?;
+            }
+        }
         let attached: Vec<ObjectId> = self
             .catalog
             .objects
@@ -819,6 +843,19 @@ impl Engine {
                 let _ = s.tx.send(SubEvent::Error(SqlError::new(
                     codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     format!("materialized view \"{name}\" changed its columns"),
+                )));
+                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        // subscriptions to queries reading the view (directly or through
+        // other views) have dataflows built on its old version, which they
+        // would go on with (and which receives no more changes when the
+        // view was re-planned after an upstream change): they end
+        for s in self.subs.iter() {
+            if s.view != Some(id) && s.reads.contains(&id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                    codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{name}\" was replaced"),
                 )));
                 s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -1200,6 +1237,19 @@ fn object_type_name(t: ast::ObjectType) -> &'static str {
         ast::ObjectType::Index => "index",
         _ => "object",
     }
+}
+
+/// Reject reads of the catalog in maintained views: system relations,
+/// regclass casts and functions such as pg_get_viewdef() are bound as
+/// constants from the catalog of the time. A view would not follow the
+/// catalog's changes (no log record changes it), and planning it again (a
+/// restart does) would change it.
+pub(crate) fn check_catalog_reads(bq: &crate::sql::BoundQuery) -> Result<()> {
+    if let Some(what) = &bq.catalog_reads {
+        return Err(SqlError::new(codes::FEATURE_NOT_SUPPORTED, format!("{what} is not allowed in a materialized view"))
+            .with_detail("Maintained views must be deterministic: their state is a pure function of the input log, which does not hold the catalog's contents."));
+    }
+    Ok(())
 }
 
 /// Reject non-deterministic functions in maintained views.

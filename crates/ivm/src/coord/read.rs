@@ -393,7 +393,7 @@ impl Engine {
         self.parked = still;
     }
 
-    fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
+    pub(super) fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
         let mut view = None;
         let (node, pinned, columns, reads): (NodeId, Option<NodeId>, Vec<ResultColumn>, Vec<ObjectId>) = match target {
             SubscribeTarget::Name(name) => {
@@ -429,6 +429,7 @@ impl Engine {
             SubscribeTarget::Query(q, _) => {
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
+                super::ddl::check_catalog_reads(&bq)?;
                 self.check_broken(&bq.rel)?;
                 // what it reads: the relations of the plan, and the views
                 // (inlined in it) it reads them through
@@ -442,6 +443,10 @@ impl Engine {
                 }
                 let mut reads = self.catalog.references(&q.to_string()).unwrap_or_default();
                 gets(&bq.rel, &mut reads);
+                // and what the materialized views it reads read in turn: the
+                // subscription's dataflow is built on their current versions,
+                // so it ends when one of them is replaced or re-planned
+                self.add_view_reads(&mut reads);
                 reads.sort_unstable();
                 reads.dedup();
                 let names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
@@ -451,14 +456,24 @@ impl Engine {
                 let arr_mark = self.graph.arr_count();
                 let rt = &self.rt;
                 let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-                let node = {
+                let lowered = {
                     let mut lw = Lowerer { g: &mut self.graph, env: &mut self.env, objects: &objects };
-                    let l = lw.lower(&rel)?;
-                    lw.materialize(l)
+                    lw.lower(&rel).map(|l| lw.materialize(l))
+                };
+                let node = match lowered {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // what lowering created before it failed is unreferenced
+                        self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
+                        return Err(e);
+                    }
                 };
                 self.graph.retain_node(node);
                 self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-                self.graph.hydrate(&mut self.env, self.processed)?;
+                if let Err(e) = self.graph.hydrate(&mut self.env, self.processed) {
+                    let _ = self.graph.release_node(&mut self.env, node);
+                    return Err(e);
+                }
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
                 (node, Some(node), cols, reads)
             }
@@ -474,6 +489,22 @@ impl Engine {
         let _ = tx.send(SubEvent::Progress { gsn: self.processed });
         self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
         Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
+    }
+
+    /// Add to `reads` the relations that the materialized views in it read
+    /// (directly or through views), transitively.
+    fn add_view_reads(&self, reads: &mut Vec<ObjectId>) {
+        let mut i = 0;
+        while i < reads.len() {
+            if let Some(ObjectKind::MaterializedView(v)) = self.catalog.get(reads[i]).map(|o| &o.kind) {
+                for r in self.catalog.references(&v.sql).unwrap_or_default() {
+                    if !reads.contains(&r) {
+                        reads.push(r);
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 
     /// Result columns and parameter types without executing.
