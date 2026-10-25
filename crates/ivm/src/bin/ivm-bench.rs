@@ -313,6 +313,8 @@ struct Measure {
     engine_wait: f64,
     /// Allocations (count, bytes) of the engine thread.
     engine_allocs: (u64, u64),
+    /// Allocations of the source threads.
+    source_allocs: u64,
     process_cpu: f64,
     upstream_cpu: f64,
     peak_rss_mb: f64,
@@ -338,16 +340,19 @@ impl Meter {
         let mut cpu: BTreeMap<&'static str, f64> = BTreeMap::new();
         let mut engine_wait = 0.0;
         let mut engine_allocs = (0, 0);
+        let mut source_allocs = 0;
         for (tid, (name, ns, wait)) in &now {
             let (b, bw) = self.cpu0.get(tid).filter(|(n, _, _)| n == name).map(|(_, b, w)| (*b, *w)).unwrap_or((0, 0));
             let g = group_of(name);
             *cpu.entry(g).or_default() += ns.saturating_sub(b) as f64 / 1e9;
+            let (c, by) = allocs.get(tid).copied().unwrap_or((0, 0));
+            let (c0, by0) = self.allocs0.get(tid).copied().unwrap_or((0, 0));
             if g == "engine" {
                 engine_wait += wait.saturating_sub(bw) as f64 / 1e9;
-                let (c, by) = allocs.get(tid).copied().unwrap_or((0, 0));
-                let (c0, by0) = self.allocs0.get(tid).copied().unwrap_or((0, 0));
                 engine_allocs.0 += c.saturating_sub(c0);
                 engine_allocs.1 += by.saturating_sub(by0);
+            } else if g == "source" {
+                source_allocs += c.saturating_sub(c0);
             }
         }
         cpu.entry("engine").or_default();
@@ -356,6 +361,7 @@ impl Meter {
             cpu,
             engine_wait,
             engine_allocs,
+            source_allocs,
             process_cpu: process_cpu_s() - self.proc0,
             upstream_cpu: upstream_cpu_s() - self.up0,
             peak_rss_mb: status_kb("VmHWM:") as f64 / 1024.0,
@@ -387,6 +393,7 @@ impl Report {
         parts.push(format!("\"engine_wait_s\":{:.4}", m.engine_wait));
         parts.push(format!("\"engine_allocs\":{}", m.engine_allocs.0));
         parts.push(format!("\"engine_alloc_mb\":{:.1}", m.engine_allocs.1 as f64 / 1e6));
+        parts.push(format!("\"source_allocs\":{}", m.source_allocs));
         parts.push(format!("\"process_cpu_s\":{:.3}", m.process_cpu));
         parts.push(format!("\"upstream_cpu_s\":{:.3}", m.upstream_cpu));
         parts.push(format!("\"peak_rss_mb\":{:.1}", m.peak_rss_mb));

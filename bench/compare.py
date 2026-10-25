@@ -29,6 +29,7 @@ METRICS = [
     "engine_allocs",
     "engine_allocs_per_txn",
     "engine_allocs_per_row",
+    "source_allocs",
     "source_us_per_row",
     "mean_ms",
     "p99_ms",
