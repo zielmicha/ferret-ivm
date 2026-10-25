@@ -8,13 +8,14 @@
 //! DISTINCT ON, set operations, recursive CTEs, ...), and a sequence of
 //! actions: random DML (also primary key changes and rows changed several
 //! times), checkpoints, clean restarts, crash restarts (no final checkpoint,
-//! so recovery replays the log), views created and dropped on the way, and
+//! so recovery replays the log; sometimes the log ends in a torn record),
+//! views created and dropped on the way, and
 //! reads AS OF earlier GSNs, which must return what the views held then. All
 //! views are compared after every action.
 //!
 //! Cases come from proptest, so a failure shrinks to a minimal set of views
 //! and actions, and is recorded under `proptest-regressions/`.
-//! `PROPTEST_CASES=N` runs N cases (default 6), `PROPTEST_RNG_SEED=N` fixes
+//! `PROPTEST_CASES=N` runs N cases (default 10), `PROPTEST_RNG_SEED=N` fixes
 //! the seed; the long variant runs bigger cases:
 //! `cargo test -p ivm --release --test selfdiff -- --ignored`.
 //! `SELFDIFF_VERBOSE=1` prints the views and actions of each case.
@@ -40,7 +41,9 @@ enum Action {
     Dml(u64),
     Checkpoint,
     Restart,
-    Crash,
+    /// A crash; with `true`, the input log also ends in a torn record (a
+    /// write the crash cut short, never acknowledged).
+    Crash(bool),
     CreateView(u64),
     DropView(usize),
     /// Reads AS OF an earlier GSN must return what the views held then.
@@ -52,7 +55,7 @@ fn arb_action() -> impl Strategy<Value = Action> {
         60 => any::<u64>().prop_map(Action::Dml),
         5 => Just(Action::Checkpoint),
         4 => Just(Action::Restart),
-        5 => Just(Action::Crash),
+        5 => any::<bool>().prop_map(Action::Crash),
         5 => any::<u64>().prop_map(Action::CreateView),
         2 => any::<usize>().prop_map(Action::DropView),
         6 => any::<usize>().prop_map(Action::AsOf),
@@ -179,9 +182,18 @@ impl Case {
         }
     }
 
-    fn restart(&mut self, crash: bool) {
+    fn restart(&mut self, crash: bool, torn_log: bool) {
         let r = self.running.take().unwrap();
         if crash { r.crash() } else { r.shutdown() }
+        if torn_log {
+            let mut segs: Vec<PathBuf> = std::fs::read_dir(self.dir.join("log")).unwrap().map(|e| e.unwrap().path()).collect();
+            segs.sort();
+            let last = segs.last().expect("a log segment");
+            let mut data = std::fs::read(last).unwrap();
+            // a frame header promising more than follows, then some bytes
+            data.extend_from_slice(&[200, 0, 0, 0, 1, 2, 3, 4, 9, 9, 9]);
+            std::fs::write(last, data).unwrap();
+        }
         if !AS_OF_ACROSS_RESTARTS {
             self.history.clear();
         }
@@ -309,11 +321,11 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
             }
             Action::Restart => {
                 case.note("-- restart".into());
-                case.restart(false);
+                case.restart(false, false);
             }
-            Action::Crash => {
-                case.note("-- crash".into());
-                case.restart(true);
+            Action::Crash(torn) => {
+                case.note(format!("-- crash{}", if *torn { " (torn log tail)" } else { "" }));
+                case.restart(true, *torn);
             }
             Action::CreateView(seed) => case.create_view(*seed),
             Action::DropView(pick) => {
@@ -351,7 +363,7 @@ fn proptest_config(cases: u32) -> ProptestConfig {
 }
 
 proptest! {
-    #![proptest_config(proptest_config(proptest_cases(6)))]
+    #![proptest_config(proptest_config(proptest_cases(10)))]
 
     #[test]
     fn views_match_ad_hoc_queries(
