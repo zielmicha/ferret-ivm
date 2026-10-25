@@ -322,7 +322,10 @@ pub fn start(cfg: Config) -> Result<Running> {
         }
     })?;
     let h2 = handle.clone();
-    let t2 = std::thread::Builder::new().name("ivm-engine".into()).spawn(move || {
+    // a large stack: statements are bound and planned here (syntax trees up
+    // to sql::parser::MAX_OPERATOR_CHAIN deep, bound expressions up to
+    // sql::binder_expr::MAX_EXPR_DEPTH); reserved, not committed, memory
+    let t2 = std::thread::Builder::new().name("ivm-engine".into()).stack_size(64 << 20).spawn(move || {
         if let Err(e) = engine.run(erx, h2) {
             log::error!("engine failed: {e}");
         }

@@ -328,7 +328,15 @@ fn finalize_sum(st: &AggState, arg: &SqlType) -> Result<Datum> {
         }
         (AggState::SumInt(v), _) => Datum::numeric(Numeric::from_i128(*v)),
         (AggState::SumNumeric(n), _) => Datum::numeric(n.value()),
-        (AggState::SumFloat(f), SqlType::Float4) => Datum::Float4(float_sum_value(f)? as f32),
+        (AggState::SumFloat(f), SqlType::Float4) => {
+            // as with float4pl, a finite sum beyond real's range overflows
+            let v = float_sum_value(f)?;
+            let r = v as f32;
+            if r.is_infinite() && v.is_finite() {
+                return Err(crate::expr::ops_overflow());
+            }
+            Datum::Float4(r)
+        }
         (AggState::SumFloat(f), _) => Datum::Float8(float_sum_value(f)?),
         _ => return Err(SqlError::internal("sum state mismatch")),
     })

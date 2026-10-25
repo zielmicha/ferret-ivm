@@ -207,6 +207,11 @@ pub fn apply_typmod(d: Datum, ty: &SqlType, tm: i32, explicit: bool) -> Result<D
         (SqlType::TimestampTz, Datum::TimestampTz(v)) => Datum::TimestampTz(pgdatetime::adjust_timestamp(v, tm)?),
         (SqlType::Time, Datum::Time(v)) => Datum::Time(pgdatetime::adjust_time(v, tm)),
         (SqlType::Interval, Datum::Interval(iv)) => Datum::Interval(pgdatetime::adjust_interval_raw_typmod(iv, tm)?),
+        // an array type's modifier applies to each element
+        (SqlType::Array(elem), Datum::Array(a)) => {
+            let elems = a.elems.iter().map(|e| apply_typmod(e.clone(), elem, tm, explicit)).collect::<Result<Vec<_>>>()?;
+            Datum::array(crate::types::ArrayValue { elem_type: a.elem_type.clone(), dims: a.dims.clone(), elems })
+        }
         (_, d) => d,
     })
 }

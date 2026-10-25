@@ -100,7 +100,40 @@ fn sqrt_n(a: &Datum) -> Result<Datum> {
     Ok(Datum::numeric(n(a).sqrt()?))
 }
 fn cbrt_f(a: &Datum) -> Result<Datum> {
-    f8(f(a).cbrt())
+    f8(glibc_cbrt(f(a)))
+}
+
+/// cbrt() as PostgreSQL computes it with glibc (sysdeps/ieee754/dbl-64/
+/// s_cbrt.c, constants verbatim), which is not correctly rounded:
+/// cbrt(27) = 3.0000000000000004. Rust's f64::cbrt gives other last digits.
+#[allow(clippy::excessive_precision)]
+fn glibc_cbrt(x: f64) -> f64 {
+    const CBRT2: f64 = 1.2599210498948731648; // 2^(1/3)
+    const SQR_CBRT2: f64 = 1.5874010519681994748; // 2^(2/3)
+    const FACTOR: [f64; 5] = [1.0 / SQR_CBRT2, 1.0 / CBRT2, 1.0, CBRT2, SQR_CBRT2];
+    if x == 0.0 || !x.is_finite() {
+        return x + x;
+    }
+    // frexp: |x| = xm * 2^xe with xm in [0.5, 1)
+    let (mut ax, mut adj) = (x.abs(), 0);
+    if ax < f64::MIN_POSITIVE {
+        ax *= f64::from_bits(0x4350_0000_0000_0000); // 2^54
+        adj = -54;
+    }
+    let bits = ax.to_bits();
+    let xe = ((bits >> 52) & 0x7ff) as i32 - 1022 + adj;
+    let xm = f64::from_bits((bits & !(0x7ff_u64 << 52)) | (1022_u64 << 52));
+    let u = 0.354895765043919860
+        + ((1.50819193781584896
+            + ((-2.11499494167371287
+                + ((2.44693122563534430 + ((-1.83469277483613086 + (0.784932344976639262 - 0.145263899385486377 * xm) * xm) * xm))
+                    * xm))
+                * xm))
+            * xm);
+    let t2 = u * u * u;
+    let ym = u * (t2 + 2.0 * xm) / (2.0 * t2 + xm) * FACTOR[(2 + xe % 3) as usize];
+    // ldexp(±ym, xe / 3); the exponent stays well inside the normal range
+    (if x > 0.0 { ym } else { -ym }) * f64::from_bits(((0x3ff + xe / 3) as u64) << 52)
 }
 fn exp_f(a: &Datum) -> Result<Datum> {
     let x = f(a);
@@ -250,30 +283,66 @@ fn scale(a: &Datum) -> Result<Datum> {
 fn min_scale(a: &Datum) -> Result<Datum> {
     Ok(n(a).min_scale().map(Datum::Int4).unwrap_or(Datum::Null))
 }
-fn width_bucket_f(args: &[Datum]) -> Result<Datum> {
-    let (x, lo, hi, cnt) = (f(&args[0]), f(&args[1]), f(&args[2]), i(&args[3]));
+fn width_bucket_args(cnt: i64, nan: bool, infinite_bound: bool) -> Result<()> {
     if cnt <= 0 {
         return Err(SqlError::new("2201G", "count must be greater than zero"));
     }
-    if lo == hi || lo.is_nan() || hi.is_nan() || lo.is_infinite() || hi.is_infinite() {
-        return Err(SqlError::new("2201G", "lower bound cannot equal upper bound"));
+    if nan {
+        return Err(SqlError::new("2201G", "operand, lower bound, and upper bound cannot be NaN"));
     }
+    if infinite_bound {
+        return Err(SqlError::new("2201G", "lower and upper bounds must be finite"));
+    }
+    Ok(())
+}
+fn width_bucket_result(r: i64) -> Result<Datum> {
+    i32::try_from(r).map(Datum::Int4).map_err(|_| SqlError::new(codes::NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range"))
+}
+/// width_bucket_float8
+fn width_bucket_f(args: &[Datum]) -> Result<Datum> {
+    let (x, lo, hi, cnt) = (f(&args[0]), f(&args[1]), f(&args[2]), i(&args[3]));
+    width_bucket_args(cnt, x.is_nan() || lo.is_nan() || hi.is_nan(), lo.is_infinite() || hi.is_infinite())?;
+    // count * (a - b) / (c - d) for an operand inside the range; halve the
+    // inputs when the bounds' difference overflows
+    let inside = |a: f64, b: f64, c: f64, d: f64| {
+        let q = if (c - d).is_infinite() { (a / 2.0 - b / 2.0) / (c / 2.0 - d / 2.0) } else { (a - b) / (c - d) };
+        // the quotient can round to 1
+        ((cnt as f64 * q) as i64).min(cnt - 1) + 1
+    };
     let r = if lo < hi {
         if x < lo {
             0
         } else if x >= hi {
             cnt + 1
         } else {
-            ((cnt as f64) * ((x - lo) / (hi - lo))) as i64 + 1
+            inside(x, lo, hi, lo)
         }
-    } else if x > lo {
-        0
-    } else if x <= hi {
-        cnt + 1
+    } else if lo > hi {
+        if x > lo {
+            0
+        } else if x <= hi {
+            cnt + 1
+        } else {
+            inside(lo, x, lo, hi)
+        }
     } else {
-        ((cnt as f64) * ((lo - x) / (lo - hi))) as i64 + 1
+        return Err(SqlError::new("2201G", "lower bound cannot equal upper bound"));
     };
-    Ok(Datum::Int4(r as i32))
+    width_bucket_result(r)
+}
+/// width_bucket_numeric: exact, ((x - lo) * count) / (hi - lo) + 1 truncated
+fn width_bucket_n(args: &[Datum]) -> Result<Datum> {
+    let (x, lo, hi, cnt) = (n(&args[0]), n(&args[1]), n(&args[2]), i(&args[3]));
+    width_bucket_args(cnt, x.is_nan() || lo.is_nan() || hi.is_nan(), lo.is_infinite() || hi.is_infinite())?;
+    let r = match lo.cmp(hi) {
+        std::cmp::Ordering::Equal => return Err(SqlError::new("2201G", "lower bound cannot equal upper bound")),
+        std::cmp::Ordering::Less if x < lo => 0,
+        std::cmp::Ordering::Greater if x > lo => 0,
+        std::cmp::Ordering::Less if x >= hi => cnt + 1,
+        std::cmp::Ordering::Greater if x <= hi => cnt + 1,
+        _ => x.sub(lo)?.mul(&Numeric::from_i64(cnt))?.div_trunc(&hi.sub(lo)?)?.to_i64()? + 1,
+    };
+    width_bucket_result(r)
 }
 fn random(_: &[Datum]) -> Result<Datum> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -356,6 +425,10 @@ fn ltrim2(a: &Datum, b: &Datum) -> Result<Datum> {
 fn rtrim1(a: &Datum) -> Result<Datum> {
     Ok(txt(pgfuncs::text::rtrim(s(a), " ")))
 }
+/// text(bpchar): the cast from character(n), which drops trailing spaces.
+fn bpchar_text(a: &Datum) -> Result<Datum> {
+    Ok(txt(s(a).trim_end_matches(' ').to_string()))
+}
 fn rtrim2(a: &Datum, b: &Datum) -> Result<Datum> {
     Ok(txt(pgfuncs::text::rtrim(s(a), s(b))))
 }
@@ -427,6 +500,13 @@ fn quote_literal(a: &Datum) -> Result<Datum> {
 }
 fn quote_nullable(args: &[Datum]) -> Result<Datum> {
     Ok(if args[0].is_null() { txt("NULL".into()) } else { txt(pgfuncs::text::quote_literal(&as_text(&args[0]))) })
+}
+/// quote_literal(character(n)) quotes $1::text, which drops the padding.
+fn quote_literal_bpchar(a: &Datum) -> Result<Datum> {
+    Ok(txt(pgfuncs::text::quote_literal(s(a).trim_end_matches(' '))))
+}
+fn quote_nullable_bpchar(args: &[Datum]) -> Result<Datum> {
+    if args[0].is_null() { Ok(txt("NULL".into())) } else { quote_literal_bpchar(&args[0]) }
 }
 fn to_hex(a: &Datum) -> Result<Datum> {
     Ok(txt(match a {
@@ -649,6 +729,38 @@ fn null_text(_: &[Datum]) -> Result<Datum> {
 }
 fn owner_name(_: &Datum) -> Result<Datum> {
     Ok(Datum::text("ivm"))
+}
+/// current_setting(name [, missing_ok]): the server's fixed settings (as
+/// reported by SHOW and the startup ParameterStatus messages).
+fn current_setting(args: &[Datum]) -> Result<Datum> {
+    let name = s(&args[0]).to_ascii_lowercase();
+    let v = match name.as_str() {
+        "server_version" => "17.0",
+        "server_version_num" => "170000",
+        "server_encoding" | "client_encoding" => "UTF8",
+        "timezone" => "UTC",
+        "datestyle" => "ISO, MDY",
+        "intervalstyle" => "postgres",
+        "transaction_isolation" | "default_transaction_isolation" => "serializable",
+        "standard_conforming_strings" | "integer_datetimes" | "is_superuser" => "on",
+        "transaction_read_only" | "default_transaction_read_only" => "off",
+        "search_path" => "\"$user\", public",
+        "max_identifier_length" => "63",
+        "extra_float_digits" => "1",
+        "bytea_output" => "hex",
+        "lc_collate" | "lc_ctype" | "lc_messages" | "lc_monetary" | "lc_numeric" | "lc_time" => "C",
+        "application_name" => "",
+        _ if args.get(1).and_then(|d| d.as_bool()) == Some(true) => return Ok(Datum::Null),
+        _ => {
+            return Err(SqlError::new(codes::UNDEFINED_OBJECT, format!("unrecognized configuration parameter \"{}\"", s(&args[0]))));
+        }
+    };
+    Ok(txt(v.to_string()))
+}
+/// set_config(name, value, is_local): settings cannot be changed through
+/// expressions; like SET, the call is accepted and returns the value.
+fn set_config(args: &[Datum]) -> Result<Datum> {
+    Ok(args[1].clone())
 }
 fn encoding_name(_: &Datum) -> Result<Datum> {
     Ok(Datum::text("UTF8"))
@@ -1347,6 +1459,7 @@ pub fn register(b: &mut Builder) {
     b.f1("min_scale", T::Numeric, T::Int4, min_scale);
     b.last().can_return_null = true;
     b.fnn("width_bucket", vec![T::Float8, T::Float8, T::Float8, T::Int4], T::Int4, width_bucket_f);
+    b.fnn("width_bucket", vec![T::Numeric, T::Numeric, T::Numeric, T::Int4], T::Int4, width_bucket_n);
     b.fnn("random", vec![], T::Float8, random);
     b.last().volatility = Volatility::Volatile;
 
@@ -1356,6 +1469,10 @@ pub fn register(b: &mut Builder) {
     }
     b.f1("length", T::Bytea, T::Int4, length);
     b.f1("octet_length", T::Text, T::Int4, octet_length);
+    // character(n) counts its padding in octet_length (length() does not:
+    // it applies to the value cast to text)
+    b.f1("octet_length", T::Bpchar, T::Int4, octet_length);
+    b.f1("text", T::Bpchar, T::Text, bpchar_text);
     b.f1("octet_length", T::Bytea, T::Int4, octet_length);
     b.f1("bit_length", T::Text, T::Int4, bit_length);
     b.f1("bit_length", T::Bytea, T::Int4, bit_length);
@@ -1403,6 +1520,8 @@ pub fn register(b: &mut Builder) {
     b.f1("quote_literal", T::Text, T::Text, quote_literal);
     b.poly("quote_literal", vec![P::AnyElement], Ret::T(T::Text), Imp::F1(quote_literal));
     b.poly("quote_nullable", vec![P::AnyElement], Ret::T(T::Text), Imp::FN(quote_nullable)).strict = false;
+    b.f1("quote_literal", T::Bpchar, T::Text, quote_literal_bpchar);
+    b.poly("quote_nullable", vec![P::T(T::Bpchar)], Ret::T(T::Text), Imp::FN(quote_nullable_bpchar)).strict = false;
     b.f1("to_hex", T::Int4, T::Text, to_hex);
     b.f1("to_hex", T::Int8, T::Text, to_hex);
     {
@@ -1486,6 +1605,8 @@ pub fn register(b: &mut Builder) {
         ("pg_get_constraintdef", vec![P::T(T::Oid), P::T(T::Bool)]),
         ("pg_get_viewdef", vec![P::T(T::Oid)]),
         ("pg_get_viewdef", vec![P::T(T::Oid), P::T(T::Bool)]),
+        ("pg_get_ruledef", vec![P::T(T::Oid)]),
+        ("pg_get_ruledef", vec![P::T(T::Oid), P::T(T::Bool)]),
         ("pg_get_triggerdef", vec![P::T(T::Oid)]),
         ("pg_get_partkeydef", vec![P::T(T::Oid)]),
         ("pg_get_statisticsobjdef_columns", vec![P::T(T::Oid)]),
@@ -1510,6 +1631,13 @@ pub fn register(b: &mut Builder) {
         b.poly(name, vec![P::Any, P::Any, P::Any], Ret::T(T::Bool), Imp::FN(always_true));
     }
     b.f1("pg_encoding_to_char", T::Int4, T::Name, encoding_name);
+    b.fnn("set_config", vec![T::Text, T::Text, T::Bool], T::Text, set_config);
+    b.last().volatility = Volatility::Volatile;
+    for params in [vec![T::Text], vec![T::Text, T::Bool]] {
+        b.fnn("current_setting", params, T::Text, current_setting);
+        b.last().volatility = Volatility::Stable;
+        b.last().can_return_null = true;
+    }
     b.fnn("pg_backend_pid", vec![], T::Int4, backend_pid);
     b.fnn("pg_is_in_recovery", vec![], T::Bool, always_false);
     {

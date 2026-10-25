@@ -66,6 +66,23 @@ impl BoundQuery {
     pub fn column_types(&self) -> Vec<ColumnType> {
         self.rel.schema().into_iter().take(self.visible).collect()
     }
+
+    /// Resolve untyped (unknown) result columns as text, as PostgreSQL does
+    /// for the outputs of a query, subquery, CTE or view (but not for the
+    /// branches of a set operation, which unify their types first).
+    pub fn resolve_unknowns(mut self, b: &mut Binder) -> Result<BoundQuery> {
+        let schema = self.rel.schema();
+        if !schema.iter().take(self.visible).any(|c| c.ty == SqlType::Unknown) {
+            return Ok(self);
+        }
+        let target: Vec<ColumnType> = schema
+            .iter()
+            .enumerate()
+            .map(|(i, c)| if i < self.visible && c.ty == SqlType::Unknown { ColumnType::new(SqlType::Text).nullable(c.nullable) } else { c.clone() })
+            .collect();
+        self.rel = b.coerce_rel(self.rel, &target, "SELECT")?;
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +158,11 @@ pub struct Binder<'a> {
     pub params: Vec<ParamSlot>,
     pub(crate) next_rec_id: u64,
     view_depth: usize,
+    /// Binding a stored view definition: a parameter placeholder binds as
+    /// NULL, as it did when such definitions were still accepted.
+    pub(crate) stored_definition: bool,
+    /// Nesting depth of the expression being bound (see MAX_EXPR_DEPTH).
+    pub(crate) expr_depth: usize,
     /// WINDOW clause of the SELECT being bound.
     pub(crate) named_windows: Vec<ast::NamedWindowDefinition>,
 }
@@ -176,6 +198,8 @@ impl<'a> Binder<'a> {
             params: Vec::new(),
             next_rec_id: 1,
             view_depth: 0,
+            stored_definition: false,
+            expr_depth: 0,
             named_windows: Vec::new(),
         }
     }
@@ -188,7 +212,12 @@ impl<'a> Binder<'a> {
     // ------------------------------------------------------------------ queries
 
     pub fn bind_query(&mut self, q: &ast::Query) -> Result<BoundQuery> {
-        if q.fetch.is_some() && q.limit_clause.is_some() {
+        // (OFFSET alone is kept in the limit clause too: OFFSET n FETCH ...)
+        let has_limit = matches!(
+            &q.limit_clause,
+            Some(ast::LimitClause::LimitOffset { limit: Some(_), .. } | ast::LimitClause::OffsetCommaLimit { .. })
+        );
+        if q.fetch.is_some() && has_limit {
             sql_bail!(codes::SYNTAX_ERROR, "cannot use both LIMIT and FETCH");
         }
         if !q.locks.is_empty() {
@@ -213,10 +242,10 @@ impl<'a> Binder<'a> {
         for cte in &w.cte_tables {
             let name = ident(&cte.alias.name);
             let alias_cols: Vec<String> = cte.alias.columns.iter().map(|c| ident(&c.name)).collect();
-            let binding = if w.recursive && query_references(&cte.query, &name) {
+            let binding = if w.recursive && self.cte_refers_to_itself(&name, &cte.query) {
                 self.bind_recursive_cte(&name, &alias_cols, &cte.query)?
             } else {
-                let bq = self.bind_query(&cte.query)?;
+                let bq = self.bind_query(&cte.query)?.resolve_unknowns(self)?;
                 let mut names = bq.names.clone();
                 names.truncate(bq.visible);
                 apply_alias_names(&mut names, &alias_cols, &name)?;
@@ -227,6 +256,25 @@ impl<'a> Binder<'a> {
         Ok(())
     }
 
+    /// Whether a WITH RECURSIVE query refers to its own name: bind it with a
+    /// placeholder relation for that name and look for the placeholder (a
+    /// binding error means it was referenced too, e.g. by a column).
+    fn cte_refers_to_itself(&mut self, name: &str, q: &ast::Query) -> bool {
+        const PROBE: u64 = u64::MAX;
+        if !query_references(q, name) {
+            return false;
+        }
+        self.ctes.last_mut().unwrap().push((name.to_string(), CteBinding { rel: Rel::RecRef { id: PROBE, columns: vec![] }, names: vec![] }));
+        let saved = self.next_rec_id;
+        let probe = self.bind_query(q);
+        self.next_rec_id = saved;
+        self.ctes.last_mut().unwrap().pop();
+        match probe {
+            Ok(bq) => rel_uses_recref(&bq.rel, PROBE),
+            Err(_) => true,
+        }
+    }
+
     fn bind_recursive_cte(&mut self, name: &str, alias_cols: &[String], q: &ast::Query) -> Result<CteBinding> {
         let ast::SetExpr::SetOperation { left, op: ast::SetOperator::Union, set_quantifier, right } = &*q.body else {
             sql_bail!(
@@ -235,7 +283,16 @@ impl<'a> Binder<'a> {
             );
         };
         let distinct = !matches!(set_quantifier, ast::SetQuantifier::All);
-        let (base, mut names) = self.bind_set_expr(left)?;
+        let (mut base, mut names) = self.bind_set_expr(left)?;
+        // the non-recursive term fixes the column types: untyped ones are text
+        let schema = base.schema();
+        if schema.iter().any(|c| c.ty == SqlType::Unknown) {
+            let target: Vec<ColumnType> = schema
+                .iter()
+                .map(|c| if c.ty == SqlType::Unknown { ColumnType::new(SqlType::Text).nullable(c.nullable) } else { c.clone() })
+                .collect();
+            base = self.coerce_rel(base, &target, "UNION")?;
+        }
         apply_alias_names(&mut names, alias_cols, name)?;
         let id = self.next_rec_id;
         self.next_rec_id += 1;
@@ -315,10 +372,10 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_query_body(&mut self, q: &ast::Query) -> Result<BoundQuery> {
-        let order_by: Vec<ast::OrderByExpr> = match &q.order_by {
-            None => vec![],
+        let order_by: &[ast::OrderByExpr] = match &q.order_by {
+            None => &[],
             Some(ob) => match &ob.kind {
-                ast::OrderByKind::Expressions(v) => v.clone(),
+                ast::OrderByKind::Expressions(v) => v,
                 ast::OrderByKind::All(_) => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "ORDER BY ALL is not supported"),
             },
         };
@@ -326,7 +383,7 @@ impl<'a> Binder<'a> {
         if with_ties && order_by.is_empty() {
             sql_bail!(codes::SYNTAX_ERROR, "WITH TIES cannot be specified without ORDER BY clause");
         }
-        let mut bq = self.bind_query_body_inner(q, &order_by, limit, offset)?;
+        let mut bq = self.bind_query_body_inner(q, order_by, limit, offset)?;
         bq.with_ties = with_ties;
         Ok(bq)
     }
@@ -355,7 +412,7 @@ impl<'a> Binder<'a> {
                 let mut extra = Vec::new();
                 for ob in order_by {
                     let spec = sort_spec(&ob.options);
-                    let col = match self.order_by_output_ref(&ob.expr, &names, visible)? {
+                    let col = match self.order_by_output_ref(&ob.expr, &names, visible, None)? {
                         Some(c) => c,
                         None => {
                             let e = self.bind_expr(&ob.expr, &Ctx::plain(&scope, "ORDER BY"))?;
@@ -375,8 +432,10 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// ORDER BY item naming an output column (alias or ordinal).
-    fn order_by_output_ref(&self, e: &ast::Expr, names: &[String], visible: usize) -> Result<Option<usize>> {
+    /// ORDER BY item naming an output column (alias or ordinal). Several
+    /// output columns of that name are ambiguous unless they are the same
+    /// expression (`exprs`, when known).
+    fn order_by_output_ref(&self, e: &ast::Expr, names: &[String], visible: usize, exprs: Option<&[Expr]>) -> Result<Option<usize>> {
         match e {
             ast::Expr::Value(v) => {
                 if let ast::Value::Number(n, _) = &v.value {
@@ -394,6 +453,7 @@ impl<'a> Binder<'a> {
                 match hits.len() {
                     0 => Ok(None),
                     1 => Ok(Some(hits[0])),
+                    _ if exprs.is_some_and(|x| same_exprs(x, &hits)) => Ok(Some(hits[0])),
                     _ => sql_bail!(codes::AMBIGUOUS_COLUMN, "ORDER BY \"{name}\" is ambiguous"),
                 }
             }
@@ -558,11 +618,13 @@ impl<'a> Binder<'a> {
             match item {
                 ast::SelectItem::UnnamedExpr(e) => {
                     names.push(derive_name(e));
-                    sel_exprs.push(self.bind_expr(e, &ctx)?);
+                    let x = self.bind_expr(e, &ctx)?;
+                    sel_exprs.push(self.display_reg(e, x));
                 }
                 ast::SelectItem::ExprWithAlias { expr, alias } => {
                     names.push(ident(alias));
-                    sel_exprs.push(self.bind_expr(expr, &ctx)?);
+                    let x = self.bind_expr(expr, &ctx)?;
+                    sel_exprs.push(self.display_reg(expr, x));
                 }
                 ast::SelectItem::Wildcard(_) => {
                     let cols = scope.star(None)?;
@@ -648,6 +710,11 @@ impl<'a> Binder<'a> {
                             uses_sets = true;
                             sets.iter().map(|l| bind_list(self, l, &mut group_exprs)).collect::<Result<_>>()?
                         }
+                        // (): the empty grouping set
+                        ast::Expr::Tuple(v) if v.is_empty() => {
+                            uses_sets = true;
+                            vec![vec![]]
+                        }
                         e => vec![vec![bind_one(self, e, &mut group_exprs)?]],
                     };
                     let mut next = Vec::with_capacity(combos.len() * alts.len());
@@ -686,7 +753,7 @@ impl<'a> Binder<'a> {
         let mut order_items: Vec<(OrderTarget, SortSpec)> = Vec::new();
         for ob in order_by {
             let spec = sort_spec(&ob.options);
-            if let Some(c) = self.order_by_output_ref(&ob.expr, &names, names.len())? {
+            if let Some(c) = self.order_by_output_ref(&ob.expr, &names, names.len(), Some(&sel_exprs))? {
                 // an alias that is also an input column name prefers the output column (PG)
                 order_items.push((OrderTarget::Output(c), spec));
                 continue;
@@ -888,6 +955,11 @@ impl<'a> Binder<'a> {
             proj_exprs.push(win_rewrite(post(e)?));
         }
         let visible = proj_exprs.len();
+        let fp = |e: &Expr| {
+            let mut v = Vec::new();
+            e.fingerprint(&mut v);
+            v
+        };
         let mut order = Vec::new();
         let mut extra: Vec<Expr> = Vec::new();
         for (target, spec) in order_items {
@@ -895,16 +967,11 @@ impl<'a> Binder<'a> {
                 OrderTarget::Output(c) => c,
                 OrderTarget::Expr(e) => {
                     let e = win_rewrite(post(&e)?);
-                    let mut fp = Vec::new();
-                    e.fingerprint(&mut fp);
-                    match proj_exprs.iter().position(|p| {
-                        let mut f2 = Vec::new();
-                        p.fingerprint(&mut f2);
-                        f2 == fp
-                    }) {
+                    let f = fp(&e);
+                    match proj_exprs.iter().position(|p| fp(p) == f) {
                         Some(c) => c,
                         None => {
-                            if s.distinct.is_some() {
+                            if matches!(s.distinct, Some(ast::Distinct::Distinct)) {
                                 sql_bail!(
                                     codes::INVALID_COLUMN_REFERENCE,
                                     "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
@@ -917,6 +984,29 @@ impl<'a> Binder<'a> {
                 }
             };
             order.push(SortKey { col, spec });
+        }
+        // DISTINCT ON targets: output columns (alias, ordinal or the same
+        // expression) or further helper columns
+        let mut distinct_on = Vec::new();
+        if let Some(ast::Distinct::On(exprs)) = &s.distinct {
+            for e in exprs {
+                let c = match self.order_by_output_ref(e, &names, visible, Some(&proj_exprs))? {
+                    Some(c) => c,
+                    None => {
+                        let ex = self.bind_expr(e, &Ctx::plain(&scope, "DISTINCT ON"))?;
+                        let ex = win_rewrite(post(&ex)?);
+                        let f = fp(&ex);
+                        match proj_exprs.iter().chain(extra.iter()).position(|p| fp(p) == f) {
+                            Some(c) => c,
+                            None => {
+                                extra.push(ex);
+                                visible + extra.len() - 1
+                            }
+                        }
+                    }
+                };
+                distinct_on.push(c);
+            }
         }
         let mut all_out = proj_exprs;
         all_out.extend(extra);
@@ -934,47 +1024,12 @@ impl<'a> Binder<'a> {
             Some(ast::Distinct::Distinct) => {
                 rel = Rel::Distinct { input: Box::new(rel) };
             }
-            Some(ast::Distinct::On(exprs)) => {
-                // DISTINCT ON expressions are bound against the select list scope
-                let out_scope = Scope::new(
-                    names_all
-                        .iter()
-                        .zip(rel.schema())
-                        .map(|(n, t)| ScopeItem { table: None, name: n.clone(), ty: t, hidden: false })
-                        .collect(),
-                );
-                let mut group = Vec::new();
-                let mut extra = Vec::new();
-                for e in exprs {
-                    let c = match self.order_by_output_ref(e, &names_all, visible)? {
-                        Some(c) => c,
-                        None => {
-                            // expression over input columns: must match a select expression
-                            let ex = self.bind_expr(e, &Ctx::plain(&scope, "DISTINCT ON"))?;
-                            let ex = post(&ex)?;
-                            match self.find_matching_output(&rel, &ex) {
-                                Some(c) => c,
-                                None => {
-                                    let _ = &out_scope;
-                                    extra.push(ex);
-                                    usize::MAX
-                                }
-                            }
-                        }
-                    };
-                    if c == usize::MAX {
-                        sql_bail!(codes::FEATURE_NOT_SUPPORTED, "DISTINCT ON expressions must appear in the select list");
-                    }
-                    group.push(c);
-                }
-                rel = Rel::TopK { input: Box::new(rel), group, order: order.clone(), limit: Some(1), offset: 0, with_ties: false };
+            Some(ast::Distinct::On(_)) => {
+                // the first row of each group in ORDER BY order
+                rel = Rel::TopK { input: Box::new(rel), group: distinct_on, order: order.clone(), limit: Some(1), offset: 0, with_ties: false };
             }
         }
         Ok(BoundQuery { rel, names: names_all, visible, order, limit, offset, with_ties: false })
-    }
-
-    fn find_matching_output(&self, _rel: &Rel, _e: &Expr) -> Option<usize> {
-        None
     }
 
     /// Group-by item: output ordinal, output alias (if not an input column), or expression.
@@ -991,9 +1046,11 @@ impl<'a> Binder<'a> {
             }
             ast::Expr::Identifier(id) => {
                 let name = ident(id);
-                if scope.resolve(None, &name)?.is_none() && self.lookup_outer(None, &name)?.is_none() {
+                // a FROM column of this query wins over an output alias, but
+                // columns of outer queries do not (as in PostgreSQL)
+                if scope.resolve(None, &name)?.is_none() {
                     let hits: Vec<usize> = (0..names.len()).filter(|i| names[*i] == name).collect();
-                    if hits.len() == 1 {
+                    if !hits.is_empty() && same_exprs(sel, &hits) {
                         return Ok(sel[hits[0]].clone());
                     }
                 }
@@ -1007,17 +1064,13 @@ impl<'a> Binder<'a> {
     fn functional_dependencies(&self, rel: &Rel, scope: &Scope, group: &[Expr]) -> Vec<usize> {
         let grouped: Vec<usize> = group.iter().filter_map(|g| g.as_column()).collect();
         let mut out = Vec::new();
-        // find Get leaves and their column offsets within the FROM scope
-        let mut leaves = Vec::new();
-        collect_get_offsets(rel, 0, &mut leaves);
-        for (offset, arity, keys) in leaves {
+        // base tables of the FROM clause and where their columns are in it
+        let mut tables = Vec::new();
+        collect_tables(rel, &mut tables);
+        for (positions, keys) in tables {
             for key in keys {
-                if !key.is_empty() && key.iter().all(|k| grouped.contains(&(offset + k))) {
-                    for c in 0..arity {
-                        if offset + c < scope.len() {
-                            out.push(offset + c);
-                        }
-                    }
+                if !key.is_empty() && key.iter().all(|k| positions[*k].iter().any(|p| grouped.contains(p))) {
+                    out.extend(positions.iter().flatten().copied().filter(|p| *p < scope.len()));
                 }
             }
         }
@@ -1195,8 +1248,7 @@ impl<'a> Binder<'a> {
                 }
                 if let Some(args) = args {
                     let (_, fname) = object_name(name)?;
-                    let fargs: Vec<ast::FunctionArg> = args.args.clone();
-                    return self.bind_table_function(&fname, &fargs, alias.as_ref(), left_scope, *with_ordinality);
+                    return self.bind_table_function(&fname, &args.args, alias.as_ref(), left_scope, *with_ordinality);
                 }
                 let (schema, tname) = object_name(name)?;
                 let (rel, scope) = self.bind_named_relation(schema.as_deref(), &tname, alias.as_ref())?;
@@ -1219,9 +1271,11 @@ impl<'a> Binder<'a> {
             ast::TableFactor::NestedJoin { table_with_joins, alias } => {
                 let (rel, mut scope) = self.bind_table_with_joins(table_with_joins, None)?;
                 if let Some(a) = alias {
+                    // the alias names the join's output columns; the columns
+                    // merged by USING are no longer reachable at all
                     let t = ident(&a.name);
                     for it in scope.items.iter_mut() {
-                        it.table = Some(t.clone());
+                        it.table = if it.hidden { None } else { Some(t.clone()) };
                     }
                 }
                 Ok((rel, scope, false))
@@ -1245,6 +1299,7 @@ impl<'a> Binder<'a> {
     }
 
     fn derived(&mut self, bq: BoundQuery, alias: Option<&ast::TableAlias>) -> Result<(Rel, Scope)> {
+        let bq = bq.resolve_unknowns(self)?;
         let mut names = bq.names.clone();
         names.truncate(bq.visible);
         let rel = bq.into_rel();
@@ -1308,8 +1363,9 @@ impl<'a> Binder<'a> {
                 let stmt = super::parser::parse_single_query(&sql)?;
                 let mut sub = Binder::new(self.catalog);
                 sub.view_depth = self.view_depth + 1;
+                sub.stored_definition = true;
                 sub.next_rec_id = self.next_rec_id + 1000;
-                let bq = sub.bind_query(&stmt)?;
+                let bq = sub.bind_query(&stmt)?.resolve_unknowns(&mut sub)?;
                 self.next_rec_id = sub.next_rec_id;
                 let rel = bq.into_rel();
                 let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
@@ -1345,13 +1401,59 @@ enum OrderTarget {
     Expr(Expr),
 }
 
-fn collect_get_offsets(rel: &Rel, offset: usize, out: &mut Vec<(usize, usize, Vec<Vec<usize>>)>) {
+/// Whether the expressions at `idx` are all the same.
+fn same_exprs(exprs: &[Expr], idx: &[usize]) -> bool {
+    let fp = |e: &Expr| {
+        let mut v = Vec::new();
+        e.fingerprint(&mut v);
+        v
+    };
+    let first = fp(&exprs[idx[0]]);
+    idx[1..].iter().all(|i| fp(&exprs[*i]) == first)
+}
+
+/// A base table seen through a FROM relation: the output positions of each
+/// of its columns, and its keys.
+type BaseTable = (Vec<Vec<usize>>, Vec<Vec<usize>>);
+
+/// Base tables a FROM relation reads directly: for each, the output
+/// positions of each of its columns (several when a USING join merges it,
+/// none when projected away) and its keys.
+fn collect_tables(rel: &Rel, out: &mut Vec<BaseTable>) {
     match rel {
-        Rel::Get { columns, keys, .. } => out.push((offset, columns.len(), keys.clone())),
-        Rel::Filter { input, .. } => collect_get_offsets(input, offset, out),
+        Rel::Get { columns, keys, .. } => out.push(((0..columns.len()).map(|c| vec![c]).collect(), keys.clone())),
+        Rel::Filter { input, .. } => collect_tables(input, out),
         Rel::Join { left, right, kind, .. } if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right | JoinKind::Full) => {
-            collect_get_offsets(left, offset, out);
-            collect_get_offsets(right, offset + left.arity(), out);
+            collect_tables(left, out);
+            let mut r = Vec::new();
+            collect_tables(right, &mut r);
+            let nl = left.arity();
+            for (positions, keys) in r {
+                out.push((positions.into_iter().map(|ps| ps.into_iter().map(|p| p + nl).collect()).collect(), keys));
+            }
+        }
+        // a LATERAL subquery's columns are not base table columns
+        Rel::Apply { left, kind: ApplyKind::Lateral { .. }, .. } => collect_tables(left, out),
+        Rel::Map { input, exprs } => {
+            let n = input.arity();
+            let start = out.len();
+            collect_tables(input, out);
+            for (positions, _) in out[start..].iter_mut() {
+                for ps in positions.iter_mut() {
+                    let copies: Vec<usize> =
+                        exprs.iter().enumerate().filter(|(_, e)| matches!(e, Expr::Column(c) if ps.contains(c))).map(|(j, _)| n + j).collect();
+                    ps.extend(copies);
+                }
+            }
+        }
+        Rel::Project { input, cols } => {
+            let start = out.len();
+            collect_tables(input, out);
+            for (positions, _) in out[start..].iter_mut() {
+                for ps in positions.iter_mut() {
+                    *ps = cols.iter().enumerate().filter(|(_, c)| ps.contains(c)).map(|(i, _)| i).collect();
+                }
+            }
         }
         _ => {}
     }
@@ -1377,49 +1479,81 @@ pub(crate) fn apply_alias_names(names: &mut [String], alias: &[String], table: &
     Ok(())
 }
 
-/// PostgreSQL's output column naming.
+/// PostgreSQL's output column naming (FigureColname).
 pub(crate) fn derive_name(e: &ast::Expr) -> String {
+    figure_colname(e).0
+}
+
+/// A column name for `e` and its strength (PostgreSQL's FigureColnameInternal):
+/// 2 for names of columns, functions and the like, 1 for type names from
+/// casts, 0 for nothing better than "?column?". A cast or CASE takes its
+/// argument's (ELSE result's) name when that is strong.
+fn figure_colname(e: &ast::Expr) -> (String, u8) {
+    let strong = |n: &str| (n.to_string(), 2);
     match e {
-        ast::Expr::Identifier(i) => ident(i),
-        ast::Expr::CompoundIdentifier(v) => v.last().map(ident).unwrap_or_default(),
-        ast::Expr::Function(f) => f.name.0.last().and_then(|p| p.as_ident()).map(ident).unwrap_or_else(|| "?column?".into()),
-        ast::Expr::Cast { expr, data_type, .. } => match &**expr {
-            ast::Expr::Value(_) => type_name_for_alias(data_type),
-            other => {
-                let n = derive_name(other);
-                if n == "?column?" { type_name_for_alias(data_type) } else { n }
-            }
+        ast::Expr::Identifier(i) => (ident(i), 2),
+        ast::Expr::CompoundIdentifier(v) => (v.last().map(ident).unwrap_or_default(), 2),
+        ast::Expr::Function(f) => match f.name.0.last().and_then(|p| p.as_ident()) {
+            Some(i) => (ident(i), 2),
+            None => ("?column?".into(), 0),
         },
-        ast::Expr::Nested(inner) => derive_name(inner),
-        ast::Expr::Case { .. } => "case".into(),
-        ast::Expr::Exists { .. } => "exists".into(),
-        ast::Expr::Array(_) => "array".into(),
-        ast::Expr::Extract { .. } => "extract".into(),
-        ast::Expr::Substring { .. } => "substring".into(),
-        ast::Expr::Position { .. } => "position".into(),
-        ast::Expr::Trim { .. } => "btrim".into(),
-        ast::Expr::Ceil { .. } => "ceil".into(),
-        ast::Expr::Floor { .. } => "floor".into(),
-        ast::Expr::Overlay { .. } => "overlay".into(),
+        ast::Expr::Cast { expr, data_type, .. } => {
+            let (n, st) = figure_colname(expr);
+            match type_name_for_alias(data_type) {
+                Some(t) if st <= 1 => (t, 1),
+                _ => (n, st),
+            }
+        }
+        ast::Expr::Nested(inner) | ast::Expr::Collate { expr: inner, .. } => figure_colname(inner),
+        ast::Expr::Case { else_result, .. } => {
+            let (n, st) = else_result.as_deref().map(figure_colname).unwrap_or(("?column?".into(), 0));
+            if st <= 1 { ("case".into(), 1) } else { (n, st) }
+        }
+        ast::Expr::Exists { .. } => strong("exists"),
+        ast::Expr::Array(_) => strong("array"),
+        ast::Expr::Extract { .. } => strong("extract"),
+        ast::Expr::Substring { shorthand, .. } => strong(if *shorthand { "substr" } else { "substring" }),
+        // subscripts keep the name of what they subscript; a field access
+        // is named after the field
+        ast::Expr::CompoundFieldAccess { root, access_chain } => match access_chain.last() {
+            Some(ast::AccessExpr::Dot(ast::Expr::Identifier(i))) => (ident(i), 2),
+            _ => figure_colname(root),
+        },
+        ast::Expr::Position { .. } => strong("position"),
+        ast::Expr::Trim { trim_where, .. } => strong(match trim_where {
+            Some(ast::TrimWhereField::Leading) => "ltrim",
+            Some(ast::TrimWhereField::Trailing) => "rtrim",
+            _ => "btrim",
+        }),
+        ast::Expr::Ceil { .. } => strong("ceil"),
+        ast::Expr::Floor { .. } => strong("floor"),
+        ast::Expr::Overlay { .. } => strong("overlay"),
         ast::Expr::Subquery(q) => match &*q.body {
             ast::SetExpr::Select(s) if s.projection.len() == 1 => match &s.projection[0] {
-                ast::SelectItem::UnnamedExpr(e) => derive_name(e),
-                ast::SelectItem::ExprWithAlias { alias, .. } => ident(alias),
-                _ => "?column?".into(),
+                ast::SelectItem::UnnamedExpr(e) => figure_colname(e),
+                ast::SelectItem::ExprWithAlias { alias, .. } => (ident(alias), 2),
+                _ => ("?column?".into(), 0),
             },
-            _ => "?column?".into(),
+            _ => ("?column?".into(), 0),
         },
-        ast::Expr::TypedString(ts) => type_name_for_alias(&ts.data_type),
-        ast::Expr::Interval(_) => "interval".into(),
-        ast::Expr::AtTimeZone { .. } => "timezone".into(),
-        ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => "bool".into(),
-        _ => "?column?".into(),
+        ast::Expr::TypedString(ts) => match type_name_for_alias(&ts.data_type) {
+            Some(t) => (t, 1),
+            None => ("?column?".into(), 0),
+        },
+        ast::Expr::Interval(_) => ("interval".into(), 1),
+        ast::Expr::AtTimeZone { .. } => strong("timezone"),
+        ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => ("bool".into(), 1),
+        _ => ("?column?".into(), 0),
     }
 }
 
-fn type_name_for_alias(dt: &ast::DataType) -> String {
-    match super::binder_expr::sql_type_of(dt) {
-        Ok((t, _)) => match t {
+/// The type name a cast contributes to a column name (arrays: the element's).
+fn type_name_for_alias(dt: &ast::DataType) -> Option<String> {
+    if let Some(reg) = super::binder_expr::reg_kind(dt) {
+        return Some(reg);
+    }
+    let name = |t: SqlType| -> String {
+        match t {
             SqlType::Int2 => "int2".into(),
             SqlType::Int4 => "int4".into(),
             SqlType::Int8 => "int8".into(),
@@ -1431,14 +1565,31 @@ fn type_name_for_alias(dt: &ast::DataType) -> String {
             SqlType::Timestamp => "timestamp".into(),
             SqlType::TimestampTz => "timestamptz".into(),
             SqlType::Time => "time".into(),
-            SqlType::Array(_) => "?column?".into(),
             other => other.name(),
-        },
-        Err(_) => "?column?".into(),
+        }
+    };
+    match super::binder_expr::sql_type_of(dt) {
+        Ok((SqlType::Array(e), _)) => Some(name(*e)),
+        Ok((t, _)) => Some(name(t)),
+        Err(_) => None,
     }
 }
 
-/// Does `q` reference relation `name` (for detecting recursive CTEs)?
+/// Whether `rel` (or a subquery in it) reads the recursive relation `id`.
+fn rel_uses_recref(rel: &Rel, id: u64) -> bool {
+    fn expr_uses(e: &Expr, id: u64) -> bool {
+        match e {
+            Expr::Subquery(s) => rel_uses_recref(&s.rel, id) || e.children().iter().any(|c| expr_uses(c, id)),
+            _ => e.children().iter().any(|c| expr_uses(c, id)),
+        }
+    }
+    matches!(rel, Rel::RecRef { id: r, .. } if *r == id)
+        || rel.exprs().iter().any(|e| expr_uses(e, id))
+        || rel.inputs().iter().any(|i| rel_uses_recref(i, id))
+}
+
+/// Could `q` reference relation `name` (a cheap textual pre-check for
+/// recursive CTEs)?
 fn query_references(q: &ast::Query, name: &str) -> bool {
     let s = q.to_string().to_lowercase();
     // conservative textual check on word boundaries
@@ -1553,41 +1704,25 @@ fn replace_window_refs(e: Expr, base: usize) -> Expr {
     }
 }
 
-/// PostgreSQL select_common_type (simplified).
+/// PostgreSQL's select_common_type: unknown inputs are ignored (all unknown:
+/// text); every other input must be of the first one's type category; a
+/// later input's type replaces the candidate when the candidate is not the
+/// category's preferred type and converts to it implicitly, but not back.
 pub fn common_type(types: &[SqlType], context: &str) -> Result<SqlType> {
+    use crate::expr::cast::implicit_castable;
     let known: Vec<&SqlType> = types.iter().filter(|t| **t != SqlType::Unknown).collect();
     let Some(first) = known.first() else { return Ok(SqlType::Text) };
-    if known.iter().all(|t| t == first) {
-        return Ok((*first).clone());
+    let mut ptype = (*first).clone();
+    for t in &known[1..] {
+        if **t == ptype {
+            continue;
+        }
+        if t.category() != ptype.category() {
+            sql_bail!(codes::DATATYPE_MISMATCH, "{context} types {} and {} cannot be matched", ptype, t);
+        }
+        if !ptype.is_preferred() && implicit_castable(&ptype, t) && !implicit_castable(t, &ptype) {
+            ptype = (*t).clone();
+        }
     }
-    let rank_num = |t: &SqlType| match t {
-        SqlType::Int2 => Some(0),
-        SqlType::Int4 => Some(1),
-        SqlType::Int8 => Some(2),
-        SqlType::Numeric => Some(3),
-        SqlType::Float4 => Some(4),
-        SqlType::Float8 => Some(5),
-        _ => None,
-    };
-    if known.iter().all(|t| rank_num(t).is_some()) {
-        return Ok((*known.iter().max_by_key(|t| rank_num(t).unwrap()).unwrap()).clone());
-    }
-    if known.iter().all(|t| t.is_string()) {
-        return Ok(SqlType::Text);
-    }
-    let rank_dt = |t: &SqlType| match t {
-        SqlType::Date => Some(0),
-        SqlType::Timestamp => Some(1),
-        SqlType::TimestampTz => Some(2),
-        _ => None,
-    };
-    if known.iter().all(|t| rank_dt(t).is_some()) {
-        return Ok((*known.iter().max_by_key(|t| rank_dt(t).unwrap()).unwrap()).clone());
-    }
-    if let (SqlType::Array(_), true) = (first, known.iter().all(|t| matches!(t, SqlType::Array(_)))) {
-        let elems: Vec<SqlType> = known.iter().map(|t| t.elem().unwrap().clone()).collect();
-        return Ok(SqlType::Array(Box::new(common_type(&elems, context)?)));
-    }
-    let other = known.iter().find(|t| *t != first).unwrap();
-    sql_bail!(codes::DATATYPE_MISMATCH, "{context} types {} and {} cannot be matched", first, other)
+    Ok(ptype)
 }

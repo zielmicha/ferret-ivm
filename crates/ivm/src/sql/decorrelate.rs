@@ -242,13 +242,32 @@ fn lift_expr(e: Expr, input: Rel, n: usize, added: usize) -> Result<(Expr, Rel, 
     match e {
         Expr::Subquery(sq) => {
             let right = extract(sq.rel)?;
-            let kind = match sq.kind {
-                SubqueryKind::Scalar => ApplyKind::Scalar,
-                k => ApplyKind::Mark { kind: k },
+            // placeholder column markers resolved by shift_map_refs
+            let (kind, value, width) = match sq.kind {
+                SubqueryKind::Scalar => {
+                    // the value, or the cardinality error where it is used
+                    // (value and row count columns)
+                    let count = Expr::Column(usize::MAX - added - 1);
+                    let many = Expr::Call(Box::new(crate::expr::Call {
+                        func: resolve(">", &[SqlType::Int8, SqlType::Int8])?.func,
+                        args: vec![count, Expr::Literal(Datum::Int8(1), SqlType::Int8)],
+                        ret: SqlType::Bool,
+                    }));
+                    let err = Expr::Error(
+                        codes::CARDINALITY_VIOLATION.to_string(),
+                        "more than one row returned by a subquery used as an expression".to_string(),
+                    );
+                    let value = Expr::Case(Box::new(crate::expr::CaseExpr {
+                        whens: vec![(many, err)],
+                        else_: Expr::Column(usize::MAX - added),
+                        ty: sq.ty.clone(),
+                    }));
+                    (ApplyKind::Scalar, value, 2)
+                }
+                k => (ApplyKind::Mark { kind: k }, Expr::Column(usize::MAX - added), 1),
             };
             let rel = Rel::Apply { left: Box::new(input), right: Box::new(right), kind };
-            // placeholder column marker resolved by shift_map_refs
-            Ok((Expr::Column(usize::MAX - added), rel, 1))
+            Ok((value, rel, width))
         }
         mut other => {
             let mut cur = input;
@@ -307,21 +326,30 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
     let mut cols = BTreeMap::new();
     outer_cols(&right, 1, &mut cols);
     let ccols: Vec<usize> = cols.keys().copied().collect();
-    let k = ccols.len();
     let dpos: BTreeMap<usize, usize> = ccols.iter().enumerate().map(|(i, c)| (*c, i)).collect();
-    let d = Rel::Distinct { input: Box::new(left.clone().project(ccols.clone())) };
+    let left_types = left.schema();
+    // D's key over left columns: the correlated columns, plus the exact text
+    // of those whose equal values can differ in representation (1.0 and
+    // 1.00): the subquery must see each outer value as it is
+    let mut dkeys: Vec<Expr> = ccols.iter().map(|c| Expr::Column(*c)).collect();
+    for c in &ccols {
+        if left_types[*c].ty.needs_fidelity() {
+            dkeys.push(Expr::Cast(Box::new(Expr::Column(*c)), SqlType::Text, -1, false));
+        }
+    }
+    let k = dkeys.len();
+    let d = Rel::Distinct { input: Box::new(left.clone().map(dkeys.clone()).project((nl..nl + k).collect())) };
     let mut r2 = push_dep(right, &d, k, &dpos)?;
     shift_outer_depth(&mut r2, 1);
     let nr = r2.arity() - k;
-    let left_types = left.schema();
     let d_cond = |offset: usize| -> Vec<Expr> {
-        ccols.iter().enumerate().map(|(i, c)| nd_eq(Expr::Column(*c), Expr::Column(offset + i))).collect()
+        dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(offset + i))).collect()
     };
     match kind {
         ApplyKind::Semi { lhs, negated, null_aware } => {
             if null_aware {
                 // NOT IN: keep rows whose IN-mark is false
-                let marked = mark_join(left, r2, k, &ccols, SubqueryKind::In(lhs))?;
+                let marked = mark_join(left, r2, k, &dkeys, SubqueryKind::In(lhs))?;
                 let m = marked.arity() - 1;
                 return Ok(marked.filter(vec![Expr::Not(Box::new(Expr::Column(m)))]).project((0..nl).collect()));
             }
@@ -333,21 +361,13 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
             }
             Ok(Rel::Join { left: Box::new(left), right: Box::new(r2), kind: if negated { JoinKind::Anti } else { JoinKind::Semi }, on })
         }
-        ApplyKind::Mark { kind: sk } => mark_join(left, r2, k, &ccols, sk),
+        ApplyKind::Mark { kind: sk } => mark_join(left, r2, k, &dkeys, sk),
         ApplyKind::Scalar => {
-            // at most one row per D value
-            let rtypes = r2.schema();
-            let unique = unique_on_prefix(&r2, k);
-            let r3 = if unique {
-                r2
-            } else {
-                let mut ret = rtypes[k].clone();
-                ret.nullable = true;
-                Rel::Aggregate { input: Box::new(r2), group: (0..k).collect(), aggs: vec![agg(AggFunc::SingleValue, vec![k], ret)] }
-            };
+            // per D value: the value and the number of rows
+            let r3 = scalar_value_and_count(r2, k);
             let j = Rel::Join { left: Box::new(left), right: Box::new(r3), kind: JoinKind::Left, on: d_cond(nl) };
             let mut proj: Vec<usize> = (0..nl).collect();
-            proj.push(nl + k);
+            proj.extend([nl + k, nl + k + 1]);
             Ok(j.project(proj))
         }
         ApplyKind::Lateral { left_outer } => {
@@ -361,6 +381,24 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
             proj.extend(nl + k..nl + k + nr);
             Ok(j.project(proj))
         }
+    }
+}
+
+/// A scalar subquery's rows (k leading D columns, then its value) as one row
+/// per D value: [D, value, number of rows].
+fn scalar_value_and_count(r: Rel, k: usize) -> Rel {
+    let one = || Expr::Literal(Datum::Int8(1), SqlType::Int8);
+    let global_agg = k == 0 && matches!(&r, Rel::Aggregate { group, .. } if group.is_empty());
+    if (k > 0 && unique_on_prefix(&r, k)) || global_agg {
+        return r.map(vec![one()]);
+    }
+    let mut ret = r.schema()[k].clone();
+    ret.nullable = true;
+    let i8 = ColumnType::new(SqlType::Int8).not_null();
+    Rel::Aggregate {
+        input: Box::new(r),
+        group: (0..k).collect(),
+        aggs: vec![agg(AggFunc::AnyValue, vec![k], ret), agg(AggFunc::CountStar, vec![], i8)],
     }
 }
 
@@ -378,13 +416,14 @@ fn unique_on_prefix(rel: &Rel, k: usize) -> bool {
     }
 }
 
-/// Mark join: append a boolean column computed per left row.
-fn mark_join(left: Rel, r2: Rel, k: usize, ccols: &[usize], sk: SubqueryKind) -> Result<Rel> {
+/// Mark join: append a boolean column computed per left row. `r2` starts
+/// with the k columns of D, whose key over left columns is `dkeys`.
+fn mark_join(left: Rel, r2: Rel, k: usize, dkeys: &[Expr], sk: SubqueryKind) -> Result<Rel> {
     let nl = left.arity();
     let left_types = left.schema();
     let i8 = ColumnType::new(SqlType::Int8).not_null();
     let d_on = |offset: usize| -> Vec<Expr> {
-        ccols.iter().enumerate().map(|(i, c)| nd_eq(Expr::Column(*c), Expr::Column(offset + i))).collect()
+        dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(offset + i))).collect()
     };
     match sk {
         SubqueryKind::Exists => {
@@ -402,7 +441,7 @@ fn mark_join(left: Rel, r2: Rel, k: usize, ccols: &[usize], sk: SubqueryKind) ->
             // (x, y) IN (...) is = ANY over rows: fields compare as a conjunction
             let lt: Vec<SqlType> = lhs.iter().map(|e| e.ty(&left_types)).collect();
             let rt: Vec<SqlType> = r2.schema()[k..].iter().map(|c| c.ty.clone()).collect();
-            quantified_join(left, r2, k, ccols, lhs, false, &|l, r| {
+            quantified_join(left, r2, k, dkeys, lhs, false, &|l, r| {
                 let mut parts = Vec::with_capacity(l.len());
                 for i in 0..l.len() {
                     parts.push(sql_eq(l[i].clone(), &lt[i], r[i].clone(), &rt[i])?);
@@ -468,7 +507,7 @@ fn mark_join(left: Rel, r2: Rel, k: usize, ccols: &[usize], sk: SubqueryKind) ->
             proj.push(a - 1);
             Ok(m.project(proj))
         }
-        SubqueryKind::AnyAll { lhs, func, all } => quantified_join(left, r2, k, ccols, vec![*lhs], all, &|l, r| {
+        SubqueryKind::AnyAll { lhs, func, all } => quantified_join(left, r2, k, dkeys, vec![*lhs], all, &|l, r| {
             Ok(Expr::Call(Box::new(crate::expr::Call { func, args: vec![l[0].clone(), r[0].clone()], ret: SqlType::Bool })))
         }),
         SubqueryKind::Scalar => unreachable!(),
@@ -482,7 +521,7 @@ fn quantified_join(
     left: Rel,
     r2: Rel,
     k: usize,
-    ccols: &[usize],
+    dkeys: &[Expr],
     lhs: Vec<Expr>,
     all: bool,
     pred: &dyn Fn(&[Expr], &[Expr]) -> Result<Expr>,
@@ -495,7 +534,7 @@ fn quantified_join(
     let lm = left.clone().map(lhs);
     let rm = r2.map(vec![Expr::bool(true)]);
     let n1 = nl + m;
-    let on: Vec<Expr> = ccols.iter().enumerate().map(|(i, c)| nd_eq(Expr::Column(*c), Expr::Column(n1 + i))).collect();
+    let on: Vec<Expr> = dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(n1 + i))).collect();
     let j = Rel::Join { left: Box::new(lm), right: Box::new(rm), kind: JoinKind::Left, on };
     let lcols: Vec<Expr> = (nl..nl + m).map(Expr::Column).collect();
     let rcols: Vec<Expr> = (n1 + k..n1 + k + w).map(Expr::Column).collect();
@@ -560,14 +599,8 @@ fn uncorrelated(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
         }
         ApplyKind::Mark { kind } => mark_join(left, right, 0, &[], kind),
         ApplyKind::Scalar => {
-            let rtypes = right.schema();
-            let mut ret = rtypes[0].clone();
-            ret.nullable = true;
-            let single = if unique_on_prefix(&right, 0) && matches!(right, Rel::Aggregate { ref group, .. } if group.is_empty()) {
-                right
-            } else {
-                Rel::Aggregate { input: Box::new(right), group: vec![], aggs: vec![agg(AggFunc::SingleValue, vec![0], ret)] }
-            };
+            // exactly one row: the value (NULL when empty) and the row count
+            let single = scalar_value_and_count(right, 0);
             Ok(Rel::Join { left: Box::new(left), right: Box::new(single), kind: JoinKind::Inner, on: vec![] })
         }
         ApplyKind::Lateral { left_outer } => Ok(Rel::Join {
@@ -950,42 +983,43 @@ fn simple_scalar_agg(left: &Rel, right: &Rel) -> Result<Option<Rel>> {
     if base.has_outer_refs(1) || lifted.is_empty() {
         return Ok(None);
     }
-    // every lifted predicate must be `inner_expr = <outer column>`
-    let mut keys: Vec<(Expr, usize)> = Vec::new();
+    // every lifted predicate must be `inner_expr = outer_expr`, an equality
+    // between an expression over the subquery's rows and one over outer
+    // columns only; the subquery is grouped by the inner expressions and
+    // joined with the same equalities (operator and casts unchanged)
+    let mut keys: Vec<Expr> = Vec::new();
+    let mut eqs: Vec<(&crate::expr::Call, usize)> = Vec::new(); // (equality, argument that is the key)
+    let outer_only = |e: &Expr| e.has_outer() && e.column_set().is_empty() && !e.has_subquery();
     for p in &lifted {
         let Expr::Call(c) = p else { return Ok(None) };
         if crate::expr::func::func_def(c.func).name != "=" || c.args.len() != 2 {
             return Ok(None);
         }
-        let outer_col = |e: &Expr| -> Option<usize> {
-            match e {
-                Expr::Outer(1, col, _) => Some(*col),
-                Expr::Cast(inner, ..) => match &**inner {
-                    Expr::Outer(1, col, _) => Some(*col),
-                    _ => None,
-                },
-                _ => None,
-            }
-        };
         let (a, b) = (&c.args[0], &c.args[1]);
-        match (outer_col(a), outer_col(b)) {
-            (None, Some(oc)) if !a.has_outer() => keys.push((a.clone(), oc)),
-            (Some(oc), None) if !b.has_outer() => keys.push((b.clone(), oc)),
-            _ => return Ok(None),
-        }
+        let k = if outer_only(b) && !a.has_outer() {
+            0
+        } else if outer_only(a) && !b.has_outer() {
+            1
+        } else {
+            return Ok(None);
+        };
+        keys.push(c.args[k].clone());
+        eqs.push((c, k));
     }
     shift_outer_depth(&mut base, 1);
     let nb = base.arity();
     let nk = keys.len();
     let na = aggs.len();
-    let mapped = base.map(keys.iter().map(|(e, _)| e.clone()).collect());
+    let mapped = base.map(keys);
     let agg2 = Rel::Aggregate { input: Box::new(mapped), group: (nb..nb + nk).collect(), aggs: aggs.clone() };
     let nl = left.arity();
-    let lt = left.schema();
-    let a2t = agg2.schema();
     let mut on = Vec::new();
-    for (i, (_, oc)) in keys.iter().enumerate() {
-        on.push(sql_eq(Expr::Column(*oc), &lt[*oc].ty, Expr::Column(nl + i), &a2t[i].ty)?);
+    for (i, (c, k)) in eqs.iter().enumerate() {
+        let mut args = vec![Expr::Column(nl + i), to_join_cond(&c.args[1 - k], nl)];
+        if *k == 1 {
+            args.reverse();
+        }
+        on.push(Expr::Call(Box::new(crate::expr::Call { func: c.func, args, ret: c.ret.clone() })));
     }
     let j = Rel::Join { left: Box::new(left.clone()), right: Box::new(agg2), kind: JoinKind::Left, on };
     // aggregate values over the joined row (COUNT of no rows is 0)
@@ -1019,9 +1053,10 @@ fn simple_scalar_agg(left: &Rel, right: &Rel) -> Result<Option<Rel>> {
         return Ok(None);
     }
     let value = exprs[0].substitute(&vals);
-    let out = j.map(vec![value]);
+    // one aggregate row per outer row: the row count is 1
+    let out = j.map(vec![value, Expr::Literal(Datum::Int8(1), SqlType::Int8)]);
     let a = out.arity();
     let mut proj: Vec<usize> = (0..nl).collect();
-    proj.push(a - 1);
+    proj.extend([a - 2, a - 1]);
     Ok(Some(out.project(proj)))
 }

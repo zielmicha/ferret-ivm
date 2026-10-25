@@ -142,4 +142,5 @@ pub mod codes {
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
     pub const TOO_MANY_ARGUMENTS: &str = "54023";
+    pub const STATEMENT_TOO_COMPLEX: &str = "54001";
 }
