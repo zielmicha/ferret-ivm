@@ -283,30 +283,66 @@ fn scale(a: &Datum) -> Result<Datum> {
 fn min_scale(a: &Datum) -> Result<Datum> {
     Ok(n(a).min_scale().map(Datum::Int4).unwrap_or(Datum::Null))
 }
-fn width_bucket_f(args: &[Datum]) -> Result<Datum> {
-    let (x, lo, hi, cnt) = (f(&args[0]), f(&args[1]), f(&args[2]), i(&args[3]));
+fn width_bucket_args(cnt: i64, nan: bool, infinite_bound: bool) -> Result<()> {
     if cnt <= 0 {
         return Err(SqlError::new("2201G", "count must be greater than zero"));
     }
-    if lo == hi || lo.is_nan() || hi.is_nan() || lo.is_infinite() || hi.is_infinite() {
-        return Err(SqlError::new("2201G", "lower bound cannot equal upper bound"));
+    if nan {
+        return Err(SqlError::new("2201G", "operand, lower bound, and upper bound cannot be NaN"));
     }
+    if infinite_bound {
+        return Err(SqlError::new("2201G", "lower and upper bounds must be finite"));
+    }
+    Ok(())
+}
+fn width_bucket_result(r: i64) -> Result<Datum> {
+    i32::try_from(r).map(Datum::Int4).map_err(|_| SqlError::new(codes::NUMERIC_VALUE_OUT_OF_RANGE, "integer out of range"))
+}
+/// width_bucket_float8
+fn width_bucket_f(args: &[Datum]) -> Result<Datum> {
+    let (x, lo, hi, cnt) = (f(&args[0]), f(&args[1]), f(&args[2]), i(&args[3]));
+    width_bucket_args(cnt, x.is_nan() || lo.is_nan() || hi.is_nan(), lo.is_infinite() || hi.is_infinite())?;
+    // count * (a - b) / (c - d) for an operand inside the range; halve the
+    // inputs when the bounds' difference overflows
+    let inside = |a: f64, b: f64, c: f64, d: f64| {
+        let q = if (c - d).is_infinite() { (a / 2.0 - b / 2.0) / (c / 2.0 - d / 2.0) } else { (a - b) / (c - d) };
+        // the quotient can round to 1
+        ((cnt as f64 * q) as i64).min(cnt - 1) + 1
+    };
     let r = if lo < hi {
         if x < lo {
             0
         } else if x >= hi {
             cnt + 1
         } else {
-            ((cnt as f64) * ((x - lo) / (hi - lo))) as i64 + 1
+            inside(x, lo, hi, lo)
         }
-    } else if x > lo {
-        0
-    } else if x <= hi {
-        cnt + 1
+    } else if lo > hi {
+        if x > lo {
+            0
+        } else if x <= hi {
+            cnt + 1
+        } else {
+            inside(lo, x, lo, hi)
+        }
     } else {
-        ((cnt as f64) * ((lo - x) / (lo - hi))) as i64 + 1
+        return Err(SqlError::new("2201G", "lower bound cannot equal upper bound"));
     };
-    Ok(Datum::Int4(r as i32))
+    width_bucket_result(r)
+}
+/// width_bucket_numeric: exact, ((x - lo) * count) / (hi - lo) + 1 truncated
+fn width_bucket_n(args: &[Datum]) -> Result<Datum> {
+    let (x, lo, hi, cnt) = (n(&args[0]), n(&args[1]), n(&args[2]), i(&args[3]));
+    width_bucket_args(cnt, x.is_nan() || lo.is_nan() || hi.is_nan(), lo.is_infinite() || hi.is_infinite())?;
+    let r = match lo.cmp(hi) {
+        std::cmp::Ordering::Equal => return Err(SqlError::new("2201G", "lower bound cannot equal upper bound")),
+        std::cmp::Ordering::Less if x < lo => 0,
+        std::cmp::Ordering::Greater if x > lo => 0,
+        std::cmp::Ordering::Less if x >= hi => cnt + 1,
+        std::cmp::Ordering::Greater if x <= hi => cnt + 1,
+        _ => x.sub(lo)?.mul(&Numeric::from_i64(cnt))?.div_trunc(&hi.sub(lo)?)?.to_i64()? + 1,
+    };
+    width_bucket_result(r)
 }
 fn random(_: &[Datum]) -> Result<Datum> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1423,6 +1459,7 @@ pub fn register(b: &mut Builder) {
     b.f1("min_scale", T::Numeric, T::Int4, min_scale);
     b.last().can_return_null = true;
     b.fnn("width_bucket", vec![T::Float8, T::Float8, T::Float8, T::Int4], T::Int4, width_bucket_f);
+    b.fnn("width_bucket", vec![T::Numeric, T::Numeric, T::Numeric, T::Int4], T::Int4, width_bucket_n);
     b.fnn("random", vec![], T::Float8, random);
     b.last().volatility = Volatility::Volatile;
 

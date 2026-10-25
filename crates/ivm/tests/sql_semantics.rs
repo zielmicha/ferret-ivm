@@ -796,3 +796,31 @@ fn quote_literal_of_character_drops_padding() {
     );
     running.shutdown();
 }
+
+#[test]
+fn width_bucket_matches_postgresql() {
+    let running = start("width-bucket");
+    let h = running.handle.clone();
+    for (q, msg) in [
+        // a NaN operand fell through every comparison into bucket 1
+        ("SELECT width_bucket('NaN'::float8, 0, 10, 5)", "operand, lower bound, and upper bound cannot be NaN"),
+        ("SELECT width_bucket(5::numeric, 'NaN', 10, 5)", "operand, lower bound, and upper bound cannot be NaN"),
+        ("SELECT width_bucket(5::float8, '-Infinity', 10, 5)", "lower and upper bounds must be finite"),
+        // count + 1 wrapped around to -2147483648
+        ("SELECT width_bucket(10::float8, 0, 10, 2147483647)", "integer out of range"),
+        ("SELECT width_bucket(10::numeric, 0, 10, 2147483647)", "integer out of range"),
+    ] {
+        let err = try_rows(&h, q).unwrap_err();
+        assert!(err.contains(msg), "{q}: {err}");
+    }
+    // bounds whose difference overflows, and numeric arguments, which used
+    // to be computed in (inexact) double precision
+    assert_eq!(
+        rows(&h, "SELECT width_bucket(0::float8, -1e308, 1e308, 10), width_bucket(0.3, 0.1, 0.5, 2), \
+                  width_bucket(0.3::float8, 0.1, 0.5, 2), width_bucket(5.35, 0.024, 10.06, 5), width_bucket(5, 10, 0, 3), \
+                  width_bucket('Infinity'::numeric, 0, 10, 5), width_bucket(0.3, 0.5, 0.1, 2), \
+                  width_bucket(-1e308::float8, 1e308, -1e308, 4), width_bucket('-Infinity'::numeric, 0, 10, 5)"),
+        vec!["6|2|1|3|2|6|2|5|0"]
+    );
+    running.shutdown();
+}
