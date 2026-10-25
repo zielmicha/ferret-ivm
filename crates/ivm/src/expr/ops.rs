@@ -194,6 +194,26 @@ fn float_mul(a: &Datum, b: &Datum) -> Result<Datum> {
 fn float_div(a: &Datum, b: &Datum) -> Result<Datum> {
     float_binop(a, b, '/')
 }
+/// float4 op float8 / float8 op float4 (float48pl etc.): computed in double
+/// precision.
+fn float48_binop(a: &Datum, b: &Datum, op: char) -> Result<Datum> {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => float_binop(&Datum::Float8(x), &Datum::Float8(y), op),
+        _ => Err(internal("float op", a, b)),
+    }
+}
+fn float48_add(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '+')
+}
+fn float48_sub(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '-')
+}
+fn float48_mul(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '*')
+}
+fn float48_div(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '/')
+}
 fn float_neg(a: &Datum) -> Result<Datum> {
     Ok(match a {
         Datum::Float4(x) => Datum::Float4(-x),
@@ -681,6 +701,15 @@ pub fn register(b: &mut Builder) {
         b.op1("-", t.clone(), t.clone(), float_neg);
         b.op1("+", t.clone(), t.clone(), identity);
         b.op1("@", t.clone(), t.clone(), float_abs);
+    }
+    // mixed float4/float8 arithmetic is float8; these operators also make
+    // float4 op integer/numeric resolve to float8, as in PostgreSQL (no
+    // cross-type comparisons: "=" operands must share a type)
+    for (x, y) in [(T::Float4, T::Float8), (T::Float8, T::Float4)] {
+        b.op2("+", x.clone(), y.clone(), T::Float8, float48_add);
+        b.op2("-", x.clone(), y.clone(), T::Float8, float48_sub);
+        b.op2("*", x.clone(), y.clone(), T::Float8, float48_mul);
+        b.op2("/", x, y, T::Float8, float48_div);
     }
     b.op2("^", T::Float8, T::Float8, T::Float8, float8_pow);
     b.op2("+", T::Numeric, T::Numeric, T::Numeric, num_add);

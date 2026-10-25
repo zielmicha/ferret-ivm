@@ -320,3 +320,22 @@ fn character_n_compares_and_casts_without_padding() {
     assert_eq!(rows(&h, "SELECT 'a'::char(3) LIKE 'a', d ~ 'a  ', d SIMILAR TO 'a  ' FROM t WHERE a = 1"), vec!["f|t|t"]);
     running.shutdown();
 }
+
+#[test]
+fn float4_arithmetic_with_other_numbers_is_float8() {
+    let running = start("float48");
+    let h = running.handle.clone();
+    // PostgreSQL resolves real op integer/numeric to the float4-float8
+    // operators (float48pl, ...): computed and returned in double precision
+    let q = "SELECT 1.5::float4 + 1, 0.1::float4 + 1, 0.1::float4 * 3, 0.1::float4 + 0.1::float4, 1::float4 / 3, \
+             0.1::float4 - 1.5, 2 * 0.1::float4, 0.1::float4 + 0.2::float8, 0.5::float4 + '1'";
+    assert_eq!(
+        rows(&h, q),
+        vec!["2.5|1.1000000014901161|0.30000000447034836|0.2|0.3333333333333333|-1.3999999985098839|0.20000000298023224|0.30000000149011613|1.5"]
+    );
+    assert_eq!(
+        column_types(&h, q),
+        vec!["double precision", "double precision", "double precision", "real", "double precision", "double precision", "double precision", "double precision", "real"]
+    );
+    running.shutdown();
+}
