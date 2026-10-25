@@ -230,6 +230,7 @@ handles:
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
+| `Request(SinkSnapshot)` | a sink thread resynchronizes its target: read its relation at the last applied GSN and send it through the sink's channel in chunks of 10,000 rows (from the arrangement, chunk by chunk), after the changes sent so far ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)) |
 | `Request(Inspect)` | build a snapshot for the web UI (`coord/inspect.rs`) between two records, so that it is consistent at one GSN, and hand it to the requester's callback |
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
 | `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |

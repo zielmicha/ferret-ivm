@@ -96,6 +96,11 @@ pub enum Request {
     /// sequencer; this is for engine-originated records).
     Log { rec: LogRecord },
     Checkpoint { reply: Sender<Result<Gsn>> },
+    /// A sink's thread asks for its relation's contents, to resynchronize
+    /// its target; they are sent through the sink's channel
+    /// (`sink::SinkMsg::Snapshot`). `token` is the thread's
+    /// (`SinkHandle::token`).
+    SinkSnapshot { sink: crate::sql::plan::ObjectId, token: u64 },
     /// Introspection snapshot for the web UI (see `coord::inspect`).
     Inspect(super::inspect::InspectRequest),
 }

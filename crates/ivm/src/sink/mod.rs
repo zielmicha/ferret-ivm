@@ -16,11 +16,40 @@ use std::sync::Arc;
 pub enum SinkMsg {
     Data(Gsn, Delta),
     Progress(Gsn),
+    /// Rows of the relation as of the GSN, which the sink asked for to
+    /// resynchronize its target (`Request::SinkSnapshot`): one chunk of
+    /// them. The changes sent before the first chunk are at or before the
+    /// GSN, those after the last one after it.
+    Snapshot(Gsn, Delta),
+    /// The end of a snapshot; an error if it could not be read whole.
+    SnapshotEnd(Gsn, Option<String>),
     Stop,
+}
+
+/// Bounds of a sink's writes and memory.
+#[derive(Clone, Copy, Debug)]
+pub struct SinkLimits {
+    /// Most SQL text sent to the target in one message (a single statement
+    /// can be larger): a transaction is written in as many messages as it
+    /// needs (PostgreSQL rejects messages over 1 GB).
+    pub message_bytes: usize,
+    /// Most changes (estimated encoded bytes) a sink keeps while it cannot
+    /// write them; beyond it they are dropped and the target is
+    /// resynchronized from a fresh snapshot once it can be written again.
+    pub pending_bytes: usize,
+}
+
+impl Default for SinkLimits {
+    fn default() -> Self {
+        SinkLimits { message_bytes: 8 << 20, pending_bytes: 256 << 20 }
+    }
 }
 
 pub struct SinkHandle {
     pub node: NodeId,
+    /// Identifies this sink's thread in its snapshot requests (a replaced
+    /// sink's thread can still be running).
+    pub token: u64,
     tx: Sender<SinkMsg>,
     status: Arc<Mutex<String>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -37,6 +66,10 @@ impl SinkHandle {
     pub fn progress(&self, gsn: Gsn) {
         let _ = self.tx.send(SinkMsg::Progress(gsn));
     }
+    /// The sink's channel (to send it a snapshot).
+    pub fn sender(&self) -> Sender<SinkMsg> {
+        self.tx.clone()
+    }
     pub fn status(&self) -> String {
         self.status.lock().clone()
     }
@@ -52,6 +85,9 @@ impl SinkHandle {
     }
 }
 
+/// Start a sink that receives the changes of `node` after `gsn` (the
+/// engine's last applied GSN). It asks the engine for a snapshot when its
+/// target has to be resynchronized.
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     id: ObjectId,
@@ -59,15 +95,19 @@ pub fn start(
     def: SinkDef,
     node: NodeId,
     columns: Vec<Column>,
-    snapshot: Delta,
     gsn: Gsn,
-    _engine: EngineHandle,
+    limits: SinkLimits,
+    engine: EngineHandle,
 ) -> Result<SinkHandle> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TOKENS: AtomicU64 = AtomicU64::new(1);
+    let token = TOKENS.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = crossbeam_channel::unbounded();
     let status = Arc::new(Mutex::new("starting".to_string()));
     let st = status.clone();
     let thread = std::thread::Builder::new().name(format!("ivm-sink-{name}")).spawn(move || {
-        postgres::run(id, name, def, columns, snapshot, gsn, rx, st);
+        let ask = move || engine.request_sink_snapshot(id, token);
+        postgres::run(name, def, columns, gsn, limits, rx, st, &ask);
     })?;
-    Ok(SinkHandle { node, tx, status, thread: Some(thread) })
+    Ok(SinkHandle { node, token, tx, status, thread: Some(thread) })
 }

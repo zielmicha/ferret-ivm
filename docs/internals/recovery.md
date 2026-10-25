@@ -70,9 +70,9 @@ with status 1 at once) and accepts connections only once recovery is done.
    the checkpoint GSN (`Graph::hydrate`; the rebuilt arrangements' history
    starts there), then **drop** recovered trees that nothing attached
    (arrangements that no longer exist) and set the retention frontier.
-7. **Start the sinks** from the recovered state (each takes a snapshot at
-   the checkpoint GSN; a target at least that far resumes, one behind it is
-   resynchronised, see
+7. **Start the sinks** from the recovered state (each receives the changes
+   after the checkpoint GSN; a target at least that far resumes, one behind
+   it asks for a snapshot and is resynchronised, see
    [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)). A sink
    that cannot start (it reads a broken view) is marked broken.
 8. **Replay** every log record after the checkpoint GSN through

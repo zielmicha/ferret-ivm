@@ -87,6 +87,7 @@ fn config(dir: &Path, cache_bytes: usize) -> coord::Config {
         checkpoint_interval: Duration::from_secs(24 * 3600),
         cache_bytes,
         retention_gsns: 100_000,
+        ..Default::default()
     }
 }
 

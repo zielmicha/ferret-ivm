@@ -44,7 +44,44 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
     Ok((hi << 32) | lo)
 }
 
+/// Rows per chunk of a snapshot sent to a sink or a subscriber.
+const SNAPSHOT_CHUNK_ROWS: usize = 10_000;
+
 impl Engine {
+    /// The current contents of dataflow node `node`, handed to `f` in
+    /// chunks of at most `SNAPSHOT_CHUNK_ROWS` rows. An arranged node is
+    /// read from its arrangement chunk by chunk, so no copy of the whole
+    /// relation is built here (a node without one is computed whole).
+    pub(crate) fn snapshot_chunks(&mut self, node: NodeId, f: &mut dyn FnMut(crate::dataflow::Delta)) -> Result<()> {
+        let Some(a) = self.graph.any_arrangement(node) else {
+            let mut rows = self.graph.snapshot(&mut self.env, node)?.data.into_iter();
+            loop {
+                let chunk: Vec<_> = rows.by_ref().take(SNAPSHOT_CHUNK_ROWS).collect();
+                if chunk.is_empty() {
+                    return Ok(());
+                }
+                f(chunk);
+            }
+        };
+        let arr = self.graph.arr(a);
+        let (layout, tree) = (&arr.layout, arr.tree);
+        let mut chunk = Vec::new();
+        self.env.for_each(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
+            let w = h.weight(ReadAt::Latest);
+            if w != 0 {
+                chunk.push((layout.decode_row(k)?, w));
+                if chunk.len() >= SNAPSHOT_CHUNK_ROWS {
+                    f(std::mem::take(&mut chunk));
+                }
+            }
+            Ok(true)
+        })?;
+        if !chunk.is_empty() {
+            f(chunk);
+        }
+        Ok(())
+    }
+
     pub(crate) fn execute(
         &mut self,
         stmt: Statement,

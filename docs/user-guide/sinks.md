@@ -58,11 +58,12 @@ started (its status says why).
 
 ### Start-up and resynchronisation
 
-1. The engine takes a snapshot of the relation's current contents at the last
-   applied GSN (the *snapshot GSN*) and starts a sink thread. At an engine
-   start this happens before the log is replayed, from the checkpoint's
-   state: the snapshot GSN is the checkpoint's, and the replayed records
-   reach the sink like live ones.
+1. The engine starts a sink thread, which receives every change of the
+   relation after the last applied GSN (the *start GSN*). At an engine
+   start this happens before the log is replayed: the start GSN is the
+   checkpoint's, and the replayed records reach the sink like live ones.
+   No snapshot of the relation is taken unless the target needs one
+   (below).
 2. The thread connects and runs, every time it (re)connects:
 
    ```sql
@@ -76,15 +77,33 @@ started (its status says why).
    primary key is added when `KEY` is given. `ivm_sink_progress` is created
    unqualified, i.e. in the first schema of the role's `search_path`.
 3. It reads its progress row (`SELECT gsn FROM ivm_sink_progress WHERE sink = '<name>'`):
-   - if the recorded GSN is at or after the snapshot GSN, delivery resumes
-     after it;
-   - otherwise — no row yet, or the target is behind the snapshot — the
-     target is **resynchronised** in one transaction: `DELETE FROM <target>`,
-     `INSERT` of the snapshot rows (each row repeated by its multiplicity, 500
-     rows per statement), and the progress row set to the snapshot GSN. This
-     happens only at the thread's first synchronisation; if on a later
-     reconnect the row is missing or behind the snapshot GSN, the sink
-     reports `error: sink progress row went backwards` and keeps retrying.
+   - if the recorded GSN is at or after the start GSN (or the snapshot GSN
+     of the sink's last resynchronisation), delivery resumes after it;
+   - otherwise — no row yet, or the target is behind the changes the sink
+     has — the target is **resynchronised**. This happens only at the
+     thread's first synchronisation (and after dropped changes, see
+     [Delivering changes](#delivering-changes)); if on a later reconnect the
+     row is missing or behind, the sink reports
+     `error: sink progress row went backwards` and keeps retrying.
+
+To resynchronise, the sink thread asks the engine for a snapshot. The
+engine reads the relation at its last applied GSN (the *snapshot GSN*),
+between two records, and sends it to the thread in chunks of 10,000 rows,
+after the changes it sent before (the snapshot includes them; the thread
+drops them). The thread writes it in one transaction, opened at the first
+chunk: `DELETE FROM <target>`, `INSERT`s of the snapshot rows (each row
+repeated by its multiplicity, up to 500 rows per statement), and the
+progress row set to the snapshot GSN. `SHOW SINKS` shows
+`resynchronizing to gsn <n>` meanwhile. If the transaction fails, it is
+rolled back, the rest of the snapshot is dropped, and once the thread is
+connected again it asks for a new snapshot. The snapshot is not kept after
+it is written.
+
+Every transaction a sink writes is sent in as many messages as it needs,
+each at most 8 MiB of SQL text (a single statement can be longer; an
+`INSERT` holds fewer than 500 rows when they would exceed it): PostgreSQL
+rejects messages over 1 GB, which a resynchronisation of a few million rows
+in one message used to exceed.
 
 ### Delivering changes
 
@@ -92,7 +111,9 @@ For every GSN at which the relation changes, the engine hands the
 consolidated change (rows with positive and negative multiplicities) to the
 sink thread. The thread batches changes and flushes when more than 1000 rows
 are pending or 100 ms have passed since the last flush. A flush is one
-transaction:
+transaction of whole GSNs, about 50,000 rows (at least one GSN): a backlog
+is written in several transactions, each of which leaves the target as of
+a GSN, without waiting in between:
 
 ```sql
 BEGIN;
@@ -105,6 +126,15 @@ INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('<name>', <last gsn delivered>
   ON CONFLICT (sink) DO UPDATE SET gsn = GREATEST(ivm_sink_progress.gsn, EXCLUDED.gsn);
 COMMIT;
 ```
+
+The changes a sink has received but not written are bounded: when they
+exceed 256 MiB (estimated from their values) and more than one GSN — the
+target is unreachable for long, or keeps rejecting a batch — they are
+dropped (logged as `more than 256 MiB of changes are waiting to be written;
+dropping them and resynchronizing the target from a snapshot`), further
+changes are ignored, and once the thread is connected again the target is
+resynchronised from a fresh snapshot. (A single GSN's change is kept
+whatever its size.)
 
 Every write — a flush, a progress update, a resynchronisation — first locks
 the sink's progress row, so that the writers of one sink take turns, and
@@ -136,6 +166,10 @@ Without `KEY`:
   `0`), deleting a row the view still has;
 - added rows are plain `INSERT`s.
 
+No index can answer such a condition, so every removed row costs a scan of
+the target table: a keyless sink of a large relation that changes often is
+slow. Give the sink a `KEY` when the relation has unique columns.
+
 Values are written as typed literals, `'<text output>'::<type>`, or `NULL`.
 
 ### Exactly-once delivery
@@ -144,7 +178,7 @@ Each flush stores the data and the sink's progress GSN in the same
 transaction. If the transaction fails or its outcome is unknown, the thread
 waits, reconnects and reads the progress row again: batches at or below the
 committed GSN are discarded, the rest are applied again. Changes that arrive
-meanwhile are kept. A batch is therefore applied exactly once while the
+meanwhile are kept (up to the bound above). A batch is therefore applied exactly once while the
 engine keeps running. Failed connection attempts and failed writes are
 retried after 100 ms, then with a delay doubling up to 10 s while they keep
 failing (a batch the target rejects keeps failing until the target is
@@ -162,7 +196,7 @@ log is replayed. A target whose progress is at or after the checkpoint's GSN
 applied GSN when they stop, before the final checkpoint — resumes after
 its progress and receives the replayed changes; it is not rewritten. Only a
 target behind the checkpoint (the sink could not write for a while before a
-crash, or it was created by an older version) is resynchronised from the
+crash, or it was created by an older version) is resynchronised from a
 snapshot in one transaction. Changes that the sink received but had not
 written when the engine stopped are written when it stops.
 
@@ -205,8 +239,8 @@ removed from the view, so the sink deletes its row.
 - When the relation's columns change anyway — an upstream schema change of
   a replicated table, or a materialized view re-planned after one
   ([Sources](sources.md#upstream-schema-changes)) — the sink restarts with
-  the new columns, like a new sink: from a fresh snapshot, with a
-  resynchronisation (its progress is behind that snapshot). The target
+  the new columns, like a new sink: with a resynchronisation from a fresh
+  snapshot (its progress is behind the GSN it starts at). The target
   table is never altered: until it has every new column, with a type the
   values convert to, the resynchronisation fails (for example
   `error: column "c" of relation "t" does not exist`) and is retried. Add
@@ -222,7 +256,9 @@ removed from the view, so the sink deletes its row.
 
 `SHOW SINKS` shows `name`, `from` (the relation), `table` (the target as
 given), and `status`: `starting`, `running (gsn <n>)` (the GSN up to which
-the target is current, as committed in the progress row), `error: <message>`
+the target is current, as committed in the progress row),
+`resynchronizing to gsn <n>` (a snapshot is being written),
+`error: <message>`
 while it cannot connect or its writes fail (the error of the last attempt,
 shown until a write succeeds: reconnecting alone does not clear the error of
 a batch the target rejects), `error: broken: <reason>` (the relation is a
@@ -251,6 +287,9 @@ engine waits up to 5 s for its sinks to stop.
 
 See also [Troubleshooting](troubleshooting.md#known-problems).
 
-- The queue of changes from the engine to each sink is unbounded: while a
-  sink cannot write (its target is down, or a batch keeps failing), the
-  changes it has not written accumulate in memory.
+- The queue of changes from the engine to each sink is unbounded: the sink
+  thread takes changes from it between its transactions (and between the
+  chunks of a snapshot it writes), so what waits there is bounded only by
+  what arrives during one transaction. A snapshot is read on the engine
+  thread in one go, and its chunks wait in that queue until the sink has
+  written them.

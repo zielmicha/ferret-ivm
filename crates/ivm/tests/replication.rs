@@ -29,7 +29,12 @@ struct Ivm {
 
 impl Ivm {
     fn start(dir: &PathBuf) -> Ivm {
-        let cfg = Config { data_dir: dir.clone(), sync: false, ..Default::default() };
+        Ivm::start_with(dir, |_| {})
+    }
+
+    fn start_with(dir: &PathBuf, configure: impl FnOnce(&mut Config)) -> Ivm {
+        let mut cfg = Config { data_dir: dir.clone(), sync: false, ..Default::default() };
+        configure(&mut cfg);
         let running = coord::start(cfg).expect("engine starts");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1025,6 +1030,51 @@ fn sink_keeps_changes_while_its_target_is_unreachable() {
     eventually("sink", || {
         later.query("SELECT count(*) FROM v_copy").map(|r| r.rows[0][0].clone()).ok().flatten() == Some("6".to_string())
     });
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink writes a transaction in messages of bounded size (a
+/// resynchronization used to be one SQL string, which PostgreSQL rejects
+/// beyond 1 GB, so a large relation never finished its first sync), and
+/// bounds the changes it keeps while it cannot write: beyond the bound it
+/// drops them and resynchronizes the target from a fresh snapshot instead
+/// (they used to grow without limit, and the catch-up write with them).
+/// Each resynchronization is one transaction.
+#[test]
+fn sinks_write_in_bounded_messages_and_resynchronize_a_large_backlog() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int)");
+    let dir = tmpdir("sink-bounded");
+    let mut ivm = Ivm::start_with(&dir, |c| c.sink_limits = ivm::sink::SinkLimits { message_bytes: 4096, pending_bytes: 16 << 10 });
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    ivm.exec("INSERT INTO t SELECT g, g FROM generate_series(1, 3000) g");
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    let same = |ivm: &mut Ivm, up: &mut Upstream| {
+        let want = ivm.rows("SELECT count(*), sum(v) FROM t");
+        up.client.query("SELECT count(*), sum(v) FROM target").ok().map(|r| r.rows.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>().join("|")).collect::<Vec<_>>()) == Some(want)
+    };
+    // (about 50 KB of SQL in messages of 4 KB)
+    eventually("the first sync", || same(&mut ivm, &mut up));
+    let xmins = |up: &mut Upstream| up.rows("SELECT count(DISTINCT xmin::text) FROM target");
+    assert_eq!(xmins(&mut up), ["1"], "the first sync is one transaction");
+    eventually("the sink to run", || status(&mut ivm).starts_with("running"));
+    ivm.exec("INSERT INTO t VALUES (5000, 5000)");
+    eventually("a change", || same(&mut ivm, &mut up));
+    // the target rejects every change while about 100 KB of changes come
+    up.exec("ALTER TABLE target ADD CONSTRAINT small CHECK (v < 10000)");
+    for i in 0..40 {
+        ivm.exec(&format!("UPDATE t SET v = v + 10000 WHERE id % 40 = {i}"));
+    }
+    eventually("the writes to fail", || status(&mut ivm).contains("violates check constraint"));
+    up.exec("ALTER TABLE target DROP CONSTRAINT small");
+    eventually("the target to catch up", || same(&mut ivm, &mut up));
+    // by a resynchronization (rows that did not change were rewritten too)
+    assert_eq!(xmins(&mut up), ["1"], "the backlog was dropped and the target rewritten in one transaction");
+    eventually("the sink to run again", || status(&mut ivm).starts_with("running"));
+    ivm.exec("DELETE FROM t WHERE id <= 10");
+    eventually("the next change", || same(&mut ivm, &mut up));
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }

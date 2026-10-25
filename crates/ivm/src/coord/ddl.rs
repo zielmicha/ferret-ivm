@@ -1211,8 +1211,8 @@ impl Engine {
             Some(ObjectKind::Table(t)) => t.columns.clone(),
             _ => vec![],
         };
-        let snapshot = self.graph.snapshot(&mut self.env, node)?.data;
-        let h = crate::sink::start(id, name.to_string(), def.clone(), node, columns, snapshot, self.processed, handle.clone())?;
+        // (no snapshot: the sink asks for one when its target is behind)
+        let h = crate::sink::start(id, name.to_string(), def.clone(), node, columns, self.processed, self.cfg.sink_limits, handle.clone())?;
         self.sink_handles.insert(id, h);
         Ok(())
     }

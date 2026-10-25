@@ -37,6 +37,8 @@ pub struct Config {
     pub retention_gsns: u64,
     /// Interval of logged clock ticks (the time now() refers to).
     pub tick: Option<Duration>,
+    /// Bounds of the sinks' messages and memory.
+    pub sink_limits: crate::sink::SinkLimits,
 }
 
 impl Default for Config {
@@ -48,6 +50,7 @@ impl Default for Config {
             sync: true,
             retention_gsns: 1000,
             tick: Some(Duration::from_secs(1)),
+            sink_limits: Default::default(),
         }
     }
 }
@@ -289,6 +292,12 @@ impl EngineHandle {
             .send(SeqMsg::Append { rec, ack: Some(tx) })
             .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))?;
         Ok(rx)
+    }
+
+    /// Ask for a snapshot for sink `sink`'s thread `token` (see
+    /// `Request::SinkSnapshot`).
+    pub fn request_sink_snapshot(&self, sink: ObjectId, token: u64) {
+        let _ = self.tx.send(EngineMsg::Request(Request::SinkSnapshot { sink, token }));
     }
 
     /// Log the commit of a spooled transaction without waiting (see
@@ -702,6 +711,7 @@ impl Engine {
                 let _ = self.seq.send(SeqMsg::Append { rec, ack: None });
             }
             Request::Inspect(r) => self.inspect(r),
+            Request::SinkSnapshot { sink, token } => self.send_sink_snapshot(sink, token),
             other => self.run_execute(other, handle),
         }
     }
@@ -979,6 +989,21 @@ impl Engine {
             log::error!("sink {name} is broken and not started: {}", e.message);
             self.rt.broken.insert(id, e.message);
         }
+    }
+
+    /// Send sink `id`'s thread `token` (not that of a sink it replaced) its
+    /// relation's current contents, through its channel after the changes
+    /// sent to it so far: it resynchronizes its target from them.
+    pub(crate) fn send_sink_snapshot(&mut self, id: ObjectId, token: u64) {
+        let Some(h) = self.sink_handles.get(&id).filter(|h| h.token == token) else { return };
+        let (node, tx, gsn) = (h.node, h.sender(), self.processed);
+        let r = self.snapshot_chunks(node, &mut |rows| {
+            let _ = tx.send(crate::sink::SinkMsg::Snapshot(gsn, rows));
+        });
+        if let Err(e) = &r {
+            log::error!("cannot read the snapshot of sink {id}: {e}");
+        }
+        let _ = tx.send(crate::sink::SinkMsg::SnapshotEnd(gsn, r.err().map(|e| e.message)));
     }
 
     /// The error of using broken object `id`, if it is broken.
