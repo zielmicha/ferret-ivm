@@ -855,23 +855,31 @@ impl<'a> Lowerer<'a> {
 
     fn lower_distinct_aggs(&mut self, input: &Rel, group: &[usize], aggs: &[AggCall]) -> Result<Lowered> {
         let ng = group.len();
-        // all DISTINCT aggregates over the same argument set can share one distinct input
-        let distinct_args: Vec<Vec<usize>> = {
-            let mut v: Vec<Vec<usize>> = aggs.iter().filter(|a| a.distinct).map(|a| a.args.clone()).collect();
+        // all DISTINCT aggregates over the same argument set and FILTER can
+        // share one distinct input
+        let distinct_args: Vec<(Vec<usize>, Option<usize>)> = {
+            let mut v: Vec<(Vec<usize>, Option<usize>)> = aggs.iter().filter(|a| a.distinct).map(|a| (a.args.clone(), a.filter)).collect();
             v.sort();
             v.dedup();
             v
         };
-        if distinct_args.len() == 1 && aggs.iter().all(|a| a.distinct && a.filter.is_none()) {
-            // Aggregate(Distinct(Project(group ++ args)))
-            let args = &distinct_args[0];
+        if distinct_args.len() == 1 && aggs.iter().all(|a| a.distinct) {
+            // Aggregate(Distinct(Project(group ++ args [++ filter])))
+            let (args, filter) = &distinct_args[0];
             let mut cols: Vec<usize> = group.to_vec();
             cols.extend(args.iter().copied());
+            // the FILTER flag is part of the distinct rows: a value counts once
+            // among the rows that pass the filter, and groups none of whose
+            // rows pass it still exist
+            if let Some(f) = filter {
+                cols.push(*f);
+            }
             let projected = Rel::Distinct { input: Box::new(input.clone().project(cols)) };
             let new_aggs: Vec<AggCall> = aggs
                 .iter()
                 .map(|a| AggCall {
                     distinct: false,
+                    filter: a.filter.map(|_| ng + args.len()),
                     args: a.args.iter().map(|x| ng + args.iter().position(|y| y == x).unwrap()).collect(),
                     order: a.order.iter().map(|k| SortKey { col: ng + args.iter().position(|y| *y == k.col).unwrap_or(0), spec: k.spec }).collect(),
                     ..a.clone()

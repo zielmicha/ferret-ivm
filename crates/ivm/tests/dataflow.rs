@@ -100,3 +100,39 @@ fn window_range_offsets_that_overflow() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// DISTINCT aggregates with FILTER: the filter applies before duplicates
+/// are removed, and groups none of whose rows pass the filter still exist.
+/// (Lowering them used to recurse forever and overflow the engine's stack.)
+/// Expected rows are PostgreSQL's.
+#[test]
+fn distinct_aggregates_with_filter() {
+    let dir = tmpdir("distinct-filter");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, x int, y int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 1, -1), (2, 1, 1, 5), (3, 1, 2, 5), (4, 1, NULL, 1), (5, 2, NULL, 1), (6, 2, 7, 1), (7, 1, 9, 0), (8, 3, 4, -1)");
+    exec(&h, "CREATE MATERIALIZED VIEW one AS SELECT g, count(DISTINCT x) FILTER (WHERE y > 0) AS c FROM t GROUP BY g");
+    exec(
+        &h,
+        "CREATE MATERIALIZED VIEW mixed AS SELECT g, count(DISTINCT x) FILTER (WHERE y > 0) AS c, count(DISTINCT x) AS d, \
+         sum(DISTINCT x) FILTER (WHERE y <= 0) AS s, array_agg(DISTINCT x ORDER BY x) FILTER (WHERE y > 0) AS a, count(*) AS n \
+         FROM t GROUP BY g",
+    );
+    exec(
+        &h,
+        "CREATE MATERIALIZED VIEW global AS SELECT count(DISTINCT x) FILTER (WHERE y > 0) AS c, \
+         string_agg(DISTINCT x::text, ',' ORDER BY x::text) FILTER (WHERE y <> 5) AS s FROM t",
+    );
+    assert_eq!(rows(&h, "SELECT * FROM one ORDER BY g"), ["1|2", "2|1", "3|0"]);
+    assert_eq!(rows(&h, "SELECT * FROM mixed ORDER BY g"), ["1|2|3|10|{1,2,NULL}|5", "2|1|1||{7,NULL}|2", "3|0|1|4||1"]);
+    assert_eq!(rows(&h, "SELECT * FROM global"), ["3|1,4,7,9"]);
+    exec(&h, "UPDATE t SET y = 3 WHERE id = 8");
+    exec(&h, "DELETE FROM t WHERE id = 2");
+    exec(&h, "INSERT INTO t VALUES (9, 2, 7, -3), (10, 2, 7, 2)");
+    assert_eq!(rows(&h, "SELECT * FROM one ORDER BY g"), ["1|1", "2|1", "3|1"]);
+    assert_eq!(rows(&h, "SELECT * FROM mixed ORDER BY g"), ["1|1|3|10|{2,NULL}|4", "2|1|1|7|{7,NULL}|4", "3|1|1||{4}|1"]);
+    assert_eq!(rows(&h, "SELECT * FROM global"), ["3|1,4,7,9"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
