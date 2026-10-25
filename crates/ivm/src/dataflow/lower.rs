@@ -397,6 +397,7 @@ impl<'a> Lowerer<'a> {
                 width: s.width,
                 offset: offsets[i],
                 presence: s.presence,
+                exact: s.exact,
             });
             nodes.push(s.node);
             let size = self
@@ -463,11 +464,14 @@ impl<'a> Lowerer<'a> {
                 let (j, _) = best.unwrap();
                 // key columns for j: pairs (expr over j's raw rows, expr over joined row)
                 let mut pairs: Vec<(Expr, Expr, bool)> = Vec::new();
+                // keyed by the values of an exact presence input: match by identity
+                let mut exact = false;
                 for e in &edges {
                     let (je, oe, other) = if e.a == j { (&e.ea, &e.eb, e.b) } else if e.b == j { (&e.eb, &e.ea, e.a) } else { continue };
                     if !bound.contains(&other) {
                         continue;
                     }
+                    exact |= inputs[other].exact;
                     // j-side expr over j's local post-mfp columns -> raw node columns
                     let local = je.remapped(&|c| c - offsets[j]);
                     let raw = if inputs[j].presence.is_some() {
@@ -504,6 +508,7 @@ impl<'a> Lowerer<'a> {
                     key: pairs.iter().map(|(_, o, _)| o.clone()).collect(),
                     null_safe: pairs.iter().map(|(_, _, ns)| *ns).collect(),
                     filters,
+                    exact,
                 });
             }
             paths.push(DeltaPath { source: src, source_filters, steps });
@@ -551,7 +556,7 @@ impl<'a> Lowerer<'a> {
         }
         let specs: Vec<JoinInputSpec> = inputs
             .into_iter()
-            .map(|l| JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None })
+            .map(|l| JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None, exact: false })
             .collect();
         let (plan, nodes, schema) = self.plan_join(specs, conds)?;
         let node = self.g.add_node(NodeKind::Join(plan), nodes, schema);
@@ -608,16 +613,19 @@ impl<'a> Lowerer<'a> {
                 let _ = &mut inputs;
                 self.lower_inner(inputs, conds)?
             };
-            let mut proj = joined;
-            proj.mfp.project(&(0..nl).collect::<Vec<_>>());
-            proj.schema.truncate(nl);
-            let matched = self.distinct(proj)?;
+            let mut matched = joined;
+            matched.mfp.project(&(0..nl).collect::<Vec<_>>());
+            matched.schema.truncate(nl);
             let pairs_all: Vec<(Expr, Expr, bool)> = (0..nl).map(|c| (Expr::Column(c), Expr::Column(c), true)).collect();
             let mut lf = l.clone();
             for p in &left_only {
                 lf.mfp.add_filter(p.clone());
             }
-            self.presence_join(lf, matched, pairs_all)?
+            // the matched rows are looked up exactly: rows that are equal but
+            // differ in representation (numeric scale, ...) may differ in
+            // whether they match, so neither a distinct nor a lookup by
+            // equality may conflate them
+            self.presence_join(lf, matched, pairs_all, true)?
         } else {
             let mut lf = l.clone();
             for p in &left_only {
@@ -637,7 +645,7 @@ impl<'a> Lowerer<'a> {
             rk.schema = rk.schema[base_w..].to_vec();
             let pairs_local: Vec<(Expr, Expr, bool)> =
                 pairs.iter().enumerate().map(|(i, (le, _, ns))| (le.clone(), Expr::Column(i), *ns)).collect();
-            self.presence_join(lf, rk, pairs_local)?
+            self.presence_join(lf, rk, pairs_local, false)?
         };
         if !anti {
             return Ok(semi);
@@ -646,8 +654,9 @@ impl<'a> Lowerer<'a> {
         self.union(vec![l, semi], vec![false, true])
     }
 
-    /// Semijoin of `l` with the key set of `r` (r's columns are the keys).
-    fn presence_join(&mut self, l: Lowered, r: Lowered, pairs: Vec<(Expr, Expr, bool)>) -> Result<Lowered> {
+    /// Semijoin of `l` with the key set of `r` (r's columns are the keys),
+    /// matching keys by equality or, if `exact`, by identity.
+    fn presence_join(&mut self, l: Lowered, r: Lowered, pairs: Vec<(Expr, Expr, bool)>, exact: bool) -> Result<Lowered> {
         let nl = l.schema.len();
         let k = r.schema.len();
         let r_schema = r.schema.clone();
@@ -655,8 +664,8 @@ impl<'a> Lowerer<'a> {
         let key: Vec<Expr> = (0..k).map(Expr::Column).collect();
         let parr = self.arrange(rnode, key, vec![SortSpec::ASC; k], vec![]);
         let inputs = vec![
-            JoinInputSpec { width: nl, node: l.node, mfp: l.mfp.clone(), schema: l.schema.clone(), presence: None },
-            JoinInputSpec { width: k, node: rnode, mfp: Mfp::identity(k), schema: r_schema, presence: Some(parr) },
+            JoinInputSpec { width: nl, node: l.node, mfp: l.mfp.clone(), schema: l.schema.clone(), presence: None, exact: false },
+            JoinInputSpec { width: k, node: rnode, mfp: Mfp::identity(k), schema: r_schema, presence: Some(parr), exact },
         ];
         let lschema = l.schema.clone();
         let conds: Vec<Expr> = pairs
@@ -900,11 +909,13 @@ pub struct JoinInputSpec {
     pub width: usize,
     pub schema: Vec<ColumnType>,
     pub presence: Option<ArrId>,
+    /// Presence matches exactly (see JoinInput::exact).
+    pub exact: bool,
 }
 
 impl From<Lowered> for JoinInputSpec {
     fn from(l: Lowered) -> Self {
-        JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None }
+        JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None, exact: false }
     }
 }
 

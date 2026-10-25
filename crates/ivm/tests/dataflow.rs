@@ -200,3 +200,46 @@ fn percentiles_with_nulls_first() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Semijoins, antijoins and outer joins on conditions other than
+/// equalities compare left rows by identity: rows that are equal but differ
+/// in representation (numeric scale) can differ in whether they match.
+/// Expected rows are PostgreSQL's.
+#[test]
+fn general_semijoins_keep_representations_apart() {
+    let dir = tmpdir("semijoin-repr");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE l (x numeric)"); // a multiset
+    exec(&h, "CREATE TABLE r (id int PRIMARY KEY, s text)");
+    exec(&h, "INSERT INTO l VALUES (1.0), (1.00), (2), (1.0)");
+    exec(&h, "INSERT INTO r VALUES (1, '1.0')");
+    let semi = "SELECT x FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.s LIKE l.x::text)";
+    let anti = "SELECT x FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.s LIKE l.x::text)";
+    let outer = "SELECT l.x, r.id FROM l LEFT JOIN r ON r.s LIKE l.x::text";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW semi AS {semi}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW anti AS {anti}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW outer_ AS {outer}"));
+    let check = |want: [&[&str]; 3]| {
+        for ((q, v), want) in [(semi, "semi"), (anti, "anti"), (outer, "outer_")].into_iter().zip(want) {
+            let mut want = want.to_vec();
+            want.sort();
+            let mut got = rows(&h, &format!("SELECT * FROM {v}"));
+            got.sort();
+            assert_eq!(got, want, "{v}");
+            let mut adhoc = rows(&h, q);
+            adhoc.sort();
+            assert_eq!(adhoc, want, "{q}");
+        }
+    };
+    check([&["1.0", "1.0"], &["1.00", "2"], &["1.0|1", "1.0|1", "1.00|", "2|"]]);
+    exec(&h, "INSERT INTO r VALUES (2, '1.00')");
+    exec(&h, "DELETE FROM r WHERE id = 1");
+    check([&["1.00"], &["1.0", "1.0", "2"], &["1.0|", "1.0|", "1.00|2", "2|"]]);
+    exec(&h, "DELETE FROM l WHERE x = 2");
+    exec(&h, "INSERT INTO r VALUES (3, '1.0'), (4, '2')");
+    exec(&h, "INSERT INTO l VALUES (2.0)");
+    check([&["1.0", "1.0", "1.00"], &["2.0"], &["1.0|3", "1.0|3", "1.00|2", "2.0|"]]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
