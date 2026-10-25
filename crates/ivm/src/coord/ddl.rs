@@ -535,16 +535,17 @@ impl Engine {
         let mut diff: Vec<(crate::types::Row, i64)> = new_rows;
         diff.extend(old_rows.into_iter().map(|(r, w)| (r, -w)));
         crate::dataflow::consolidate(&mut diff);
+        // (by view: other views and ad hoc subscriptions may share the old node)
         for s in self.subs.iter_mut() {
-            if s.node == old.node {
+            if s.view == Some(id) {
                 s.node = new_node;
                 if !diff.is_empty() {
                     let _ = s.tx.send(SubEvent::Data { gsn, rows: diff.clone() });
                 }
             }
         }
-        for sink in self.sink_handles.values_mut() {
-            if sink.node == old.node {
+        for (sink_id, sink) in self.sink_handles.iter_mut() {
+            if matches!(self.catalog.get(*sink_id).map(|o| &o.kind), Some(ObjectKind::Sink(def)) if def.from == id) {
                 sink.node = new_node;
                 sink.send(gsn, &diff);
             }

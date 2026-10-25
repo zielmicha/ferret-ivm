@@ -477,3 +477,33 @@ fn dropping_a_view_leaves_subscriptions_to_its_twin_alone() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Replacing a view moved every subscription on its dataflow node to the
+/// new definition, also those to another view sharing the node (here an
+/// identical view b): they then streamed the replacement's changes.
+#[test]
+fn replacing_a_view_leaves_subscriptions_to_its_twin_alone() {
+    let dir = tmpdir("replace-twin");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1), (2, 2)");
+    exec(&h, "CREATE MATERIALIZED VIEW a AS SELECT DISTINCT a FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW b AS SELECT DISTINCT a FROM t");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO b") else { panic!("not a subscription") };
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW a AS SELECT DISTINCT a + 10 AS a FROM t");
+    exec(&h, "INSERT INTO t VALUES (3, 3)");
+    let mut acc = std::collections::BTreeMap::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let SubEvent::Data { rows, .. } = ev {
+            for (r, w) in rows {
+                *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
+            }
+        }
+    }
+    acc.retain(|_, w| *w != 0);
+    assert_eq!(acc.keys().cloned().collect::<Vec<_>>(), ["1", "2", "3"]);
+    assert_eq!(rows(&h, "SELECT * FROM a ORDER BY 1"), ["11", "12", "13"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

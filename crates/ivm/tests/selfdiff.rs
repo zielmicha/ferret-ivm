@@ -9,7 +9,7 @@
 //! actions: random DML (also primary key changes and rows changed several
 //! times), checkpoints, clean restarts, crash restarts (no final checkpoint,
 //! so recovery replays the log; sometimes the log ends in a torn record),
-//! views created and dropped on the way, and reads AS OF earlier GSNs, which
+//! views created, replaced and dropped on the way, and reads AS OF earlier GSNs, which
 //! must return what the views held then. Every view is also subscribed to
 //! (some views' queries too, which builds their own dataflow): the stream of
 //! changes must add up to the view's (query's) contents. All views are
@@ -51,6 +51,8 @@ enum Action {
     Crash(bool),
     CreateView(u64),
     DropView(usize),
+    /// CREATE OR REPLACE a view with another query.
+    ReplaceView(usize, u64),
     /// Reads AS OF an earlier GSN must return what the views held then.
     AsOf(usize),
 }
@@ -63,6 +65,7 @@ fn arb_action() -> impl Strategy<Value = Action> {
         5 => any::<bool>().prop_map(Action::Crash),
         5 => any::<u64>().prop_map(Action::CreateView),
         2 => any::<usize>().prop_map(Action::DropView),
+        3 => (any::<usize>(), any::<u64>()).prop_map(|(i, s)| Action::ReplaceView(i, s)),
         6 => any::<usize>().prop_map(Action::AsOf),
     ]
 }
@@ -130,8 +133,8 @@ fn query(h: &EngineHandle, sql: &str, trim_numeric: bool) -> Rows {
 /// changes adds up to.
 struct Sub {
     view: String,
-    /// Subscribed to the view's query, not to the view.
-    to_query: bool,
+    /// Subscribed to this query (the view's when subscribed), not to the view.
+    to_query: Option<String>,
     columns: Vec<ResultColumn>,
     rx: crossbeam_channel::Receiver<SubEvent>,
     cancel: Arc<AtomicBool>,
@@ -235,9 +238,9 @@ impl Case {
     fn subscribe(&mut self, i: usize, to_query: bool) {
         let h = self.h();
         let v = &self.views[i];
-        let mut targets = vec![(false, v.name.clone())];
+        let mut targets = vec![(None, v.name.clone())];
         if to_query {
-            targets.push((true, format!("({})", v.query)));
+            targets.push((Some(v.query.clone()), format!("({})", v.query)));
         }
         for (q, target) in targets {
             match execute(&h, &format!("SUBSCRIBE TO {target}")) {
@@ -268,7 +271,7 @@ impl Case {
         }
         // subscriptions end with the engine: subscribe again
         let resubscribe: Vec<(usize, bool)> =
-            (0..self.views.len()).map(|i| (i, self.subs.iter().any(|s| s.to_query && s.view == self.views[i].name))).collect();
+            (0..self.views.len()).map(|i| (i, self.subs.iter().any(|s| s.to_query.is_some() && s.view == self.views[i].name))).collect();
         self.subs.clear();
         self.running = Some(coord::start(config(&self.dir, self.cache_bytes)).expect("engine restarts"));
         for (i, q) in resubscribe {
@@ -307,11 +310,16 @@ impl Case {
             // what subscriptions to it (or to its query) add up to
             for sub in self.subs.iter_mut().filter(|s| s.view == v.name) {
                 sub.drain(v.trim);
-                let (expect, of) = if sub.to_query { (&want, "its query") } else { (&got, "the view") };
-                if let (Ok(expect), None) = (expect, &sub.failed) {
+                let (expect, of) = match &sub.to_query {
+                    Some(q) if q == &v.query => (want.clone(), "its query"),
+                    // the view was replaced since: the query subscription goes on
+                    Some(q) => (query(&h, q, v.trim), "its former query"),
+                    None => (got.clone(), "the view"),
+                };
+                if let (Ok(expect), None) = (&expect, &sub.failed) {
                     let acc = sub.contents();
                     if &acc != expect {
-                        let msg = format!("after {what}: subscription to {} of {} = {}\n  stream adds up to: {acc:?}\n  {of} holds:       {expect:?}", if sub.to_query { "the query" } else { "view" }, v.name, v.query);
+                        let msg = format!("after {what}: subscription to {} of {} = {}\n  stream adds up to: {acc:?}\n  {of} holds:       {expect:?}", if sub.to_query.is_some() { "the query" } else { "view" }, v.name, v.query);
                         panic!("{msg}\ncase:\n  {}", self.log.join("\n  "));
                     }
                 }
@@ -430,6 +438,40 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
                             sub.cancel.store(true, std::sync::atomic::Ordering::Release);
                         }
                         case.subs.retain(|s| s.view != name);
+                    }
+                }
+            }
+            Action::ReplaceView(pick, seed) => {
+                if !case.views.is_empty() {
+                    let i = pick % case.views.len();
+                    let name = case.views[i].name.clone();
+                    let has_dependents = case.views.iter().any(|v| v.reads.as_deref() == Some(name.as_str()));
+                    let q = sqlgen::Gen { rng: &mut Rng::new(*seed), tables: &case.tables }.query();
+                    if !has_dependents && execute(&case.h(), &format!("CREATE OR REPLACE MATERIALIZED VIEW {name} AS {q}")).is_ok() {
+                        let created = case.gsn();
+                        case.note(format!("{name} replaced (gsn {created}): {q}"));
+                        let v = &mut case.views[i];
+                        v.trim = sqlgen::dedups(&q);
+                        v.query = q;
+                        v.reads = None;
+                        // (its history before the replacement is gone)
+                        v.created = created;
+                        // Subscriptions to the view continue with the change to
+                        // the new contents; their result columns cannot change,
+                        // so subscribe again if the replacement's did.
+                        let Ok(ExecResult::Query { columns, .. }) = execute(&case.h(), &format!("SELECT * FROM {name}")) else { continue };
+                        let same = |a: &[ResultColumn]| {
+                            a.len() == columns.len() && a.iter().zip(&columns).all(|(x, y)| x.name == y.name && x.ty == y.ty && x.typmod == y.typmod)
+                        };
+                        let changed = case.subs.iter().any(|s| s.view == name && s.to_query.is_none() && !same(&s.columns));
+                        if changed {
+                            for sub in case.subs.iter().filter(|s| s.view == name && s.to_query.is_none()) {
+                                sub.cancel.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            case.subs.retain(|s| !(s.view == name && s.to_query.is_none()));
+                            case.note(format!("-- {name}: columns changed, subscribing again"));
+                            case.subscribe(i, false);
+                        }
                     }
                 }
             }
