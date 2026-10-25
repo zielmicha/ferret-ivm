@@ -121,20 +121,69 @@ impl Catalog {
         self.objects.remove(&id)
     }
 
+    /// Relations a query reads as the binder resolves their names, including
+    /// those of the views it expands; None when it does not bind.
+    pub fn references(&self, sql: &str) -> Option<Vec<ObjectId>> {
+        struct Recording<'a> {
+            cat: &'a Catalog,
+            seen: std::cell::RefCell<Vec<ObjectId>>,
+        }
+        impl BindCatalog for Recording<'_> {
+            fn definitions(&self, kind: &str) -> Vec<(u32, String)> {
+                self.cat.definitions(kind)
+            }
+            fn resolve_relation(&self, schema: Option<&str>, name: &str) -> Option<CatalogRelation> {
+                let r = self.cat.resolve_relation(schema, name);
+                if let Some(CatalogRelation::Table { id, .. } | CatalogRelation::View { id, .. }) = &r {
+                    self.seen.borrow_mut().push(*id);
+                }
+                r
+            }
+        }
+        let q = crate::sql::parser::parse_single_query(sql).ok()?;
+        let rec = Recording { cat: self, seen: Default::default() };
+        crate::sql::Binder::new(&rec).bind_query(&q).ok()?;
+        Some(rec.seen.into_inner())
+    }
+
+    /// Does the query `sql` read object `id` (by name, conservatively, if
+    /// it does not bind)?
+    pub fn query_reads(&self, sql: &str, id: ObjectId) -> bool {
+        match self.references(sql) {
+            Some(refs) => refs.contains(&id),
+            None => self.get(id).is_some_and(|o| sql_mentions(sql, &o.name)),
+        }
+    }
+
+    /// (Non-materialized) views `sql` reads: queries inline them, so their
+    /// planned form no longer shows them.
+    pub fn mentioned_views(&self, sql: &str) -> Vec<ObjectId> {
+        let refs = self.references(sql);
+        self.objects
+            .values()
+            .filter(|o| matches!(o.kind, ObjectKind::View(_)))
+            .filter(|o| match &refs {
+                Some(r) => r.contains(&o.id),
+                None => sql_mentions(sql, &o.name),
+            })
+            .map(|o| o.id)
+            .collect()
+    }
+
     /// Objects that depend on `id` (views referencing it, indexes on it,
     /// sinks from it, tables of a source).
     pub fn dependents(&self, id: ObjectId) -> Vec<ObjectId> {
-        let target = match self.get(id) {
-            Some(o) => o.name.clone(),
-            None => return vec![],
-        };
+        if self.get(id).is_none() {
+            return vec![];
+        }
         let mut out = Vec::new();
         for o in self.objects.values() {
             let dep = match &o.kind {
                 ObjectKind::Index(i) => i.on == id,
                 ObjectKind::Sink(s) => s.from == id,
                 ObjectKind::Table(t) => t.source == Some(id),
-                ObjectKind::MaterializedView(v) | ObjectKind::View(v) => sql_mentions(&v.sql, &target),
+                // the relations it reads, not every identifier equal to the name
+                ObjectKind::MaterializedView(v) | ObjectKind::View(v) => self.query_reads(&v.sql, id),
                 ObjectKind::Source(_) => false,
             };
             if dep && o.id != id {
@@ -146,7 +195,7 @@ impl Catalog {
 }
 
 /// Conservative test whether a view's SQL references a relation name.
-fn sql_mentions(sql: &str, name: &str) -> bool {
+pub(crate) fn sql_mentions(sql: &str, name: &str) -> bool {
     let lower = sql.to_lowercase();
     lower.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).any(|w| w.trim_matches('"') == name)
 }

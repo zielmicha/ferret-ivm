@@ -140,8 +140,17 @@ fn range_bound(rs: &[&Row], ro: &RangeOffsets, p: &Peers, i: usize, offset: &Dat
     };
     let target = match f(&cur, offset) {
         Ok(t) => t,
-        // out of range: the bound is beyond every value
-        Err(_) => return if start { lo as i64 } else { hi as i64 - 1 },
+        // out of range: as in PostgreSQL's in_range functions, the bound lies
+        // beyond every value in the offset's direction (before all of them
+        // for PRECEDING, after all of them for FOLLOWING)
+        Err(_) => {
+            return match (start, preceding) {
+                (true, true) => lo as i64,
+                (true, false) => hi as i64,
+                (false, true) => lo as i64 - 1,
+                (false, false) => hi as i64 - 1,
+            };
+        }
     };
     let before = |v: &Datum, strict: bool| {
         let c = v.sql_cmp(&target);
@@ -170,10 +179,11 @@ fn frame_bounds(rs: &[&Row], f: &WinSpec, p: &Peers, i: usize) -> (usize, usize)
         (_, FrameBound::UnboundedPreceding) => 0,
         (FrameUnits::Rows, FrameBound::Preceding(k)) => i.saturating_sub(k as usize),
         (FrameUnits::Rows, FrameBound::CurrentRow) => i,
-        (FrameUnits::Rows, FrameBound::Following(k)) => i + k as usize,
-        (FrameUnits::Groups, FrameBound::Preceding(k)) => gstart[(g as i64 - k).max(0) as usize],
+        // a start past the partition is an empty frame at its end
+        (FrameUnits::Rows, FrameBound::Following(k)) => (i as i64).saturating_add(k).min(n as i64) as usize,
+        (FrameUnits::Groups, FrameBound::Preceding(k)) => gstart[(g as i64).saturating_sub(k).max(0) as usize],
         (FrameUnits::Groups, FrameBound::Following(k)) => {
-            let gg = g as i64 + k;
+            let gg = (g as i64).saturating_add(k);
             if gg >= ng { n } else { gstart[gg as usize] }
         }
         (_, FrameBound::CurrentRow) => gstart[g],
@@ -186,12 +196,12 @@ fn frame_bounds(rs: &[&Row], f: &WinSpec, p: &Peers, i: usize) -> (usize, usize)
             range_bound(rs, ro, p, i, ro.end.as_ref().unwrap(), matches!(f.end, FrameBound::Preceding(_)), false)
         }
         (_, FrameBound::UnboundedFollowing) => n as i64 - 1,
-        (FrameUnits::Rows, FrameBound::Following(k)) => (i as i64 + k).min(n as i64 - 1),
+        (FrameUnits::Rows, FrameBound::Following(k)) => (i as i64).saturating_add(k).min(n as i64 - 1),
         (FrameUnits::Rows, FrameBound::CurrentRow) => i as i64,
-        (FrameUnits::Rows, FrameBound::Preceding(k)) => i as i64 - k,
-        (FrameUnits::Groups, FrameBound::Following(k)) => gend[((g as i64 + k).min(ng - 1)) as usize] as i64,
+        (FrameUnits::Rows, FrameBound::Preceding(k)) => (i as i64).saturating_sub(k),
+        (FrameUnits::Groups, FrameBound::Following(k)) => gend[((g as i64).saturating_add(k).min(ng - 1)) as usize] as i64,
         (FrameUnits::Groups, FrameBound::Preceding(k)) => {
-            let gg = g as i64 - k;
+            let gg = (g as i64).saturating_sub(k);
             if gg < 0 { -1 } else { gend[gg as usize] as i64 }
         }
         (_, FrameBound::CurrentRow) => gend[g] as i64,
@@ -258,7 +268,11 @@ fn compute_func(rs: &[&Row], f: &WinSpec, p: &Peers) -> Result<Vec<Datum>> {
                     WindowFunc::FirstValue => (s < e).then(|| rs[s][f.args[0]].clone()),
                     WindowFunc::LastValue => (s < e).then(|| rs[e - 1][f.args[0]].clone()),
                     _ => {
-                        let k = rs[i][f.args[1]].as_i64().unwrap_or(0);
+                        // a NULL position yields NULL (as in PostgreSQL)
+                        let Some(k) = rs[i][f.args[1]].as_i64() else {
+                            out.push(Datum::Null);
+                            continue;
+                        };
                         if k <= 0 {
                             return Err(SqlError::new("22016", "argument of nth_value must be greater than zero"));
                         }

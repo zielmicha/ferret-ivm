@@ -4,7 +4,7 @@
 use crate::coord::api::{ExecResult, ResultColumn, SessionVars, SubEvent};
 use crate::coord::EngineHandle;
 use crate::error::{codes, Result, SqlError};
-use crate::sql::parser::{parse_statement, split_statements, ShowKind, Statement};
+use crate::sql::parser::{parse_statement, split_statements, AsOf, ShowKind, Statement, SubscribeTarget};
 use crate::sql::ParamSlot;
 use crate::types::text::{format_datum, parse_datum, recv_datum, send_datum};
 use crate::types::{Datum, Row, SqlType};
@@ -25,6 +25,11 @@ pub struct ServerConfig {
 }
 
 type CancelMap = Arc<Mutex<HashMap<u32, (u32, Arc<AtomicBool>)>>>;
+
+/// Stack size of session threads: syntax trees of long operator chains (up
+/// to sql::parser::MAX_OPERATOR_CHAIN deep) are dropped recursively.
+/// Reserved, not committed, memory.
+const SESSION_STACK: usize = 16 << 20;
 
 /// Accept connections forever.
 pub fn serve(cfg: ServerConfig, engine: EngineHandle) -> Result<()> {
@@ -47,6 +52,8 @@ pub fn serve_listener(listener: TcpListener, cfg: ServerConfig, engine: EngineHa
         let pid = next_pid.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
             .name(format!("ivm-session-{pid}"))
+            // statements (and their syntax trees) may nest deeply
+            .stack_size(SESSION_STACK)
             .spawn(move || {
                 let _ = stream.set_nodelay(true);
                 if let Err(e) = Session::run(stream, cfg, engine, cancels.clone(), pid) {
@@ -59,18 +66,22 @@ pub fn serve_listener(listener: TcpListener, cfg: ServerConfig, engine: EngineHa
     Ok(())
 }
 
+/// Prepared statements and portals keep the statement's text and parse it
+/// again when needed: syntax trees can be deep, and cloning one recurses
+/// once per level (parsing does not).
 struct Prepared {
     text: String,
-    stmt: Statement,
     param_types: Vec<SqlType>,
+    /// Number of parameters a Bind must supply.
+    nparams: usize,
 }
 
 struct Portal {
-    stmt: Statement,
+    text: String,
     params: Vec<ParamSlot>,
     result_formats: Vec<i16>,
-    /// Remaining rows of a partially fetched result.
-    pending: Option<(Vec<ResultColumn>, std::vec::IntoIter<Row>, usize)>,
+    /// Remaining rows of a partially fetched (or exhausted) result.
+    pending: Option<(Vec<ResultColumn>, std::vec::IntoIter<Row>)>,
 }
 
 struct Session {
@@ -89,12 +100,14 @@ struct Session {
 }
 
 fn field(c: &ResultColumn, format: i16) -> FieldDescription {
+    // untyped literals in a result are text (PostgreSQL resolves them so)
+    let ty = if c.ty == SqlType::Unknown { &SqlType::Text } else { &c.ty };
     FieldDescription {
         name: c.name.clone(),
         table_oid: 0,
         column_attr: 0,
-        type_oid: c.ty.oid(),
-        type_size: c.ty.type_size(),
+        type_oid: ty.oid(),
+        type_size: ty.type_size(),
         type_modifier: c.typmod,
         format,
     }
@@ -201,6 +214,24 @@ impl Session {
             pending_copy: false,
         };
         s.settings.insert("application_name".into(), app);
+        // settings clients SHOW (besides those reported above)
+        for (k, v) in [
+            ("server_version_num", "170000"),
+            ("integer_datetimes", "on"),
+            ("max_identifier_length", "63"),
+            ("search_path", "\"$user\", public"),
+            ("extra_float_digits", "1"),
+            ("bytea_output", "hex"),
+            ("is_superuser", "on"),
+            ("default_transaction_isolation", "serializable"),
+            ("transaction_read_only", "off"),
+        ] {
+            s.settings.insert(k.into(), v.into());
+        }
+        // the session's read mode, also before any SET
+        for k in ["read_mode", "ivm.read_mode"] {
+            s.settings.insert(k.into(), s.vars.read_mode.clone());
+        }
         s.main_loop()
     }
 
@@ -272,7 +303,13 @@ impl Session {
                 }
                 FrontendMessage::Sync => {
                     skip_until_sync = false;
-                    self.portals.retain(|k, _| !k.is_empty());
+                    // portals end with the transaction (outside a transaction
+                    // block, with the implicit one Sync closes)
+                    if self.in_txn {
+                        self.portals.retain(|k, _| !k.is_empty());
+                    } else {
+                        self.portals.clear();
+                    }
                     let st = self.txn_status();
                     self.out.ready_for_query(st);
                     self.flush()?;
@@ -282,7 +319,11 @@ impl Session {
                 FrontendMessage::CopyData(_) | FrontendMessage::CopyDone | FrontendMessage::CopyFail(_) => {}
                 FrontendMessage::Password(_) => {}
                 FrontendMessage::FunctionCall => {
+                    // like a simple query: the error, then ReadyForQuery
                     self.error(&SqlError::unsupported("function call protocol is not supported"));
+                    let st = self.txn_status();
+                    self.out.ready_for_query(st);
+                    self.flush()?;
                 }
             }
         }
@@ -299,12 +340,16 @@ impl Session {
                 }
                 sqlparser::ast::Statement::Commit { .. } => {
                     self.in_txn = false;
+                    self.portals.clear();
                     Some(Ok(ExecResult::Command { tag: "COMMIT".into() }))
                 }
                 sqlparser::ast::Statement::Rollback { .. } => {
                     self.in_txn = false;
+                    self.portals.clear();
                     Some(Ok(ExecResult::Command { tag: "ROLLBACK".into() }))
                 }
+                // settings are fixed or kept per session: nothing to reset
+                sqlparser::ast::Statement::Reset(_) => Some(Ok(ExecResult::Command { tag: "RESET".into() })),
                 sqlparser::ast::Statement::ShowVariable { variable } => {
                     let name = variable.iter().map(|i| i.value.to_lowercase()).collect::<Vec<_>>().join("_");
                     self.settings.get(&name).map(|v| {
@@ -344,7 +389,11 @@ impl Session {
                 if v != "fresh" && v != "latest" {
                     return Err(SqlError::new(codes::INVALID_PARAMETER_VALUE, format!("invalid value for read_mode: \"{value}\"")));
                 }
-                self.vars.read_mode = v;
+                self.vars.read_mode = v.clone();
+                for k in ["read_mode", "ivm.read_mode"] {
+                    self.settings.insert(k.into(), v.clone());
+                }
+                return Ok(ExecResult::Command { tag: "SET".into() });
             }
             "timezone" | "time zone" => {
                 let v = value.to_lowercase();
@@ -358,9 +407,30 @@ impl Session {
                     return Err(SqlError::unsupported(format!("client_encoding \"{value}\" is not supported; use UTF8")));
                 }
             }
+            // the remaining checks reject values that would be accepted but
+            // not honored: output is always ISO / postgres / hex, input dates
+            // are read month first and backslashes are not escapes
             "datestyle" => {
-                if !value.to_uppercase().contains("ISO") {
-                    return Err(SqlError::unsupported("only DateStyle ISO is supported"));
+                let ok = value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|t| !t.is_empty())
+                    .all(|t| matches!(t.to_uppercase().as_str(), "ISO" | "MDY" | "US" | "NONEURO" | "NONEUROPEAN" | "DEFAULT"));
+                if !ok {
+                    return Err(SqlError::unsupported(format!("DateStyle \"{value}\" is not supported; only ISO, MDY is")));
+                }
+            }
+            "intervalstyle" | "bytea_output" => {
+                let fixed = if name == "intervalstyle" { "postgres" } else { "hex" };
+                let v = value.to_lowercase();
+                if v != fixed && v != "default" {
+                    return Err(SqlError::unsupported(format!("{name} \"{value}\" is not supported; only {fixed} is")));
+                }
+            }
+            "standard_conforming_strings" => {
+                let v = value.to_lowercase();
+                let on = matches!(v.as_str(), "on" | "1" | "default") || (!v.is_empty() && ("true".starts_with(&v) || "yes".starts_with(&v)));
+                if !on {
+                    return Err(SqlError::unsupported("standard_conforming_strings = off is not supported"));
                 }
             }
             _ => {}
@@ -598,9 +668,10 @@ impl Session {
             return Err(SqlError::syntax("cannot insert multiple commands into a prepared statement"));
         }
         let text = stmts.into_iter().next().unwrap_or_default();
-        let stmt = parse_statement(&text)?;
-        let types = param_types.iter().map(|o| SqlType::from_oid(*o).unwrap_or(SqlType::Unknown)).collect();
-        self.prepared.insert(name.to_string(), Prepared { text, stmt, param_types: types });
+        parse_statement(&text)?;
+        let types: Vec<SqlType> = param_types.iter().map(|o| SqlType::from_oid(*o).unwrap_or(SqlType::Unknown)).collect();
+        let nparams = crate::sql::parser::max_param_index(&text).max(types.len());
+        self.prepared.insert(name.to_string(), Prepared { text, param_types: types, nparams });
         Ok(())
     }
 
@@ -609,6 +680,12 @@ impl Session {
             .prepared
             .get(stmt)
             .ok_or_else(|| SqlError::new(codes::INVALID_SQL_STATEMENT_NAME, format!("prepared statement \"{stmt}\" does not exist")))?;
+        if params.len() != p.nparams {
+            return Err(SqlError::new(
+                codes::PROTOCOL_VIOLATION,
+                format!("bind message supplies {} parameters, but prepared statement \"{stmt}\" requires {}", params.len(), p.nparams),
+            ));
+        }
         let mut slots = Vec::with_capacity(params.len());
         for (i, v) in params.iter().enumerate() {
             let ty = p.param_types.get(i).cloned().unwrap_or(SqlType::Unknown);
@@ -627,9 +704,8 @@ impl Session {
             };
             slots.push(ParamSlot { ty: ty.clone(), value: Some(value) });
         }
-        let stmt = p.stmt.clone();
-        let _ = &p.text;
-        self.portals.insert(portal.to_string(), Portal { stmt, params: slots, result_formats, pending: None });
+        let text = p.text.clone();
+        self.portals.insert(portal.to_string(), Portal { text, params: slots, result_formats, pending: None });
         Ok(())
     }
 
@@ -639,24 +715,44 @@ impl Session {
                 .prepared
                 .get(name)
                 .ok_or_else(|| SqlError::new(codes::INVALID_SQL_STATEMENT_NAME, format!("prepared statement \"{name}\" does not exist")))?;
-            let params: Vec<ParamSlot> = p.param_types.iter().map(|t| ParamSlot { ty: t.clone(), value: None }).collect();
-            (p.stmt.clone(), params, vec![], true)
+            // a slot for every parameter used, typed or still unknown
+            let params: Vec<ParamSlot> = (0..p.nparams)
+                .map(|i| ParamSlot { ty: p.param_types.get(i).cloned().unwrap_or(SqlType::Unknown), value: None })
+                .collect();
+            (parse_statement(&p.text)?, params, vec![], true)
         } else {
             let p = self
                 .portals
                 .get(name)
                 .ok_or_else(|| SqlError::new(codes::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist")))?;
-            (p.stmt.clone(), p.params.clone(), p.result_formats.clone(), false)
+            (parse_statement(&p.text)?, p.params.clone(), p.result_formats.clone(), false)
         };
         let (cols, ptypes) = match &stmt {
             Statement::Show(_) | Statement::Explain { .. } => {
                 // run eagerly to learn the columns
-                match self.run_statement(stmt.clone(), params.clone())? {
+                match self.run_statement(stmt, params)? {
                     ExecResult::Query { columns, .. } => (columns, vec![]),
                     _ => (vec![], vec![]),
                 }
             }
-            _ => self.engine.describe(stmt.clone(), params.clone())?,
+            // rows streamed by SUBSCRIBE: gsn [, progressed], diff, then the
+            // target's columns (COPY (SUBSCRIBE ...) has no row description)
+            Statement::Subscribe { target, progress, copy: false, .. } => {
+                let text = match target {
+                    SubscribeTarget::Name(n) => format!("SELECT * FROM \"{}\"", n.replace('"', "\"\"")),
+                    SubscribeTarget::Query(_, text) => text.clone(),
+                };
+                let query = Box::new(crate::sql::parser::parse_single_query(&text)?);
+                let (columns, ptypes) = self.engine.describe(Statement::Select { query, as_of: AsOf::Default, text }, params)?;
+                let mut cols = vec![ResultColumn { name: "gsn".into(), ty: SqlType::Int8, typmod: -1 }];
+                if *progress {
+                    cols.push(ResultColumn { name: "progressed".into(), ty: SqlType::Bool, typmod: -1 });
+                }
+                cols.push(ResultColumn { name: "diff".into(), ty: SqlType::Int8, typmod: -1 });
+                cols.extend(columns);
+                (cols, ptypes)
+            }
+            _ => self.engine.describe(stmt, params)?,
         };
         if is_stmt {
             let mut oids: Vec<u32> = ptypes.iter().map(|t| t.oid()).collect();
@@ -699,12 +795,11 @@ impl Session {
             return Err(SqlError::new(codes::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist")));
         };
         if portal.pending.is_none() {
-            let res = self.run_statement(portal.stmt.clone(), portal.params.clone())?;
+            let stmt = parse_statement(&portal.text)?;
+            self.pending_copy = matches!(stmt, Statement::Subscribe { copy: true, .. });
+            let res = self.run_statement(stmt, portal.params.clone())?;
             match res {
-                ExecResult::Query { columns, rows } => {
-                    let n = rows.len();
-                    portal.pending = Some((columns, rows.into_iter(), n));
-                }
+                ExecResult::Query { columns, rows } => portal.pending = Some((columns, rows.into_iter())),
                 other => {
                     self.send_result(other, &portal.result_formats, max_rows, false)?;
                     return Ok(());
@@ -712,7 +807,7 @@ impl Session {
             }
         }
         let formats = portal.result_formats.clone();
-        let (cols, iter, total) = portal.pending.as_mut().unwrap();
+        let (cols, iter) = portal.pending.as_mut().unwrap();
         let limit = if max_rows <= 0 { usize::MAX } else { max_rows as usize };
         let mut sent = 0;
         for r in iter.by_ref() {
@@ -735,13 +830,15 @@ impl Session {
                 break;
             }
         }
-        if sent >= limit && iter.len() > 0 {
+        // as in PostgreSQL: suspended whenever max_rows rows were sent, and
+        // the count is that of this Execute; an exhausted portal stays (until
+        // Close or the end of the transaction) and yields no more rows
+        if max_rows > 0 && sent == limit {
             self.out.portal_suspended();
-            self.portals.insert(name.to_string(), portal);
         } else {
-            let t = *total;
-            self.out.command_complete(&format!("SELECT {t}"));
+            self.out.command_complete(&format!("SELECT {sent}"));
         }
+        self.portals.insert(name.to_string(), portal);
         Ok(())
     }
 }

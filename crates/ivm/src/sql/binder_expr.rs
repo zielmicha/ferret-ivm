@@ -9,7 +9,7 @@ use crate::expr::func::{func_def, resolve};
 use crate::expr::{BoolTest, CaseExpr, Expr, LikeExpr, SubqueryExpr, SubqueryKind};
 use crate::sql_bail;
 use crate::types::encoding::SortSpec;
-use crate::types::text::parse_datum;
+use crate::types::text::{apply_typmod, parse_datum};
 use crate::types::{typmod, ColumnType, Datum, SqlType};
 use sqlparser::ast;
 use std::sync::Arc;
@@ -58,7 +58,25 @@ pub fn sql_type_of(dt: &ast::DataType) -> Result<(SqlType, i32)> {
             ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => (SqlType::TimestampTz, ts_prec(p)),
             _ => (SqlType::Timestamp, ts_prec(p)),
         },
-        D::Interval { precision, .. } => (SqlType::Interval, precision.map(|p| (0x7FFF << 16) | p as i32).unwrap_or(-1)),
+        D::Interval { fields, precision } => {
+            use ast::IntervalFields as F;
+            let range = fields.as_ref().map(|f| match f {
+                F::Year => interval_range(&[YEAR]),
+                F::Month => interval_range(&[MONTH]),
+                F::Day => interval_range(&[DAY]),
+                F::Hour => interval_range(&[HOUR]),
+                F::Minute => interval_range(&[MINUTE]),
+                F::Second => interval_range(&[SECOND]),
+                F::YearToMonth => interval_range(&[YEAR, MONTH]),
+                F::DayToHour => interval_range(&[DAY, HOUR]),
+                F::DayToMinute => interval_range(&[DAY, HOUR, MINUTE]),
+                F::DayToSecond => interval_range(&[DAY, HOUR, MINUTE, SECOND]),
+                F::HourToMinute => interval_range(&[HOUR, MINUTE]),
+                F::HourToSecond => interval_range(&[HOUR, MINUTE, SECOND]),
+                F::MinuteToSecond => interval_range(&[MINUTE, SECOND]),
+            });
+            (SqlType::Interval, interval_typmod(range, *precision))
+        }
         D::Uuid => (SqlType::Uuid, -1),
         D::JSON => (SqlType::Json, -1),
         D::JSONB => (SqlType::Jsonb, -1),
@@ -70,8 +88,9 @@ pub fn sql_type_of(dt: &ast::DataType) -> Result<(SqlType, i32)> {
                 | ast::ArrayElemTypeDef::Qualified(t, _) => t,
                 ast::ArrayElemTypeDef::None => sql_bail!(codes::SYNTAX_ERROR, "array element type required"),
             };
-            let (t, _) = sql_type_of(inner)?;
-            (t.array_of(), -1)
+            // an array type's modifier is its elements' (varchar(2)[])
+            let (t, tm) = sql_type_of(inner)?;
+            (t.array_of(), tm)
         }
         D::Custom(name, args) => {
             let (_, n) = object_name(name)?;
@@ -109,6 +128,38 @@ pub fn sql_type_of(dt: &ast::DataType) -> Result<(SqlType, i32)> {
         D::Regclass => (SqlType::Oid, -1),
         other => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "type {other} is not supported"),
     })
+}
+
+// interval field bits (PostgreSQL's datetime.h)
+const MONTH: i32 = 1;
+const YEAR: i32 = 2;
+const DAY: i32 = 3;
+const HOUR: i32 = 10;
+const MINUTE: i32 = 11;
+const SECOND: i32 = 12;
+
+fn interval_range(fields: &[i32]) -> i32 {
+    fields.iter().fold(0, |m, b| m | (1 << b))
+}
+
+/// PostgreSQL's interval typmod: (field range << 16) | precision.
+fn interval_typmod(range: Option<i32>, precision: Option<u64>) -> i32 {
+    if range.is_none() && precision.is_none() {
+        return -1;
+    }
+    (range.unwrap_or(0x7FFF) << 16) | precision.map(|p| p as i32).unwrap_or(0xFFFF)
+}
+
+/// The reg* type a cast targets (regclass, regtype, regnamespace).
+pub(crate) fn reg_kind(dt: &ast::DataType) -> Option<String> {
+    match dt {
+        ast::DataType::Custom(name, _) => {
+            let n = name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default();
+            matches!(n.as_str(), "regclass" | "regtype" | "regnamespace").then_some(n)
+        }
+        ast::DataType::Regclass => Some("regclass".to_string()),
+        _ => None,
+    }
 }
 
 fn binop_name(op: &ast::BinaryOperator) -> Option<&'static str> {
@@ -210,6 +261,40 @@ pub fn is_aggregate_name(n: &str) -> bool {
     AGGREGATES.contains(&n)
 }
 
+/// A table function with its coerced arguments, output columns and their
+/// default names.
+type ResolvedTableFunc = (TableFunc, Vec<Expr>, Vec<ColumnType>, Vec<String>);
+
+/// Deepest expression nesting accepted (see Binder::bind_expr).
+pub const MAX_EXPR_DEPTH: usize = 1000;
+
+/// While a statement is described, a parameter of still unknown type binds
+/// as an unknown literal holding this marker and its index; the first
+/// context that coerces it determines its type, as in PostgreSQL. (A NUL
+/// character never occurs in a text value, so no literal collides.)
+const PARAM_MARK: &str = "\u{0}ivm-param:";
+
+fn param_marker(i: usize) -> Expr {
+    Expr::Literal(Datum::text_owned(format!("{PARAM_MARK}{i}")), SqlType::Unknown)
+}
+
+fn param_marker_index(s: &str) -> Option<usize> {
+    s.strip_prefix(PARAM_MARK)?.parse().ok()
+}
+
+/// A character(n) value as text: without its trailing spaces. This is the
+/// cast PostgreSQL applies (text(bpchar)), and how bpchar values compare.
+fn bpchar_to_text(e: Expr) -> Expr {
+    let func = resolve("text", &[SqlType::Bpchar]).expect("text(bpchar) is registered").func;
+    let literal = e.is_literal();
+    let call = Expr::Call(Box::new(crate::expr::Call { func, args: vec![e], ret: SqlType::Text }));
+    if literal { call.clone().fold().unwrap_or(call) } else { call }
+}
+
+fn is_comparison(op: &str) -> bool {
+    matches!(op, "=" | "<>" | "<" | "<=" | ">" | ">=")
+}
+
 impl<'a> Binder<'a> {
     fn types(ctx: &Ctx) -> Vec<ColumnType> {
         ctx.scope.types()
@@ -223,6 +308,15 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Record the type a parameter of unknown type was first coerced to.
+    fn note_param_type(&mut self, i: usize, t: &SqlType) {
+        if let Some(p) = self.params.get_mut(i)
+            && p.ty == SqlType::Unknown
+        {
+            p.ty = t.clone();
+        }
+    }
+
     /// Coerce `e` (of type `from`) to `to`.
     pub(crate) fn coerce(&mut self, e: Expr, from: &SqlType, to: &SqlType, cctx: CastContext, what: &str) -> Result<Expr> {
         if from == to || *to == SqlType::Unknown {
@@ -231,9 +325,19 @@ impl<'a> Binder<'a> {
         if *from == SqlType::Unknown {
             return Ok(match e {
                 Expr::Literal(Datum::Null, _) => Expr::Literal(Datum::Null, to.clone()),
-                Expr::Literal(Datum::Text(s), _) => Expr::Literal(parse_datum(&s, to, -1)?, to.clone()),
+                Expr::Literal(Datum::Text(s), _) => match param_marker_index(&s) {
+                    Some(i) => {
+                        self.note_param_type(i, to);
+                        Expr::Literal(Datum::Null, to.clone())
+                    }
+                    None => Expr::Literal(parse_datum(&s, to, -1)?, to.clone()),
+                },
                 other => Expr::Cast(Box::new(other), to.clone(), -1, false),
             });
+        }
+        if *from == SqlType::Bpchar && matches!(to, SqlType::Text | SqlType::Varchar | SqlType::Name) {
+            let t = bpchar_to_text(e);
+            return Ok(if *to == SqlType::Text { t } else { fold_cast(Expr::Cast(Box::new(t), to.clone(), -1, cctx == CastContext::Explicit)) });
         }
         match cast_context(from, to) {
             Some(c) if c <= cctx => Ok(fold_cast(Expr::Cast(Box::new(e), to.clone(), -1, cctx == CastContext::Explicit))),
@@ -254,6 +358,14 @@ impl<'a> Binder<'a> {
     /// Resolve and build a binary operator application.
     pub(crate) fn make_binary(&mut self, op: &str, l: Expr, lt: SqlType, r: Expr, rt: SqlType) -> Result<Expr> {
         let res = resolve(op, &[lt.clone(), rt.clone()])?;
+        if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] && is_comparison(op) {
+            // character(n) compares without trailing spaces: compare the
+            // values as text, so that equality is plain value equality (as
+            // joins, IN and decorrelation assume)
+            let l = self.coerce(l, &lt, &SqlType::Bpchar, CastContext::Implicit, op)?;
+            let r = self.coerce(r, &rt, &SqlType::Bpchar, CastContext::Implicit, op)?;
+            return self.make_binary(op, bpchar_to_text(l), SqlType::Text, bpchar_to_text(r), SqlType::Text);
+        }
         let l = self.coerce(l, &lt, &res.arg_types[0], CastContext::Implicit, op)?;
         let r = self.coerce(r, &rt, &res.arg_types[1], CastContext::Implicit, op)?;
         Ok(Expr::Call(Box::new(crate::expr::Call { func: res.func, args: vec![l, r], ret: res.ret })))
@@ -269,6 +381,21 @@ impl<'a> Binder<'a> {
     }
 
     pub(crate) fn bind_expr(&mut self, e: &ast::Expr, ctx: &Ctx) -> Result<Expr> {
+        // Deeply nested expressions (long chains of binary operators, which
+        // the parser builds without recursing) would overflow the stack in
+        // binding and in every later pass over the tree: refuse them, like
+        // PostgreSQL's stack depth check does.
+        if self.expr_depth >= MAX_EXPR_DEPTH {
+            return Err(SqlError::new(codes::STATEMENT_TOO_COMPLEX, "stack depth limit exceeded")
+                .with_hint(format!("Expressions may be nested at most {MAX_EXPR_DEPTH} levels deep.")));
+        }
+        self.expr_depth += 1;
+        let r = self.bind_expr_nested(e, ctx);
+        self.expr_depth -= 1;
+        r
+    }
+
+    fn bind_expr_nested(&mut self, e: &ast::Expr, ctx: &Ctx) -> Result<Expr> {
         use ast::Expr as E;
         match e {
             E::Identifier(id) => self.bind_column(None, &ident(id), ctx),
@@ -317,6 +444,7 @@ impl<'a> Binder<'a> {
                 let res = resolve("=", &[xt.clone(), yt.clone()])?;
                 let x = self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IS DISTINCT FROM")?;
                 let y = self.coerce(y, &yt, &res.arg_types[1], CastContext::Implicit, "IS DISTINCT FROM")?;
+                let (x, y) = if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] { (bpchar_to_text(x), bpchar_to_text(y)) } else { (x, y) };
                 Ok(Expr::IsDistinct(Box::new(x), Box::new(y), negated))
             }
             E::BinaryOp { left, op, right } => self.bind_binary(left, op, right, ctx),
@@ -357,40 +485,19 @@ impl<'a> Binder<'a> {
                 let t = common_type(&types, "IN")?;
                 // make sure "=" exists for the type
                 resolve("=", &[t.clone(), t.clone()])?;
-                let x = self.coerce(x, &types[0], &t, CastContext::Implicit, "IN")?;
+                let mut x = self.coerce(x, &types[0], &t, CastContext::Implicit, "IN")?;
                 let mut out = Vec::with_capacity(items.len());
                 for (i, it) in items.into_iter().enumerate() {
                     out.push(self.coerce(it, &types[i + 1], &t, CastContext::Implicit, "IN")?);
                 }
+                if t == SqlType::Bpchar {
+                    // compared without trailing spaces
+                    x = bpchar_to_text(x);
+                    out = out.into_iter().map(bpchar_to_text).collect();
+                }
                 Ok(Expr::InList(Box::new(x), out, *negated))
             }
-            E::InSubquery { expr, subquery, negated } => {
-                // a row constructor compares several columns at once
-                let lhs: Vec<Expr> = match &**expr {
-                    E::Tuple(items) => items.iter().map(|i| self.bind_expr(i, ctx)).collect::<Result<_>>()?,
-                    other => vec![self.bind_expr(other, ctx)?],
-                };
-                let rel = self.bind_subquery(subquery, ctx)?;
-                let sub_types = rel.schema();
-                if sub_types.len() != lhs.len() {
-                    sql_bail!(
-                        codes::SYNTAX_ERROR,
-                        "subquery has too {} columns",
-                        if sub_types.len() > lhs.len() { "many" } else { "few" }
-                    );
-                }
-                let mut ls = Vec::with_capacity(lhs.len());
-                let mut targets = Vec::with_capacity(lhs.len());
-                for (x, st) in lhs.into_iter().zip(&sub_types) {
-                    let xt = self.ty_of(&x, ctx);
-                    let res = resolve("=", &[xt.clone(), st.ty.clone()])?;
-                    ls.push(self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IN")?);
-                    targets.push(ColumnType::new(res.arg_types[1].clone()));
-                }
-                let rel = self.coerce_rel(rel, &targets, "IN")?;
-                let sq = Expr::Subquery(Box::new(SubqueryExpr { kind: SubqueryKind::In(ls), rel, ty: SqlType::Bool }));
-                Ok(if *negated { Expr::Not(Box::new(sq)) } else { sq })
-            }
+            E::InSubquery { expr, subquery, negated } => self.bind_in_subquery(expr, subquery, *negated, ctx),
             E::Exists { subquery, negated } => {
                 let rel = self.bind_subquery(subquery, ctx)?;
                 let sq = Expr::Subquery(Box::new(SubqueryExpr { kind: SubqueryKind::Exists, rel, ty: SqlType::Bool }));
@@ -406,6 +513,14 @@ impl<'a> Binder<'a> {
             }
             E::AnyOp { left, compare_op, right, .. } | E::AllOp { left, compare_op, right } => {
                 let all = matches!(e, E::AllOp { .. });
+                // rows: (a, b) = ANY (subquery) is IN, (a, b) <> ALL is NOT IN
+                if let (E::Tuple(_), E::Subquery(q)) = (&**left, &**right) {
+                    return match (compare_op, all) {
+                        (ast::BinaryOperator::Eq, false) => self.bind_in_subquery(left, q, false, ctx),
+                        (ast::BinaryOperator::NotEq, true) => self.bind_in_subquery(left, q, true, ctx),
+                        _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "row comparisons with {compare_op} ANY/ALL are not supported"),
+                    };
+                }
                 let opname =
                     binop_name(compare_op).ok_or_else(|| SqlError::unsupported(format!("operator {compare_op} in ANY/ALL")))?;
                 let x = self.bind_expr(left, ctx)?;
@@ -444,17 +559,22 @@ impl<'a> Binder<'a> {
             }
             E::Like { negated, expr, pattern, escape_char, any, .. }
             | E::ILike { negated, expr, pattern, escape_char, any, .. } => {
-                if *any {
-                    sql_bail!(codes::FEATURE_NOT_SUPPORTED, "LIKE ANY is not supported");
-                }
                 let ci = matches!(e, E::ILike { .. });
+                if *any {
+                    return self.bind_like_any(expr, pattern, escape_char.is_some(), ci, *negated, ctx);
+                }
                 self.bind_like(expr, pattern, escape_char.as_deref(), ci, *negated, ctx)
             }
             E::SimilarTo { negated, expr, pattern, escape_char } => {
                 let x = self.bind_expr(expr, ctx)?;
                 let p = self.bind_expr(pattern, ctx)?;
                 let xt = self.ty_of(&x, ctx);
-                let x = self.coerce(x, &xt, &SqlType::Text, CastContext::Implicit, "SIMILAR TO")?;
+                // character(n) matches with its padding, as with ~
+                let x = if xt == SqlType::Bpchar {
+                    Expr::Cast(Box::new(x), SqlType::Text, -1, false)
+                } else {
+                    self.coerce(x, &xt, &SqlType::Text, CastContext::Implicit, "SIMILAR TO")?
+                };
                 let escape = match escape_char {
                     Some(ec) => self.const_text(ec, ctx)?.and_then(|s| s.chars().next()),
                     None => Some('\\'),
@@ -479,13 +599,14 @@ impl<'a> Binder<'a> {
                 let (t, tm) = sql_type_of(data_type)?;
                 let x = self.bind_expr(expr, ctx)?;
                 // reg* types print as names: map OIDs through the catalog
-                let reg = match data_type {
-                    ast::DataType::Custom(name, _) => {
-                        let n = name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default();
-                        matches!(n.as_str(), "regclass" | "regtype" | "regnamespace").then_some(n)
-                    }
-                    _ => None,
-                };
+                let reg = reg_kind(data_type);
+                // and read names: 'users'::regclass is the OID of users (kept
+                // an oid, so that it compares with oid columns)
+                if let (Some(kind), Expr::Literal(Datum::Text(name), SqlType::Unknown | SqlType::Text)) = (&reg, &x)
+                    && name.trim().parse::<i64>().is_err()
+                {
+                    return Ok(Expr::Literal(Datum::Oid(self.reg_name_oid(kind, name)?), SqlType::Oid));
+                }
                 let x = self.explicit_cast(x, &t, tm, ctx)?;
                 match reg {
                     Some(kind) => Ok(self.oid_lookup(x, &kind, true)),
@@ -499,7 +620,8 @@ impl<'a> Binder<'a> {
                     ast::Value::EscapedStringLiteral(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let d = parse_datum(&s, &t, tm)?;
+                // `type 'string'` is a cast: too long strings are truncated
+                let d = apply_typmod(parse_datum(&s, &t, -1)?, &t, tm, true)?;
                 Ok(Expr::Literal(d, t))
             }
             E::Interval(iv) => {
@@ -509,22 +631,53 @@ impl<'a> Binder<'a> {
                     Expr::Literal(d, _) if !d.is_null() => crate::types::text::format_datum(d),
                     _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "INTERVAL requires a constant"),
                 };
-                let text = match &iv.leading_field {
-                    Some(f) if iv.last_field.is_none() && text.trim().parse::<f64>().is_ok() => {
-                        format!("{} {}", text.trim(), datetime_field_name(f))
-                    }
-                    _ => text,
+                // INTERVAL '...' DAY etc.: the fields restrict the value (and
+                // give unit-less numbers their unit), as interval_in does
+                use ast::DateTimeField as F;
+                let bit = |f: &F| -> Option<i32> {
+                    Some(match f {
+                        F::Year | F::Years => YEAR,
+                        F::Month | F::Months => MONTH,
+                        F::Day | F::Days => DAY,
+                        F::Hour | F::Hours => HOUR,
+                        F::Minute | F::Minutes => MINUTE,
+                        F::Second | F::Seconds => SECOND,
+                        _ => return None,
+                    })
                 };
-                Ok(Expr::Literal(parse_datum(&text, &SqlType::Interval, -1)?, SqlType::Interval))
+                let bad = || SqlError::syntax(format!("invalid interval qualifier in {e}"));
+                let range = match (&iv.leading_field, &iv.last_field) {
+                    (None, None) => None,
+                    (Some(l), None) => Some(interval_range(&[bit(l).ok_or_else(bad)?])),
+                    (Some(l), Some(t)) => {
+                        let (l, t) = (bit(l).ok_or_else(bad)?, bit(t).ok_or_else(bad)?);
+                        let span: &[i32] = match (l, t) {
+                            (YEAR, MONTH) => &[YEAR, MONTH],
+                            (DAY, HOUR) => &[DAY, HOUR],
+                            (DAY, MINUTE) => &[DAY, HOUR, MINUTE],
+                            (DAY, SECOND) => &[DAY, HOUR, MINUTE, SECOND],
+                            (HOUR, MINUTE) => &[HOUR, MINUTE],
+                            (HOUR, SECOND) => &[HOUR, MINUTE, SECOND],
+                            (MINUTE, SECOND) => &[MINUTE, SECOND],
+                            _ => return Err(bad()),
+                        };
+                        Some(interval_range(span))
+                    }
+                    (None, Some(_)) => return Err(bad()),
+                };
+                let seconds_only = range == Some(interval_range(&[SECOND]));
+                let precision = iv.fractional_seconds_precision.or(if seconds_only { iv.leading_precision } else { None });
+                let d = pgdatetime::parse_interval_raw_typmod(&text, interval_typmod(range, precision))?;
+                Ok(Expr::Literal(Datum::Interval(d), SqlType::Interval))
             }
             E::AtTimeZone { timestamp, time_zone } => {
                 let ts = self.bind_expr(timestamp, ctx)?;
                 let tz = self.bind_expr(time_zone, ctx)?;
                 let (tst, tzt) = (self.ty_of(&ts, ctx), self.ty_of(&tz, ctx));
+                // a date resolves to the timestamptz variant (preferred type)
                 let ts_target = match tst {
                     SqlType::Timestamp | SqlType::TimestampTz => tst.clone(),
-                    SqlType::Date => SqlType::Timestamp,
-                    SqlType::Unknown => SqlType::TimestampTz,
+                    SqlType::Date | SqlType::Unknown => SqlType::TimestampTz,
                     other => sql_bail!(codes::DATATYPE_MISMATCH, "AT TIME ZONE requires a timestamp, got {other}"),
                 };
                 let ts = self.coerce(ts, &tst, &ts_target, CastContext::Implicit, "AT TIME ZONE")?;
@@ -677,6 +830,47 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// `expr [NOT] IN (subquery)`; `expr` may be a row constructor.
+    fn bind_in_subquery(&mut self, expr: &ast::Expr, subquery: &ast::Query, negated: bool, ctx: &Ctx) -> Result<Expr> {
+        use ast::Expr as E;
+        {
+                // a row constructor compares several columns at once
+                let lhs: Vec<Expr> = match expr {
+                    E::Tuple(items) => items.iter().map(|i| self.bind_expr(i, ctx)).collect::<Result<_>>()?,
+                    other => vec![self.bind_expr(other, ctx)?],
+                };
+                let rel = self.bind_subquery(subquery, ctx)?;
+                let sub_types = rel.schema();
+                if sub_types.len() != lhs.len() {
+                    sql_bail!(
+                        codes::SYNTAX_ERROR,
+                        "subquery has too {} columns",
+                        if sub_types.len() > lhs.len() { "many" } else { "few" }
+                    );
+                }
+                let mut ls = Vec::with_capacity(lhs.len());
+                let mut targets = Vec::with_capacity(lhs.len());
+                for (x, st) in lhs.into_iter().zip(&sub_types) {
+                    let xt = self.ty_of(&x, ctx);
+                    let res = resolve("=", &[xt.clone(), st.ty.clone()])?;
+                    let x = self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IN")?;
+                    // character(n) is compared as text without trailing spaces
+                    ls.push(if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] { bpchar_to_text(x) } else { x });
+                    targets.push(ColumnType::new(res.arg_types[1].clone()));
+                }
+                let mut rel = self.coerce_rel(rel, &targets, "IN")?;
+                if targets.iter().any(|t| t.ty == SqlType::Bpchar) {
+                    let text: Vec<ColumnType> = targets
+                        .iter()
+                        .map(|t| if t.ty == SqlType::Bpchar { ColumnType::new(SqlType::Text) } else { t.clone() })
+                        .collect();
+                    rel = self.coerce_rel(rel, &text, "IN")?;
+                }
+                let sq = Expr::Subquery(Box::new(SubqueryExpr { kind: SubqueryKind::In(ls), rel, ty: SqlType::Bool }));
+                Ok(if negated { Expr::Not(Box::new(sq)) } else { sq })
+        }
+    }
+
     fn bool_test(&mut self, x: &ast::Expr, t: BoolTest, ctx: &Ctx) -> Result<Expr> {
         let e = self.bind_expr(x, ctx)?;
         let e = self.coerce_bool(e, "IS TRUE")?;
@@ -686,6 +880,7 @@ impl<'a> Binder<'a> {
     fn const_text(&mut self, e: &ast::Expr, ctx: &Ctx) -> Result<Option<String>> {
         let x = self.bind_expr(e, ctx)?.fold()?;
         match x {
+            Expr::Literal(Datum::Text(s), _) if param_marker_index(&s).is_some() => Ok(None),
             Expr::Literal(Datum::Text(s), _) => Ok(Some(s.to_string())),
             Expr::Literal(Datum::Null, _) => Ok(None),
             _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "a constant string is required"),
@@ -706,7 +901,12 @@ impl<'a> Binder<'a> {
         let (xt, pt) = (self.ty_of(&x, ctx), self.ty_of(&p, ctx));
         let bytea = xt == SqlType::Bytea;
         let target = if bytea { SqlType::Bytea } else { SqlType::Text };
-        let x = self.coerce(x, &xt, &target, CastContext::Implicit, "LIKE")?;
+        // character(n) matches with its padding (bpcharlike)
+        let x = if xt == SqlType::Bpchar {
+            Expr::Cast(Box::new(x), SqlType::Text, -1, false)
+        } else {
+            self.coerce(x, &xt, &target, CastContext::Implicit, "LIKE")?
+        };
         let p = self.coerce(p, &pt, &target, CastContext::Implicit, "LIKE")?.fold()?;
         let escape = match escape {
             Some(ec) => match self.const_text(ec, ctx)? {
@@ -730,12 +930,61 @@ impl<'a> Binder<'a> {
         Ok(Expr::Like(Box::new(LikeExpr { expr: x, pattern: p, escape, case_insensitive: ci, negated, bytea, compiled })))
     }
 
+    /// `x [NOT] [I]LIKE ANY (array)`: the ~~ operators applied to the
+    /// elements (NOT LIKE ANY is !~~ ANY: some pattern does not match).
+    fn bind_like_any(&mut self, expr: &ast::Expr, pattern: &ast::Expr, escape: bool, ci: bool, negated: bool, ctx: &Ctx) -> Result<Expr> {
+        if escape {
+            sql_bail!(codes::FEATURE_NOT_SUPPORTED, "LIKE ANY with ESCAPE is not supported");
+        }
+        let op = match (negated, ci) {
+            (false, false) => "~~",
+            (false, true) => "~~*",
+            (true, false) => "!~~",
+            (true, true) => "!~~*",
+        };
+        let x = self.bind_expr(expr, ctx)?;
+        let xt = self.ty_of(&x, ctx);
+        // like PostgreSQL's LIKE, character(n) matches with its padding
+        let x = if xt == SqlType::Bpchar {
+            Expr::Cast(Box::new(x), SqlType::Text, -1, false)
+        } else {
+            self.coerce(x, &xt, &SqlType::Text, CastContext::Implicit, "LIKE")?
+        };
+        let pat = match pattern {
+            ast::Expr::Nested(inner) => &**inner,
+            ast::Expr::Tuple(items) if items.len() == 1 => &items[0],
+            other => other,
+        };
+        let arr = self.bind_expr(pat, ctx)?;
+        let at = self.ty_of(&arr, ctx);
+        let text_arr = SqlType::Array(Box::new(SqlType::Text));
+        let arr = match &at {
+            SqlType::Array(_) | SqlType::Unknown => self.coerce(arr, &at, &text_arr, CastContext::Implicit, "LIKE ANY")?,
+            other => sql_bail!(codes::DATATYPE_MISMATCH, "op ANY/ALL (array) requires array on right side, got {other}"),
+        };
+        let func = resolve(op, &[SqlType::Text, SqlType::Text])?.func;
+        Ok(Expr::AnyAll { expr: Box::new(x), array: Box::new(arr), func, all: false })
+    }
+
     fn explicit_cast(&mut self, x: Expr, t: &SqlType, tm: i32, ctx: &Ctx) -> Result<Expr> {
         let xt = self.ty_of(&x, ctx);
         match x {
-            Expr::Literal(Datum::Text(s), SqlType::Unknown) => Ok(Expr::Literal(parse_datum(&s, t, tm)?, t.clone())),
+            Expr::Literal(Datum::Text(s), SqlType::Unknown) => match param_marker_index(&s) {
+                Some(i) => {
+                    self.note_param_type(i, t);
+                    Ok(Expr::Literal(Datum::Null, t.clone()))
+                }
+                // an explicit cast: too long strings are truncated
+                None => Ok(Expr::Literal(apply_typmod(parse_datum(&s, t, -1)?, t, tm, true)?, t.clone())),
+            },
             Expr::Literal(Datum::Null, _) => Ok(Expr::Literal(Datum::Null, t.clone())),
             x => {
+                // character(n) to a string type drops the padding
+                let (x, xt) = if xt == SqlType::Bpchar && matches!(t, SqlType::Text | SqlType::Varchar | SqlType::Name) {
+                    (bpchar_to_text(x), SqlType::Text)
+                } else {
+                    (x, xt)
+                };
                 if xt == *t && tm < 0 {
                     return Ok(x);
                 }
@@ -790,6 +1039,11 @@ impl<'a> Binder<'a> {
             }
             V::DoubleQuotedString(s) => Expr::Literal(Datum::text(s), SqlType::Unknown),
             V::HexStringLiteral(s) => {
+                // the literal may hold any characters: check them before
+                // slicing by byte offsets
+                if let Some(c) = s.chars().find(|c| !c.is_ascii_hexdigit()) {
+                    sql_bail!(codes::INVALID_TEXT_REPRESENTATION, "\"{c}\" is not a valid hexadecimal digit");
+                }
                 let bytes = (0..s.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&s[i..(i + 2).min(s.len())], 16))
@@ -804,7 +1058,10 @@ impl<'a> Binder<'a> {
                     .trim_start_matches('$')
                     .parse()
                     .map_err(|_| SqlError::syntax(format!("bad parameter placeholder {p}")))?;
-                if n == 0 {
+                // statements are described with a slot for every parameter
+                // they use; elsewhere a missing one is an error (it used to
+                // bind as NULL, also into view definitions)
+                if n == 0 || (n > self.params.len() && !self.stored_definition) {
                     sql_bail!(codes::UNDEFINED_PARAMETER, "there is no parameter ${n}");
                 }
                 while self.params.len() < n {
@@ -813,11 +1070,30 @@ impl<'a> Binder<'a> {
                 let slot = &self.params[n - 1];
                 match &slot.value {
                     Some(d) => Expr::Literal(d.clone(), slot.ty.clone()),
+                    // described without a value: its context gives the type
+                    None if slot.ty == SqlType::Unknown => param_marker(n - 1),
                     None => Expr::Literal(Datum::Null, slot.ty.clone()),
                 }
             }
             other => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "unsupported literal {other}"),
         })
+    }
+
+    /// A select-list item that is a reg* cast prints the name (as regclassout
+    /// does) also when the cast read a name, which yields an oid so that it
+    /// compares with oid columns elsewhere.
+    pub(crate) fn display_reg(&self, item: &ast::Expr, x: Expr) -> Expr {
+        let mut e = item;
+        while let ast::Expr::Nested(inner) = e {
+            e = inner;
+        }
+        match (e, &x) {
+            (ast::Expr::Cast { data_type, .. }, Expr::Literal(_, SqlType::Oid)) => match reg_kind(data_type) {
+                Some(kind) => self.oid_lookup(x, &kind, true),
+                None => x,
+            },
+            _ => x,
+        }
     }
 
     /// `CASE oid WHEN o1 THEN 'text1' ... END` over a catalog mapping; with
@@ -837,6 +1113,56 @@ impl<'a> Binder<'a> {
             return else_;
         }
         Expr::Case(Box::new(crate::expr::CaseExpr { whens, else_, ty: SqlType::Text }))
+    }
+
+    /// The OID named by the input of a reg* type (regclassin etc.): a
+    /// possibly schema-qualified, possibly quoted name.
+    fn reg_name_oid(&self, kind: &str, input: &str) -> Result<u32> {
+        let defs = self.catalog.definitions(kind);
+        let find = |n: &str| defs.iter().find(|(_, d)| d == n).map(|(o, _)| *o);
+        if kind == "regtype" {
+            if let Some(o) = find(input.trim()) {
+                return Ok(o);
+            }
+            let ty = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+                .try_with_sql(input)
+                .and_then(|mut p| p.parse_data_type())
+                .ok()
+                .and_then(|dt| sql_type_of(&dt).ok());
+            return match ty {
+                Some((t, _)) => Ok(t.oid()),
+                None => Err(SqlError::new(codes::UNDEFINED_OBJECT, format!("type \"{input}\" does not exist"))),
+            };
+        }
+        // the last dotted part, unquoted (else lowercased)
+        let mut parts = Vec::new();
+        let mut cur = String::new();
+        let (mut quoted, mut chars) = (false, input.trim().chars().peekable());
+        let mut was_quoted = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => {
+                    quoted = !quoted;
+                    was_quoted = true;
+                }
+                '.' if !quoted => {
+                    parts.push((std::mem::take(&mut cur), was_quoted));
+                    was_quoted = false;
+                }
+                c => cur.push(c),
+            }
+        }
+        parts.push((cur, was_quoted));
+        let (name, q) = parts.last().cloned().unwrap_or_default();
+        let name = if q { name } else { name.to_lowercase() };
+        find(&name).ok_or_else(|| match kind {
+            "regnamespace" => SqlError::new("3F000", format!("schema \"{name}\" does not exist")),
+            _ => SqlError::new(codes::UNDEFINED_TABLE, format!("relation \"{input}\" does not exist")),
+        })
     }
 
     /// (start, end|length) OVERLAPS (start, end|length).
@@ -914,14 +1240,29 @@ impl<'a> Binder<'a> {
         }
         match op {
             B::And | B::Or => {
-                let l = self.bind_expr(left, ctx)?;
-                let r = self.bind_expr(right, ctx)?;
+                // a chain of ANDs (ORs) is one n-ary node: generated SQL has
+                // chains of thousands of terms, too deep to bind recursively
+                let mut terms = Vec::new();
+                let mut stack = vec![right, left];
+                while let Some(x) = stack.pop() {
+                    match x {
+                        ast::Expr::BinaryOp { left: l, op: o, right: r } if o == op => {
+                            stack.push(r);
+                            stack.push(l);
+                        }
+                        ast::Expr::Nested(inner) if matches!(&**inner, ast::Expr::BinaryOp { op: o, .. } if o == op) => stack.push(inner),
+                        other => terms.push(other),
+                    }
+                }
                 let what = if matches!(op, B::And) { "AND" } else { "OR" };
-                let l = self.coerce_bool(l, what)?;
-                let r = self.coerce_bool(r, what)?;
+                let mut bound = Vec::with_capacity(terms.len());
+                for t in terms {
+                    let b = self.bind_expr(t, ctx)?;
+                    bound.push(self.coerce_bool(b, what)?);
+                }
                 Ok(match op {
-                    B::And => Expr::And(vec![l, r]),
-                    _ => Expr::Or(vec![l, r]),
+                    B::And => Expr::And(bound),
+                    _ => Expr::Or(bound),
                 })
             }
             B::PGLikeMatch | B::PGILikeMatch | B::PGNotLikeMatch | B::PGNotILikeMatch => {
@@ -941,6 +1282,16 @@ impl<'a> Binder<'a> {
                 let l = self.bind_expr(left, ctx)?;
                 let r = self.bind_expr(right, ctx)?;
                 let (lt, rt) = (self.ty_of(&l, ctx), self.ty_of(&r, ctx));
+                // || concatenates character(n) values as text (PostgreSQL
+                // resolves textcat / anytextcat / textanycat), i.e. unpadded
+                if name == "||" && (lt == SqlType::Bpchar || rt == SqlType::Bpchar) {
+                    let arrays = matches!(lt, SqlType::Array(_)) || matches!(rt, SqlType::Array(_));
+                    if !arrays {
+                        let (l, lt) = if lt == SqlType::Bpchar { (bpchar_to_text(l), SqlType::Text) } else { (l, lt) };
+                        let (r, rt) = if rt == SqlType::Bpchar { (bpchar_to_text(r), SqlType::Text) } else { (r, rt) };
+                        return self.make_binary(name, l, lt, r, rt);
+                    }
+                }
                 // text-key json operators with unknown literals
                 self.make_binary(name, l, lt, r, rt)
             }
@@ -1026,7 +1377,11 @@ impl<'a> Binder<'a> {
         };
         results.push(else_);
         let types: Vec<SqlType> = results.iter().map(|r| self.ty_of(r, ctx)).collect();
-        let t = common_type(&types, "CASE")?;
+        // PostgreSQL resolves CASE with the ELSE result as the first input
+        let mut order = Vec::with_capacity(types.len());
+        order.push(types[types.len() - 1].clone());
+        order.extend(types[..types.len() - 1].iter().cloned());
+        let t = common_type(&order, "CASE")?;
         let mut coerced = Vec::with_capacity(results.len());
         for (r, rt) in results.into_iter().zip(types) {
             coerced.push(self.coerce(r, &rt, &t, CastContext::Implicit, "CASE")?);
@@ -1119,7 +1474,7 @@ impl<'a> Binder<'a> {
             return self.bind_window(&name, f, &args, dup, star, ctx);
         }
         if is_aggregate_name(&name) {
-            return self.bind_aggregate(&name, f, &args, dup, &order, star, ctx);
+            return self.bind_aggregate(&name, f, &args, dup, &order, star, ctx, None);
         }
         if WINDOW_ONLY.contains(&name.as_str()) {
             sql_bail!(codes::WINDOWING_ERROR, "window function {name} requires an OVER clause");
@@ -1191,9 +1546,26 @@ impl<'a> Binder<'a> {
                     sql_bail!(codes::UNDEFINED_FUNCTION, "function nullif requires 2 arguments");
                 }
                 let res = resolve("=", &types)?;
+                // PostgreSQL compares these with cross-type operators, so the
+                // first argument (and the result) keeps its own type
+                let datetime = |t: &SqlType| matches!(t, SqlType::Date | SqlType::Timestamp | SqlType::TimestampTz);
+                let (t0, t1) = (&types[0], &types[1]);
+                if res.arg_types[0] != *t0
+                    && ((t0.is_integer() && t1.is_integer()) || (t0.is_float() && t1.is_float()) || (datetime(t0) && datetime(t1)))
+                {
+                    let eq = self.make_binary("=", bound[0].clone(), t0.clone(), bound[1].clone(), t1.clone())?;
+                    let whens = vec![(eq, Expr::null(t0.clone()))];
+                    return Ok(Expr::Case(Box::new(CaseExpr { whens, else_: bound[0].clone(), ty: t0.clone() })));
+                }
                 let mut it = bound.into_iter();
                 let a = self.coerce(it.next().unwrap(), &types[0], &res.arg_types[0], CastContext::Implicit, "NULLIF")?;
                 let b = self.coerce(it.next().unwrap(), &types[1], &res.arg_types[1], CastContext::Implicit, "NULLIF")?;
+                if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] {
+                    // compare without trailing spaces, return the padded value
+                    let eq = self.make_binary("=", a.clone(), SqlType::Bpchar, b, SqlType::Bpchar)?;
+                    let whens = vec![(eq, Expr::null(SqlType::Bpchar))];
+                    return Ok(Expr::Case(Box::new(CaseExpr { whens, else_: a, ty: SqlType::Bpchar })));
+                }
                 return Ok(Expr::NullIf(Box::new(a), Box::new(b)));
             }
             // definitions come from the catalog: inlined as OID mappings
@@ -1213,6 +1585,10 @@ impl<'a> Binder<'a> {
                 return Ok(Expr::Literal(Datum::text(&types[0].name()), SqlType::Text));
             }
             "version" => return Ok(Expr::Literal(Datum::text("PostgreSQL 17.0 (ivm)"), SqlType::Text)),
+            // SQL value functions the parser reads as function calls
+            "current_user" | "session_user" | "user" | "current_role" | "current_catalog" if bound.is_empty() => {
+                return Ok(Expr::Literal(Datum::text("ivm"), SqlType::Name));
+            }
             "current_database" => return Ok(Expr::Literal(Datum::text("ivm"), SqlType::Name)),
             "current_schema" => return Ok(Expr::Literal(Datum::text("public"), SqlType::Name)),
             "generate_series" | "unnest" | "jsonb_array_elements" | "jsonb_array_elements_text" | "jsonb_each"
@@ -1267,6 +1643,9 @@ impl<'a> Binder<'a> {
         order_by: &[ast::OrderByExpr],
         star: bool,
         ctx: &Ctx,
+        // context for the arguments, FILTER and ORDER BY when it is not the
+        // aggregate's own (window aggregates: they may contain aggregates)
+        args_ctx: Option<&Ctx>,
     ) -> Result<Expr> {
         let Some(collector) = ctx.collector else {
             sql_bail!(codes::GROUPING_ERROR, "aggregate functions are not allowed in {}", ctx.clause);
@@ -1274,28 +1653,53 @@ impl<'a> Binder<'a> {
         if ctx.in_agg {
             sql_bail!(codes::GROUPING_ERROR, "aggregate function calls cannot be nested");
         }
-        let inner = Ctx { scope: ctx.scope, collector: ctx.collector, in_agg: true, clause: ctx.clause };
+        let own = Ctx { scope: ctx.scope, collector: ctx.collector, in_agg: true, clause: ctx.clause };
+        let inner = args_ctx.unwrap_or(&own);
         let mut bound = Vec::new();
         if !star {
             for a in args {
                 match a {
-                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => bound.push(self.bind_expr(e, &inner)?),
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => bound.push(self.bind_expr(e, inner)?),
                     _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "unsupported aggregate argument"),
                 }
             }
         }
         let distinct = matches!(dup, Some(ast::DuplicateTreatment::Distinct));
+        // (fingerprints of the arguments as written, before coercions)
+        let arg_fps: Vec<Vec<u8>> = bound
+            .iter()
+            .map(|b| {
+                let mut v = Vec::new();
+                b.fingerprint(&mut v);
+                v
+            })
+            .collect();
         let filter = match &f.filter {
             Some(fe) => {
-                let e = self.bind_expr(fe, &inner)?;
+                let e = self.bind_expr(fe, inner)?;
                 Some(self.coerce_bool(e, "FILTER")?)
             }
             None => None,
         };
         let mut order: Vec<(Expr, SortSpec)> = Vec::new();
         for ob in order_by.iter().chain(f.within_group.iter()) {
-            let e = self.bind_expr(&ob.expr, &inner)?;
+            let e = self.bind_expr(&ob.expr, inner)?;
             order.push((e, super::binder::sort_spec(&ob.options)));
+        }
+        // An aggregate whose arguments reference only columns of enclosing
+        // queries belongs to the nearest such query in PostgreSQL (it is
+        // evaluated over that query's rows); evaluating it over this
+        // query's rows would silently give other results. (Window
+        // aggregates are always evaluated at their own level.)
+        let (mut local, mut outer) = (false, false);
+        for e in bound.iter().chain(filter.iter()).chain(order.iter().map(|(e, _)| e)) {
+            var_levels(e, &mut local, &mut outer);
+        }
+        if outer && !local && args_ctx.is_none() {
+            sql_bail!(
+                codes::FEATURE_NOT_SUPPORTED,
+                "aggregate functions whose arguments reference only columns of an outer query are not supported"
+            );
         }
         let mut types: Vec<SqlType> = bound.iter().map(|b| self.ty_of(b, ctx)).collect();
         use AggFunc as A;
@@ -1417,8 +1821,18 @@ impl<'a> Binder<'a> {
                 types.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
             ),
         };
-        if distinct && func.is_ordered() && !order.is_empty() {
-            // ORDER BY must match the argument for DISTINCT aggregates (PG rule)
+        if distinct {
+            // with DISTINCT, rows are ordered by (some of) the argument values
+            for (o, _) in &order {
+                let mut fp = Vec::new();
+                o.fingerprint(&mut fp);
+                if !arg_fps.contains(&fp) {
+                    sql_bail!(
+                        codes::INVALID_COLUMN_REFERENCE,
+                        "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+                    );
+                }
+            }
         }
         // pin down order-sensitive aggregates without ORDER BY: order by arguments
         if func.is_ordered() && order.is_empty() {
@@ -1553,10 +1967,14 @@ impl<'a> Binder<'a> {
                             };
                             let negative = match &d {
                                 Datum::Interval(_) => d.sql_cmp(&Datum::Interval(Default::default())) == std::cmp::Ordering::Less,
-                                other => other.as_f64().is_some_and(|f| f < 0.0),
+                                Datum::Numeric(n) => n.is_negative(),
+                                other => other.as_i64().map(|v| v < 0).or_else(|| other.as_f64().map(|f| f < 0.0)).unwrap_or(false),
                             };
-                            if negative {
+                            if negative && range_types.is_some() {
                                 sql_bail!("22013", "invalid preceding or following size in window function");
+                            }
+                            if negative {
+                                sql_bail!("22013", "frame {} offset must not be negative", if slot == 0 { "starting" } else { "ending" });
                             }
                             let n = if range_types.is_some() { 0 } else { d.as_i64().unwrap_or(0) };
                             offsets[slot] = Some(d);
@@ -1568,11 +1986,29 @@ impl<'a> Binder<'a> {
                         }
                     })
                 };
+                if units == FrameUnits::Groups && order.is_empty() {
+                    sql_bail!(codes::WINDOWING_ERROR, "GROUPS mode requires an ORDER BY clause");
+                }
                 let start = bound_of(self, &wf.start_bound, 0)?;
                 let end = match &wf.end_bound {
                     Some(e) => bound_of(self, e, 1)?,
                     None => FrameBound::CurrentRow,
                 };
+                // the frame shapes PostgreSQL's grammar rejects
+                use FrameBound as FB;
+                let invalid = match (&start, &end) {
+                    (FB::UnboundedFollowing, _) => Some("frame start cannot be UNBOUNDED FOLLOWING"),
+                    (_, FB::UnboundedPreceding) => Some("frame end cannot be UNBOUNDED PRECEDING"),
+                    (FB::CurrentRow, FB::Preceding(_)) => Some("frame starting from current row cannot have preceding rows"),
+                    (FB::Following(_), FB::CurrentRow) if wf.end_bound.is_none() => {
+                        Some("frame starting from following row cannot end with current row")
+                    }
+                    (FB::Following(_), FB::Preceding(_) | FB::CurrentRow) => Some("frame starting from following row cannot have preceding rows"),
+                    _ => None,
+                };
+                if let Some(msg) = invalid {
+                    sql_bail!(codes::WINDOWING_ERROR, "{msg}");
+                }
                 if let Some((_, minus, plus, cmp_type)) = range_types {
                     let [s, e] = offsets;
                     range = Some(crate::sql::plan::RangeOffsets { start: s, end: e, minus, plus, cmp_type });
@@ -1613,8 +2049,8 @@ impl<'a> Binder<'a> {
                 // bind as an aggregate to get its type, but with a private collector
                 let tmp = std::cell::RefCell::new(super::binder::Collector::default());
                 let tctx = Ctx { scope: ctx.scope, collector: Some(&tmp), in_agg: false, clause: ctx.clause };
-                let fcopy = ast::Function { over: None, ..f.clone() };
-                let _ = self.bind_aggregate(agg, &fcopy, args, dup, &[], star, &tctx)?;
+                // aggregates in the arguments belong to the query's aggregation
+                let _ = self.bind_aggregate(agg, f, args, dup, &[], star, &tctx, Some(&actx))?;
                 let mut t = tmp.into_inner();
                 if t.aggs.len() != 1 {
                     sql_bail!(codes::FEATURE_NOT_SUPPORTED, "unsupported window aggregate");
@@ -1692,15 +2128,36 @@ impl<'a> Binder<'a> {
         name: &str,
         mut bound: Vec<Expr>,
         types: Vec<SqlType>,
-    ) -> Result<(TableFunc, Vec<Expr>, Vec<ColumnType>, Vec<String>)> {
+    ) -> Result<ResolvedTableFunc> {
         let (func, out, names): (TableFunc, Vec<ColumnType>, Vec<String>) = match (name, bound.len()) {
             ("generate_series", 2 | 3) => {
-                // the step's type follows from the bounds' (interval for timestamps)
-                let t = match common_type(&types[..2], "generate_series")? {
+                // the step's type follows from the bounds' (interval for
+                // timestamps); untyped bounds take the step's
+                let bounds = if types[0] == SqlType::Unknown && types[1] == SqlType::Unknown {
+                    match types.get(2) {
+                        Some(SqlType::Interval) => SqlType::TimestampTz,
+                        Some(t) if t.is_numeric_family() => t.clone(),
+                        _ => sql_bail!(
+                            codes::AMBIGUOUS_FUNCTION,
+                            "function generate_series({}) is not unique",
+                            types.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
+                        ),
+                    }
+                } else {
+                    common_type(&types[..2], "generate_series")?
+                };
+                // numeric bounds and step share one type
+                let bounds = match (&bounds, types.get(2)) {
+                    (b, Some(st)) if b.is_numeric_family() && st.is_numeric_family() => {
+                        common_type(&[bounds.clone(), st.clone()], "generate_series")?
+                    }
+                    _ => bounds,
+                };
+                let t = match bounds {
                     SqlType::Int2 | SqlType::Int4 => SqlType::Int4,
                     SqlType::Int8 => SqlType::Int8,
                     SqlType::Numeric => SqlType::Numeric,
-                    SqlType::Timestamp | SqlType::Unknown => SqlType::Timestamp,
+                    SqlType::Timestamp => SqlType::Timestamp,
                     // dates resolve to the timestamptz variant (preferred type)
                     SqlType::TimestampTz | SqlType::Date => SqlType::TimestampTz,
                     other => sql_bail!(codes::UNDEFINED_FUNCTION, "function generate_series({other}) does not exist"),
@@ -1921,7 +2378,14 @@ impl<'a> Binder<'a> {
         }
         let lateral = pushed && bound.iter().any(|b| b.has_outer());
         let types: Vec<SqlType> = bound.iter().map(|b| b.ty(&[])).collect();
-        let (func, bound, mut out, mut names) = self.resolve_table_function(name, bound, types)?;
+        // unnest(a, b, ...): one unnest per array, zipped (as ROWS FROM)
+        let calls: Vec<ResolvedTableFunc> = if name == "unnest" && bound.len() > 1 {
+            bound.into_iter().zip(types).map(|(b, t)| self.resolve_table_function(name, vec![b], vec![t])).collect::<Result<_>>()?
+        } else {
+            vec![self.resolve_table_function(name, bound, types)?]
+        };
+        let mut out: Vec<ColumnType> = calls.iter().flat_map(|c| c.2.iter().cloned()).collect();
+        let mut names: Vec<String> = calls.iter().flat_map(|c| c.3.iter().cloned()).collect();
         if ordinality {
             out.push(ColumnType::new(SqlType::Int8).not_null());
             names.push("ordinality".into());
@@ -1941,14 +2405,23 @@ impl<'a> Binder<'a> {
         for c in out.iter_mut() {
             c.typmod = -1;
         }
-        let arity = out.len() - ordinality as usize;
-        let rel = Rel::FlatMap {
-            input: Box::new(Rel::unit()),
-            funcs: vec![crate::sql::plan::SrfCall { func, args: bound, arity }],
-            out: out.clone(),
-            ordinality,
-        };
+        let funcs = calls.into_iter().map(|(func, args, out, _)| crate::sql::plan::SrfCall { func, args, arity: out.len() }).collect();
+        let rel = Rel::FlatMap { input: Box::new(Rel::unit()), funcs, out: out.clone(), ordinality };
         Ok((rel, Scope::from_table(&tname, &names, &out), lateral))
+    }
+}
+
+/// Whether `e` references columns of the current query (`local`) or of
+/// enclosing queries (`outer`).
+fn var_levels(e: &Expr, local: &mut bool, outer: &mut bool) {
+    match e {
+        Expr::Column(_) => *local = true,
+        Expr::Outer(..) => *outer = true,
+        _ => {
+            for c in e.children() {
+                var_levels(c, local, outer);
+            }
+        }
     }
 }
 

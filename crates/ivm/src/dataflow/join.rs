@@ -12,6 +12,7 @@
 
 use super::mfp::Mfp;
 use super::*;
+use crate::types::datum::exact_cmp;
 use crate::types::Datum;
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,9 @@ pub struct JoinInput {
     /// For presence inputs: arrangement keyed by the presence key; the
     /// input's rows are the key values (width = key length).
     pub presence: Option<ArrId>,
+    /// Presence matches key values exactly, including the representation
+    /// of equal values (numeric scale, -0.0, ...), rather than by equality.
+    pub exact: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,8 +41,11 @@ pub struct LookupStep {
     pub null_safe: Vec<bool>,
     /// Predicates over the joined row checked after this step.
     pub filters: Vec<Expr>,
-    /// Columns of the looked-up entries the input's MFP reads (computed on
-    /// first use; not part of the plan's identity).
+    /// Keys must be identical, including the representation of equal
+    /// values (lookups keyed by the values of an exact presence input).
+    pub exact: bool,
+    /// Columns of the looked-up entries the input's MFP (and an exact
+    /// match) reads, computed on first use; not part of the plan's identity.
     pub decode: std::sync::OnceLock<Option<super::layout::PartialDecode>>,
 }
 
@@ -77,7 +84,12 @@ impl JoinPlan {
             fp.extend_from_slice(cx.node(i.node));
             i.mfp.fingerprint(fp);
             match i.presence {
-                Some(a) => fp.extend_from_slice(cx.arr(a)),
+                Some(a) => {
+                    fp.extend_from_slice(cx.arr(a));
+                    if i.exact {
+                        fp.push(0xE0);
+                    }
+                }
                 None => fp.push(0),
             }
         }
@@ -97,6 +109,9 @@ impl JoinPlan {
                 fp.extend(s.null_safe.iter().map(|b| *b as u8));
                 for f in &s.filters {
                     f.fingerprint(fp);
+                }
+                if s.exact {
+                    fp.push(0xE1);
                 }
             }
         }
@@ -120,6 +135,13 @@ fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], at: ReadA
     })
 }
 
+/// Key of presence values in their arrangement: the canonical key prefix,
+/// or for exact presence the whole entry (values with their representation;
+/// presence arrangements are keyed by all columns, so it has no payload).
+fn presence_prefix(layout: &Layout, vals: &[Datum], exact: bool) -> Result<Vec<u8>> {
+    if exact { layout.encode_row(vals) } else { Ok(layout.encode_prefix(vals)) }
+}
+
 struct Ctx<'a> {
     g: &'a Graph,
     p: &'a JoinPlan,
@@ -139,23 +161,39 @@ fn lookup_key(step: &LookupStep, row: &[Datum]) -> Option<Vec<Datum>> {
     Some(key)
 }
 
-/// Rows of input `step.input` matching an encoded key (post-MFP); for
-/// presence inputs, whether the key is present (the row is then the key).
-fn lookup_prefix(env: &mut Env, cx: &Ctx, step: &LookupStep, prefix: &[u8], at: ReadAt) -> Result<Vec<(Row, i64)>> {
+/// Rows of input `step.input` matching the key values `key`, encoded as
+/// `prefix` (post-MFP); for presence inputs, whether the key is present
+/// (the row is then the key).
+fn lookup_prefix(env: &mut Env, cx: &Ctx, step: &LookupStep, prefix: &[u8], key: &[Datum], at: ReadAt) -> Result<Vec<(Row, i64)>> {
     let inp = &cx.p.inputs[step.input];
     if let Some(parr) = inp.presence {
         let c = presence_count(env, cx.g, parr, prefix, at, cx.pres_delta[step.input].as_ref())?;
         return Ok(if c > 0 { vec![(Vec::new(), 1)] } else { vec![] });
     }
     let a = cx.g.arr(step.arr);
-    // only the columns the input's MFP reads are decoded
-    let plan = step.decode.get_or_init(|| a.layout.decode_plan(&inp.mfp.input_columns())).as_ref();
+    let layout = &a.layout;
+    // only the columns the input's MFP (and an exact match) reads are decoded
+    let plan = step
+        .decode
+        .get_or_init(|| {
+            let mut cols = inp.mfp.input_columns();
+            if step.exact {
+                cols.extend(layout.key.iter().flat_map(|k| k.column_set()));
+            }
+            layout.decode_plan(&cols)
+        })
+        .as_ref();
     let mut out = Vec::new();
     env.for_each_prefix(a.tree, prefix, &mut |k, h| {
         let w = h.weight(at);
-        if w > 0
-            && let Ok(Some(post)) = inp.mfp.eval(&a.layout.decode_row_with(k, plan)?)
-        {
+        if w <= 0 {
+            return Ok(true);
+        }
+        let r = layout.decode_row_with(k, plan)?;
+        if step.exact && layout.key_values(&r)?.iter().zip(key).any(|(a, b)| exact_cmp(a, b) != std::cmp::Ordering::Equal) {
+            return Ok(true);
+        }
+        if let Ok(Some(post)) = inp.mfp.eval(&r) {
             out.push((post, w));
         }
         Ok(true)
@@ -185,17 +223,24 @@ fn run_path(env: &mut Env, cx: &Ctx, path: &DeltaPath, start: Vec<(Row, i64)>, g
             }
         };
         let inp = &cx.p.inputs[step.input];
-        let arr = inp.presence.unwrap_or(step.arr);
-        let layout = &cx.g.arr(arr).layout;
-        // rows with equal encoded keys share one lookup: (key, row index, key values)
-        let mut keyed: Vec<(Vec<u8>, usize, Vec<Datum>)> = Vec::with_capacity(frontier.len());
+        // Rows whose keys encode equally share one lookup: (grouping key,
+        // length of the lookup key in it, row index, key values). Exact
+        // steps group by the values' exact encoding too.
+        let mut keyed: Vec<(Vec<u8>, usize, usize, Vec<Datum>)> = Vec::with_capacity(frontier.len());
         for (i, (row, _)) in frontier.iter().enumerate() {
-            if let Some(key) = lookup_key(step, row) {
-                keyed.push((layout.encode_prefix(&key), i, key));
+            let Some(key) = lookup_key(step, row) else { continue };
+            let mut k = match inp.presence {
+                Some(parr) => presence_prefix(&cx.g.arr(parr).layout, &key, inp.exact)?,
+                None => cx.g.arr(step.arr).layout.encode_prefix(&key),
+            };
+            let n = k.len();
+            if step.exact && inp.presence.is_none() {
+                crate::types::codec::encode_row(&key, &mut k);
             }
+            keyed.push((k, n, i, key));
         }
         if keyed.len() > 1 {
-            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
         }
         let mut next = Vec::new();
         let mut j = 0;
@@ -204,8 +249,9 @@ fn run_path(env: &mut Env, cx: &Ctx, path: &DeltaPath, start: Vec<(Row, i64)>, g
             while end < keyed.len() && keyed[end].0 == keyed[j].0 {
                 end += 1;
             }
-            let matches = lookup_prefix(env, cx, step, &keyed[j].0, at)?;
-            for (_, i, key) in &keyed[j..end] {
+            let (k, n, _, key) = &keyed[j];
+            let matches = lookup_prefix(env, cx, step, &k[..*n], key, at)?;
+            for (_, _, i, key) in &keyed[j..end] {
                 let (row, w) = &frontier[*i];
                 for (post, mw) in &matches {
                     let mut r = row.clone();
@@ -236,7 +282,7 @@ fn presence_deltas(g: &Graph, p: &JoinPlan, all: &FxHashMap<NodeId, Output>) -> 
                 if let Some(o) = all.get(&inp.node) {
                     for (row, w) in &o.data {
                         let kv = layout.key_values(row)?;
-                        *m.entry(layout.encode_prefix(&kv)).or_default() += w;
+                        *m.entry(presence_prefix(layout, &kv, inp.exact)?).or_default() += w;
                     }
                 }
                 v.push(Some(m));
@@ -269,7 +315,7 @@ pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all:
                 let new = presence_count(env, g, parr, prefix, ReadAt::Latest, None)?;
                 let old = new - dw;
                 if (old > 0) != (new > 0) {
-                    let (kv, _) = layout.decode_key_values(prefix)?;
+                    let kv = if src.exact { layout.decode_row(prefix)? } else { layout.decode_key_values(prefix)?.0 };
                     let mut row = vec![Datum::Null; p.width];
                     row[src.offset..src.offset + src.width].clone_from_slice(&kv);
                     start.push((row, if new > 0 { 1 } else { -1 }));
@@ -326,6 +372,19 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Res
     let path = p.paths.iter().find(|pa| pa.source == src).expect("path for every input");
     let inp = &p.inputs[src];
     let mut cache = FxHashMap::default();
+    // expression errors in the other regular inputs' maps count once per
+    // input row, as on their delta paths (lookups skip the failing rows)
+    for (i, other) in p.inputs.iter().enumerate() {
+        if i == src || other.presence.is_some() || other.mfp.steps.is_empty() {
+            continue;
+        }
+        let snap = super::ops::snapshot_node(g, env, other.node, &mut cache)?;
+        for (raw, w) in &snap.data {
+            if let Err(e) = other.mfp.eval(raw) {
+                out.errs.push((err_record(&e), *w));
+            }
+        }
+    }
     let snap = super::ops::owned(super::ops::snapshot_node(g, env, inp.node, &mut cache)?);
     let mut start = Vec::with_capacity(snap.data.len());
     for (raw, w) in snap.data {

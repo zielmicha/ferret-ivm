@@ -73,7 +73,197 @@ pub enum Statement {
     Empty,
 }
 
-/// Split a query string into statements at top-level semicolons.
+/// If a string literal, quoted identifier, comment or dollar-quoted string
+/// starts at byte `i`, the index of its last byte (clamped to the input).
+fn skip_lexical(b: &[u8], i: usize) -> Option<usize> {
+    let ident_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    match b[i] {
+        q @ (b'\'' | b'"') => {
+            // E'...' strings also take backslash escapes
+            let escapes = q == b'\''
+                && i > 0
+                && matches!(b[i - 1], b'e' | b'E')
+                && !(i > 1 && (ident_byte(b[i - 2]) || b[i - 2] == b'$'));
+            let mut j = i + 1;
+            while j < b.len() {
+                if escapes && b[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if b[j] == q {
+                    if j + 1 < b.len() && b[j + 1] == q {
+                        j += 2;
+                        continue;
+                    }
+                    return Some(j);
+                }
+                j += 1;
+            }
+            Some(b.len() - 1)
+        }
+        b'-' if b.get(i + 1) == Some(&b'-') => {
+            let mut j = i;
+            while j + 1 < b.len() && b[j + 1] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if b.get(i + 1) == Some(&b'*') => {
+            // block comments nest
+            let (mut j, mut depth) = (i + 2, 1);
+            while j < b.len() {
+                if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                    depth += 1;
+                    j += 2;
+                } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        return Some(j - 1);
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            Some(b.len() - 1)
+        }
+        // dollar quoting: $tag$ ... $tag$ (not $1 parameters, not inside identifiers)
+        b'$' if !(i > 0 && ident_byte(b[i - 1])) => {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] >= 0x80) {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'$' && !(j > i + 1 && b[i + 1].is_ascii_digit()) {
+                let tag = &b[i..=j];
+                let end = b[j + 1..].windows(tag.len()).position(|w| w == tag);
+                return Some(match end {
+                    Some(p) => j + p + tag.len(),
+                    None => b.len() - 1,
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The highest parameter number ($n) used in a statement (0 if none).
+pub fn max_param_index(sql: &str) -> usize {
+    let b = sql.as_bytes();
+    let mut max = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
+        if b[i] == b'$' && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] >= 0x80)) {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if let Ok(n) = sql[i + 1..j].parse::<usize>() {
+                max = max.max(n);
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    max
+}
+
+/// Longest chain of operators accepted at one nesting level (see
+/// check_operator_chains).
+pub const MAX_OPERATOR_CHAIN: usize = 50_000;
+
+/// The parser turns a chain of binary (or postfix) operators into a tree as
+/// deep as the chain is long without recursing, but cloning or dropping that
+/// tree recurses once per level and would overflow the stack (aborting the
+/// process) for very long chains. Bound the depth from the text: count the
+/// operators (symbols and operator keywords) between commas, per level of
+/// parentheses and CASE.
+fn check_operator_chains(sql: &str) -> Result<()> {
+    // keywords of infix and postfix operators (prefix NOT recurses in the
+    // parser, which limits that by itself; NOT LIKE etc. are one operator)
+    const INFIX: &[&str] = &["and", "or", "is", "like", "ilike", "similar", "between", "in", "at", "collate", "overlaps", "isnull", "notnull"];
+    const RESET: &[&str] = &[
+        "select", "from", "where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "join", "on",
+        "using", "when", "then", "else", "values", "set", "returning", "window",
+    ];
+    let b = sql.as_bytes();
+    let is_op = |c: u8| b"+-*/%^<>=!|&#~@?:".contains(&c);
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let mut counts = vec![0usize];
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
+        let c = b[i];
+        let mut word = None;
+        if is_op(c) {
+            while i < b.len() && is_op(b[i]) && skip_lexical(b, i).is_none() {
+                i += 1;
+            }
+            *counts.last_mut().unwrap() += 1;
+        } else if is_word(c) {
+            let start = i;
+            while i < b.len() && is_word(b[i]) {
+                i += 1;
+            }
+            word = Some(sql[start..i].to_ascii_lowercase());
+        } else {
+            match c {
+                b'(' => counts.push(0),
+                b')' if counts.len() > 1 => {
+                    counts.pop();
+                }
+                b',' | b';' => *counts.last_mut().unwrap() = 0,
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(w) = word {
+            if w == "case" {
+                counts.push(0);
+            } else if w == "end" && counts.len() > 1 {
+                counts.pop();
+            } else if INFIX.contains(&w.as_str()) {
+                *counts.last_mut().unwrap() += 1;
+            } else if RESET.contains(&w.as_str()) {
+                *counts.last_mut().unwrap() = 0;
+            }
+        }
+        if counts.last().is_some_and(|n| *n > MAX_OPERATOR_CHAIN) {
+            return Err(SqlError::new(codes::STATEMENT_TOO_COMPLEX, "stack depth limit exceeded")
+                .with_hint(format!("Chains of more than {MAX_OPERATOR_CHAIN} operators are not supported.")));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `sql` holds nothing but whitespace and comments.
+fn is_blank(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let comment = b[i..].starts_with(b"--") || b[i..].starts_with(b"/*");
+        match skip_lexical(b, i) {
+            Some(end) if comment => i = end + 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Split a query string into statements at top-level semicolons (dropping
+/// statements that are only comments, as PostgreSQL does).
 pub fn split_statements(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
@@ -81,53 +271,16 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     let mut i = 0;
     let mut depth = 0i32;
     while i < b.len() {
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
         match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == q {
-                        if i + 1 < b.len() && b[i + 1] == q {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'$' => {
-                // dollar quoting: $tag$ ... $tag$
-                let mut j = i + 1;
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-                    j += 1;
-                }
-                if j < b.len() && b[j] == b'$' && !(j > i + 1 && b[i + 1].is_ascii_digit()) {
-                    let tag = &sql[i..=j];
-                    if let Some(end) = sql[j + 1..].find(tag) {
-                        i = j + 1 + end + tag.len() - 1;
-                    } else {
-                        i = b.len();
-                    }
-                }
-            }
             b'(' => depth += 1,
             b')' => depth -= 1,
             b';' if depth <= 0 => {
                 let s = sql[start..i].trim();
-                if !s.is_empty() {
+                if !is_blank(s) {
                     out.push(s.to_string());
                 }
                 start = i + 1;
@@ -137,7 +290,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         i += 1;
     }
     let s = sql[start..].trim();
-    if !s.is_empty() {
+    if !is_blank(s) {
         out.push(s.to_string());
     }
     out
@@ -287,9 +440,10 @@ impl Toks {
 
 /// Strip a trailing `AS OF ...` clause from a SELECT.
 fn strip_as_of(sql: &str) -> Result<(String, AsOf)> {
-    let lower = sql.to_lowercase();
-    let Some(idx) = find_top_level(&lower, " as of ") else { return Ok((sql.to_string(), AsOf::Default)) };
-    let rest = sql[idx + 7..].trim();
+    // ASCII lowercasing keeps byte offsets valid for `sql`
+    let lower = sql.to_ascii_lowercase();
+    let Some((idx, rest_at)) = find_as_of(&lower) else { return Ok((sql.to_string(), AsOf::Default)) };
+    let rest = sql[rest_at..].trim();
     let mut t = Toks::new(rest);
     let as_of = if t.eat("at") {
         t.expect("least")?;
@@ -309,31 +463,35 @@ fn strip_as_of(sql: &str) -> Result<(String, AsOf)> {
     Ok((sql[..idx].to_string(), as_of))
 }
 
-/// Last occurrence of `pat` outside quotes/parentheses.
-fn find_top_level(s: &str, pat: &str) -> Option<usize> {
+/// The last `AS OF` (words separated by whitespace, followed by more text)
+/// outside parentheses, quotes and comments of a lowercased statement:
+/// (offset of the whitespace before AS, offset just after OF).
+fn find_as_of(s: &str) -> Option<(usize, usize)> {
     let b = s.as_bytes();
+    let ws = |c: u8| c.is_ascii_whitespace();
     let mut depth = 0;
-    let mut in_q: Option<u8> = None;
     let mut found = None;
     let mut i = 0;
     while i < b.len() {
-        let c = b[i];
-        match in_q {
-            Some(q) => {
-                if c == q {
-                    in_q = None;
-                }
-            }
-            None => match c {
-                b'\'' | b'"' => in_q = Some(c),
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {
-                    if depth == 0 && s[i..].starts_with(pat) {
-                        found = Some(i);
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            c if depth == 0 && ws(c) && b[i + 1..].starts_with(b"as") => {
+                let mut j = i + 3;
+                if j < b.len() && ws(b[j]) {
+                    while j < b.len() && ws(b[j]) {
+                        j += 1;
+                    }
+                    if b[j..].starts_with(b"of") && b.get(j + 2).is_some_and(|c| ws(*c)) {
+                        found = Some((i, j + 2));
                     }
                 }
-            },
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -352,9 +510,10 @@ fn parse_std(sql: &str) -> Result<ast::Statement> {
 /// Parse one statement.
 pub fn parse_statement(sql: &str) -> Result<Statement> {
     let sql = sql.trim().trim_end_matches(';').trim();
-    if sql.is_empty() {
+    if is_blank(sql) {
         return Ok(Statement::Empty);
     }
+    check_operator_chains(sql)?;
     let mut t = Toks::new(sql);
     let first = t.peek().unwrap_or("").to_string();
     match first.as_str() {
@@ -396,8 +555,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
             return parse_subscribe(sql, &mut t, false);
         }
         "copy" => {
-            // COPY (SUBSCRIBE ...) TO STDOUT
-            let lower = sql.to_lowercase();
+            // COPY (SUBSCRIBE ...) TO STDOUT (ASCII lowercasing keeps
+            // byte offsets valid for `sql`)
+            let lower = sql.to_ascii_lowercase();
             if let Some(p) = lower.find("subscribe")
                 && lower[..p].trim_end().ends_with('(')
             {
@@ -707,6 +867,66 @@ mod tests {
     fn split() {
         let v = split_statements("select 1; select ';' ; -- c;\nselect $$a;b$$; select (1;2)");
         assert_eq!(v.len(), 4, "{v:?}");
+        // escaped quotes in E'' strings, nested comments, tagged dollar quotes
+        let v = split_statements(r"select E'a\';b'; select /* x /* y; */ z; */ 2; select $f$;$$;$f$; select 'ü;'");
+        // comment-only statements are no statements
+        assert_eq!(split_statements("select 1; -- done\n /* end */"), vec!["select 1"]);
+        assert!(split_statements("-- nothing").is_empty());
+        assert!(matches!(parse_statement("/* nothing */"), Ok(Statement::Empty)));
+        assert_eq!(v, vec![r"select E'a\';b'", "select /* x /* y; */ z; */ 2", "select $f$;$$;$f$", "select 'ü;'"]);
+    }
+
+    fn as_of(sql: &str) -> AsOf {
+        match parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+            Statement::Select { as_of, .. } => as_of,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn as_of_clause() {
+        // non-ASCII text outside quotes used to panic (byte slicing inside a character)
+        assert_eq!(as_of("select 1 as ü"), AsOf::Default);
+        assert_eq!(as_of("select 'İİ' as x, ü from t as of 7"), AsOf::Gsn(7));
+        // AS OF inside comments, strings and dollar quotes is not a clause
+        assert_eq!(as_of("select a from t -- as of 1"), AsOf::Default);
+        assert_eq!(as_of("select a from t /* as of 1 */"), AsOf::Default);
+        assert_eq!(as_of("select $$ as of 1 $$"), AsOf::Default);
+        assert_eq!(as_of("select ' as of 1'"), AsOf::Default);
+        // any whitespace separates the words
+        assert_eq!(as_of("select a from t\nAS\tOF 12"), AsOf::Gsn(12));
+        assert_eq!(as_of("select a from t as of latest"), AsOf::Latest);
+        match parse_statement("select a from t as of 3").unwrap() {
+            Statement::Select { text, .. } => assert_eq!(text, "select a from t"),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_statement("COPY (SUBSCRIBE (select 'İ' from t)) TO STDOUT").is_ok());
+    }
+
+    #[test]
+    fn operator_chains() {
+        // deep syntax trees are dropped recursively: use a session-sized stack
+        std::thread::Builder::new().stack_size(16 << 20).spawn(operator_chains_body).unwrap().join().unwrap();
+    }
+
+    fn operator_chains_body() {
+        let chain = |n: usize, sep: &str| vec!["1"; n].join(sep);
+        assert!(parse_statement(&format!("select {}", chain(MAX_OPERATOR_CHAIN, "+"))).is_ok());
+        let err = parse_statement(&format!("select {}", chain(MAX_OPERATOR_CHAIN + 2, "+"))).unwrap_err();
+        assert!(err.message.contains("stack depth limit exceeded"), "{}", err.message);
+        assert!(parse_statement(&format!("select 1 where {}", vec!["a = 1"; MAX_OPERATOR_CHAIN].join(" or "))).is_err());
+        // commas, CASE branches and parentheses start new chains
+        assert!(parse_statement(&format!("select 1 where a in ({})", vec!["-1"; 3 * MAX_OPERATOR_CHAIN].join(", "))).is_ok());
+        let parened = vec!["(a = 1 and b = 2)"; MAX_OPERATOR_CHAIN / 2].join(" or ");
+        assert!(parse_statement(&format!("select 1 where {parened}")).is_ok());
+        assert!(parse_statement(&format!("select 1 where '{}' = ''", "+".repeat(10 * MAX_OPERATOR_CHAIN))).is_ok());
+    }
+
+    #[test]
+    fn param_count() {
+        assert_eq!(max_param_index("select $1, $12 + $3"), 12);
+        assert_eq!(max_param_index("select '$4', $$ $5 $$, $t$ $6 $t$, \"$7\", a$8 -- $9\n, $2"), 2);
+        assert_eq!(max_param_index("select 1"), 0);
     }
 
     #[test]

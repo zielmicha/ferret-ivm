@@ -24,3 +24,12 @@ num-bigint = "0.5.1"
 num-traits = "0.2.19"
 num-integer = "0.1.47"
 mimalloc = { version = "0.1.52", default-features = false }
+# web UI (--http-listen): HTTP/1.1 server on its own tokio runtime
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+hyper = { version = "1.12", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server", "http1", "service"] }
+tower = { version = "0.5.3", default-features = false }
+tower-http = { version = "0.6.11", features = ["timeout", "limit", "compression-gzip", "set-header"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+base64 = "0.22.1"

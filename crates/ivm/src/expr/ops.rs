@@ -73,7 +73,11 @@ fn int_xor(a: &Datum, b: &Datum) -> Result<Datum> {
 fn int_shift(a: &Datum, b: &Datum, left: bool) -> Result<Datum> {
     let s = b.as_i64().unwrap_or(0) as u32;
     Ok(match a {
-        Datum::Int2(x) => Datum::Int2(if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }),
+        // as in C, int2 is shifted as an int (masking the count to 5 bits)
+        Datum::Int2(x) => {
+            let x = *x as i32;
+            Datum::Int2((if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }) as i16)
+        }
         Datum::Int4(x) => Datum::Int4(if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }),
         Datum::Int8(x) => Datum::Int8(if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }),
         _ => return Err(internal("<<", a, b)),
@@ -193,6 +197,26 @@ fn float_mul(a: &Datum, b: &Datum) -> Result<Datum> {
 }
 fn float_div(a: &Datum, b: &Datum) -> Result<Datum> {
     float_binop(a, b, '/')
+}
+/// float4 op float8 / float8 op float4 (float48pl etc.): computed in double
+/// precision.
+fn float48_binop(a: &Datum, b: &Datum, op: char) -> Result<Datum> {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => float_binop(&Datum::Float8(x), &Datum::Float8(y), op),
+        _ => Err(internal("float op", a, b)),
+    }
+}
+fn float48_add(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '+')
+}
+fn float48_sub(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '-')
+}
+fn float48_mul(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '*')
+}
+fn float48_div(a: &Datum, b: &Datum) -> Result<Datum> {
+    float48_binop(a, b, '/')
 }
 fn float_neg(a: &Datum) -> Result<Datum> {
     Ok(match a {
@@ -363,6 +387,23 @@ pub fn regex(pattern: &str, flags: &str) -> Result<Arc<pgfuncs::pattern::Regex>>
         m.insert(key, r.clone());
         Ok(r)
     })
+}
+
+/// The ~~ operator family: LIKE / ILIKE (escape \\), and their negations.
+fn like_op(a: &Datum, b: &Datum, ci: bool) -> Result<bool> {
+    pgfuncs::pattern::LikePattern::new_lenient(b.as_str().unwrap(), Some('\\'), ci).try_matches(a.as_str().unwrap()).map_err(Into::into)
+}
+fn like_match(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(like_op(a, b, false)?))
+}
+fn ilike_match(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(like_op(a, b, true)?))
+}
+fn like_nmatch(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(!like_op(a, b, false)?))
+}
+fn ilike_nmatch(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(!like_op(a, b, true)?))
 }
 
 fn re_match(a: &Datum, b: &Datum) -> Result<Datum> {
@@ -682,6 +723,15 @@ pub fn register(b: &mut Builder) {
         b.op1("+", t.clone(), t.clone(), identity);
         b.op1("@", t.clone(), t.clone(), float_abs);
     }
+    // mixed float4/float8 arithmetic is float8; these operators also make
+    // float4 op integer/numeric resolve to float8, as in PostgreSQL (no
+    // cross-type comparisons: "=" operands must share a type)
+    for (x, y) in [(T::Float4, T::Float8), (T::Float8, T::Float4)] {
+        b.op2("+", x.clone(), y.clone(), T::Float8, float48_add);
+        b.op2("-", x.clone(), y.clone(), T::Float8, float48_sub);
+        b.op2("*", x.clone(), y.clone(), T::Float8, float48_mul);
+        b.op2("/", x, y, T::Float8, float48_div);
+    }
     b.op2("^", T::Float8, T::Float8, T::Float8, float8_pow);
     b.op2("+", T::Numeric, T::Numeric, T::Numeric, num_add);
     b.op2("-", T::Numeric, T::Numeric, T::Numeric, num_sub);
@@ -739,10 +789,17 @@ pub fn register(b: &mut Builder) {
     b.op2p("||", P::T(T::Text), P::AnyNonArray, Ret::T(T::Text), textcat);
     b.op2p("||", P::AnyNonArray, P::T(T::Text), Ret::T(T::Text), textcat);
     b.op2("||", T::Bytea, T::Bytea, T::Bytea, byteacat);
-    b.op2("~", T::Text, T::Text, T::Bool, re_match);
-    b.op2("~*", T::Text, T::Text, T::Bool, re_imatch);
-    b.op2("!~", T::Text, T::Text, T::Bool, re_nmatch);
-    b.op2("!~*", T::Text, T::Text, T::Bool, re_nimatch);
+    b.op2("~~", T::Text, T::Text, T::Bool, like_match);
+    b.op2("~~*", T::Text, T::Text, T::Bool, ilike_match);
+    b.op2("!~~", T::Text, T::Text, T::Bool, like_nmatch);
+    b.op2("!~~*", T::Text, T::Text, T::Bool, ilike_nmatch);
+    // character(n) matches with its padding (bpcharregexeq etc.)
+    for t in [T::Text, T::Bpchar] {
+        b.op2("~", t.clone(), T::Text, T::Bool, re_match);
+        b.op2("~*", t.clone(), T::Text, T::Bool, re_imatch);
+        b.op2("!~", t.clone(), T::Text, T::Bool, re_nmatch);
+        b.op2("!~*", t, T::Text, T::Bool, re_nimatch);
+    }
 
     // date/time
     b.op2("+", T::Date, T::Int4, T::Date, date_pl_int);

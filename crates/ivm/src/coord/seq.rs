@@ -40,21 +40,26 @@ impl Sequencer {
             // the wall clock enters the log as a tick stream, so time is as
             // deterministic on replay as any other input
             let first = match self.tick {
-                Some(every) => match self.rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
-                    Ok(m) => m,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        next_tick = Instant::now() + every;
-                        last_micros = wall_micros().max(last_micros + 1);
-                        SeqMsg::Append { rec: LogRecord::Tick { micros: last_micros }, ack: None }
-                    }
+                Some(_) => match self.rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+                    Ok(m) => Some(m),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
                     Err(_) => return Ok(()),
                 },
                 None => match self.rx.recv() {
-                    Ok(m) => m,
+                    Ok(m) => Some(m),
                     Err(_) => return Ok(()),
                 },
             };
-            let mut batch = vec![first];
+            let mut batch: Vec<SeqMsg> = first.into_iter().collect();
+            // the clock ticks on schedule whether or not work is waiting
+            // (under steady load a message is always ready first)
+            if let Some(every) = self.tick
+                && Instant::now() >= next_tick
+            {
+                next_tick = Instant::now() + every;
+                last_micros = wall_micros().max(last_micros + 1);
+                batch.push(SeqMsg::Append { rec: LogRecord::Tick { micros: last_micros }, ack: None });
+            }
             while batch.len() < 4096 {
                 match self.rx.try_recv() {
                     Ok(m) => batch.push(m),
@@ -94,5 +99,41 @@ impl Sequencer {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::{read_from, LogWriter};
+
+    /// Clock ticks keep coming while the sequencer is never idle: under a
+    /// steady stream of appends, receiving the next message always beat the
+    /// tick deadline, so the logical clock (and temporal filters) stood
+    /// still for as long as the load lasted.
+    #[test]
+    fn ticks_are_not_starved_by_load() {
+        let base = std::env::var("IVM_TEST_TMP").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("ivm-seq-ticks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // with fsync, every group commit takes long enough for the next
+        // appends to be queued when the sequencer looks for work
+        let writer = LogWriter::open(&dir, true).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (etx, erx) = crossbeam_channel::unbounded();
+        let seq = Sequencer { writer, rx, engine: etx, shared: Arc::new(Shared::default()), tick: Some(Duration::from_millis(5)) };
+        let t = std::thread::spawn(move || seq.run().unwrap());
+        // keep the sequencer busy for 300ms
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(300) {
+            tx.send(SeqMsg::Append { rec: LogRecord::Progress { source: 1, lsn: 0, state: String::new() }, ack: None }).unwrap();
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        tx.send(SeqMsg::Shutdown).unwrap();
+        t.join().unwrap();
+        drop(erx);
+        let ticks = read_from(&dir, 0).unwrap().iter().filter(|(_, r)| matches!(r, LogRecord::Tick { .. })).count();
+        assert!(ticks >= 10, "only {ticks} ticks in 300ms at a 5ms interval");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

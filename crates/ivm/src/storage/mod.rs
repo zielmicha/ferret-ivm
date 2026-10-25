@@ -12,12 +12,14 @@
 //! deleting segments once nothing references them.
 
 pub mod history;
+mod inspect;
 pub mod manifest;
 pub mod node;
 pub mod segment;
 pub mod summary;
 
 pub use history::{History, ReadAt};
+pub use inspect::TreeResidency;
 pub use summary::{AggKind, AggState, FloatSum, Summary};
 
 use crate::error::{Result, SqlError};

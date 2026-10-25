@@ -131,7 +131,14 @@ impl Writer {
                     .columns
                     .iter()
                     .zip(r)
-                    .map(|(c, d)| format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c)))
+                    .map(|(c, d)| {
+                        if c.ty.ty == crate::types::SqlType::Json {
+                            // json has no equality operator; its text is kept as written
+                            format!("{}::text IS NOT DISTINCT FROM {}::text", qident(&c.name), lit(d, c))
+                        } else {
+                            format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c))
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" AND ");
                 format!("DELETE FROM {0} WHERE ctid = (SELECT ctid FROM {0} WHERE {cond} LIMIT 1)", self.table)
@@ -196,6 +203,23 @@ pub fn run(
     let mut applied: Option<Gsn> = None;
     let mut backoff = Duration::from_millis(100);
     let mut last_flush = Instant::now();
+    // Wait out a backoff, still taking messages: changes are kept for later
+    // (they used to be read and dropped), a Stop ends the sink. False on Stop.
+    let wait = |backoff: Duration, applied: Option<Gsn>, pending: &mut Vec<(Gsn, Delta)>| -> bool {
+        let deadline = Instant::now() + backoff;
+        loop {
+            match rx.recv_deadline(deadline) {
+                Ok(SinkMsg::Data(g, d)) => {
+                    if g > applied.unwrap_or(snapshot_gsn) {
+                        pending.push((g, d));
+                    }
+                }
+                Ok(SinkMsg::Progress(_)) => {}
+                Ok(SinkMsg::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+                Err(RecvTimeoutError::Timeout) => return true,
+            }
+        }
+    };
     loop {
         if writer.is_none() {
             match Writer::connect(&name, &def, &columns) {
@@ -205,11 +229,10 @@ pub fn run(
                 }
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
-                    if matches!(rx.try_recv(), Ok(SinkMsg::Stop)) {
+                    if !wait(backoff, applied, &mut pending) {
                         return;
                     }
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
                     continue;
                 }
             }
@@ -233,7 +256,9 @@ pub fn run(
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
                     writer = None;
-                    std::thread::sleep(backoff);
+                    if !wait(backoff, applied, &mut pending) {
+                        return;
+                    }
                     continue;
                 }
             }

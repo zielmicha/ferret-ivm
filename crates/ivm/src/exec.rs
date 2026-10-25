@@ -202,13 +202,20 @@ impl<'a> ExecCtx<'a> {
     }
 
     fn read_node(&mut self, node: NodeId) -> Result<Rows> {
-        match self.g.any_arrangement(node) {
+        match self.g.arrangement_at(node, self.at) {
             Some(a) => {
                 let mut rows = self.g.scan_arr(self.env, a, self.at)?;
                 rows.retain(|(_, w)| *w > 0);
                 Ok(rows)
             }
             None => {
+                if let (ReadAt::AsOf(t), Some(a)) = (self.at, self.g.any_arrangement(node)) {
+                    // (re)built later: its history before then is not kept
+                    return Err(SqlError::new(
+                        codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        format!("AS OF {t} is before the history of a relation it reads, which starts at {}", self.g.arr(a).since),
+                    ));
+                }
                 if self.at != ReadAt::Latest {
                     return Err(SqlError::unsupported("time travel requires an arranged relation"));
                 }
@@ -254,7 +261,8 @@ impl<'a> ExecCtx<'a> {
         let mut best: Option<(usize, Vec<Datum>, Option<&Datum>, Option<(&Datum, bool)>)> = None;
         for &a in &self.g.node(node).arrangements {
             let arr = self.g.arr(a);
-            if !arr.hydrated {
+            // (an index built after the read's GSN lacks its history)
+            if !arr.covers(self.at) {
                 continue;
             }
             let usable = |c: usize, t: &SqlType, d: &Datum| schema[c].ty == *t && literal_matches(d, t);
@@ -322,7 +330,8 @@ impl<'a> ExecCtx<'a> {
         let Some(node) = (self.objects)(b.id) else { return Ok(None) };
         let (arr, lo_key, hi_key) = match self.index_range(node, &b.preds) {
             Some(r) => r,
-            None => match self.g.any_arrangement(node) {
+            // (the general path reports reads before an arrangement's history)
+            None => match self.g.arrangement_at(node, self.at) {
                 Some(a) => (a, Vec::new(), None),
                 None => return Ok(None),
             },
@@ -510,7 +519,8 @@ impl<'a> ExecCtx<'a> {
         let mut best: Option<(usize, Vec<usize>)> = None;
         for &a in &self.g.node(node).arrangements {
             let arr = self.g.arr(a);
-            if !arr.hydrated {
+            // (an index built after the read's GSN lacks its history)
+            if !arr.covers(self.at) {
                 continue;
             }
             let mut used = Vec::new();
@@ -884,6 +894,12 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
         g.summary.count += w;
         for i in 0..specs.len() {
             let w_eff = if aggs[i].distinct {
+                // the FILTER applies before duplicates are removed
+                if let Some(f) = aggs[i].filter
+                    && !matches!(r[f], Datum::Bool(true))
+                {
+                    continue;
+                }
                 let args: Vec<Datum> = aggs[i].args.iter().map(|c| r[*c].clone()).collect();
                 let mut dk = k.clone();
                 dk.extend(key_bytes(&args));
@@ -918,16 +934,22 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
         }
         let mut row = g.key_row.clone();
         for (i, s) in specs.iter().enumerate() {
-            let v = if s.func.is_ordered() {
+            let v = if s.func.is_ordered() && aggs[i].distinct {
+                // the FILTER applies before duplicates are removed, and the
+                // group's rows stay intact for the other aggregates
+                let a = &aggs[i].args;
+                let mut seen = FxHashMap::default();
+                let mut rs: Rows = g
+                    .rows
+                    .iter()
+                    .filter(|(r, _)| aggs[i].filter.is_none_or(|f| matches!(r[f], Datum::Bool(true))))
+                    .filter(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none())
+                    .map(|(r, _)| (r.clone(), 1))
+                    .collect();
+                sort_rows(&mut rs, &aggs[i].order);
+                s.finalize_ordered(&mut rs.into_iter())?
+            } else if s.func.is_ordered() {
                 let mut rs = std::mem::take(&mut g.rows);
-                if aggs[i].distinct {
-                    let mut seen = FxHashMap::default();
-                    let a = aggs[i].args.clone();
-                    rs.retain(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none());
-                    for x in rs.iter_mut() {
-                        x.1 = 1;
-                    }
-                }
                 sort_rows(&mut rs, &aggs[i].order);
                 let v = s.finalize_ordered(&mut rs.iter().cloned())?;
                 g.rows = rs;

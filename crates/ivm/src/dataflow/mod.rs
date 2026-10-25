@@ -127,6 +127,21 @@ pub struct Arrangement {
     pub refs: usize,
     pub fp: Vec<u8>,
     pub hydrated: bool,
+    /// GSN from which the arrangement's history is complete (it was
+    /// hydrated then): reads as of earlier GSNs must not use it.
+    pub since: Gsn,
+}
+
+impl Arrangement {
+    /// Can a read at `at` use this arrangement?
+    pub fn covers(&self, at: ReadAt) -> bool {
+        self.hydrated
+            && match at {
+                ReadAt::Latest => true,
+                ReadAt::AsOf(t) => self.since <= t,
+                ReadAt::Before(t) => self.since < t,
+            }
+    }
 }
 
 /// Recovered arrangement trees, by fingerprint.
@@ -142,19 +157,67 @@ pub struct Graph {
     topo_dirty: bool,
     /// Trees from the checkpoint to attach instead of creating new ones.
     pub recovery: RecoveryMap,
+    /// `since` of the recovered trees, by fingerprint.
+    pub recovery_since: FxHashMap<Vec<u8>, Gsn>,
     /// Per-node delta-rate statistics (rows per tick, EWMA) for the planner.
     pub stats: FxHashMap<NodeId, NodeStats>,
+    /// Per-node activity counters for introspection (one update per node
+    /// per step, never per row).
+    pub counters: FxHashMap<NodeId, NodeCounters>,
+    /// Sum of all node counters ever recorded (monotonic).
+    pub step_totals: NodeCounters,
     /// Logical time of the current GSN (timestamptz microseconds), from the
     /// logged clock ticks.
     pub now: i64,
     /// `now` as of the previous step (temporal filters run when it moves).
     stepped_now: i64,
+    /// Error records currently in each node's contents (its accumulated
+    /// output errors). Authoritative for nodes with a hydrated arrangement:
+    /// their snapshots read the arrangement, which holds rows only.
+    node_errors: FxHashMap<NodeId, BTreeMap<(String, String), i64>>,
+}
+
+/// Error state that must survive restarts, by node fingerprint: the error
+/// records in the contents of arranged nodes (views created later over
+/// them must see them), and the error state of operators that remember
+/// which of their groups are in error (to retract the error when the group
+/// recovers).
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ErrorState {
+    pub nodes: Vec<(Vec<u8>, Vec<((String, String), i64)>)>,
+    #[serde(default)]
+    pub operators: Vec<(Vec<u8>, Vec<(Vec<u8>, (String, String))>)>,
+}
+
+/// Groups of an operator currently in error, by group key prefix.
+pub type OpErrors = Arc<parking_lot::Mutex<BTreeMap<Vec<u8>, (String, String)>>>;
+
+/// The per-group error state of an operator, if it keeps one.
+fn operator_errors(kind: &NodeKind) -> Option<&OpErrors> {
+    match kind {
+        NodeKind::Reduce(p) => Some(&p.errors),
+        NodeKind::Recursive(p) => Some(&p.errors),
+        _ => None,
+    }
 }
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct NodeStats {
     pub ticks: u64,
     pub rows: u64,
+}
+
+/// Activity of a node since it was created.
+#[derive(Default, Clone, Copy, Debug, serde::Serialize)]
+pub struct NodeCounters {
+    /// Steps in which the node ran (it had input changes).
+    pub steps: u64,
+    /// Input delta rows (base table changes for table nodes).
+    pub in_rows: u64,
+    /// Output delta rows.
+    pub out_rows: u64,
+    /// Time spent running the operator and updating its arrangements.
+    pub nanos: u64,
 }
 
 impl Graph {
@@ -347,8 +410,9 @@ impl Graph {
             }
             _ => (env.create_tree(summarizer), false),
         };
+        let since = self.recovery_since.get(&afp).copied().unwrap_or(0);
         let arr = self.arrs.len();
-        self.arrs.push(Some(Arrangement { id: arr, node: id, layout, tree, refs: 0, fp: afp.clone(), hydrated }));
+        self.arrs.push(Some(Arrangement { id: arr, node: id, layout, tree, refs: 0, fp: afp.clone(), hydrated, since }));
         self.arr_by_fp.insert(afp, arr);
         patch(&mut kind, arr);
         for i in &inputs {
@@ -432,8 +496,9 @@ impl Graph {
             }
             _ => (env.create_tree(summarizer), false),
         };
+        let since = self.recovery_since.get(&full_fp).copied().unwrap_or(0);
         let id = self.arrs.len();
-        self.arrs.push(Some(Arrangement { id, node, layout, tree, refs: 0, fp: full_fp.clone(), hydrated }));
+        self.arrs.push(Some(Arrangement { id, node, layout, tree, refs: 0, fp: full_fp.clone(), hydrated, since }));
         self.arr_by_fp.insert(full_fp, id);
         self.node_mut(node).arrangements.push(id);
         id
@@ -471,6 +536,8 @@ impl Graph {
         }
         let node = self.nodes[id].take().unwrap();
         self.node_by_fp.remove(&node.fp);
+        self.node_errors.remove(&id);
+        self.counters.remove(&id);
         self.topo_dirty = true;
         // arrangements used by this operator
         for a in operator_arrangements(&node.kind) {
@@ -538,6 +605,69 @@ impl Graph {
         self.node(node).arrangements.iter().copied().find(|a| self.arr(*a).hydrated)
     }
 
+    /// Error records in a node's contents (exact for arranged nodes).
+    pub fn errors_of(&self, node: NodeId) -> ErrDelta {
+        self.node_errors.get(&node).map(|m| m.iter().map(|(e, w)| (e.clone(), *w)).collect()).unwrap_or_default()
+    }
+
+    fn add_errors(&mut self, node: NodeId, errs: &ErrDelta) {
+        if errs.is_empty() {
+            return;
+        }
+        let m = self.node_errors.entry(node).or_default();
+        for (e, w) in errs {
+            let v = m.entry(e.clone()).or_default();
+            *v += w;
+            if *v == 0 {
+                m.remove(e);
+            }
+        }
+        if m.is_empty() {
+            self.node_errors.remove(&node);
+        }
+    }
+
+    fn set_errors(&mut self, node: NodeId, errs: &ErrDelta) {
+        self.node_errors.remove(&node);
+        self.add_errors(node, errs);
+    }
+
+    /// Error state for a checkpoint.
+    pub fn error_state(&self) -> ErrorState {
+        let mut st = ErrorState::default();
+        for n in self.live_nodes() {
+            if let Some(m) = self.node_errors.get(&n.id)
+                && self.any_arrangement(n.id).is_some()
+            {
+                st.nodes.push((n.fp.clone(), m.iter().map(|(e, w)| (e.clone(), *w)).collect()));
+            }
+            if let Some(errs) = operator_errors(&n.kind) {
+                let errs = errs.lock();
+                if !errs.is_empty() {
+                    st.operators.push((n.fp.clone(), errs.iter().map(|(k, e)| (k.clone(), e.clone())).collect()));
+                }
+            }
+        }
+        st
+    }
+
+    /// Restore checkpointed error state into a graph rebuilt for recovery
+    /// (before hydrating whatever could not be recovered).
+    pub fn restore_error_state(&mut self, st: ErrorState) {
+        for (fp, errs) in st.nodes {
+            if let Some(&id) = self.node_by_fp.get(&fp) {
+                self.set_errors(id, &errs);
+            }
+        }
+        for (fp, groups) in st.operators {
+            if let Some(&id) = self.node_by_fp.get(&fp)
+                && let Some(errs) = operator_errors(&self.node(id).kind)
+            {
+                *errs.lock() = groups.into_iter().collect();
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ ticks
 
     /// Process one GSN. `changes` holds base table changes keyed by table node.
@@ -557,9 +687,13 @@ impl Graph {
             if !node.hydrated {
                 continue;
             }
+            let (started, in_rows);
             let out = if let NodeKind::Table { .. } = node.kind {
                 match changes.remove(&id) {
-                    Some(ch) => ops::table_step(self, env, node, ch, gsn)?,
+                    Some(ch) => {
+                        (started, in_rows) = (std::time::Instant::now(), ch.len());
+                        ops::table_step(self, env, node, ch, gsn)?
+                    }
                     None => continue,
                 }
             } else {
@@ -569,18 +703,32 @@ impl Graph {
                 }
                 let empty = Output::default();
                 let inputs: Vec<&Output> = node.inputs.iter().map(|i| outputs.get(i).unwrap_or(&empty)).collect();
+                (started, in_rows) = (std::time::Instant::now(), inputs.iter().map(|o| o.data.len()).sum());
                 ops::step_node(self, env, node, &inputs, gsn, &outputs)?
             };
             if out.is_empty() {
+                self.count_step(id, in_rows, 0, started);
                 continue;
             }
+            self.add_errors(id, &out.errs);
             self.apply_to_arrangements(env, id, &out.data, gsn)?;
+            self.count_step(id, in_rows, out.data.len(), started);
             let st = self.stats.entry(id).or_default();
             st.ticks += 1;
             st.rows += out.data.len() as u64;
             outputs.insert(id, out);
         }
         Ok(outputs)
+    }
+
+    fn count_step(&mut self, id: NodeId, in_rows: usize, out_rows: usize, started: std::time::Instant) {
+        let nanos = started.elapsed().as_nanos() as u64;
+        for c in [self.counters.entry(id).or_default(), &mut self.step_totals] {
+            c.steps += 1;
+            c.in_rows += in_rows as u64;
+            c.out_rows += out_rows as u64;
+            c.nanos += nanos;
+        }
     }
 
     fn apply_to_arrangements(&self, env: &mut Env, node: NodeId, delta: &Delta, gsn: Gsn) -> Result<()> {
@@ -604,12 +752,11 @@ impl Graph {
     // ------------------------------------------------------------------ hydration
 
     /// Bring every new node and arrangement up to date as of `gsn`, computing
-    /// their contents from existing state (never from the sources). Returns
-    /// the error records found in the contents of newly hydrated nodes.
-    pub fn hydrate(&mut self, env: &mut Env, gsn: Gsn) -> Result<FxHashMap<NodeId, ErrDelta>> {
+    /// their contents from existing state (never from the sources). The
+    /// error records in their contents are kept per node (`errors_of`).
+    pub fn hydrate(&mut self, env: &mut Env, gsn: Gsn) -> Result<()> {
         let order: Vec<NodeId> = self.topo().to_vec();
         let mut cache: ops::SnapCache = FxHashMap::default();
-        let mut errors: FxHashMap<NodeId, ErrDelta> = FxHashMap::default();
         // snapshots are cached only while a node still to be hydrated may
         // read them (large views would otherwise hold every intermediate)
         let needs = |g: &Graph, id: NodeId| {
@@ -659,16 +806,15 @@ impl Graph {
                         let mut batch = ups.split_off(ups.len().saturating_sub(100_000));
                         env.apply(arr.tree, &mut batch, gsn)?;
                     }
-                    self.arrs[a].as_mut().unwrap().hydrated = true;
+                    let a = self.arrs[a].as_mut().unwrap();
+                    a.hydrated = true;
+                    a.since = gsn;
                 }
-                if !snap.errs.is_empty() {
-                    errors.insert(id, snap.errs.clone());
-                }
-            } else if needs_node
-                && let Some(s) = cache.get(&id)
-                && !s.errs.is_empty()
-            {
-                errors.insert(id, s.errs.clone());
+                // the arrangement holds the rows; the errors are kept here
+                self.set_errors(id, &snap.errs);
+            } else if needs_node && let Some(s) = cache.get(&id) {
+                let errs = s.errs.clone();
+                self.set_errors(id, &errs);
             }
             self.node_mut(id).hydrated = true;
             // drop snapshots nobody further down will read (including those
@@ -680,12 +826,22 @@ impl Graph {
             }
             cache.retain(|k, _| readers.get(k).copied().unwrap_or(0) > 0);
         }
-        Ok(errors)
+        Ok(())
     }
 
     /// Arrangement fingerprint -> tree for checkpoints.
     pub fn arrangement_trees(&self) -> BTreeMap<Vec<u8>, TreeId> {
         self.live_arrangements().filter(|a| a.hydrated).map(|a| (a.fp.clone(), a.tree)).collect()
+    }
+
+    /// Arrangement fingerprint -> `since` for checkpoints.
+    pub fn arrangement_since(&self) -> BTreeMap<Vec<u8>, Gsn> {
+        self.live_arrangements().filter(|a| a.hydrated).map(|a| (a.fp.clone(), a.since)).collect()
+    }
+
+    /// The first of a node's arrangements holding its history as of `at`.
+    pub fn arrangement_at(&self, node: NodeId, at: ReadAt) -> Option<ArrId> {
+        self.node(node).arrangements.iter().copied().find(|a| self.arr(*a).covers(at))
     }
 }
 

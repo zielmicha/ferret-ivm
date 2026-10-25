@@ -61,6 +61,12 @@ impl AggSpec {
             A::Max => vec![(AggKind::Max, self.arg_expr())],
             A::BoolAnd => vec![(AggKind::CountFalse, self.arg_expr()), (AggKind::CountNonNull, self.arg_expr())],
             A::BoolOr => vec![(AggKind::CountTrue, self.arg_expr()), (AggKind::CountNonNull, self.arg_expr())],
+            // squares of int8 values (up to 2^126) overflow i128 sums: those
+            // are summed as numerics (exactly, like PostgreSQL)
+            A::StddevSamp | A::StddevPop | A::VarSamp | A::VarPop if self.arg_type == SqlType::Int8 => {
+                let num = Expr::Cast(Box::new(self.arg_expr()), SqlType::Numeric, -1, false);
+                vec![(AggKind::SumNumeric, num.clone()), (AggKind::SumSqNumeric, num), (AggKind::CountNonNull, self.arg_expr())]
+            }
             A::StddevSamp | A::StddevPop | A::VarSamp | A::VarPop => vec![
                 (sum_kind(false), self.arg_expr()),
                 (sum_kind(true), self.arg_expr()),
@@ -322,7 +328,15 @@ fn finalize_sum(st: &AggState, arg: &SqlType) -> Result<Datum> {
         }
         (AggState::SumInt(v), _) => Datum::numeric(Numeric::from_i128(*v)),
         (AggState::SumNumeric(n), _) => Datum::numeric(n.value()),
-        (AggState::SumFloat(f), SqlType::Float4) => Datum::Float4(float_sum_value(f)? as f32),
+        (AggState::SumFloat(f), SqlType::Float4) => {
+            // as with float4pl, a finite sum beyond real's range overflows
+            let v = float_sum_value(f)?;
+            let r = v as f32;
+            if r.is_infinite() && v.is_finite() {
+                return Err(crate::expr::ops_overflow());
+            }
+            Datum::Float4(r)
+        }
         (AggState::SumFloat(f), _) => Datum::Float8(float_sum_value(f)?),
         _ => return Err(SqlError::internal("sum state mismatch")),
     })
