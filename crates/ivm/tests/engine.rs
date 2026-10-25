@@ -350,3 +350,24 @@ fn multidimensional_arrays() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Hydrating a top-k (DISTINCT ON) view re-encodes the group keys it decodes
+/// from the input index; decoding clamped infinite intervals, so their groups
+/// went missing.
+#[test]
+fn distinct_on_infinite_intervals() {
+    let dir = tmpdir("distinct-on-intervals");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, iv interval)");
+    exec(&h, "INSERT INTO t VALUES (1, 'infinity'), (2, 'infinity'), (3, '-infinity'), (4, '1 mon'), (5, '30 days'), (6, NULL)");
+    let q = "SELECT DISTINCT ON (iv) iv, id FROM t ORDER BY iv, id";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    let want = ["-infinity|3", "1 mon|4", "infinity|1", "|6"];
+    assert_eq!(rows(&h, &format!("{q}")), want);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), want);
+    exec(&h, "DELETE FROM t WHERE id IN (1, 4)");
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), ["-infinity|3", "30 days|5", "infinity|2", "|6"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

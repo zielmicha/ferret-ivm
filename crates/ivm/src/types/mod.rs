@@ -362,3 +362,6 @@ pub fn format_type(ty: &SqlType, typmod: i32) -> String {
         _ => ty.name(),
     }
 }
+
+#[cfg(test)]
+mod tests;

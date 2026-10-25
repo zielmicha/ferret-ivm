@@ -247,14 +247,19 @@ fn decode_value(buf: &[u8], ty: &SqlType) -> Result<(Datum, usize)> {
     })
 }
 
+/// An interval with the given span (interval_cmp_value). Spans beyond what
+/// whole months can carry (the infinities, extreme field values) spill into
+/// days and then microseconds, so that the result always has exactly this
+/// span: re-encoding a decoded key must give the same bytes.
 fn interval_from_span(span: i128) -> Interval {
     // interval_cmp_value = ((months*30 + days) * USECS_PER_DAY) + micros
     const USECS_PER_DAY: i128 = 86_400_000_000;
-    let days = span.div_euclid(USECS_PER_DAY);
-    let micros = span.rem_euclid(USECS_PER_DAY);
-    let months = days / 30;
-    let days = days % 30;
-    Interval { months: months.clamp(i32::MIN as i128, i32::MAX as i128) as i32, days: days as i32, micros: micros as i64 }
+    let clamp32 = |v: i128| v.clamp(i32::MIN as i128, i32::MAX as i128);
+    let total_days = span.div_euclid(USECS_PER_DAY);
+    let months = clamp32(total_days / 30);
+    let days = clamp32(total_days - months * 30);
+    let micros = span - (months * 30 + days) * USECS_PER_DAY;
+    Interval { months: months as i32, days: days as i32, micros: micros.clamp(i64::MIN as i128, i64::MAX as i128) as i64 }
 }
 
 fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, usize)> {
@@ -385,87 +390,4 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn enc(d: &Datum, spec: SortSpec) -> Vec<u8> {
-        let mut v = Vec::new();
-        encode_key(d, spec, &mut v);
-        v
-    }
-
-    #[test]
-    fn int_order_and_roundtrip() {
-        let vals = [i64::MIN, -5, -1, 0, 1, 7, i64::MAX];
-        for spec in [SortSpec::ASC, SortSpec::DESC] {
-            let encs: Vec<_> = vals.iter().map(|v| enc(&Datum::Int8(*v), spec)).collect();
-            for w in encs.windows(2) {
-                if spec.desc {
-                    assert!(w[0] > w[1]);
-                } else {
-                    assert!(w[0] < w[1]);
-                }
-            }
-            for (v, e) in vals.iter().zip(&encs) {
-                let (d, n) = decode_key(e, &SqlType::Int8, spec).unwrap();
-                assert_eq!(n, e.len());
-                assert_eq!(d.as_i64(), Some(*v));
-            }
-        }
-    }
-
-    #[test]
-    fn text_prefix_free() {
-        let vals = ["", "\0", "a", "a\0", "a\0b", "ab", "b"];
-        for spec in [SortSpec::ASC, SortSpec::DESC] {
-            let encs: Vec<_> = vals.iter().map(|v| enc(&Datum::text(v), spec)).collect();
-            for w in encs.windows(2) {
-                if spec.desc {
-                    assert!(w[0] > w[1], "{w:?}");
-                } else {
-                    assert!(w[0] < w[1], "{w:?}");
-                }
-            }
-            for (v, e) in vals.iter().zip(&encs) {
-                let (d, n) = decode_key(e, &SqlType::Text, spec).unwrap();
-                assert_eq!(n, e.len());
-                assert_eq!(d.as_str(), Some(*v));
-            }
-        }
-    }
-
-    #[test]
-    fn null_placement() {
-        let n_last = enc(&Datum::Null, SortSpec::ASC);
-        let v = enc(&Datum::Int4(i32::MAX), SortSpec::ASC);
-        assert!(v < n_last);
-        let n_first = enc(&Datum::Null, SortSpec::DESC);
-        let v = enc(&Datum::Int4(i32::MIN), SortSpec::DESC);
-        assert!(n_first < v);
-    }
-
-    #[test]
-    fn float_order() {
-        let vals = [f64::NEG_INFINITY, -1.5, -0.0, 0.0, 1e-300, 2.0, f64::INFINITY, f64::NAN];
-        let encs: Vec<_> = vals.iter().map(|v| enc(&Datum::Float8(*v), SortSpec::ASC)).collect();
-        for w in encs.windows(2) {
-            assert!(w[0] <= w[1]);
-        }
-        assert_eq!(encs[2], encs[3]); // -0 == 0 canonically
-        let mut f = Vec::new();
-        encode_fidelity(&Datum::Float8(-0.0), &mut f);
-        let (mut d, _) = decode_key(&encs[2], &SqlType::Float8, SortSpec::ASC).unwrap();
-        apply_fidelity(&mut d, &f).unwrap();
-        assert!(d.as_f64().unwrap().is_sign_negative());
-    }
-
-    #[test]
-    fn successor() {
-        assert_eq!(prefix_successor(&[1, 2]), Some(vec![1, 3]));
-        assert_eq!(prefix_successor(&[1, 0xFF]), Some(vec![2]));
-        assert_eq!(prefix_successor(&[0xFF]), None);
-    }
 }

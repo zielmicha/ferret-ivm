@@ -275,38 +275,3 @@ pub fn decode_type(buf: &mut &[u8]) -> Result<SqlType> {
     let oid = get_uvarint(buf)? as u32;
     SqlType::from_oid(oid).ok_or_else(|| SqlError::corrupt(format!("unknown type oid {oid}")))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn varints() {
-        for v in [0i64, 1, -1, 63, -64, 64, i64::MAX, i64::MIN, 1 << 40] {
-            let mut b = Vec::new();
-            put_ivarint(&mut b, v);
-            let mut s = &b[..];
-            assert_eq!(get_ivarint(&mut s).unwrap(), v);
-            assert!(s.is_empty());
-        }
-    }
-
-    #[test]
-    fn rows() {
-        let row = vec![
-            Datum::Null,
-            Datum::Bool(true),
-            Datum::Int4(-7),
-            Datum::Float8(-0.0),
-            Datum::text("héllo"),
-            Datum::Date(1234),
-            Datum::Interval(Interval { months: 1, days: -2, micros: 3 }),
-            Datum::Uuid([7; 16]),
-        ];
-        let mut b = Vec::new();
-        encode_row(&row, &mut b);
-        let mut s = &b[..];
-        let back = decode_row(&mut s).unwrap();
-        assert_eq!(format!("{row:?}"), format!("{back:?}"));
-    }
-}
