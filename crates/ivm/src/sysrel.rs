@@ -159,6 +159,18 @@ fn relations(cat: &Catalog) -> Vec<(u32, String, &'static str, Vec<Column>, bool
     out
 }
 
+/// OIDs of the relations with a secondary index (relhasindex also counts the
+/// primary key).
+fn indexed_relations(cat: &Catalog) -> std::collections::HashSet<u32> {
+    cat.objects
+        .values()
+        .filter_map(|o| match &o.kind {
+            ObjectKind::Index(ix) => Some(rel_oid(ix.on)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A system relation by (schema, name), as columns and rows.
 pub fn system_relation(cat: &Catalog, schema: Option<&str>, name: &str) -> Option<(Vec<Column>, Vec<Row>)> {
     let r = match schema {
@@ -251,9 +263,10 @@ fn pg_catalog(cat: &Catalog, name: &str) -> Option<Rel> {
                 ]
             };
             let mut rows = Vec::new();
+            let indexed = indexed_relations(cat);
             for (o, n, kind, cols, pk) in relations(cat) {
                 let am = if kind == "v" { 0 } else { AM_HEAP };
-                rows.push(row(o, &n, kind, cols.len(), am, pk));
+                rows.push(row(o, &n, kind, cols.len(), am, pk || indexed.contains(&o)));
                 if pk {
                     rows.push(row(o + 1_000_000, &format!("{n}_pkey"), "i", 0, AM_BTREE, false));
                 }
@@ -609,9 +622,11 @@ fn pg_catalog(cat: &Catalog, name: &str) -> Option<Rel> {
                 ("ispopulated", T::Bool),
                 ("definition", T::Text),
             ]);
+            let indexed = indexed_relations(cat);
             for o in cat.objects.values() {
                 if let ObjectKind::MaterializedView(v) = &o.kind {
-                    r.push(vec![text("public"), text(&o.name), text("ivm"), NULL, b(false), b(true), text(&v.sql)]);
+                    let hasindexes = indexed.contains(&rel_oid(o.id));
+                    r.push(vec![text("public"), text(&o.name), text("ivm"), NULL, b(hasindexes), b(true), text(&v.sql)]);
                 }
             }
             r
@@ -627,9 +642,11 @@ fn pg_catalog(cat: &Catalog, name: &str) -> Option<Rel> {
                 ("hastriggers", T::Bool),
                 ("rowsecurity", T::Bool),
             ]);
-            for (_, n, kind, _, pk) in relations(cat) {
+            let indexed = indexed_relations(cat);
+            for (o, n, kind, _, pk) in relations(cat) {
                 if kind == "r" {
-                    r.push(vec![text("public"), text(&n), text("ivm"), NULL, b(pk), b(false), b(false), b(false)]);
+                    let hasindexes = pk || indexed.contains(&o);
+                    r.push(vec![text("public"), text(&n), text("ivm"), NULL, b(hasindexes), b(false), b(false), b(false)]);
                 }
             }
             r

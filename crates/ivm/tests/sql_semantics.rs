@@ -755,3 +755,20 @@ fn sum_of_reals_overflows_like_postgresql() {
     assert_eq!(rows(&h, "SELECT * FROM rs"), vec!["3e+38"]);
     running.shutdown();
 }
+
+#[test]
+fn relhasindex_counts_secondary_indexes() {
+    let running = start("relhasindex");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE ri (a int, b int)");
+    exec(&h, "CREATE MATERIALIZED VIEW rm AS SELECT a, count(*) AS c FROM ri GROUP BY a");
+    let q = "SELECT relname, relhasindex FROM pg_class WHERE relname IN ('ri', 'rm') ORDER BY 1";
+    assert_eq!(rows(&h, q), vec!["ri|f", "rm|f"]);
+    exec(&h, "CREATE INDEX ON ri (b)");
+    exec(&h, "CREATE INDEX ON rm (a)");
+    // psql's \d only lists indexes of relations with relhasindex set
+    assert_eq!(rows(&h, q), vec!["ri|t", "rm|t"]);
+    assert_eq!(rows(&h, "SELECT hasindexes FROM pg_tables WHERE tablename = 'ri'"), vec!["t"]);
+    assert_eq!(rows(&h, "SELECT hasindexes FROM pg_matviews WHERE matviewname = 'rm'"), vec!["t"]);
+    running.shutdown();
+}
