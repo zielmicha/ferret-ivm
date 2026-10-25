@@ -56,7 +56,7 @@ export class DagView {
     this.positioned = false;
     this.ro = new ResizeObserver(() => {
       this.size = { w: this.svg.clientWidth, h: this.svg.clientHeight };
-      if (!this.positioned && this.layoutKey && this.size.w > 0) this.fit();
+      if (!this.positioned && this.layoutKey && this.size.w > 0) this.fit(false);
     });
     this.ro.observe(this.svg);
   }
@@ -88,7 +88,7 @@ export class DagView {
     if (relayout) this.drawEdges();
     if (relayout && (fit || this.firstLayout !== false)) {
       this.firstLayout = false;
-      this.fit();
+      this.fit(false);
     }
     this.restyle();
   }
@@ -215,11 +215,26 @@ export class DagView {
     return { w: this.svg.clientWidth || 800, h: this.svg.clientHeight || 500 };
   }
 
-  fit() {
+  /**
+   * Fit the graph into view. With `all` false, a graph that would shrink
+   * below readability is fitted along its long side's cross axis instead
+   * (a tall graph to the width, a wide one to the height) and panned.
+   */
+  fit(all = true) {
     if (!this.bounds) return;
     const { w, h } = this.viewSize();
-    const k = Math.max(MIN_K, Math.min(1.2, (w - 16) / this.bounds.w, (h - 16) / this.bounds.h));
-    this.t = { k, x: (w - this.bounds.w * k) / 2, y: (h - this.bounds.h * k) / 2 };
+    const kw = (w - 16) / this.bounds.w;
+    const kh = (h - 16) / this.bounds.h;
+    const kAll = Math.max(MIN_K, Math.min(1.2, kw, kh));
+    if (all || kAll >= 0.45) {
+      this.t = { k: kAll, x: (w - this.bounds.w * kAll) / 2, y: (h - this.bounds.h * kAll) / 2 };
+    } else if (kw >= kh) {
+      const k = Math.max(kAll, Math.min(1, kw));
+      this.t = { k, x: Math.max(8, (w - this.bounds.w * k) / 2), y: 8 };
+    } else {
+      const k = Math.max(kAll, Math.min(1, kh));
+      this.t = { k, x: 8, y: Math.max(8, (h - this.bounds.h * k) / 2) };
+    }
     this.apply();
   }
 
@@ -296,11 +311,19 @@ export class DagView {
     };
     this.svg.addEventListener('pointerup', end);
     this.svg.addEventListener('pointercancel', end);
+    // wheel and two-finger scroll pan; pinch (reported with ctrlKey) and
+    // Ctrl/Cmd + wheel zoom around the pointer
     this.svg.addEventListener('wheel', (e) => {
       e.preventDefault();
-      const p = pt(e);
-      const f = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015));
-      this.zoomBy(f, p.x, p.y);
+      const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this.viewSize().h : 1;
+      if (e.ctrlKey || e.metaKey) {
+        const p = pt(e);
+        this.zoomBy(Math.exp(-e.deltaY * scale * 0.01), p.x, p.y);
+      } else {
+        this.t.x -= (e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX) * scale;
+        this.t.y -= (e.shiftKey && !e.deltaX ? 0 : e.deltaY) * scale;
+        this.apply();
+      }
     }, { passive: false });
     this.svg.addEventListener('keydown', (e) => {
       if (e.target !== this.svg) return;

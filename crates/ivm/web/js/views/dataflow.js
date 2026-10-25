@@ -279,7 +279,7 @@ export default {
       parts.push(h('div', h('h3', 'Largest state'), byRecords.length
         ? h('div.chips', ...byRecords.map((n) => nodeLink(n, fmt.compact(n.records))))
         : h('div.muted.small', 'No arrangements')));
-      parts.push(h('div.small.muted', 'Click an operator for details. Drag to pan, scroll or pinch to zoom; + / − / 0 on the focused graph.'));
+      parts.push(h('div.small.muted', 'Click an operator for details. Drag or scroll to pan; pinch or Ctrl + scroll to zoom; + / − / 0 on the focused graph.'));
       replace(inspector, h('div.card-head', h('h2', 'Dataflow')), h('div.card-body', ...parts));
     }
 
