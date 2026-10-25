@@ -51,4 +51,4 @@ relying on a feature.
 | Document | Contents |
 |---|---|
 | [On-disk format](on-disk-format.md) | byte-level layout of the data directory: input log, segments and nodes, manifest, checkpoints, key and row encodings, fingerprints, compatibility |
-| [Testing](testing.md) | the test suites, how the golden data was generated, `ivm-difftest` |
+| [Testing](testing.md) | the test suites, how the golden data was generated, `ivm-difftest`, the `ivm-bench` benchmark |

@@ -221,6 +221,9 @@ extended along *i*'s path. Input *j* is read *after* the GSN if `j < i` and
 
 - A lookup with a NULL key on a non-null-safe column matches nothing; keys
   compared with `IS NOT DISTINCT FROM` match NULLs.
+- Rows of the frontier whose lookup keys encode equally (exact lookups:
+  whose key values are identical) share one lookup. Looked-up entries are
+  decoded only in the columns the input's MFP (and an exact match) reads.
 - A presence input contributes its key if the key's count (a range summary
   over the key prefix) is positive. Its count *before* the GSN is the current
   count minus the presence delta of this GSN. When a presence input is the
@@ -364,12 +367,19 @@ state, never from the sources**:
    operators with private state initialise it (the temporal filter computes
    its pending events from its input's snapshot).
 2. If the node has arrangements that are not hydrated, compute the node's
-   *snapshot* — its full contents — and write it into each of them at `gsn`
-   (in batches of 100,000 rows). A snapshot (`ops::snapshot_node`) is read
-   from any hydrated arrangement of the node if there is one; otherwise it is
-   computed from the inputs' snapshots: a table from its primary index, an
-   `Mfp` by evaluating its input's snapshot, a join by driving one path, a
-   `Reduce` group by group from its input index, and so on.
+   *snapshot* — its full contents — and write it into each of them at `gsn`:
+   its rows are encoded as the arrangement's entries, sorted by key and
+   applied in batches of 100,000 that each cover one key range (so a batch
+   rewrites only the leaves of its range). A snapshot (`ops::snapshot_node`)
+   is read from any hydrated arrangement of the node if there is one;
+   otherwise it is computed from the inputs' snapshots: a table from its
+   primary index, an `Mfp` by evaluating its input's snapshot, a join by
+   driving one path, a `Reduce` group by group from its input index (seeking
+   from one group's key prefix to the next), and so on. Snapshots of
+   row-wise operators (`Mfp`, `Union`, `Negate`, `FlatMap`, `DeltaJoin`,
+   `TemporalFilter`) are passed on unconsolidated: arrangements consolidate
+   entries as they apply them, and `Graph::snapshot` consolidates its
+   result.
 3. Error records found in snapshots are returned to the caller; the root
    node's become the new view's initial error counts. A snapshot read from an
    existing arrangement carries no error records, so errors of rows below any
