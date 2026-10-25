@@ -5,7 +5,7 @@
 //! materialized views, applies random transactions upstream, and after each
 //! round compares every view with PostgreSQL recomputing the same query.
 //!
-//! usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--keep]
+//! usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--sinks N] [--keep]
 //!
 //! - `--restarts N`: restart the engine N times at random points of the run
 //!   (a clean shutdown, or a crash that skips the final checkpoint so that
@@ -13,6 +13,9 @@
 //! - `--kill`: run the engine as a child process (the `ivm` binary next to
 //!   this one) and SIGKILL it for the restarts, at random moments: while it
 //!   applies changes, during a checkpoint, or during the initial snapshot.
+//! - `--sinks N` (default 3): the first N views are also written back to
+//!   PostgreSQL (another database) by sinks; every round each sink table must
+//!   converge to the view's contents (exactly once, also across restarts).
 //! - `DIFFTEST_VERBOSE=1` prints the views and details of every mismatch.
 //! - `DIFFTEST_DUMP_DIR=dir` writes the upstream tables as INSERT statements
 //!   before every round (`dir/round-N.sql`), to replay a failing round.
@@ -82,6 +85,15 @@ fn normalize_with(types: &[u32], mut rows: Vec<Vec<Option<String>>>, trim_numeri
         rows.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "∅".into())).collect::<Vec<_>>().join("|")).collect();
     out.sort();
     out
+}
+
+/// How often each row occurs.
+fn counts(rows: &[String]) -> std::collections::BTreeMap<&str, i64> {
+    let mut m = std::collections::BTreeMap::new();
+    for r in rows {
+        *m.entry(r.as_str()).or_default() += 1;
+    }
+    m
 }
 
 /// The engine under test: in this process, or a child process to SIGKILL.
@@ -180,14 +192,15 @@ struct Args {
     rounds: usize,
     restarts: usize,
     kill: bool,
+    sinks: usize,
     keep: bool,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { seed: 42, views: 25, rounds: 20, restarts: 0, kill: false, keep: false };
+    let mut a = Args { seed: 42, views: 25, rounds: 20, restarts: 0, kill: false, sinks: 3, keep: false };
     let mut it = std::env::args().skip(1);
     let usage = || -> ! {
-        eprintln!("usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--keep]");
+        eprintln!("usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--sinks N] [--keep]");
         std::process::exit(2)
     };
     while let Some(arg) = it.next() {
@@ -198,6 +211,7 @@ fn parse_args() -> Args {
             "--rounds" => a.rounds = num() as usize,
             "--restarts" => a.restarts = num() as usize,
             "--kill" => a.kill = true,
+            "--sinks" => a.sinks = num() as usize,
             "--keep" => a.keep = true,
             _ => usage(),
         }
@@ -311,6 +325,24 @@ fn main() {
         }
     }
     println!("created {} views ({unsupported} rejected)", views.len());
+    // sinks write views back into another database (not in the publication)
+    up.execute("CREATE DATABASE sinks").unwrap();
+    let sink_conn = pg.conninfo("sinks");
+    let mut sinkdb = connect(&sink_conn);
+    let mut sinks: Vec<(String, String)> = Vec::new();
+    for (name, q) in &views {
+        if sinks.len() >= args.sinks {
+            break;
+        }
+        // views that fail now would not converge
+        if reads.contains_key(name) || rows(&mut ivm, &format!("SELECT * FROM {name}")).is_err() {
+            continue;
+        }
+        match ivm.execute(&format!("CREATE SINK s_{name} FROM {name} INTO POSTGRES (CONNECTION '{sink_conn}', TABLE 'sink_{name}')")) {
+            Ok(_) => sinks.push((name.clone(), q.clone())),
+            Err(e) => println!("sink on {name} rejected: {}", e.message),
+        }
+    }
 
     let mut failures = 0;
     for round in 0..=args.rounds {
@@ -432,7 +464,52 @@ fn main() {
                 }
             }
         }
-        println!("round {round}: {matched}/{} views match ({total_rows} rows, {both_err} both-error) in {:?}", views.len(), t0.elapsed());
+        // sink tables converge to the views (polled: progress is written with data)
+        let mut sink_rows = 0;
+        for (name, q) in &sinks {
+            let Ok((et, er)) = rows(&mut up, q) else { continue };
+            let want = normalize(&et, er.clone());
+            let want_trim = normalize_with(&et, er, true);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut last = Vec::new();
+            let converged = loop {
+                if let Ok((_, gr)) = rows(&mut sinkdb, &format!("SELECT * FROM sink_{name}")) {
+                    last = normalize(&et, gr.clone());
+                    if last == want || (sqlgen::dedups(q) && normalize_with(&et, gr, true) == want_trim) {
+                        break true;
+                    }
+                }
+                if Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            sink_rows += last.len();
+            if !converged {
+                failures += 1;
+                println!("SINK MISMATCH round {round} view {name}: {q}");
+                println!("  postgres rows {} / sink rows {}", want.len(), last.len());
+                println!("  only in postgres: {:?}", want.iter().filter(|x| !last.contains(x)).take(5).collect::<Vec<_>>());
+                println!("  only in the sink: {:?}", last.iter().filter(|x| !want.contains(x)).take(5).collect::<Vec<_>>());
+                let (cw, cl) = (counts(&want), counts(&last));
+                let diff: Vec<String> = cw
+                    .keys()
+                    .chain(cl.keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|k| cw.get(*k) != cl.get(*k))
+                    .take(5)
+                    .map(|k| format!("{k}: postgres x{} sink x{}", cw.get(k).unwrap_or(&0), cl.get(k).unwrap_or(&0)))
+                    .collect();
+                println!("  multiplicities: {diff:?}");
+                if let Ok((_, st)) = rows(&mut ivm, "SHOW SINKS") {
+                    for r in st.iter().filter(|r| r[0].as_deref() == Some(&format!("s_{name}"))) {
+                        println!("  sink status: {}", r[3].clone().unwrap_or_default());
+                    }
+                }
+            }
+        }
+        println!("round {round}: {matched}/{} views match ({total_rows} rows, {both_err} both-error), {} sinks ({sink_rows} rows), in {:?}", views.len(), sinks.len(), t0.elapsed());
         if failures > 0 && round > 0 {
             break;
         }
