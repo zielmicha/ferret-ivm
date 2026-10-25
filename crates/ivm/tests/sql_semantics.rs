@@ -824,3 +824,26 @@ fn width_bucket_matches_postgresql() {
     );
     running.shutdown();
 }
+
+#[test]
+fn strict_calls_with_null_constants_fold_to_null() {
+    let running = start("strict-null-fold");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // PostgreSQL replaces a strict function with a constant NULL argument by
+    // NULL at plan time, so these CASE branches are unreachable and their
+    // constant errors are never raised
+    assert_eq!(
+        rows(&h, "SELECT count(*), count(x) FROM (SELECT CASE WHEN a = NULL::int THEN coalesce(a, 'NaN'::float8::int) END AS x FROM t1) s"),
+        vec!["5|0"]
+    );
+    assert_eq!(
+        rows(&h, "SELECT count(*), count(x) FROM (SELECT CASE WHEN NOT (a < NULL) THEN 1/0 ELSE 2 END AS x FROM t1) s"),
+        vec!["5|5"]
+    );
+    assert_eq!(rows(&h, "SELECT count(*) FROM t1 WHERE CASE WHEN length(s || NULL) > 0 THEN 1/0 = 1 ELSE true END"), vec!["5"]);
+    assert_eq!(rows(&h, "SELECT CASE WHEN upper(NULL) = s THEN 1/0 END FROM t1 WHERE id = 1"), vec![""]);
+    // the arguments are still simplified first, as in PostgreSQL
+    assert!(try_rows(&h, "SELECT count(*) FROM t1 WHERE a + NULL::int > 1/0").unwrap_err().contains("division by zero"));
+    running.shutdown();
+}

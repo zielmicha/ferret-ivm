@@ -318,6 +318,14 @@ impl Expr {
             let taken = std::mem::replace(c, Expr::Literal(Datum::Null, crate::types::SqlType::Unknown));
             *c = taken.fold()?;
         }
+        // a strict function with a constant NULL argument is never called,
+        // whatever its other arguments and volatility (evaluate_function)
+        if let Expr::Call(c) = &e
+            && func_def(c.func).strict
+            && c.args.iter().any(|a| matches!(a, Expr::Literal(Datum::Null, _)))
+        {
+            return Ok(Expr::Literal(Datum::Null, c.ret.clone()));
+        }
         let foldable = !matches!(
             e,
             Expr::Literal(..)
