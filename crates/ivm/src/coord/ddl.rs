@@ -679,10 +679,13 @@ impl Engine {
         let mut cat = self.catalog.clone();
         cat.insert(CatalogObject { kind: new.clone(), ..old.clone() });
         for o in self.catalog.objects.values() {
-            // (a broken view does not plan, whatever the replacement)
+            // (a broken view does not plan, whatever the replacement; a view
+            // that does not read the replaced one is not re-planned, and may
+            // predate rules that are stricter now)
             if let ObjectKind::MaterializedView(v) = &o.kind
                 && o.id != old.id
                 && !self.rt.broken.contains_key(&o.id)
+                && self.catalog.query_reads(&v.sql, old.id)
             {
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
                 // (it inlines the views it reads: they must keep it deterministic)
