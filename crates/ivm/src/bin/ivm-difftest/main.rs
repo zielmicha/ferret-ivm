@@ -5,7 +5,8 @@
 //! materialized views, applies random transactions upstream, and after each
 //! round compares every view with PostgreSQL recomputing the same query.
 //!
-//! usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--sinks N] [--keep]
+//! usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--sinks N]
+//!                      [--schema-changes N] [--keep]
 //!
 //! - `--restarts N`: restart the engine N times at random points of the run
 //!   (a clean shutdown, or a crash that skips the final checkpoint so that
@@ -16,6 +17,10 @@
 //! - `--sinks N` (default 3): the first N views are also written back to
 //!   PostgreSQL (another database) by sinks; every round each sink table must
 //!   converge to the view's contents (exactly once, also across restarts).
+//! - `--schema-changes N` (default 1): add N columns to replicated tables
+//!   upstream at random rounds (some with a default); views must survive
+//!   the new table shape.
+//! - Besides the views, every replicated table is compared with upstream.
 //! - `DIFFTEST_VERBOSE=1` prints the views and details of every mismatch.
 //! - `DIFFTEST_DUMP_DIR=dir` writes the upstream tables as INSERT statements
 //!   before every round (`dir/round-N.sql`), to replay a failing round.
@@ -193,14 +198,15 @@ struct Args {
     restarts: usize,
     kill: bool,
     sinks: usize,
+    schema_changes: usize,
     keep: bool,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { seed: 42, views: 25, rounds: 20, restarts: 0, kill: false, sinks: 3, keep: false };
+    let mut a = Args { seed: 42, views: 25, rounds: 20, restarts: 0, kill: false, sinks: 3, schema_changes: 1, keep: false };
     let mut it = std::env::args().skip(1);
     let usage = || -> ! {
-        eprintln!("usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--sinks N] [--keep]");
+        eprintln!("usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--sinks N] [--schema-changes N] [--keep]");
         std::process::exit(2)
     };
     while let Some(arg) = it.next() {
@@ -212,6 +218,7 @@ fn parse_args() -> Args {
             "--restarts" => a.restarts = num() as usize,
             "--kill" => a.kill = true,
             "--sinks" => a.sinks = num() as usize,
+            "--schema-changes" => a.schema_changes = num() as usize,
             "--keep" => a.keep = true,
             _ => usage(),
         }
@@ -344,6 +351,8 @@ fn main() {
         }
     }
 
+    let mut schema_rounds: Vec<usize> = (0..args.schema_changes).map(|_| 1 + rng.below(args.rounds.max(1) as u64) as usize).collect();
+    schema_rounds.sort();
     let mut failures = 0;
     for round in 0..=args.rounds {
         let restart_now = restarts_done < restart_rounds.len() && restart_rounds[restarts_done] == round;
@@ -366,6 +375,20 @@ fn main() {
             }
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(format!("{dir}/round-{round}.sql"), out).unwrap();
+        }
+        for _ in schema_rounds.iter().filter(|r| **r == round) {
+            // a new column (sometimes with a default, which the existing rows
+            // get without a change being replicated), then updates so that
+            // the new shape reaches the replication stream
+            let ti = rng.below(tables.len() as u64) as usize;
+            let ty = *rng.pick(&[sqlgen::Ty::Int, sqlgen::Ty::Text, sqlgen::Ty::Decimal]);
+            let col = sqlgen::Col { name: format!("s{}", tables[ti].cols.len()), ty, nullable: true, refs: None };
+            let default = if rng.chance(50) { format!(" DEFAULT {}", sqlgen::literal(&mut rng, ty)) } else { String::new() };
+            let t = &tables[ti].name;
+            let sql = format!("ALTER TABLE {t} ADD COLUMN {} {}{default}; UPDATE {t} SET id = id WHERE id % 3 = 0;", col.name, ty.sql());
+            println!("round {round}: {sql}");
+            up.simple_query(&sql).unwrap();
+            tables[ti].cols.push(col);
         }
         if round > 0 {
             for _ in 0..(1 + rng.below(4)) {
@@ -462,6 +485,26 @@ fn main() {
                     failures += 1;
                     println!("ERROR round {round} {name}: ivm failed: {e} :: {q}");
                 }
+            }
+        }
+        // replicated tables equal upstream
+        for t in &tables {
+            let q = format!("SELECT * FROM {}", t.name);
+            match (rows(&mut up, &q), rows(&mut ivm, &format!("{q} AS OF AT LEAST LSN '{lsn}'"))) {
+                (Ok((et, er)), Ok((_, gr))) => {
+                    let (a, b) = (normalize(&et, er), normalize(&et, gr));
+                    if a != b {
+                        failures += 1;
+                        println!("TABLE MISMATCH round {round} {}", t.name);
+                        println!("  only in postgres: {:?}", a.iter().filter(|x| !b.contains(x)).take(5).collect::<Vec<_>>());
+                        println!("  only in ivm:      {:?}", b.iter().filter(|x| !a.contains(x)).take(5).collect::<Vec<_>>());
+                    }
+                }
+                (Ok(_), Err(e)) => {
+                    failures += 1;
+                    println!("TABLE ERROR round {round} {}: {e}", t.name);
+                }
+                _ => {}
             }
         }
         // sink tables converge to the views (polled: progress is written with data)
