@@ -50,16 +50,21 @@ implementation checkpoints everything together).
    the checkpoint GSN (`Graph::hydrate`), then **drop** recovered trees that
    nothing attached (arrangements that no longer exist) and set the retention
    frontier.
-7. **Replay** every log record after the checkpoint GSN through
+7. **Start the sinks** from the recovered state (each takes a snapshot at
+   the checkpoint GSN; a target at least that far resumes, one behind it is
+   resynchronised, see
+   [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)).
+8. **Replay** every log record after the checkpoint GSN through
    `apply_record`, with `replaying = true`: DDL is re-applied from its logged
-   text and `extra`, no source or sink is started, no slot is dropped, and
-   nobody is waiting for replies. A DDL record that fails is only logged, but
+   text and `extra`, no source is started, and nobody is waiting for
+   replies; the sinks receive the replayed changes (a sink created by a
+   replayed `CREATE SINK` starts then), and slot drops of replayed
+   `DROP SOURCE`s are recorded. A DDL record that fails is only logged, but
    any other record that fails to apply stops the start-up with its error.
-8. **Start** the sources (with their logged state and resume LSN), the sinks
-   (each takes a snapshot and resynchronises, see
-   [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)), the
-   sequencer (whose next GSN is the log's last GSN + 1), and the engine
-   thread; then the server starts accepting connections.
+9. **Start** the sources (with their logged state and resume LSN), the
+   pending slot drops, the sequencer (whose next GSN is the log's last
+   GSN + 1), and the engine thread; then the server starts accepting
+   connections.
 
 A data directory without a checkpoint replays the whole log from GSN 1 (the
 log is only truncated after checkpoints).

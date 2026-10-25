@@ -51,7 +51,10 @@ engine start.
 ### Start-up and resynchronisation
 
 1. The engine takes a snapshot of the relation's current contents at the last
-   applied GSN (the *snapshot GSN*) and starts a sink thread.
+   applied GSN (the *snapshot GSN*) and starts a sink thread. At an engine
+   start this happens before the log is replayed, from the checkpoint's
+   state: the snapshot GSN is the checkpoint's, and the replayed records
+   reach the sink like live ones.
 2. The thread connects and runs, every time it (re)connects:
 
    ```sql
@@ -119,14 +122,21 @@ progress row again: batches at or below the committed GSN are discarded,
 the rest are applied again. A batch is therefore applied exactly once while
 the engine keeps running.
 
-Across an **engine restart** the sink does not replay the individual changes
-between its committed GSN and the restart: the restarted sink takes a new
-snapshot, and if the target is behind that snapshot it is resynchronised
-from the snapshot in one transaction. This is the usual case: the progress
-row records the last GSN at which the relation changed, while the snapshot
-GSN is the last applied GSN, which includes later inputs such as clock
-ticks. The target is consistent at every committed transaction, but a
-restart rewrites the whole table.
+The progress row records the last GSN the engine delivered to the sink —
+a change, or a GSN at which the relation did not change (clock ticks,
+other tables) — once everything before it is written: with every flush,
+every 5 s while nothing is pending, and when the sink stops. So it follows
+the engine's GSN even while the relation does not change.
+
+Across an **engine restart**, sinks start from the checkpoint before the
+log is replayed. A target whose progress is at or after the checkpoint's GSN
+— after a clean shutdown it is exactly that GSN, as sinks record the last
+applied GSN when they stop, before the final checkpoint — resumes after
+its progress and receives the replayed changes; it is not rewritten. Only a
+target behind the checkpoint (the sink could not write for a while before a
+crash, or it was created by an older version) is resynchronised from the
+snapshot in one transaction. Changes that the sink received but had not
+written when the engine stopped are written when it stops.
 
 ## Requirements on the target
 
@@ -160,8 +170,8 @@ replacement's GSN.
 ## Monitoring and DROP SINK
 
 `SHOW SINKS` shows `name`, `from` (the relation), `table` (the target as
-given), and `status`: `starting`, `running (gsn <n>)` (the last committed
-GSN), `error: <message>` while reconnecting, or `stopped`.
+given), and `status`: `starting`, `running (gsn <n>)` (the GSN up to which
+the target is current, as committed in the progress row), `error: <message>` while reconnecting, or `stopped`.
 
 ```sql
 DROP SINK [ IF EXISTS ] name
@@ -192,4 +202,3 @@ without waiting.
   `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`.
   Create the progress table beforehand, or create sinks one at a time. See
   [Troubleshooting](troubleshooting.md#known-problems).
-- Every engine restart resynchronises every sink (see above).

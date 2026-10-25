@@ -334,9 +334,8 @@ impl Engine {
                     created_gsn: gsn,
                     create_sql: sql.to_string(),
                 });
-                if !self.replaying
-                    && let Some(h) = self.handle.clone()
-                {
+                // (also while replaying: sinks receive replayed records)
+                if let Some(h) = self.handle.clone() {
                     self.start_sink(id, &name, &def, &h)?;
                 }
                 Ok(ExecResult::Command { tag: "CREATE SINK".into() })

@@ -114,9 +114,10 @@ schema and tables, and that an existing target table matches the relation's
 columns ([requirements](sinks.md#requirements-on-the-target)). After an
 outage, compare the target with the view: changes that arrived while the sink
 was reconnecting may be missing ([known problems](sinks.md#known-problems)).
-To force a resynchronisation, restart the engine or `DROP SINK` and
-`CREATE SINK` again: a new sink's snapshot is newer than any committed
-progress, so it rewrites the target from the snapshot.
+To force a resynchronisation, `DROP SINK` and `CREATE SINK` again: a new
+sink's snapshot is newer than any committed progress, so it rewrites the
+target from the snapshot. (A restart no longer does: a target that is up to
+date resumes.)
 
 ### Maintenance is slow
 

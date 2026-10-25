@@ -763,6 +763,52 @@ fn sink_delivers_exactly_once_across_restarts() {
     }
 }
 
+/// An engine restart does not rewrite a sink's target that is up to date:
+/// every restart used to resynchronize every sink (DELETE and INSERT of the
+/// whole table), because the progress row only recorded GSNs at which the
+/// relation changed, always older than the restarted engine's snapshot.
+#[test]
+fn restarts_do_not_resync_sinks() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, a int)");
+    up.exec("INSERT INTO t SELECT g, g % 3 FROM generate_series(1, 30) g");
+    up.exec("CREATE PUBLICATION p FOR TABLE t");
+    let dir = tmpdir("sink-no-resync");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT a, count(*) AS n FROM t GROUP BY a");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy' KEY (a)", up.conninfo));
+    let want = "SELECT a, count(*) FROM t GROUP BY a ORDER BY a";
+    let synced = |up: &mut Upstream| {
+        eventually("the sink", || up.client.query("SELECT a, n FROM v_copy ORDER BY a").map(|r| r.rows).ok() == up.client.query(want).ok().map(|r| r.rows))
+    };
+    synced(&mut up);
+    // (written by the transaction that wrote each row)
+    let xmins = |up: &mut Upstream| up.rows("SELECT a, xmin FROM v_copy ORDER BY a");
+    let before = xmins(&mut up);
+    let sink_status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    for round in 0..3 {
+        ivm.shutdown();
+        if round == 2 {
+            // a record logged after the last checkpoint, as a crash leaves
+            // them: replayed at the start, it reaches the sink like a live one
+            let mut log = ivm::log::LogWriter::open(&dir.join("log"), true).unwrap();
+            let gsn = log.last_gsn() + 1;
+            log.append(gsn, &ivm::log::LogRecord::Tick { micros: 1_000_000_000_000_000 }).unwrap();
+            log.flush().unwrap();
+        }
+        ivm = Ivm::start(&dir);
+        eventually("the sink to run", || sink_status(&mut ivm).starts_with("running"));
+        // (ticks and changes to other rows keep coming)
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(xmins(&mut up), before, "the target was rewritten (restart {round})");
+    }
+    up.exec("UPDATE t SET a = 5 WHERE id = 1");
+    synced(&mut up);
+    let after = xmins(&mut up);
+    assert_eq!(after.iter().filter(|r| before.contains(r)).count(), before.len() - 1, "only the changed row was written: {after:?}");
+}
+
 /// A sink without a key deletes a retracted row by comparing every column;
 /// json has no equality operator, so the first retraction of a row with a
 /// json column used to fail, and the sink stopped delivering for good.
