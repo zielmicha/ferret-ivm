@@ -18,8 +18,8 @@
 - **`DROP SINK`, or a `DROP` that drops a sink, hangs**: the sink is
   retrying its connection ([Sinks](sinks.md#monitoring-and-drop-sink)).
 
-Waiting statements cannot be cancelled (only `SUBSCRIBE` can); disconnect
-the client.
+A waiting read can be cancelled (Ctrl-C in psql), or ends when the client
+disconnects.
 
 ### CREATE SOURCE fails
 
@@ -253,7 +253,6 @@ Problems found while writing and checking this documentation (at commit
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| Only `SUBSCRIBE` can be cancelled | reads waiting for a snapshot, an LSN or a GSN wait forever if the condition never holds | disconnect |
 | `DROP SINK` of a sink that is retrying its connection | the engine thread waits for the sink, possibly for a long time | stop and restart the engine; the drop is replayed |
 | A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
 | A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |

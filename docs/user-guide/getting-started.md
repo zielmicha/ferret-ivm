@@ -149,9 +149,10 @@ Supported protocol features:
   and partial fetches with an `Execute` row limit (`PortalSuspended`);
 - `COPY (SUBSCRIBE ...) TO STDOUT` (CopyOut, text format);
 - query cancellation (`CancelRequest`) — it interrupts a running
-  `SUBSCRIBE` only. Other statements cannot be cancelled, including reads
-  that wait for a snapshot, an LSN or a GSN: such a read waits until its
-  condition holds, possibly forever; the client can only disconnect.
+  `SUBSCRIBE`, a read that waits (for a snapshot, an LSN or a GSN) and DML
+  queued behind another statement (`57014`). A statement that is already
+  executing on the engine thread, or DML already written to the log, runs
+  to completion.
 
 Not supported: `DECLARE`/`FETCH` cursors (so named "server-side cursors" in
 psycopg and similar drivers fail; use the protocol-level row limit instead),

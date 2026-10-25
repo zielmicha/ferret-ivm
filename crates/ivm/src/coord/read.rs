@@ -25,6 +25,18 @@ fn text_rows(columns: &[&str], rows: Vec<Vec<String>>) -> ExecResult {
     }
 }
 
+/// The error ending a waiting request whose statement was interrupted: by a
+/// cancel, or (for a read, which has no effects) because nobody waits for
+/// its result any more. Queued DML of a client that is gone still runs.
+fn interruption(req: &Request, read: bool) -> Option<SqlError> {
+    let Request::Execute { vars, .. } = req else { return None };
+    let i = vars.interrupts.as_ref()?;
+    if i.cancelled() {
+        return Some(SqlError::new(codes::QUERY_CANCELED, "canceling statement due to user request"));
+    }
+    (read && i.gone()).then(|| SqlError::new(codes::QUERY_CANCELED, "canceling statement: the client is gone"))
+}
+
 pub fn parse_lsn(s: &str) -> Result<u64> {
     let (hi, lo) = s.split_once('/').ok_or_else(|| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
     let hi = u64::from_str_radix(hi.trim(), 16).map_err(|_| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
@@ -321,8 +333,21 @@ impl Engine {
         Ok(sources.iter().all(|s| frontiers.get(s).is_some_and(|f| *f >= lsn)))
     }
 
-    /// Re-run parked reads whose GSN (or LSN) condition is now satisfied.
+    /// Re-run parked reads whose GSN (or LSN) condition is now satisfied;
+    /// end those (and queued DML) whose statement was interrupted.
     pub(crate) fn wake_parked(&mut self, _handle: &EngineHandle) {
+        if !self.dml_queue.is_empty() {
+            for req in std::mem::take(&mut self.dml_queue) {
+                match interruption(&req, false) {
+                    Some(e) => {
+                        if let Request::Execute { reply, .. } = &req {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                    None => self.dml_queue.push_back(req),
+                }
+            }
+        }
         if self.parked.is_empty() {
             return;
         }
@@ -331,6 +356,12 @@ impl Engine {
         self.snap_epoch_seen = self.snap_epoch;
         let mut still = Vec::new();
         for p in std::mem::take(&mut self.parked) {
+            if let Some(e) = interruption(&p.req, true) {
+                if let Request::Execute { reply, .. } = &p.req {
+                    let _ = reply.send(Err(e));
+                }
+                continue;
+            }
             let ready = match p.wait {
                 // (re-run on an error: it fails then, e.g. when the last
                 // source was dropped)

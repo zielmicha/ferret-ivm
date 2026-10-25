@@ -67,8 +67,8 @@ the retention) fail with SQLSTATE `55000`:
 ERROR:  AS OF 2 is before the retention frontier 3
 ```
 
-A GSN in the future makes the read wait until the engine reaches it (such a
-wait cannot be cancelled).
+A GSN in the future makes the read wait until the engine reaches it (the
+wait can be cancelled, see below).
 `SHOW GSN` returns the last applied GSN, and `SHOW FRONTIERS`
 the retention frontier. Note that every clock tick (by default one per
 second) consumes a GSN, so 1000 GSNs are at most about 17 minutes on an idle
@@ -121,9 +121,15 @@ longer holds reads back. If the engine has **no sources at all**, the read
 fails at once with SQLSTATE `55000` (`AS OF AT LEAST LSN '...' cannot be
 satisfied: there is no source`), also a waiting read when the last source
 is dropped: the LSN is a position in an upstream's WAL, so a read without
-sources could not show the commit it waits for. Waiting reads
-cannot be cancelled (only `SUBSCRIBE` can); a client that disconnects is
-freed, but the read stays parked in the engine until its condition holds.
+sources could not show the commit it waits for.
+
+A read that waits — for freshness, an LSN, a future GSN or an initial
+snapshot — ends with SQLSTATE `57014` (`canceling statement due to user
+request`) when the client cancels it (a `CancelRequest`, Ctrl-C in psql);
+DML queued behind another statement is cancelled the same way. The engine
+also drops a waiting read when its client disconnects (the session checks
+the connection every 200 ms while it waits), and the web UI console drops
+its read when it stops waiting (after 30 s).
 
 ### now() in reads
 

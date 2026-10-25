@@ -245,6 +245,14 @@ While an LSN read waits, `want_keepalive` makes the sources request a
 keepalive from the upstream, so that the frontier advances to the server's
 current WAL position even without traffic.
 
+Each request carries its session's `Interrupts` (in `SessionVars`): a
+`CancelRequest` sets `cancel` (and sends `Wake`), and the session sets
+`gone` when its client disconnects while it waits (`execute_while` checks
+the socket every 200 ms). `wake_parked` answers a parked read of a
+cancelled statement with `57014` and drops one whose client is gone; queued
+DML (`dml_queue`) is cancelled the same way, but still runs when only its
+client is gone.
+
 ## The logical clock
 
 The engine's logical clock (`Engine::clock`, PostgreSQL epoch microseconds)

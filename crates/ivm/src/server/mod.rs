@@ -1,8 +1,8 @@
 //! PostgreSQL wire protocol server: simple and extended query protocols,
 //! streaming SUBSCRIBE (as rows or COPY), cancellation.
 
-use crate::coord::api::{ExecResult, ResultColumn, SessionVars, SubEvent};
-use crate::coord::EngineHandle;
+use crate::coord::api::{ExecResult, Interrupts, ResultColumn, SessionVars, SubEvent};
+use crate::coord::{EngineHandle, EngineMsg};
 use crate::error::{codes, Result, SqlError};
 use crate::sql::parser::{parse_statement, split_statements, AsOf, ShowKind, Statement, SubscribeTarget};
 use crate::sql::ParamSlot;
@@ -24,7 +24,7 @@ pub struct ServerConfig {
     pub password: Option<String>,
 }
 
-type CancelMap = Arc<Mutex<HashMap<u32, (u32, Arc<AtomicBool>)>>>;
+type CancelMap = Arc<Mutex<HashMap<u32, (u32, Arc<Interrupts>)>>>;
 
 /// Stack size of session threads: syntax trees of long operator chains (up
 /// to sql::parser::MAX_OPERATOR_CHAIN deep) are dropped recursively.
@@ -93,7 +93,9 @@ struct Session {
     prepared: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
     in_txn: bool,
-    cancel: Arc<AtomicBool>,
+    /// Cancel requests for the running statement, the client's disconnection
+    /// (shared with the engine through `vars`).
+    interrupts: Arc<Interrupts>,
     settings: HashMap<String, String>,
     /// The statement being run is COPY (SUBSCRIBE ...) TO STDOUT.
     pending_copy: bool,
@@ -118,6 +120,21 @@ fn encode_value(d: &Datum, ty: &SqlType, binary: bool) -> Option<Vec<u8>> {
         return None;
     }
     if binary { send_datum(d, ty) } else { Some(format_datum(d).into_bytes()) }
+}
+
+/// Has the client closed the connection (or did it reset)? Peeks without
+/// blocking; pending messages (a pipelining client) mean it is there.
+fn client_gone(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut b = [0u8; 1];
+    let gone = match stream.peek(&mut b) {
+        Ok(n) => n == 0,
+        Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted),
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
 }
 
 fn copy_escape(s: &str) -> String {
@@ -148,10 +165,12 @@ impl Session {
                     writer.flush()?;
                 }
                 StartupPacket::Cancel { pid, secret } => {
-                    if let Some((s, flag)) = cancels.lock().get(&pid)
+                    if let Some((s, interrupts)) = cancels.lock().get(&pid)
                         && *s == secret
                     {
-                        flag.store(true, Ordering::Release);
+                        interrupts.cancel.store(true, Ordering::Release);
+                        // a read waiting in the engine ends now
+                        let _ = engine.tx.send(EngineMsg::Wake);
                     }
                     return Ok(());
                 }
@@ -178,8 +197,8 @@ impl Session {
         }
         out.auth_ok();
         let secret: u32 = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u32) ^ pid.wrapping_mul(2654435761);
-        let cancel = Arc::new(AtomicBool::new(false));
-        cancels.lock().insert(pid, (secret, cancel.clone()));
+        let interrupts = Arc::new(Interrupts::default());
+        cancels.lock().insert(pid, (secret, interrupts.clone()));
         let app = params.iter().find(|(k, _)| k == "application_name").map(|(_, v)| v.clone()).unwrap_or_default();
         for (k, v) in [
             ("server_version", "17.0"),
@@ -205,11 +224,11 @@ impl Session {
             reader,
             writer,
             out,
-            vars: SessionVars { read_mode: "fresh".into() },
+            vars: SessionVars { read_mode: "fresh".into(), interrupts: Some(interrupts.clone()) },
             prepared: HashMap::new(),
             portals: HashMap::new(),
             in_txn: false,
-            cancel,
+            interrupts,
             settings: HashMap::new(),
             pending_copy: false,
         };
@@ -258,7 +277,7 @@ impl Session {
             }
             match msg {
                 FrontendMessage::Query(q) => {
-                    self.cancel.store(false, Ordering::Release);
+                    self.interrupts.cancel.store(false, Ordering::Release);
                     self.simple_query(&q)?;
                     let st = self.txn_status();
                     self.out.ready_for_query(st);
@@ -287,7 +306,7 @@ impl Session {
                     }
                 }
                 FrontendMessage::Execute { portal, max_rows } => {
-                    self.cancel.store(false, Ordering::Release);
+                    self.interrupts.cancel.store(false, Ordering::Release);
                     if let Err(e) = self.execute_portal(&portal, max_rows) {
                         self.error(&e);
                         skip_until_sync = true;
@@ -460,7 +479,9 @@ impl Session {
             }
             _ => String::new(),
         };
-        self.engine.execute(stmt, params, self.vars.clone(), extra)
+        // a statement that waits ends when the client disconnects
+        let stream = self.reader.get_ref();
+        self.engine.execute_while(stmt, params, self.vars.clone(), extra, || !client_gone(stream))
     }
 
     fn source_def(&mut self, name: &str) -> Result<(String, String, Option<Vec<String>>)> {
@@ -506,6 +527,7 @@ impl Session {
                         return Ok(());
                     }
                 }
+                Err(e) if e.code == codes::IO_ERROR => return Err(e),
                 Err(e) => {
                     self.error(&e);
                     return Ok(());
@@ -590,7 +612,7 @@ impl Session {
         self.flush()?;
         let ncols = columns.len();
         loop {
-            if self.cancel.load(Ordering::Acquire) {
+            if self.interrupts.cancelled() {
                 if copy {
                     self.out.copy_done();
                 }
@@ -600,7 +622,7 @@ impl Session {
                 Ok(e) => e,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // probe the connection so disconnected clients end the subscription
-                    if self.writer.get_ref().peer_addr().is_err() {
+                    if client_gone(self.reader.get_ref()) {
                         return Err(SqlError::new(codes::IO_ERROR, "client disconnected"));
                     }
                     continue;

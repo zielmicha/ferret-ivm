@@ -198,6 +198,41 @@ impl EngineHandle {
         rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?
     }
 
+    /// `execute`, giving up when `alive` returns false (polled every 200 ms
+    /// while the statement runs or waits): the request is then marked
+    /// `gone` in its session's interrupts, so that the engine drops it if
+    /// it is still waiting (a parked read), and the call fails with
+    /// IO_ERROR.
+    pub fn execute_while(
+        &self,
+        stmt: crate::sql::parser::Statement,
+        params: Vec<crate::sql::ParamSlot>,
+        vars: SessionVars,
+        extra: String,
+        mut alive: impl FnMut() -> bool,
+    ) -> Result<ExecResult> {
+        let interrupts = vars.interrupts.clone();
+        let (tx, rx) = bounded(1);
+        self.tx
+            .send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params, vars, extra, reply: tx }))
+            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(r) => return r,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !alive() {
+                        if let Some(i) = &interrupts {
+                            i.gone.store(true, Ordering::Release);
+                            let _ = self.tx.send(EngineMsg::Wake);
+                        }
+                        return Err(SqlError::new(codes::IO_ERROR, "client disconnected"));
+                    }
+                }
+                Err(_) => return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down")),
+            }
+        }
+    }
+
     pub fn describe(
         &self,
         stmt: crate::sql::parser::Statement,
