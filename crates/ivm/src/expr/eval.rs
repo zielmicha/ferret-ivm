@@ -322,6 +322,12 @@ impl Expr {
         {
             return Ok(Expr::Literal(Datum::Null, c.ret.clone()));
         }
+        // NULLIF with a NULL constant argument: they cannot be equal
+        if let Expr::NullIf(a, b) = &mut e
+            && (matches!(**a, Expr::Literal(Datum::Null, _)) || matches!(**b, Expr::Literal(Datum::Null, _)))
+        {
+            return Ok(std::mem::replace(&mut **a, Expr::Literal(Datum::Null, crate::types::SqlType::Unknown)));
+        }
         let foldable = !matches!(
             e,
             Expr::Literal(..)

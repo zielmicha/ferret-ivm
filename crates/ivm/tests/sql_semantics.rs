@@ -845,6 +845,10 @@ fn strict_calls_with_null_constants_fold_to_null() {
     assert_eq!(rows(&h, "SELECT CASE WHEN upper(NULL) = s THEN 1/0 END FROM t1 WHERE id = 1"), vec![""]);
     // the arguments are still simplified first, as in PostgreSQL
     assert!(try_rows(&h, "SELECT count(*) FROM t1 WHERE a + NULL::int > 1/0").unwrap_err().contains("division by zero"));
+    // NULLIF with a NULL constant argument is its first argument
+    assert_eq!(rows(&h, "SELECT count(*), count(x) FROM (SELECT nullif(NULL::int, a * 2000000000) AS x FROM t1) s"), vec!["5|0"]);
+    assert_eq!(rows(&h, "SELECT string_agg(coalesce(nullif(a, NULL)::text, 'N'), ',' ORDER BY id) FROM t1"), vec!["1,2,N,2,3"]);
+    assert!(try_rows(&h, "SELECT nullif(a * 2000000000, NULL) FROM t1").unwrap_err().contains("integer out of range"));
     running.shutdown();
 }
 
