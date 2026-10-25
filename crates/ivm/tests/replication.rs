@@ -73,8 +73,14 @@ struct Upstream {
 
 impl Upstream {
     fn start() -> Upstream {
-        let pg = TempCluster::start(ClusterOptions { extra_conf: vec!["timezone = 'UTC'".into()], ..Default::default() })
-            .expect("start postgres");
+        Upstream::start_with(&[])
+    }
+
+    /// A cluster with extra postgresql.conf lines.
+    fn start_with(conf: &[&str]) -> Upstream {
+        let mut extra_conf = vec!["timezone = 'UTC'".to_string()];
+        extra_conf.extend(conf.iter().map(|c| c.to_string()));
+        let pg = TempCluster::start(ClusterOptions { extra_conf, ..Default::default() }).expect("start postgres");
         let conninfo = pg.conninfo("postgres");
         let client = connect(&conninfo);
         Upstream { _pg: pg, conninfo, client }
@@ -391,6 +397,91 @@ fn replica_identity_and_key_changes_are_detected() {
     up.exec("DELETE FROM m WHERE a = 5");
     up.exec("INSERT INTO x VALUES (6, 6)");
     all(&mut ivm, &mut up);
+}
+
+/// The replication slot of the (only) source.
+fn slot_name(ivm: &mut Ivm) -> String {
+    ivm.rows("SHOW SOURCES")[0].split('|').nth(2).unwrap().to_string()
+}
+
+/// Tables of the slot tests and their checks.
+const SLOT_TABLES: &[&str] = &[
+    "CREATE TABLE t (id int PRIMARY KEY, a int)",
+    "INSERT INTO t SELECT g, g FROM generate_series(1, 25000) g",
+    "CREATE TABLE m (a int)",
+    "ALTER TABLE m REPLICA IDENTITY FULL",
+    "INSERT INTO m VALUES (1), (2), (2)",
+];
+
+fn slot_tables_agree(ivm: &mut Ivm, up: &mut Upstream) {
+    for q in ["SELECT count(*), sum(a), sum(id) FROM t", "SELECT a FROM m ORDER BY a"] {
+        assert_eq!(caught_up(ivm, up, q), up.rows(q), "{q}");
+    }
+    assert_eq!(caught_up(ivm, up, "SELECT * FROM v"), up.rows("SELECT count(*), sum(a) FROM t"));
+}
+
+/// Changes no source sees: made while the slot does not exist.
+fn lost_changes(up: &mut Upstream, round: i32) {
+    up.exec(&format!("DELETE FROM t WHERE id % 7 = {round}"));
+    up.exec(&format!("UPDATE t SET a = -a WHERE id % 7 = {}", round + 1));
+    up.exec(&format!("INSERT INTO t VALUES ({}, 1)", 100_000 + round));
+    up.exec(&format!("DELETE FROM m WHERE a = {}", round + 1));
+    up.exec(&format!("INSERT INTO m VALUES ({})", 10 + round));
+}
+
+/// A replication slot dropped upstream is re-created and every table copied
+/// again, so that changes made while it was missing, deletes included, are
+/// not lost. The source used to fail for good (`replication slot ... does
+/// not exist`).
+#[test]
+fn dropped_slots_are_recreated() {
+    let (mut up, mut ivm, dir) = setup("slot-dropped", SLOT_TABLES);
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT count(*) AS n, sum(a) AS s FROM t");
+    slot_tables_agree(&mut ivm, &mut up);
+    let slot = slot_name(&mut ivm);
+    // dropped while the engine is stopped
+    ivm.shutdown();
+    up.exec(&format!("SELECT pg_drop_replication_slot('{slot}')"));
+    lost_changes(&mut up, 0);
+    let mut ivm = Ivm::start(&dir);
+    up.exec("DELETE FROM t WHERE id = 24999"); // while it is copied again
+    slot_tables_agree(&mut ivm, &mut up);
+    // dropped while the engine runs: end its session, drop the slot before
+    // the source reconnects
+    eventually("the slot to be dropped", || {
+        up.exec("SELECT pg_terminate_backend(pid) FROM pg_stat_replication WHERE application_name = 'ivm'");
+        up.client.simple_query(&format!("SELECT pg_drop_replication_slot('{slot}')")).is_ok()
+    });
+    lost_changes(&mut up, 2);
+    slot_tables_agree(&mut ivm, &mut up);
+    assert_eq!(up.rows(&format!("SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'")), ["1"]);
+}
+
+/// A slot invalidated because it retained too much WAL
+/// (max_slot_wal_keep_size) cannot be used again: it is dropped and
+/// re-created, and every table copied again.
+#[test]
+fn invalidated_slots_are_recreated() {
+    let mut up = Upstream::start_with(&["max_slot_wal_keep_size = 1MB"]);
+    for d in SLOT_TABLES {
+        up.exec(d);
+    }
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("slot-invalidated");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT count(*) AS n, sum(a) AS s FROM t");
+    slot_tables_agree(&mut ivm, &mut up);
+    let slot = slot_name(&mut ivm);
+    ivm.shutdown();
+    lost_changes(&mut up, 0);
+    eventually("the slot to be invalidated", || {
+        up.exec("SELECT pg_switch_wal(); CHECKPOINT");
+        up.rows(&format!("SELECT wal_status FROM pg_replication_slots WHERE slot_name = '{slot}'")) == ["lost"]
+    });
+    let mut ivm = Ivm::start(&dir);
+    slot_tables_agree(&mut ivm, &mut up);
+    assert_eq!(up.rows(&format!("SELECT wal_status <> 'lost' FROM pg_replication_slots WHERE slot_name = '{slot}'")), ["t"]);
 }
 
 /// Text in a SQL_ASCII database is not checked for any encoding, so values

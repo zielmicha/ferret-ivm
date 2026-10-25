@@ -1020,6 +1020,71 @@ pub fn run(
     }
 }
 
+/// How a replication slot was lost, from the error START_REPLICATION
+/// returned: dropped (by someone else; the source never drops its own while
+/// it exists), or invalidated because it retained more WAL than
+/// max_slot_wal_keep_size allows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SlotLost {
+    Missing,
+    Invalidated,
+}
+
+fn slot_lost(e: &pgproto::Error) -> Option<SlotLost> {
+    match e.sqlstate.as_deref() {
+        Some("42704") if e.message.contains("replication slot") => Some(SlotLost::Missing),
+        // "can no longer get changes from replication slot" (PostgreSQL 14
+        // to 17), "can no longer access replication slot" (later)
+        Some("55000") if e.message.contains("can no longer") && e.message.contains("replication slot") => Some(SlotLost::Invalidated),
+        _ => None,
+    }
+}
+
+impl PgSource {
+    /// The slot is gone, and with it the upstream changes since the last
+    /// acknowledged position, perhaps: every table is copied again, from
+    /// an empty table so that deletes are not missed, and the slot is
+    /// created again (an invalidated one is dropped first). The reset is
+    /// logged before the new slot exists: a restart in between finds the
+    /// slot missing (or new) and the tables still to be copied, never a
+    /// slot whose stream lacks the lost changes with tables counted as
+    /// complete. Returns the error that ends the session; the next one
+    /// creates the slot.
+    fn slot_lost(&mut self, lost: SlotLost) -> SqlError {
+        let what = match lost {
+            SlotLost::Missing => "does not exist (dropped upstream)",
+            SlotLost::Invalidated => "was invalidated upstream (it retained more WAL than max_slot_wal_keep_size)",
+        };
+        log::error!(
+            "source {}: replication slot \"{}\" {what}: upstream changes after LSN {} may be lost; \
+             re-creating the slot and copying all {} tables again",
+            self.id,
+            self.def.slot,
+            Lsn(self.durable_lsn),
+            self.tables.len()
+        );
+        self.state.slot_created = false;
+        for (id, t) in &self.tables {
+            self.state.tables.insert(*id, SnapState { truncate: !t.pk.is_empty(), ..Default::default() });
+        }
+        self.chunk = None;
+        if let Err(e) = self.log_progress(self.durable_lsn) {
+            return e;
+        }
+        if lost == SlotLost::Invalidated {
+            // (if this fails, the next session finds the slot invalidated
+            // again and retries)
+            if let Err(e) = connect(&self.def.conninfo, true).and_then(|mut c| Ok(c.drop_slot(&self.def.slot, false)?)) {
+                log::warn!("source {}: dropping the invalidated slot \"{}\" failed: {e}", self.id, self.def.slot);
+            }
+        }
+        SqlError::new(
+            codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            format!("replication slot \"{}\" {what}; re-creating it and copying all tables again", self.def.slot),
+        )
+    }
+}
+
 /// One replication session. Ok(true) = stop requested.
 fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
     // resume exactly after the last durable commit
@@ -1039,7 +1104,15 @@ fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
     let pub_quoted = format!("\"{}\"", src.def.publication.replace('"', "\"\""));
     let opts2 = [("proto_version", "1"), ("publication_names", pub_quoted.as_str()), ("messages", "true")];
     let _ = opts;
-    let mut stream: ReplicationStream = repl.start_logical_replication(&src.def.slot, Lsn(src.resume_lsn.max(src.durable_lsn)), &opts2)?;
+    let mut stream: ReplicationStream = match repl.start_logical_replication(&src.def.slot, Lsn(src.resume_lsn.max(src.durable_lsn)), &opts2) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(lost) = slot_lost(&e) {
+                return Err(src.slot_lost(lost));
+            }
+            return Err(e.into());
+        }
+    };
     src.session.streaming_since = Some(Instant::now());
     *src.status.lock() = "streaming".into();
     let mut last_status = Instant::now();

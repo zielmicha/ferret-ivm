@@ -31,7 +31,9 @@ protocol and replication client).
   session that runs the statement) and one for snapshot queries, which stays
   open (idle between chunks) for as long as the source runs.
 - Consider **`max_slot_wal_keep_size`**: if the engine is stopped (or cannot
-  start), its slot retains WAL without bound.
+  start), its slot retains WAL without bound. With the limit, PostgreSQL
+  invalidates a slot that falls too far behind; the source then re-creates
+  it and copies all its tables again (see [Slots](#slots)).
 
 ### Publications
 
@@ -219,6 +221,16 @@ Each source owns one logical replication slot using `pgoutput`:
   (`CREATE_REPLICATION_SLOT ... LOGICAL pgoutput NOEXPORT_SNAPSHOT`). If a
   slot with that name already exists, it is reused as is. The fact that the
   slot was created is recorded in the source's logged state.
+- If the slot later turns out to be gone — dropped upstream (`replication
+  slot "..." does not exist`) or invalidated because it retained more WAL
+  than `max_slot_wal_keep_size` allows (`can no longer get changes from
+  replication slot`) — upstream changes since the last acknowledged position
+  may be lost. The source logs an error, resets the snapshot state of all its
+  tables (logged before the slot exists again, so a restart in between still
+  copies them), drops an invalidated slot, creates the slot again and copies
+  every table again, each starting from an empty table so that rows deleted
+  in the meantime go away too. Until a table is complete, fresh reads of it
+  wait, as during the initial snapshot.
 - Streaming uses `START_REPLICATION SLOT ... LOGICAL <lsn>` with options
   `proto_version '1'`, `publication_names '"<publication>"'`,
   `messages 'true'`.

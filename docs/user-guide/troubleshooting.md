@@ -47,9 +47,11 @@ the source keeps retrying.
 The source reconnects with backoff (up to 10 s) by itself. Persistent
 errors:
 
-- `replication slot "ivm_..." does not exist`: the slot was dropped
-  upstream. The source never re-creates a slot it created before; drop and
-  re-create the source (which takes a new initial snapshot).
+- `replication slot "ivm_..." does not exist (dropped upstream); re-creating
+  it ...` or `... was invalidated upstream ...`: the slot was dropped, or
+  invalidated by `max_slot_wal_keep_size`. The source re-creates it and
+  copies all its tables again by itself
+  ([Slots](sources.md#slots)).
 - authentication or permission errors: fix the role; the source picks the
   change up on its next attempt.
 - `relation "s.t" does not exist` or `permission denied for table t` while a
@@ -268,7 +270,6 @@ Problems found while writing and checking this documentation (at commit
 | `AS OF AT LEAST LSN` without sources | waits forever | do not use it without sources |
 | `DROP SINK` of a sink that is retrying its connection | the engine thread waits for the sink, possibly for a long time | stop and restart the engine; the drop is replayed |
 | A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
-| A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
 | `SUBSCRIBE` ends when an error record is retracted; a subscription to a dropped table never ends | spurious errors; a subscription that never finishes | re-subscribe; end it from the client |
 | A multi-object `DROP` that fails part-way | the earlier objects are dropped anyway, and the statement is missing from `ivm.catalog_history` | drop objects one at a time |
 | `CREATE SINK` does not check `KEY` columns | the sink fails every connection attempt (`sink key column "x" does not exist`) | check the names; drop and re-create the sink |
