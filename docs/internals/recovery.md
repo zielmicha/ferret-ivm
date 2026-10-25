@@ -23,9 +23,13 @@ implementation checkpoints everything together).
 
 ## The recovery protocol
 
+The server binary binds its listen address before recovery (a failure exits
+with status 1 at once) and accepts connections only once recovery is done.
 `coord::start`:
 
-1. **Lock** `LOCK` (exclusive `flock`); fail if another process holds it.
+1. **Lock** `LOCK` (exclusive `flock`, retried for up to 2 s: a process
+   forked while the lock was held keeps a copy of it until it execs); fail
+   (`55006`) if another process holds it.
 2. **Open the log** (`LogWriter::open`): read the newest segment, parse frames
    until the first one that is incomplete, fails its CRC or does not decode,
    truncate the file there (`fsync`), and take the last GSN (from the
@@ -40,38 +44,50 @@ implementation checkpoints everything together).
    truncated after it.
 4. **Restore the engine state** (`Engine::recover`) from the record's
    application state (JSON `AppState`): catalog, the map from arrangement
-   fingerprint to tree id, view error counts, source states and resume LSNs,
-   the request counter and the logical clock.
+   fingerprint to tree id and to the GSN its history starts at
+   (`arr_since`), source states and resume LSNs, the request counter, the
+   logical clock and its recent ticks, and the pending slot drops.
 5. **Rebuild the dataflow** from the catalog: tables (`table_rt`), then
-   materialized views (planned and lowered again from their SQL text) and
-   indexes, each after the views it reads (`dependency_order`: ids are not
-   a dependency order, as `CREATE OR REPLACE` keeps the object's id). Every
-   arrangement the planner asks for looks up its fingerprint in the
-   recovered map (see below); found trees are attached and count as
-   hydrated. A view or index that cannot be built (its definition no longer
-   plans, or it reads a view that cannot be built) is logged and recorded
-   in `Runtime::broken` instead of stopping the start; it stays in the
-   catalog without a dataflow, and its recovered trees are dropped with the
-   other unattached ones.
+   materialized views (planned and lowered again from their SQL text, as
+   stored definitions) and indexes, each after the views it reads
+   (`dependency_order`: ids are not a dependency order, as
+   `CREATE OR REPLACE` keeps the object's id). Every arrangement the planner
+   asks for looks up its fingerprint in the recovered map (see below); found
+   trees are attached, count as hydrated and keep their `since`. A view or
+   index that cannot be built (its definition no longer plans, it reads a
+   view that cannot be built, or an index's columns are gone) is logged and
+   recorded in `Runtime::broken` with the reason instead of stopping the
+   start (I/O errors still stop it); it stays in the catalog without a
+   dataflow, and its recovered trees are dropped with the other unattached
+   ones. Then the views' error counts and, by node fingerprint, the error
+   records of arranged nodes and the per-group error state of operators are
+   restored ([Dataflow](dataflow.md#errors)).
 6. **Hydrate** everything that was not matched, from the recovered state at
-   the checkpoint GSN (`Graph::hydrate`), then **drop** recovered trees that
-   nothing attached (arrangements that no longer exist) and set the retention
-   frontier.
+   the checkpoint GSN (`Graph::hydrate`; the rebuilt arrangements' history
+   starts there), then **drop** recovered trees that nothing attached
+   (arrangements that no longer exist) and set the retention frontier.
 7. **Start the sinks** from the recovered state (each takes a snapshot at
    the checkpoint GSN; a target at least that far resumes, one behind it is
    resynchronised, see
-   [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)).
+   [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)). A sink
+   that cannot start (it reads a broken view) is marked broken.
 8. **Replay** every log record after the checkpoint GSN through
    `apply_record`, with `replaying = true`: DDL is re-applied from its logged
    text and `extra`, no source is started, and nobody is waiting for
    replies; the sinks receive the replayed changes (a sink created by a
    replayed `CREATE SINK` starts then), and slot drops of replayed
-   `DROP SOURCE`s are recorded. A DDL record that fails is only logged, but
-   any other record that fails to apply stops the start-up with its error.
-9. **Start** the sources (with their logged state and resume LSN), the
-   pending slot drops, the sequencer (whose next GSN is the log's last
-   GSN + 1), and the engine thread; then the server starts accepting
-   connections.
+   `DROP SOURCE`s are recorded. Reading the log (`log::read_from`) refuses
+   invalid data anywhere but at the end of the newest segment, and a gap in
+   the GSNs after the checkpoint, as corruption: replaying around them would
+   silently skip records. A DDL or schema record that fails is only logged,
+   but any other record that fails to apply stops the start-up with its
+   error.
+9. If the log ends before the checkpoint's GSN (an unsynced tail lost with
+   `--no-sync`), GSN numbering continues after the checkpoint
+   (`LogWriter::skip_to`). **Start** the sources (with their logged state
+   and resume LSN), the pending slot drops, the sequencer (whose next GSN is
+   the log's last GSN + 1), and the engine thread; then the server starts
+   accepting connections.
 
 A data directory without a checkpoint replays the whole log from GSN 1 (the
 log is only truncated after checkpoints).
@@ -90,11 +106,21 @@ nodes get different ids after objects were dropped and re-created
 
 When `Graph::add_arrangement` creates an arrangement whose fingerprint is in
 the recovered map and whose tree exists, it attaches that tree (with the new
-layout's summarizer) instead of creating an empty one, and marks the
-arrangement hydrated. A node all of whose arrangements were recovered needs
-no computation during hydration. Operator state kept only in memory — the
-group caches of aggregations and the per-group error map of `Reduce` — starts
-empty (which causes the stale-error problem described in
+layout's summarizer) instead of creating an empty one, marks the arrangement
+hydrated, and gives it its checkpointed `since`, so that `AS OF` reads of
+times before the restart can still use it. A node all of whose arrangements
+were recovered needs no computation during hydration. The error state of
+nodes and operators is restored by fingerprint as well; only the group
+caches of aggregations, an accelerator, start empty.
+
+An arrangement that is not matched is rebuilt, and its history starts at
+the checkpoint: reads as of earlier GSNs that would need it fail with
+`AS OF g is before the history of a relation it reads`. Besides code
+changes ([Compatibility](../on-disk-format.md#compatibility)), this happens
+when re-planning picks another join order: delta paths are ordered by the
+current sizes of their inputs, so a view whose input tables changed size
+considerably since it was planned can get a different join plan, and then
+the join's node and everything downstream of it get new fingerprints (see
 [Troubleshooting](../user-guide/troubleshooting.md#known-problems)).
 
 **Tables are special**: their rows exist nowhere else (the log before the
@@ -110,9 +136,13 @@ fingerprint mismatch only costs a rebuild.
 dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
 
 1. build `AppState`: the catalog (with its DDL history), the fingerprint →
-   tree id map of all hydrated arrangements, each materialized view's error
-   counts, each source's opaque state (JSON) and last logged LSN, the request
-   counter, and the logical clock; serialise it as JSON;
+   tree id and fingerprint → `since` maps of all hydrated arrangements, each
+   materialized view's error counts, the error records of arranged nodes and
+   the per-group error state of operators, each source's opaque state (JSON)
+   and last logged LSN, the request counter, the logical clock and its ticks
+   in the retention window (at most the last 100,000), and the pending slot
+   drops; serialise it as JSON
+   ([On-disk format](../on-disk-format.md#checkpoint-application-state-appstate));
 2. `Env::checkpoint(processed_gsn, json)`: write dirty nodes, `fsync`, append
    the manifest record (the commit point), delete dead segments
    ([Storage](storage.md#segments-and-checkpoints));
@@ -130,8 +160,12 @@ Each source logs, through the input log, everything it needs to resume:
   engine keeps the highest per source (`source_lsns`, saved in checkpoints)
   as the **resume LSN**;
 - its *state* as a `Progress` record: whether the slot has been created, and
-  per table whether its initial snapshot is done and the last copied primary
-  key (`boundary`), as JSON.
+  per table whether its initial snapshot is done, the last copied primary
+  key (`boundary`), and whether the next copy starts by truncating the table
+  (`truncate`, see [Consequences](#consequences)), as JSON. Applying a
+  `Schema` record also marks the table's snapshot to be done again in the
+  stored state, so that a restart before the re-snapshot logs progress of
+  its own still redoes it.
 
 On start, the source thread streams from `max(resume LSN, durable LSN)`
 (`START_REPLICATION ... LOGICAL <lsn>`; the server starts at the slot's
@@ -143,11 +177,12 @@ logged boundary.
 
 ## The DBLog snapshot algorithm
 
-Initial snapshots (and re-snapshots after schema changes) copy tables in
-chunks *while the change stream keeps flowing*, without locking tables and
-without a replication-slot snapshot, following the DBLog watermark idea: the
-chunk's reads are ordered against the stream by writing *watermark* messages
-into the WAL around them.
+Initial snapshots, and the copies a table needs again (after an upstream
+schema or key change, a lost replication slot, or `ALTER SOURCE ...
+REFRESH` for new tables), copy tables in chunks *while the change stream
+keeps flowing*, without locking tables and without a replication-slot
+snapshot, following the DBLog watermark idea: the chunk's reads are ordered
+against the stream by writing *watermark* messages into the WAL around them.
 
 ### Per-chunk protocol
 
@@ -157,33 +192,43 @@ in the stream and no chunk is in flight:
 1. Pick the table with the lowest id whose snapshot is not done (skipping
    tables whose chunk query failed recently: they are retried after a
    delay growing from 1 s to 60 s, while the other tables proceed).
-2. On a normal connection, emit the **low watermark**:
+2. If the table's state says `truncate`, log a commit that truncates the
+   table (here, between upstream transactions and before the chunk's low
+   watermark) and log the state without the flag: from then on the table
+   fills exactly as in an initial snapshot.
+3. On a normal connection, emit the **low watermark**:
    `SELECT pg_logical_emit_message(true, 'ivm', 'L:<source>:<table>:<run>:<seq>')`
    (a transactional message: it appears in the stream at its commit).
-   `<run>` is a random id chosen each time the source thread starts and
-   `<seq>` counts its chunks, so the tag is unique: after a restart the
-   stream resumes before watermarks of the previous run, and logical
-   messages reach every slot of the database, including those of other
-   engines.
-3. Read the chunk in one transaction, in two round trips:
+   `<run>` is a random id chosen each time the source thread starts (16 hex
+   digits) and `<seq>` counts its chunks, so the tag is unique: after a
+   restart the stream resumes before watermarks of the previous run, and
+   logical messages reach every slot of the database, including those of
+   other engines.
+4. Read the chunk in one transaction, in two round trips:
    ```sql
-   BEGIN ISOLATION LEVEL REPEATABLE READ;
-   SELECT pg_current_snapshot()::text;
+   BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text;
    -- checked: does it see every transaction decoded so far? (below)
    SELECT <columns> FROM <schema>.<table>
-     [WHERE (<pk>) > (<boundary>)] ORDER BY <pk> LIMIT 10000;
-   COMMIT
+     [WHERE (<pk>) > (<boundary>)] ORDER BY <pk> LIMIT 10000; COMMIT
    ```
    If the snapshot does not contain every transaction the stream has
    decoded while tables are being copied (see
    [Filtering stream changes](#filtering-stream-changes)), the transaction is
-   rolled back and the chunk retried 100 ms later.
-   String key columns use `COLLATE "C"`, so the upstream order matches the
-   engine's key order. The rows are kept in memory keyed by their encoded
-   primary key; the chunk records its last key (`max_key`), whether it is the
-   last chunk (fewer than 10,000 rows), and the snapshot's
-   `(xmin, xmax, xip)`.
-4. Emit the **high watermark** `'H:<source>:<table>:<run>:<seq>'`.
+   rolled back and the chunk retried 100 ms later (its low watermark is
+   then ignored: no chunk carries its tag).
+   String key columns are compared as `col::text COLLATE "C"` (and the
+   boundary as `'<value>'::<type>::text COLLATE "C"`): the byte order of
+   their text form, which is how the engine orders these keys — also for
+   upstream types it replicates as text (enums, `inet`, ...), whose own
+   order differs and which take no collation. The rows are kept in memory
+   keyed by their encoded primary key; the chunk records its last key
+   (`max_key`), whether it is the last chunk (fewer than 10,000 rows), and
+   the snapshot's `(xmin, xmax, xip)`.
+   If the chunk query fails with an error that leaves the connection usable
+   (no `SELECT` privilege, the table dropped upstream, a value that does not
+   parse), the transaction is rolled back and only that table is retried
+   later (`PgSource::failing`); other errors end the replication session.
+5. Emit the **high watermark** `'H:<source>:<table>:<run>:<seq>'`.
 
 The chunk starts in phase *before-low*. While the stream is processed:
 
@@ -196,7 +241,8 @@ The chunk starts in phase *before-low*. While the stream is processed:
 
 ### Filtering stream changes
 
-For every streamed change of key `k` in table `T` (`snapshot_filter`):
+For every streamed upsert (insert or update) of key `k` in table `T`
+(`snapshot_filter`):
 
 | Situation | Action |
 |---|---|
@@ -206,9 +252,22 @@ For every streamed change of key `k` in table `T` (`snapshot_filter`):
 | same, phase *before-low*, the transaction is **not** visible in the chunk's snapshot | apply, and remove `k` from the chunk |
 | same, phase *before-low*, the transaction **is** visible in the chunk's snapshot | skip (the chunk already contains its effect) |
 | otherwise (`k` beyond everything copied so far) | skip: a later chunk will read the row's current value |
-| `TRUNCATE` | apply always, and clear the chunk's rows of that table (unless the chunk is in phase *before-low* and its snapshot saw the truncation) |
 
-Why this yields a consistent copy (with one exception, below): the chunk's snapshot is taken after the
+Deletes (and the delete of the old key of a primary-key change) always
+apply: the filter only decides whether the chunk's row of that key is
+removed. Deleting a key the engine does not hold changes nothing, but a
+table that is copied again still holds its old rows, which no chunk would
+remove (chunks only upsert the rows that exist). A `TRUNCATE` always applies
+too, and clears the rows of a chunk of that table in flight, unless the
+chunk is in phase *before-low* and its snapshot saw the truncating
+transaction (then the chunk already holds the table as it is after the
+truncate). Unchanged TOASTed values of an applied upsert are filled from the
+chunk's row of the key when the stream wins over the chunk (for a key
+change, from the chunk's row of the old key), else from a complete old row
+(`REPLICA IDENTITY FULL`); otherwise the engine fills them from its stored
+row ([Dataflow](dataflow.md#table)).
+
+Why this yields a consistent copy: the chunk's snapshot is taken after the
 low watermark committed, so every transaction that commits after the high
 watermark is newer than the chunk and is applied by the stream (its key is
 now at or below the boundary). Transactions between the watermarks are
@@ -234,38 +293,57 @@ only once its snapshot sees all of them; transactions a snapshot sees are
 forgotten, as later snapshots see them too. If many accumulate without a
 chunk being read (a table that cannot be read), they are checked against a
 fresh `pg_current_snapshot()` at most once a second. Without this check, a
-chunk read while such a transaction was invisible kept the row's old value
-for good (reproduced with an unreachable synchronous standby,
-`chunks_see_transactions_decoded_before_them`).
+chunk read while such a transaction is invisible would keep the row's old
+value for good (the replication test
+`chunks_see_transactions_decoded_before_them` reproduces that with an
+unreachable synchronous standby).
 
 The 32-bit transaction ids of the stream are compared with the 64-bit
 snapshot by choosing the epoch closest to the snapshot (`xid_visible`).
 
 ### Tables without a primary key
 
-Tables with `REPLICA IDENTITY FULL` are read in a single chunk without
-`WHERE`/`ORDER BY`/`LIMIT`. Their changes are skipped while the table has not
-been copied yet, including during phase *before-low*; at the low watermark
-the chunk's rows are emitted as inserts; in the window, changes from
-transactions visible in the chunk's snapshot are skipped and others applied;
-after the high watermark's commit the table is done. Unlike the keyed path,
-a transaction that commits just before the low watermark but is not visible
-in the snapshot is not caught.
+Tables with `REPLICA IDENTITY FULL` and no key are read in a single chunk
+without `WHERE`/`ORDER BY`/`LIMIT`; the chunk is the whole table and
+replaces what the engine stores (`push_multiset`):
+
+- before a chunk of the table is in flight, its changes (including
+  `TRUNCATE`) are skipped: the chunk will read their effect;
+- at the low watermark the chunk is emitted as a truncate of the table
+  followed by its rows (for an initial snapshot the truncate is a no-op;
+  for a copy after a schema change it removes the rows kept from before);
+- changes decoded during phase *before-low* from transactions the chunk's
+  snapshot does not see (their commit preceded the watermark in the WAL but
+  was not yet visible) are kept and applied right after the chunk's rows;
+- in the window, changes from transactions visible in the chunk's snapshot
+  are skipped and the others applied;
+- after the high watermark's commit the table is done.
 
 ### Consequences
 
 - The source's LSN frontier does not advance while any of its tables is
   incomplete, so `AS OF AT LEAST LSN` reads never see a partial table; fresh
-  reads wait for the snapshot explicitly.
+  reads wait for the snapshot explicitly (per table: a table that cannot be
+  read keeps the fresh reads of it waiting, not those of the others).
 - A restart in the middle of a snapshot resumes after the last logged
   boundary.
 - `ALTER SOURCE ... REFRESH` adds tables that are snapshotted the same way.
 - After an upstream schema change the table's state is reset and the whole
-  table is copied again. A re-snapshot only upserts the rows it reads, so
-  stream deletes of keys beyond the boundary are applied rather than
-  skipped (the row may still be stored). When the stored rows cannot be
-  trusted — after a key change, whose deletes by the old key were lost —
-  the state also says `truncate`: before the first chunk's low watermark,
-  between upstream transactions, the source logs a commit truncating the
-  table, which then fills exactly as in an initial snapshot (see
+  table is copied again. The reset is logged before the `Schema` record, so
+  that a restart in between copies the table in its old shape and detects
+  the change again. The changes of the current upstream transaction decoded
+  before the change are rewritten for the new columns. A re-snapshot only
+  upserts the rows it reads, so stream deletes of keys beyond the boundary
+  are applied rather than skipped (the row may still be stored). When the
+  stored rows cannot be trusted — after a key change, whose deletes by the
+  old key were lost — the state also says `truncate`: before the first
+  chunk's low watermark, between upstream transactions, the source logs a
+  commit truncating the table, which then fills exactly as in an initial
+  snapshot (see
   [Sources](../user-guide/sources.md#upstream-schema-changes)).
+- When the replication slot turns out to be gone (dropped, or invalidated by
+  `max_slot_wal_keep_size`), every table's state is reset — with `truncate`
+  for keyed tables — and logged before the slot is created again; an
+  invalidated slot is dropped first. The new slot's stream starts after the
+  old resume LSN, and the tables are copied again from empty tables, so
+  rows deleted while changes were lost go away too.

@@ -2,9 +2,8 @@
 
 ivm replicates PostgreSQL tables through logical replication, maintains SQL
 views over them incrementally, and serves the results over the PostgreSQL
-wire protocol. These documents describe the code as of commit `d80c7f2`
-(with the test-tooling changes of `1275115`); the design it implements is in
-[doc.md](../doc.md).
+wire protocol. These documents describe the current code; the design it
+implements is in [doc.md](../doc.md).
 
 New users: read [Getting started](user-guide/getting-started.md),
 [Sources](user-guide/sources.md) and [Reads](user-guide/reads.md) first, and
@@ -15,14 +14,14 @@ relying on a feature.
 
 | Document | Contents |
 |---|---|
-| [Getting started](user-guide/getting-started.md) | building and installing, command-line flags, stopping the server, connecting with `psql` and drivers, a first session |
-| [Sources](user-guide/sources.md) | replicating PostgreSQL: upstream requirements (`wal_level`, publications, replica identity, privileges, WAL retention), `CREATE`/`ALTER ... REFRESH`/`DROP SOURCE`, table discovery, type mapping, slots, the initial snapshot, upstream restarts, `TRUNCATE` and schema changes |
+| [Getting started](user-guide/getting-started.md) | building and installing, command-line flags and exit statuses, stopping the server, connecting with `psql` and drivers, a first session |
+| [Sources](user-guide/sources.md) | replicating PostgreSQL: upstream requirements (`wal_level`, publications, replica identity, privileges, WAL retention), `CREATE`/`ALTER ... REFRESH`/`DROP SOURCE`, table discovery, type mapping, slots (also lost ones), the initial snapshot, upstream restarts, `TRUNCATE`, schema and key changes, tables that cannot be copied |
 | [Tables and views](user-guide/tables-and-views.md) | local tables and DML, views versus materialized views, `CREATE OR REPLACE`, indexes, `DROP` and dependencies |
-| [Reads and subscriptions](user-guide/reads.md) | fresh and latest reads, `AS OF`, `AS OF AT LEAST LSN`, `read_mode` and other session settings, `SUBSCRIBE` (options, output format, `COPY` form) |
-| [Sinks](user-guide/sinks.md) | writing views back to PostgreSQL: `CREATE SINK`, exactly-once delivery, target-table requirements |
+| [Reads and subscriptions](user-guide/reads.md) | fresh and latest reads, `AS OF`, `AS OF AT LEAST LSN`, cancelling waiting reads, `read_mode` and other session settings, `SUBSCRIBE` (options, output format, `COPY` form, when it ends) |
+| [Sinks](user-guide/sinks.md) | writing views back to PostgreSQL: `CREATE SINK`, exactly-once delivery across reconnects and restarts, target-table requirements |
 | [Introspection](user-guide/introspection.md) | `EXPLAIN PLAN`/`DATAFLOW`/`MAINTENANCE`, `SHOW`, the `ivm.*` relations, `pg_catalog` and `information_schema`, `psql` `\d` support |
 | [Temporal filters and errors](user-guide/temporal-filters-and-errors.md) | `now()` in maintained views and the logical clock; expression errors as data |
-| [Operations](user-guide/operations.md) | tuning, the data directory and `LOCK`, recovery, checkpoints, retention, durability, what is safe to delete, backups, replication-slot cleanup, monitoring |
+| [Operations](user-guide/operations.md) | tuning, the data directory and `LOCK`, recovery and broken objects, checkpoints, retention, durability, what is safe to delete, backups, replication-slot cleanup, monitoring |
 | [Troubleshooting and limitations](user-guide/troubleshooting.md) | common problems and their causes, limitations and differences from PostgreSQL, known problems with workarounds |
 | [Web UI](web-ui.md) | the inspection UI (`--http-listen`): enabling it, authentication, every screen, the JSON API |
 

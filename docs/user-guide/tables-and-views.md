@@ -7,12 +7,17 @@ schema `public` to client tools.
 
 Every DDL statement is written to the input log and applied when the log
 record is durable; replay applies it again identically. `CREATE TABLE`,
-`CREATE [MATERIALIZED] VIEW`, `CREATE SOURCE` and `ALTER SOURCE` are first
-validated against the current catalog, so their usual errors are reported
-before anything is logged; `DROP`, `CREATE INDEX` and `CREATE SINK` are only
-checked when the logged record is applied (a failing one fails again,
-harmlessly, on every replay). Code: `crates/ivm/src/coord/ddl.rs` (DDL),
-`crates/ivm/src/coord/dml.rs` (DML), `crates/ivm/src/catalog.rs`.
+`CREATE [MATERIALIZED] VIEW`, `CREATE SOURCE`, `ALTER SOURCE ... REFRESH`
+and `CREATE SINK` are first validated against the current catalog (for
+views: binding, planning, the determinism check and the column list), so
+their usual errors are reported before anything is logged. Other checks
+happen only when the logged record is applied: those of `DROP` and
+`CREATE INDEX`, the dependency checks of `CREATE OR REPLACE`, and the
+lowering and hydration of a materialized view. A statement that fails there
+stays in the log and fails again, harmlessly, on every replay; only
+successful statements appear in `ivm.catalog_history`. Code:
+`crates/ivm/src/coord/ddl.rs` (DDL), `crates/ivm/src/coord/dml.rs` (DML),
+`crates/ivm/src/catalog.rs`.
 
 ## Tables
 
@@ -43,10 +48,11 @@ CREATE TABLE [ IF NOT EXISTS ] name (
   **no sequence or default is created** and no `NOT NULL` is implied;
   `smallserial` is not accepted.
 - `PRIMARY KEY` (on a column or as a table constraint, possibly multi-column)
-  is enforced on `INSERT` and `UPDATE` and makes its columns `NOT NULL`.
-  Only one `PRIMARY KEY` table constraint is allowed; several column-level
-  `PRIMARY KEY` markers are merged into one composite key (PostgreSQL rejects
-  this).
+  is enforced on `INSERT` and `UPDATE` and makes its columns `NOT NULL`. A
+  table has at most one: a second one (two column-level `PRIMARY KEY`s, or
+  one and a table constraint) fails with SQLSTATE `42P16`
+  (`multiple primary keys for table "t" are not allowed`), and a column named
+  twice in the key, like a column defined twice, with `42701`.
 - `NOT NULL` is enforced.
 - `UNIQUE`, `CHECK`, `DEFAULT`, `REFERENCES` / `FOREIGN KEY` and other table
   constraints are **accepted and ignored**: they are not enforced and
@@ -79,6 +85,11 @@ INSERT INTO table [ ( column [ , ... ] ) ]
   explicitly (for example a `text` expression into an `integer` column),
   so values that do not convert fail at run time
   (`invalid input syntax for type integer: "abc"`).
+- Type modifiers are enforced as on assignment in PostgreSQL: a string too
+  long for `varchar(n)` or `character(n)`, or a number that does not fit
+  `numeric(p,s)`, fails (an explicit cast in the expression, such as
+  `'abcdef'::varchar(3)`, truncates first); array columns apply the modifier
+  to every element.
 - `INSERT ... SELECT` evaluates the query against the current state.
 - A duplicate primary key fails with SQLSTATE `23505`,
   `duplicate key value violates unique constraint "<table>_pkey"` and a
@@ -124,6 +135,9 @@ DELETE FROM table [ [ AS ] alias ] [ WHERE condition ]
 - DML statements are serialized: one is in flight at a time, and the client
   gets its reply after the change has been applied, so a following read sees
   it.
+- A statement planned while a `DROP` of its table was already logged (but
+  not yet applied) applies nothing and fails with SQLSTATE `42P01`
+  (`the table of this statement was dropped before it could be applied`).
 - Replicated tables reject DML
   (`cannot insert into source table "t": it is replicated from its source`,
   SQLSTATE `42501`); views reject it as well (`cannot insert into view`).
@@ -148,9 +162,13 @@ CREATE [ OR REPLACE ] [ MATERIALIZED ] VIEW [ IF NOT EXISTS ] name
 | Expression errors | the query fails | become [error records](temporal-filters-and-errors.md#errors-as-data) that make reads fail |
 
 Both kinds accept the same query language ([Queries](../sql/queries.md)).
-Column names come from the select list or from the optional column list
-(extra names in the column list are silently ignored; PostgreSQL rejects
-them); column types are derived from the query.
+Column names come from the select list or from the optional column list,
+which renames the leading columns; a column list longer than the select
+list fails with SQLSTATE `42601` (`CREATE VIEW specifies more column names
+than columns`, for materialized views `too many column names were
+specified`). Duplicate column names are accepted (PostgreSQL rejects them).
+Column types are derived from the query; an untyped literal column (such as
+`SELECT 'abc' AS s`) is `text`.
 
 ### Creating a materialized view
 
@@ -162,42 +180,63 @@ contacted. Maintenance continues from the next GSN. The statement returns
 after hydration, so a large view takes as long as one scan of its inputs.
 
 Errors found while binding and planning the query (unknown columns,
-unsupported constructs, non-deterministic functions) are reported before the
-statement is logged. Problems found later, while lowering or hydrating, are
-reported after it was logged; the statement then fails again, harmlessly, on
-every replay — but a crash at that stage recurs on every start (see
-[Known problems](troubleshooting.md#known-problems)).
+unsupported constructs, non-deterministic functions, a column list that is
+too long, a [broken](operations.md#recovery) materialized view it reads) are
+reported before the statement is logged. Problems found only while lowering
+or hydrating are reported after it was logged; the statement then fails
+again, harmlessly, on every replay.
 
 A materialized view may read other materialized views; it then consumes the
 other view's maintained output rather than re-planning its query.
 
 ### CREATE OR REPLACE
 
-- Replacing a materialized view with a materialized view builds the new
-  version (sharing unchanged fragments), hydrates it, and switches readers,
-  subscribers and sinks to it at the statement's GSN. Subscribers and sinks
-  receive the difference between the old and the new contents as one change
-  at that GSN. Two kinds of dependents are **not** switched:
-  - materialized views defined over the replaced view keep reading the old
-    version until the next restart, when they are re-planned against the new
-    one;
-  - indexes on the replaced view keep indexing the old version; the next
-    start rebuilds them by column position on the new version, and if it has
-    fewer columns than an index refers to, the engine panics at start-up.
+`CREATE OR REPLACE [MATERIALIZED] VIEW` replaces a view or materialized view
+of that name (any other kind of object fails with `"x" is not a view`,
+SQLSTATE `42809`); the object keeps its id. When the logged statement is
+applied, the replacement is first checked against what depends on the view,
+and rejected with SQLSTATE `2BP01` (`cannot replace view "x": ...`),
+changing nothing, if
 
-  Drop such views and indexes before replacing, and re-create them after.
-- In every other combination (a virtual view replaced by a materialized one,
-  or vice versa, or virtual by virtual) the old object is dropped — without
-  checking or dropping dependent objects — and the new one is created under
-  the same object id. Subscriptions to a replaced materialized view end with
-  `materialized view "x" was dropped`. If a materialized view that has an
-  index or a sink is replaced by a virtual view, the sink stops receiving
-  changes (although `SHOW SINKS` still says `running`) and the next start
-  fails with `index target without dataflow` or
-  `sink source without dataflow`.
-- `IF NOT EXISTS` succeeds without doing anything if any object with that
-  name exists. Without `OR REPLACE` or `IF NOT EXISTS`, an existing name
-  fails with `relation "x" already exists` (SQLSTATE `42P07`).
+- an index on the view would lose a key column: indexes follow their
+  columns by name, so the new definition must still have them (a virtual
+  view has none to index);
+- a sink reads the view and the replacement changes its columns (names,
+  types or type modifiers) or is a virtual view: the sink's target table has
+  the view's columns;
+- another materialized view would no longer plan over the new definition,
+  or would no longer be deterministic (for example it uses a column the
+  replacement drops, or reads it through a virtual view that now calls
+  `random()`).
+
+Otherwise:
+
+- **Materialized by materialized**: the new version is built (sharing
+  unchanged fragments with the old one and with other views), hydrated, and
+  swapped in at the statement's GSN; the view's indexes move to it, re-keyed
+  to the positions of their columns. If the columns (names, types, type
+  modifiers) are unchanged, subscriptions to the view and sinks from it
+  receive the difference between the old and the new contents as one change
+  at that GSN; otherwise subscriptions to the view end with
+  `materialized view "x" changed its columns` (SQLSTATE `55000`).
+- **Every other combination** (virtual by materialized, materialized by
+  virtual, virtual by virtual): the old object is dropped and the new one is
+  created under the same id. Subscriptions reading the old object end as for
+  a [`DROP`](#drop) (`view "x" was dropped`, `materialized view "x" was
+  dropped`).
+- In both cases the materialized views that read the replaced view —
+  directly, through other materialized views, or through virtual views they
+  expand — are re-planned at the same GSN, in dependency order, so that they
+  read the new definition, as a restart would plan them.
+- A subscription to a query (`SUBSCRIBE (query)`) that reads the replaced
+  materialized view keeps its own dataflow, built over the old version
+  (see [Known problems](troubleshooting.md#known-problems)).
+- Replacing a [broken](operations.md#recovery) materialized view with a
+  definition that plans repairs it.
+
+`IF NOT EXISTS` succeeds without doing anything if any object with that name
+exists. Without `OR REPLACE` or `IF NOT EXISTS`, an existing name fails with
+`relation "x" already exists` (SQLSTATE `42P07`).
 
 ## Indexes
 
@@ -209,13 +248,20 @@ An index is an additional *arrangement* (sorted, persistent copy) of a table
 or materialized view keyed by the given columns. It is built by scanning the
 relation's existing index at the statement's GSN and maintained from then on.
 
-- `relation` must be a table or a materialized view.
+- `relation` must be a table or a materialized view (`"x" is not a table or
+  materialized view` otherwise), and not a [broken](operations.md#recovery)
+  one.
 - Only plain column names are allowed (`only column indexes are supported`
   otherwise). Sort direction, `NULLS FIRST/LAST`, operator classes,
   `UNIQUE`, `USING`, `INCLUDE` and `WHERE` are accepted and ignored: the key
   is always ascending, unique indexes are not enforced, partial indexes are
   full.
 - The default name is `<relation>_<col1>_<col2>..._idx`.
+- When the relation changes shape — an upstream schema change of a
+  replicated table, a replacement or re-planning of a materialized view —
+  its indexes follow their key columns by name (`SHOW INDEXES` shows the new
+  positions). An index whose column is gone is dropped (logged); a
+  `CREATE OR REPLACE` that would do that is rejected instead (see above).
 
 What indexes are used for:
 
@@ -236,9 +282,11 @@ What indexes are used for:
   lookups on `t(c)` uses the existing index on `t(c)` instead of building
   another one, and vice versa.
 
-Indexes do not make joins in maintained views possible or impossible — the
-planner creates the arrangements it needs — they only avoid duplicates and
-speed up reads.
+An `AS OF` read uses only indexes whose history covers its GSN
+([Time travel](reads.md#time-travel-as-of-gsn)): an index created after
+that GSN is not used for it. Indexes do not make joins in maintained views
+possible or impossible — the planner creates the arrangements it needs —
+they only avoid duplicates and speed up reads.
 
 ## DROP
 
@@ -250,33 +298,31 @@ DROP SINK [ IF EXISTS ] name                 -- see Sinks
 
 - `DROP VIEW` also drops materialized views; `DROP MATERIALIZED VIEW` only
   materialized ones; the object kind must otherwise match
-  (`"x" is not a table`).
-- Replicated tables cannot be dropped (`drop the source instead`).
-- Dependent objects — views and materialized views whose query mentions the
-  object's name, sinks from it — make the drop fail with SQLSTATE `2BP01`
-  unless `CASCADE` is given, which drops them (recursively) first. Indexes
-  on a dropped table or materialized view are dropped with it, as in
-  PostgreSQL.
+  (`"x" is not a table`, SQLSTATE `42809`). A missing object fails with
+  `42P01` (`table "x" does not exist`) unless `IF EXISTS` is given.
+- Replicated tables cannot be dropped
+  (`cannot drop source table "t"; drop the source instead`).
+- The objects that depend on a relation are the views and materialized views
+  that read it, the sinks from it and the indexes on it. A view reads the
+  relations its query refers to as the binder resolves them, including
+  through the virtual views it expands (only for a stored query that no
+  longer binds does every occurrence of the name as a word count). Views and
+  sinks make the drop fail with SQLSTATE `2BP01`
+  (`cannot drop table t because other objects depend on it`, the first
+  dependent in the detail) unless `CASCADE` is given, which drops them,
+  recursively, first. Indexes never hold a drop back: they are dropped with
+  their table or materialized view, as in PostgreSQL. `RESTRICT` is the
+  default.
 - A statement naming several objects is atomic: every name is checked
   first, and an error (for example `table "nosuch" does not exist`) drops
   nothing. Objects named in the same statement do not hold each other back
   (`DROP VIEW v, view_over_v` needs no `CASCADE`).
-- Subscriptions to a dropped materialized view end with
-  `materialized view "x" was dropped`.
+- Subscriptions reading a dropped object — subscribed to it, or to a view or
+  query that reads it — end with `table "x" was dropped`
+  (`view "x" ...`, `materialized view "x" ...`; SQLSTATE `42P01`).
 - Dropping releases the object's dataflow nodes and indexes unless other
   objects still share them; storage is reclaimed by
   [garbage collection](operations.md#checkpoints-and-garbage-collection).
-
-Dependency detection is textual: an object depends on `x` when its stored
-query, lowercased, contains the word `x`. For ordinary lowercase names this
-errs on the safe side — but too far: a view with a column alias or a string
-literal equal to the name also counts, and `CASCADE` drops it too. It
-**misses quoted names with upper-case letters**: after
-`CREATE TABLE "MyTable" ...` and a view over it, `DROP TABLE "MyTable"`
-succeeds without `CASCADE`, and the engine then fails to start after the
-next checkpoint (`relation "MyTable" does not exist`). Avoid mixed-case
-quoted names, or drop dependent views first. See
-[Troubleshooting](troubleshooting.md#known-problems).
 
 ## Object ids
 

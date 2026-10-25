@@ -4,8 +4,9 @@ A *source* replicates the tables of one PostgreSQL publication into the
 engine through logical replication (the `pgoutput` plugin). The engine is a
 replica, not a stream consumer: it keeps the current contents of every
 replicated table in a primary index, turns every upstream change into an
-upsert or delete by primary key, and logs it with a GSN before anything is
-derived from it.
+upsert or delete by key (see
+[Primary keys and replica identity](#primary-keys-and-replica-identity)),
+and logs it with a GSN before anything is derived from it.
 
 Code: `crates/ivm/src/source/postgres.rs` (replication, snapshots),
 `crates/ivm/src/coord/ddl.rs` (catalog side), `crates/pgproto` (wire
@@ -28,8 +29,9 @@ protocol and replication client).
   logical slot and one walsender connection while running.
 - Each source additionally opens ordinary connections: one while
   `CREATE SOURCE` / `ALTER SOURCE ... REFRESH` discovers tables (from the
-  session that runs the statement) and one for snapshot queries, which stays
-  open (idle between chunks) for as long as the source runs.
+  session that runs the statement) and one for snapshot queries, opened
+  when the source has a table to copy and then kept open (idle between
+  chunks) while the source runs.
 - Consider **`max_slot_wal_keep_size`**: if the engine is stopped (or cannot
   start), its slot retains WAL without bound. With the limit, PostgreSQL
   invalidates a slot that falls too far behind; the source then re-creates
@@ -108,8 +110,8 @@ be single-quoted, with `\'` and `\\` escapes) or a `postgres://` /
   `client_encoding` (sources require `UTF8`, the default).
 - Authentication: trust, cleartext password, MD5, SCRAM-SHA-256 (without
   channel binding).
-- No TLS: `sslmode=require`/`verify-*`, `ssl=true` and
-  `channel_binding=require` are rejected; `sslmode=disable|allow|prefer`
+- No TLS: `sslmode=require`/`verify-*`, `ssl=true`, `gssencmode=require`
+  and `channel_binding=require` are rejected; `sslmode=disable|allow|prefer`
   connect without TLS. Many other libpq keywords are accepted and ignored;
   unknown keywords are an error. Multiple hosts are not supported.
 - `PG*` environment variables and `~/.pgpass` are **not** consulted.
@@ -118,7 +120,9 @@ be single-quoted, with `\'` and `\\` escapes) or a `postgres://` /
   the connection string sets it.
 
 The connection string is stored in the catalog in clear text (and is visible
-through `SHOW CREATE VIEW`, `ivm.objects` and `ivm.catalog_history`).
+through `SHOW CREATE VIEW`, `ivm.objects` and `ivm.catalog_history`, and in
+the stored statements the web UI shows; only its sources page masks
+passwords).
 
 ## CREATE SOURCE
 
@@ -163,13 +167,15 @@ What happens:
    `FOR TABLES (...)` keeps only tables whose name matches an entry, either
    as `table` or as `schema.table`; entries that match nothing are silently
    ignored.
-2. **Validation**: no other object may be called like the source; every
+2. **Validation**: no other object may be called like the source
+   (`source "x" already exists`), and no upstream table either; every
    table needs a key or `REPLICA IDENTITY FULL`; table names must not
    collide with existing objects or with each other (the engine has one
    namespace, see below).
-3. **Logging**: the statement and the discovered schemas (as JSON) are
-   written to the input log as one DDL record. Replay never contacts the
-   upstream again, so it reconstructs the same catalog.
+3. **Logging**: the statement and the discovered schemas (as JSON, with the
+   data directory's instance id for the default slot name) are written to
+   the input log as one DDL record. Replay never contacts the upstream
+   again, so it reconstructs the same catalog.
 4. **Apply**: the source object and one table object per upstream table are
    created (empty), and the source thread starts. `CREATE SOURCE` returns at
    this point; the initial snapshot runs in the background.
@@ -257,6 +263,9 @@ engine is stopped, after it fails to start, or while the source cannot
 stream (it keeps reconnecting with `error: ...`), the slot holds back WAL
 removal indefinitely. (A table the source cannot copy does not stop the
 stream, see [below](#tables-added-to-or-removed-from-the-publication).)
+When the engine falls 10,000 logged records behind in applying them, the
+input log stops taking records until it catches up: sources then stop
+reading the replication stream, and the upstream keeps the WAL meanwhile.
 
 ## Initial snapshot
 
@@ -265,17 +274,22 @@ copies each table that has not been snapshotted yet, one table at a time
 (lowest catalog object id first, which is discovery order: by schema, then
 table name):
 
-- **Tables with a primary key** are read in chunks of 10,000 rows in primary
-  key order:
-  `SELECT <columns> FROM <schema>.<table> [WHERE (pk) > (<last key>)] ORDER BY <pk> LIMIT 10000`
-  inside a `REPEATABLE READ` transaction (string key columns compare with
-  `COLLATE "C"`). Chunks are ordered against the change stream with DBLog
-  watermarks (`pg_logical_emit_message` low and high markers), so the result
-  equals a consistent copy. Every chunk becomes one logged commit; progress
-  (the last copied key) is logged too, so a restart resumes with the next
-  chunk. The algorithm is described in
+- **Tables with a key** are read in chunks of 10,000 rows in key order:
+  `SELECT <columns> FROM <schema>.<table> [WHERE (key) > (<last key>)] ORDER BY <key> LIMIT 10000`
+  inside a `REPEATABLE READ` transaction. String key columns, and key
+  columns of upstream types replicated as text (enums, `inet`, ...), are
+  compared as `col::text COLLATE "C"`: the byte order of their text, which
+  is how the engine orders them. Chunks are ordered against the change
+  stream with DBLog watermarks (`pg_logical_emit_message` low and high
+  markers), so the result equals a consistent copy; a chunk is only read
+  once its snapshot contains every transaction the stream has already
+  decoded (otherwise it is retried 100 ms later). Every chunk becomes one
+  logged commit; progress (the last copied key) is logged too, so a
+  restart resumes with the next chunk. The algorithm is described in
   [Recovery and snapshots](../internals/recovery.md#the-dblog-snapshot-algorithm).
-- **Tables with `REPLICA IDENTITY FULL`** (no key) are read in one query.
+- **Tables with `REPLICA IDENTITY FULL`** (no key) are read in one query,
+  whose rows replace the table's contents (a truncate followed by the
+  rows, in one commit).
 
 While a table's snapshot is incomplete:
 
@@ -289,8 +303,8 @@ While a table's snapshot is incomplete:
 - Materialized views over the table are maintained throughout; they show the
   partial contents too.
 
-`SHOW SOURCES` reports the status `snapshotting <schema>.<table>` during a
-snapshot and `streaming` afterwards.
+`SHOW SOURCES` reports the status `snapshotting <schema>.<table>` while a
+chunk of that table is in flight and `streaming` otherwise.
 
 ## Streaming changes
 
@@ -298,7 +312,7 @@ For every upstream transaction the source logs one *commit* record holding
 the transaction's changes (empty transactions are not logged). Mapping of
 `pgoutput` messages:
 
-| Message | Table with primary key | `REPLICA IDENTITY FULL` table |
+| Message | Table with a key | `REPLICA IDENTITY FULL` table |
 |---|---|---|
 | Insert | upsert of the new row | insert of one row |
 | Update | upsert of the new row; if the key changed, a delete of the old key first | remove one instance of the old row, insert the new row |
@@ -308,8 +322,10 @@ the transaction's changes (empty transactions are not logged). Mapping of
 | Message with prefix `ivm` | snapshot watermark | snapshot watermark |
 
 Unchanged TOASTed values (`pgoutput` sends a placeholder for large values
-that an update did not touch) are filled from the stored row; if a row is
-not present in the replica, they become NULL (with a warning in the log).
+that an update did not touch) are filled from the stored row — for an
+update that changes the key, from the row stored under the old key; while
+a snapshot chunk holding the row is in flight, from the chunk's copy. If
+there is no such row, they become NULL (with a warning in the log).
 
 Upstream transactions are applied atomically: all changes of a transaction
 get one GSN and are consolidated before any view sees them. Different
@@ -326,16 +342,17 @@ fixed once logged.
   LSN of the last commit that is durable in the input log; transactions at
   or below that LSN that the server sends again are skipped. An interrupted
   snapshot chunk is discarded and redone.
-- **Engine restart**: sources are restarted after recovery from the logged
-  per-source state (slot created, snapshot progress) and the LSN of the last
-  logged commit.
+- **Engine restart**: sources are restarted once recovery has replayed the
+  log, from the logged per-source state (slot created, snapshot progress)
+  and the LSN of the last logged commit.
 
 ### TRUNCATE
 
 `TRUNCATE` of a published table (published by default) removes all rows of
 the replicated table at the GSN of the truncating transaction; views see one
-retraction of every row. If a snapshot chunk of that table is in progress,
-its rows are discarded.
+retraction of every row. If a snapshot chunk of that table is in flight,
+the rows it read before the truncation are discarded (a chunk read after
+it keeps its rows).
 
 ### Upstream schema changes
 
@@ -353,14 +370,39 @@ different key — the source:
    nullable, key columns are `NOT NULL`) and the new key (see below);
 3. the engine rebuilds the table's primary index in the new shape: columns
    are matched **by name**; existing values are cast to the new type (a
-   failing cast gives NULL); new columns are NULL. The table's version is
-   incremented;
-4. dependent materialized views are re-planned against the new definition
-   and swapped at that GSN; indexes on the table move to its new version,
-   following their columns by name, and an index whose column is gone is
-   dropped (logged);
+   failing cast gives NULL); new columns are NULL; a row whose new key
+   would contain a NULL (a new key column) is left to the re-snapshot. The
+   table's version is incremented;
+4. at the same GSN: indexes on the table move to its new version, following
+   their columns by name (an index whose column is gone is dropped, one that
+   cannot be built is marked broken; both are logged); subscriptions that
+   read the table — `SUBSCRIBE TO` the table, a virtual view over it, or a
+   query naming it — end with `table "t" changed its columns upstream`
+   (SQLSTATE `55000`); sinks from the table restart with the new columns
+   ([Sinks](sinks.md#schema-changes-and-replacements)); and the materialized
+   views reading the table are re-planned (below);
 5. the source re-snapshots the table from the beginning, which fills the new
-   columns of existing rows. Fresh reads of the table wait for it.
+   columns of existing rows. Fresh reads of the table wait for it from the
+   schema record on.
+
+Every materialized view that reads the table, directly or through other
+views, is planned again from its `CREATE` statement, in dependency order,
+and swapped at the schema record's GSN, so that it reads the new version of
+the table (as a restart would plan it). Its indexes follow their columns by
+name. If its columns stay the same, its subscriptions and sinks continue
+and receive the difference; if they change (a `SELECT *` view, say), its
+subscriptions end with `materialized view "v" changed its columns` and its
+sinks restart with the new columns. A view that no longer plans — it uses
+a dropped or renamed column, or an expression no longer fits a new type —
+is **dropped**, together with its indexes, its sinks and the materialized
+views reading it (logged as `materialized view v is dropped: it is no
+longer valid after a change to object <id>: <reason>`). A view that is
+already [broken](operations.md#recovery) is built again if it plans now,
+and stays broken otherwise. Replaying the log repeats all of this
+identically. Virtual views are not re-planned: they stay in the catalog,
+are expanded when read, and fail then if they no longer plan (a virtual
+view over a dropped materialized view fails with `relation "m" does not
+exist`); drop or replace them.
 
 The key comes from the replica identity the Relation message describes: with
 `DEFAULT` the primary key's columns (the table becomes a keyless multiset if
@@ -379,17 +421,18 @@ Schema changes that change neither the column names, the mapped types nor
 the key are invisible to the engine: new indexes, defaults, constraints, and
 typmod-only changes such as `varchar(10)` to `varchar(20)`. A renamed column
 is a dropped column plus a new one: its values are NULL until the
-re-snapshot fills them, and materialized views that use the old name cannot
-be re-planned (see below).
+re-snapshot fills them, and materialized views that use the old name are
+dropped (see above). To keep such a view with its indexes and sinks,
+replace it before the upstream change by a definition that does not need
+the column.
 
 Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
 
-- A materialized view that cannot be re-planned (for example it uses a
-  dropped column) keeps its old dataflow and **stops being updated**; the
-  failure is only logged (`view ... could not be re-planned after a schema
-  change`). After the next checkpoint the engine **fails to start** because
-  the view cannot be planned during recovery. Drop such views before making
-  breaking upstream changes.
+- A `SUBSCRIBE (query)` whose query reads a materialized view over the
+  table keeps reading the view's old version, which no longer receives
+  changes: the subscription stays open (and with `PROGRESS` keeps reporting
+  progress) but delivers no more changes. Restart such subscriptions after
+  a schema change (`SUBSCRIBE TO` the view itself is not affected).
 
 ### Tables added to or removed from the publication
 
@@ -459,8 +502,8 @@ name of a slot still to be dropped (an explicit `SLOT`) cancels that drop.
 | `publication` | publication name |
 | `slot` | replication slot name |
 | `tables` | number of replicated tables |
-| `lsn` | the source's LSN frontier (`X/Y`): every upstream commit at or below it has been logged. It stays `0/0` until all of the source's tables have completed their initial snapshot, and does not advance during a re-snapshot. |
-| `status` | `starting`, `streaming`, `snapshotting <schema>.<table>`, `error: <message>` (while reconnecting), `error: cannot copy table <schema>.<table>: ...` (a table that cannot be read, retried while the rest streams), or `stopped` (the source thread could not be started) |
+| `lsn` | the source's LSN frontier (`X/Y`): every upstream commit at or below it has been logged. It stays `0/0` until all of the source's tables have completed their initial snapshot (and, after a restart, until the source has reported it again), and does not advance during a re-snapshot. |
+| `status` | `starting`, `streaming`, `snapshotting <schema>.<table>`, `error: <message>` (while reconnecting), `error: cannot copy table <schema>.<table>: ...` (a table that cannot be read, retried while the rest streams; further failing tables are counted as `(and <n> more tables)`), or `stopped` (the source thread could not be started) |
 
 `SHOW FRONTIERS` repeats the frontier per source; `SHOW TABLES` shows each
 table's source and row count. Source warnings and errors are written to the

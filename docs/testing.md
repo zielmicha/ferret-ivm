@@ -18,18 +18,19 @@ Requirements and environment:
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `PG_BIN` | `pgproto` integration tests, `ivm-difftest` | directory with PostgreSQL 17's `initdb`, `pg_ctl`, `postgres` and `psql` (default `/usr/lib/postgresql/17/bin`) |
+| `PG_BIN` | `pgproto` integration tests, the engine's replication tests, `ivm-difftest`, `ivm-bench` | directory with PostgreSQL 17's `initdb`, `pg_ctl`, `postgres` and `psql` (default `/usr/lib/postgresql/17/bin`) |
 | `PGPROTO_CLUSTER_DIR` | `pgproto::testutil::TempCluster` | parent directory of temporary clusters (default `$TMPDIR/pgproto-clusters`) |
 | `TMPDIR` | everything | temporary files; also the fallback directory for a cluster's Unix socket when the cluster directory is too deep for a socket path (107 bytes) |
-| `IVM_TEST_TMP` | `ivm` engine and storage tests | parent of their data directories (default: the temporary directory); a failing test keeps its directory for inspection |
+| `IVM_TEST_TMP` | the `ivm` crate's tests | parent of their data directories (default: the temporary directory); a failing test keeps its directory for inspection |
 | `PROPTEST_CASES`, `PROPTEST_RNG_SEED` | property tests (proptest) | number of cases per property (each test has its own default), and a fixed seed for the random cases |
 | `SELFDIFF_VERBOSE` | `tests/selfdiff.rs` | print each case's views and actions as it runs |
 
 Only the `pgproto` integration tests (`client`, `replication`,
 `server_codec`, `testutil`), the engine's replication tests
-(`crates/ivm/tests/replication.rs`) and `ivm-difftest` need PostgreSQL
-binaries; all other tests are self-contained. Golden tests read recorded
-data and need no server.
+(`crates/ivm/tests/replication.rs`), `ivm-difftest` and `ivm-bench` need
+PostgreSQL binaries; all other tests are self-contained (the process tests,
+`crates/ivm/tests/process.rs`, run the `ivm` binary, which `cargo test`
+builds). Golden tests read recorded data and need no server.
 
 `TempCluster` (`crates/pgproto/src/testutil.rs`) creates a throwaway cluster
 in `<base>/<pid>-<n>/`: `initdb` with user `postgres`, encoding UTF-8 and the
@@ -49,18 +50,25 @@ created with `keep: true`.
 
 | Suite | What it covers |
 |---|---|
-| unit tests (`cargo test -p ivm --lib`) | input-log round trip, torn-tail truncation and corruption before the tail (`log.rs`); exact float sums (`storage/summary.rs`); the sequencer's ticks under load (`coord/seq.rs`); statement splitting, the engine's own statement parser, planning panics turned into errors (`sql`); the source's snapshot chunks against a fake engine: truncates and keyless changes around a chunk, schema changes in the middle of a transaction, transaction-id visibility across epochs (`source/postgres.rs`); introspection and the web UI's assets (`coord/inspect.rs`, `http`); skipping key columns and fidelity suffixes without decoding them, on edge values (`types/encoding.rs`) |
+| unit tests (`cargo test -p ivm --lib`) | input-log round trip, torn-tail truncation and corruption before the tail (`log.rs`); exact float sums (`storage/summary.rs`); the sequencer's ticks under load and its backpressure on an engine that falls behind (`coord/seq.rs`); default slot names and the formats of logged `CREATE SOURCE` records (`coord/ddl.rs`); statement splitting, `AS OF` detection, operator-chain limits, parameter counts and the engine's own statements (`sql/parser.rs`); planning panics turned into errors, stored definitions with parameter placeholders (`sql`); the source against a fake engine: truncates and keyless changes around a snapshot chunk, schema changes in the middle of a transaction and their logged re-snapshot, keys implied by Relation messages and re-snapshots after a key change, watermark tags unique per run, values that are not UTF-8, chunks waiting for transactions decoded before them, transaction-id visibility across epochs (`source/postgres.rs`); pending slot drops recorded and cancelled (`source/mod.rs`); summaries decoding only the columns they read (`dataflow/layout.rs`); connection-string masking and other helpers of the introspection snapshots (`coord/inspect.rs`); the web UI's Basic auth, host check and embedded assets (`http`); skipping key columns and fidelity suffixes without decoding them, on edge values (`types/encoding.rs`) |
 | type property tests (`types/tests.rs`, proptest) | over random values of every column type (numerics of any scale, floats with NaN payloads and signed zeros, intervals, json, arrays with bounds and NULLs, ...): key order equals SQL order, for single values and composite keys; keys decode to the canonical value and, with the fidelity suffix, to the exact one; values and rows round-trip through the row codec, text I/O and binary send/recv; prefix successors bound every extension; skipping a key column, a fidelity suffix or a codec value consumes exactly what decoding it does. Plus key order on a table of edge values per type (`types/encoding.rs`) |
 | storage model test (`storage/tests.rs`, proptest) | random operation sequences on several trees (counts, and numeric, float and integer summaries over values embedded in the keys) against a model of every key's (GSN, weight) history: weighted batches, retention frontier advances, tree creation and drops, checkpoints, GC, clean reopens and crashes (no final checkpoint; garbage after the durable end of the manifest or the active segment; stray segment files; a crash in the middle of a checkpoint). Node and segment sizes, retention and the buffer pool (down to a few KB) are part of the case. Checked: point lookups after every step; scans now and AS OF every retained GSN, range and prefix scans, range summaries and `nth`; the tree structure (key ranges, parent links, `min_seg`) and the segment accounting; after a crash, the state of the last checkpoint, and replaying the operations since then must reproduce the state before the crash. Also: entries retracted behind the frontier are consolidated away, and a full-history model test with AS OF reads across crashes, checkpoints and GC that ends with GC keeping the store within a small factor of its live data |
 | engine tests (`tests/engine.rs`) | through the public API, without PostgreSQL: temporal filters following the logged clock, across a restart, and with the clock never going backwards; rejection of invalid temporal filters; temporal views (joins, aggregates, outer joins, `date_trunc`) equal to a recomputation as random changes and ticks interleave; recovery after drops (checkpointed indexes are found again although node ids changed; a multiset table keeps its rows); jsonpath views; multi-dimensional arrays and lockstep set-returning functions; ad hoc reads through index key ranges, partial decoding and index joins equal to the same queries written so that they cannot use them (`id + 0`), also `AS OF` an earlier GSN and across an index and a view rebuilt after it; regression tests (DISTINCT ON over infinite intervals, ordered aggregates after a DISTINCT one, percentiles differing only in their fraction, `WITH ORDINALITY` after `LATERAL`, predicates on derived columns filtering before the other columns are computed, quantified subqueries (`ANY`/`ALL`) as decorrelated, exact representations of values derived from presence changes, subscriptions to a view sharing its dataflow with a dropped or replaced view, subscriptions ending when a replacement changes the view's columns) and an ignored test of an open bug |
 | self-differential test (`tests/selfdiff.rs`, proptest) | random schemas of local tables and random views from `ivm-difftest`'s generator, then random actions: DML (also primary key changes and rows changed several times), checkpoints, clean restarts, crashes (sometimes with a torn record at the end of the log), views created, replaced and dropped, and reads AS OF earlier GSNs. After every action each view must equal its query run ad hoc (non-incrementally), reads AS OF a GSN must return what the views held then, and every view, and the queries of some, are subscribed to: the changes streamed must add up to their contents. A failure shrinks to a minimal case |
-| dataflow tests (`tests/dataflow.rs`) | operator regression tests: maintained views equal a recompute (an ad hoc query or a freshly hydrated copy) after every change; error records of shared nodes, across recovery and in recursive queries |
-| SQL and protocol tests (`tests/sql_semantics.rs`, `tests/server_protocol.rs`) | results checked against PostgreSQL 17 and inputs that must fail instead of crashing the engine; the wire protocol with raw messages against an in-process server |
+| dataflow tests (`tests/dataflow.rs`) | operator regression tests: maintained views equal a recompute (an ad hoc query or a freshly hydrated copy) after every change. Window frames past the partition end and `RANGE` offsets that overflow, `DISTINCT` aggregates with `FILTER` (maintained and ad hoc), percentiles over `NULLS FIRST` orders, general semijoins keeping representations of equal values apart, joins on computed keys, `bigint` variance and `numeric` sums beyond `numeric`'s range; error records of shared nodes, of aggregate groups across recovery, of recursive queries, and of join inputs at hydration |
+| recovery tests (`tests/recovery.rs`) | recovery building views after the views they read (a replaced view may read a newer one); views and indexes following a replaced view's new definition, and replacements rejected when they would invalidate a dependent view or make it non-deterministic; a log tail lost behind a checkpoint (no reused GSNs); `AS OF` reads only through arrangements whose history covers the GSN, also after a restart; views sharing a dataflow sharing its error records; dependencies as the relations a view reads; DML racing a `DROP` of its table; `bigint` variance |
+| DDL tests (`tests/ddl.rs`) | validation of definitions (at most one primary key, view column lists, `CREATE SINK` keys); `DROP` taking a relation's indexes along; atomic multi-name `DROP`; `SUBSCRIBE` to a view naming its columns like reads of it; stored definitions with parameter placeholders of earlier versions; the bounded catalog history |
+| lifecycle tests (`tests/lifecycle.rs`) | `AS OF AT LEAST LSN` without sources (also when the last source is dropped while a read waits); subscriptions ending when a relation they read is dropped, and not when an error record is retracted; `DROP SINK`, `DROP SOURCE` and shutdown not blocked by a sink or source stuck connecting to a server that never answers |
+| restart tests (`tests/restart.rs`) | data directories the current code no longer accepts as they are: a view whose stored definition no longer plans comes up broken (reads fail with `55000`, `SHOW VIEWS` and the web UI show it, `DROP` and `CREATE OR REPLACE` repair it); indexes following their columns by name after an upstream schema change; `now()` in reads `AS OF` earlier GSNs after a restart; a store without its manifest refused with every file left as it was |
+| process tests (`tests/process.rs`) | the `ivm` binary: exit status 1 when the listen address cannot be bound or the data directory is in use; `SIGTERM`, `SIGINT` and the stop file shut down after a final checkpoint with status 0 |
+| SQL and protocol tests (`tests/sql_semantics.rs`, `tests/server_protocol.rs`) | results checked against PostgreSQL 17 and inputs that must fail instead of crashing the engine; the wire protocol with raw messages against an in-process server (portals and `Bind`, parameter inference, `SUBSCRIBE` through the extended protocol, session commands and settings, cancellation and disconnects of waiting reads) |
 | HTTP tests (`tests/http.rs`) | the web UI's HTTP server and JSON API against a real engine |
-| replication tests (`tests/replication.rs`) | against a private PostgreSQL: snapshots and streaming, upstream schema changes (views over views, views a change invalidates, `SELECT *` views, DDL and DML in one transaction), re-snapshots (deletes during them, keyless tables, a crash before they log progress, key changes of TOASTed rows in a chunk's window, rows added after a truncate the chunk saw), TOASTed values across key changes, keyless tables truncated within a transaction, tables keyed by text-replicated types, `ALTER SOURCE REFRESH`; sinks: exactly once across restarts, keyless targets with json and with equal values of different representations, view replacements, unreachable targets |
+| replication tests (`tests/replication.rs`) | against a private PostgreSQL: snapshots and streaming; upstream schema changes (views over views, views a change invalidates, `SELECT *` views, DDL and DML in one transaction); `REPLICA IDENTITY USING INDEX` keys and detection of key and replica-identity changes; re-snapshots (deletes during them, keyless tables, a crash before they log progress, key changes of TOASTed rows in a chunk's window, rows added after a truncate the chunk saw); chunks waiting for transactions decoded before them (with an unreachable synchronous standby); a table that cannot be read not stopping the others; dropped and invalidated slots re-created; slots of dropped sources dropped after an outage and across restarts; default slot names differing between engines; `SQL_ASCII` upstreams rejected; reconnect backoff reset after a working session; TOASTed values across key changes, keyless tables truncated within a transaction, tables keyed by text-replicated types, `ALTER SOURCE REFRESH`; sinks: exactly once across restarts, no resynchronisation on restarts, keyless targets with json and with equal values of different representations, view replacements, unreachable targets |
 
-The engine tests start an engine with `sync: false` and `tick: None` and log
-clock ticks themselves (`LogRecord::Tick`), so time is fully controlled.
+The in-process engine tests start the engine with `sync: false` and
+`tick: None` and, where time matters, log clock ticks themselves
+(`LogRecord::Tick`), so time is fully controlled (the replication tests keep
+the default clock tick).
 
 The property tests' default case counts keep `cargo test` fast (10 cases
 for the storage model and self-differential tests, 4,096 for the type
@@ -84,6 +92,7 @@ in the `#[ignore]` reason (`cargo test -p ivm --test engine -- --ignored`).
 | `golden` | `tests/golden/*.tsv`: input (with and without typmod), arithmetic, unary and math functions, precision, casts, typmods, binary send/recv |
 | `tochar_golden` | `tests/golden/tochar.jsonl`: `to_char` for `numeric`, `int8`, `int4`, `int2`, `float8`, `float4`, and `to_number` |
 | `props` | key encoding order, scale insensitivity, round trips and rejection of garbage; binary encoding round trips; consistency of equality, hashing and ordering; float formatting round trips; helpers |
+| unit tests | normalized results, encoding lengths without decoding, exact arithmetic beyond `numeric`'s range (for aggregate states), powers of ten in float formatting |
 
 ### `crates/pgdatetime`
 
@@ -92,6 +101,7 @@ in the `#[ignore]` reason (`cargo test -p ivm --test engine -- --ignored`).
 | `golden` | `tests/golden/*.tsv`: text I/O, time-zone I/O, session time zones, all zone names and abbreviations, typmods, casts, arithmetic, comparison, fields (`extract`, `date_part`), truncation, `to_char`, `to_date`, fuzzed `to_char`/`to_timestamp`/input cases, edge cases, randomised cases |
 | `api` | behaviour not expressible as one SQL expression (for example the inverse transition of interval aggregates) |
 | `fuzz` | no public function panics on arbitrary input, including out-of-range raw values (`PGDT_FUZZ_SEED`, `PGDT_FUZZ_ITERS`; 60,000 iterations by default) |
+| unit tests | the fast paths for ISO dates and timestamps agree with the general parser on random inputs; POSIX time-zone rules; the `chrono-tz` fallback (for zones missing from the embedded database) agrees with the embedded data |
 | `bench` (ignored) | rough timings: `cargo test --release -p pgdatetime --test bench -- --ignored --nocapture` |
 
 ### `crates/pgfuncs`
@@ -100,6 +110,7 @@ in the `#[ignore]` reason (`cargo test -p ivm --test engine -- --ignored`).
 |---|---|
 | `text_golden`, `pattern_golden`, `bytea_golden`, `uuid_golden`, `array_golden`, `json_golden`, `jsonpath_golden` | `tests/data/*.jsonl`: string functions; `LIKE`, `SIMILAR TO` and regular expressions (plus a committed subset of the regex fuzz cases, `regex_fuzz.jsonl`); `bytea` I/O and `encode`/`decode`; `uuid`; array text I/O; json/jsonb functions and operators; SQL/JSON path |
 | `array_props`, `json_props` | array format/parse round trips and parser robustness; jsonb key encoding versus ordering, round trips, hash consistency, total-order laws, stack safety for deeply nested values |
+| unit tests | Unicode case mapping and character properties, JSON number normalization and ordering, jsonpath internals |
 
 Ignored tests and extra data:
 
@@ -114,7 +125,7 @@ Ignored tests and extra data:
 | Suite | What it covers |
 |---|---|
 | unit tests | connection strings (key/value and URI), command tags, LSN text form, MD5 and SCRAM authentication (RFC 7677 vector), `pgoutput` message decoding |
-| `client` | the client against PostgreSQL 17: Unix sockets (including abstract ones) and TCP, connection errors and timeouts, authentication methods (trust, cleartext, MD5, SCRAM), simple-query semantics, errors, notices and parameter status, fatal errors, large results, `COPY TO STDOUT` and `COPY FROM STDIN` |
+| `client` | the client against PostgreSQL 17: Unix sockets (including abstract ones) and TCP, connection errors and timeouts, authentication methods (trust, cleartext, MD5, SCRAM), simple-query semantics (also rows handed to a callback as values borrowed from the receive buffer, `simple_query_rows`), errors, notices and parameter status, fatal errors, large results, `COPY TO STDOUT` and `COPY FROM STDIN` |
 | `replication` | logical replication end to end: slots, `pgoutput` decoding (unchanged TOAST values, `REPLICA IDENTITY FULL`, `TRUNCATE`, logical messages), standby status updates, replication-command errors, keepalives with a short sender timeout |
 | `server_codec` | the server-side protocol code: frontend message decoding and errors, startup packets, `BackendWriter` output decoded by the client, a fake walsender, and `psql` talking to a tiny server |
 | `testutil` | `TempCluster` lifecycle (stop, restart, `psql`) and stale-cluster cleanup |
@@ -165,22 +176,27 @@ Regenerating (each script documents its usage in its header):
 PGHOST=/path/to/socketdir PGPORT=5432 python3 crates/pgnumeric/tests/gen_golden.py
 PGHOST=/path/to/socketdir PGPORT=5432 python3 crates/pgnumeric/tests/gen_tochar.py [--out PATH] [--seed N] [--scale K]
 
-# pgdatetime (runs psql; PGDT_GOLDEN_OUT overrides the output directory)
+# pgdatetime (runs the psql command in PGDT_PSQL, which is required;
+# PGDT_GOLDEN_OUT overrides the output directory)
 PGDT_PSQL="psql -h /path/to/socketdir -p 5432 -U postgres" python3 crates/pgdatetime/tools/gen_golden.py
 
 # pgfuncs (one script per data file; PGHOST/PGPORT are deliberately ignored)
 PGFUNCS_PGHOST=/path/to/socketdir PGFUNCS_PGPORT=5432 python3 crates/pgfuncs/tests/gen/gen_json.py
 ```
 
-Always set `PGDT_PSQL`: its built-in default refers to a server of the
-original development setup.
+`PGDT_PSQL`, `PGFUNCS_PGHOST`/`PGFUNCS_PGPORT` and, for `gen_tochar.py`,
+`PGHOST`/`PGPORT` are required (the scripts exit without them); the
+`pgnumeric` scripts also read `PGUSER` and `PGDATABASE` (default `postgres`
+for both), and its `gen_golden.py` falls back to libpq's default host and
+port 5432.
 
 Larger randomised runs can be checked without committing them:
 `PGNUMERIC_EXTRA_GOLDEN=a.tsv:b.tsv cargo test -p pgnumeric --test golden`,
 `PGNUMERIC_EXTRA_TOCHAR=big.jsonl cargo test -p pgnumeric --test tochar_golden`,
 and `PGDT_GOLDEN_DIR=<dir> cargo test -p pgdatetime --test golden -- --ignored`
-(checks every `*.tsv` in the directory; `PGDT_SEED` and `PGDT_SCALE` change
-the seed and multiply the size of the `pgdatetime` random cases).
+(checks every `*.tsv` in the directory; for such runs, `PGDT_SEED` and
+`PGDT_SCALE` change the generator's seed and multiply the size of the
+`pgdatetime` random cases).
 
 Other generated files: `crates/pgdatetime/src/tz/tzdata.bin` is built by
 `tools/gen_tzdata.py` from a compiled IANA zoneinfo directory (the files
@@ -262,31 +278,34 @@ What a run does:
    returns the same rows. It keeps the queries PostgreSQL accepts and
    creates each as a materialized view, printing `unsupported: <error> ::
    <query>` for those the engine rejects (at most 20 × `--views` attempts),
-   then adds views over views (grouping, `DISTINCT` and a self-join of an
-   existing view), which read the materialized view in the engine and
-   inline its query in PostgreSQL. Then the sinks.
+   then adds views over views (grouping, `DISTINCT`, or a join of an
+   existing view with an aggregate of itself), which read the materialized
+   view in the engine and inline its query in PostgreSQL. Then the sinks.
 5. Round 0 compares the initial state. Each later round first applies the
    round's schema changes, if any (`ALTER TABLE ... ADD COLUMN`, sometimes
    with a default, which existing rows get without a replicated change, so
    the source must snapshot the table again; then an update of some rows,
    which brings the new shape into the replication stream; later changes
    use the new column), then runs 1–4 random upstream transactions of 1–8
-   statements: inserts, updates of a random column, primary-key changes,
-   deletes, and occasionally `TRUNCATE` (a failing transaction is rolled
-   back and reported as ignored); sometimes a `CHECKPOINT`; and the
-   round's restart, if any.
+   statements: inserts, updates of a random column, primary-key changes
+   (also of many rows at once), deletes, rows inserted and changed (and
+   deleted) again or deleted and inserted again within the transaction,
+   upserts (`ON CONFLICT DO UPDATE`), and occasionally `TRUNCATE` (a failing
+   transaction is rolled back and reported as ignored); sometimes a
+   `CHECKPOINT`; and the round's restart, if any.
 6. It then reads `pg_current_wal_lsn()` upstream and compares every view,
    read with `AS OF AT LEAST LSN '<lsn>'`, with the same query run by
    PostgreSQL, and every replicated table with its upstream contents.
    Results are compared as sorted lists of rows in text form, with
    floating-point values rounded to 10 significant digits. For queries that
    deduplicate (`GROUP BY`, `DISTINCT`, a set operation, `min`, `max`,
-   `mode`, `LIMIT` or `FETCH`), rows that differ only in the representation
-   of equal `numeric` values (`1.0` and `1.00`) also match, because
-   PostgreSQL keeps whichever representation it meets first. A view over a
-   view that fails in the engine is not compared (it fails with its source,
-   while PostgreSQL need not compute the failing column). Each sink's table
-   must converge to its view's contents within 20 seconds.
+   `mode`, `percentile_disc`, `LIMIT` or `FETCH`), rows that differ only in
+   the representation of equal `numeric` values (`1.0` and `1.00`) also
+   match, because PostgreSQL keeps whichever representation it meets
+   first. A view over a view that fails in the engine is not compared (it
+   fails with its source, while PostgreSQL need not compute the failing
+   column). Each sink's table must converge to its view's contents within
+   20 seconds.
 7. Prints `round <n>: <m>/<k> views match (<rows> rows, <e> both-error), <s> sinks (<r> rows), in <time>`
    (and each schema change and restart as it happens).
    For a mismatch it prints the view and its query, both row counts, up to

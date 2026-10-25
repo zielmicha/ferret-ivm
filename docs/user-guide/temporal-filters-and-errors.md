@@ -12,8 +12,9 @@ maintenance. Code: `crates/ivm/src/dataflow/temporal.rs`,
 The state of a maintained view must be a pure function of the input log, so
 the wall clock is an input like any other: the sequencer writes a *tick*
 record holding the current wall-clock time (microseconds since the Unix
-epoch) to the input log every `--tick-ms` milliseconds (default 1000), when
-it has nothing else to do at that moment. Each tick gets a GSN.
+epoch) to the input log every `--tick-ms` milliseconds (default 1000), in
+the same batch as whatever else is being logged at that moment. Each tick
+gets a GSN.
 
 - The engine's **logical clock** is the time of the latest applied tick. It
   never goes backwards: a tick older than the current clock (wall clock
@@ -23,9 +24,10 @@ it has nothing else to do at that moment. Each tick gets a GSN.
 - With `--tick-ms 0` no ticks are written: the clock stays at the last logged
   tick, which is 2000-01-01 00:00:00+00 on a data directory that never had
   one.
-- Under sustained input the sequencer may postpone ticks, because a tick is
-  only generated when no other input is waiting at the tick deadline; the
-  clock then lags the wall clock.
+- Ticks keep their schedule under sustained input. They pause only while
+  the sequencer holds back all input because the engine is 10,000 or more
+  records behind ([Operations](operations.md#configuration-and-tuning)); the
+  next tick then carries the current time.
 
 Where the clock is used:
 
@@ -157,50 +159,59 @@ Rules:
 - Error records flow through every downstream operator and are counted per
   view. When the offending input row is deleted or updated, its error record
   is retracted.
+- Every operator keeps the error records currently in its output, so a view
+  created over existing operators — an identical query, a view over another
+  materialized view, any shared sub-plan — starts with the error records
+  already there, and errors below an index the plan reads count like any
+  other.
 - While a materialized view has an error record with a positive count, every
   read that references the view fails with that error (the smallest by
   SQLSTATE and message, if there are several), and `SHOW VIEWS` shows the
   number of distinct errors. A `SUBSCRIBE` ends with an error as soon as a
-  change of the subscribed relation adds (or retracts) an error record; a
-  subscription started while the view already has errors is not affected
-  until then.
+  change of the subscribed relation adds an error record (a retraction does
+  not end it); a subscription started while the view already has errors is
+  not affected until then.
 - Grouped aggregates: if an aggregate of a group fails (for example
-  `sum(float8)` overflowing to `value out of range: overflow`), the group's
-  row is removed and one error record is kept for the group until the group
-  computes again (with exceptions, see the deviations below).
+  `sum(float8)` overflowing to `value out of range: overflow`, or a `numeric`
+  sum or average beyond `numeric`'s range: `value overflows numeric format`),
+  the group's row is removed and one error record is kept for the group
+  until the group computes again. This also holds for an aggregate without
+  `GROUP BY`. (The sums themselves are kept exactly, so maintaining them
+  never fails.)
 - Window functions: if computing a partition fails (for example
   `ntile(0)`), the partition contributes an error record instead of rows.
-- Errors are part of the checkpointed state and are not delivered to sinks.
+- `WITH RECURSIVE`: an error while evaluating the query (including
+  `recursive query exceeded the iteration limit`) retracts the view's rows
+  and leaves one error record until the query evaluates without error.
+- A scalar subquery that returns more than one row raises its error only
+  where its value is used, as in PostgreSQL: a `CASE` branch that is not
+  taken does not raise it. In a maintained view the error record exists
+  while some row actually uses such a value.
+- Errors are part of the checkpointed state — the views' error records, the
+  operators', and which aggregate groups and recursive queries are in error
+  — so they are retracted correctly after a restart. They are not delivered
+  to sinks.
 - Ad hoc queries do not use error records: they fail like in PostgreSQL.
 
-In aggregates and temporal filters, errors that are not caused by data —
-internal errors (`XX...` SQLSTATEs) and I/O errors (`58...`) — are not turned
-into records. Such an error while applying a log record stops the engine
-thread; the server then answers every statement with
-`engine is shutting down` until it is restarted. Any other error that
-escapes the dataflow (a bug) is logged, the record is not applied again (it
-may be half-applied), and the statement that wrote it fails.
+In aggregates, temporal filters and recursive queries, errors that are not
+caused by data — internal errors (`XX...` SQLSTATEs) and I/O errors
+(`58...`) — are not turned into records. Such an error while applying a log
+record stops the engine thread, and the process exits with status 1; the
+next start replays the record. Any other error that escapes the dataflow (a
+bug) is logged, the record is not applied again (it may be half-applied),
+and the statement that wrote it fails; should the engine stop before its
+next checkpoint, the replay of that record fails again and stops the start.
 
 Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
 
-- Errors in **join conditions**, in join keys, and in expressions evaluated
-  on the probed side of a join are treated as "no match": the joined row is
-  silently missing and no error record is created (PostgreSQL would fail).
-  When a view is created, only expressions of the input that drives the
-  initial computation are checked.
-- After a **restart**, error records of aggregate groups that existed before
-  the restart are never retracted, so the view keeps failing even after the
-  data is fixed. Dropping and re-creating the view recomputes its errors.
-- The error of an aggregate **without `GROUP BY`** that exists when the view
-  is created is never retracted either.
-- When a view is **created**, its initial error records come only from the
-  computation of its root operator. Errors of rows that sit below an index
-  the plan reads from (inside `DISTINCT`, `GROUP BY`, set operations, top-k,
-  windows, join lookups), and errors already held by an existing view whose
-  operators the new view shares (an identical query, or a view over another
-  materialized view), are not counted: the view reads successfully although
-  PostgreSQL would fail. When the offending row is later deleted, the view's
-  count for that error drops below zero, which masks the next occurrence of
-  the same error.
+- Errors in **join conditions** are treated as "no match": the joined row is
+  silently missing and no error record is created, where PostgreSQL (and the
+  same query run ad hoc) fails. This applies to conditions that compare
+  columns of several joined inputs other than the equalities the join looks
+  rows up by: further `ON` conditions, `WHERE` conditions the optimizer
+  moves into the join, and such conditions of `EXISTS`/`IN` subqueries — for
+  example `ON a.id = b.id AND a.x / b.y > 1` with `b.y = 0`. Errors in
+  expressions over a single input (including computed join keys such as
+  `ON a.v = 100 / b.x`) are error records as usual.
 - Error records are **not versioned**: an `AS OF` read checks the view's
   current error records, whatever they were at the read's GSN.

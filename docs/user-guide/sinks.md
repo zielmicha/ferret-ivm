@@ -30,7 +30,10 @@ CREATE SINK events_out FROM events INTO POSTGRES
   CONNECTION 'postgresql://writer@reporting/reports' TABLE 'events_copy';
 ```
 
-- `relation` must be a table (local or replicated) or a materialized view.
+- `relation` must be a table (local or replicated) or a materialized view
+  (`sink source "v" must be a table or materialized view`, SQLSTATE
+  `42809`); a [broken](operations.md#recovery) materialized view is refused
+  (`55000`).
 - `CONNECTION` uses the same connection-string syntax as sources
   ([Sources](sources.md#connection-strings)); no replication privileges are
   needed.
@@ -39,12 +42,17 @@ CREATE SINK events_out FROM events INTO POSTGRES
   case-sensitive and not lowercased.
 - `KEY` lists columns of `relation` that are unique in it. With a key, rows
   are upserted and deleted by key; without one, the target is maintained as a
-  multiset. The key columns are not checked by `CREATE SINK`: a misspelled
-  column is accepted, and the sink then fails every connection attempt with
-  `error: sink key column "x" does not exist`.
+  multiset. The key is checked before the statement is logged (and again
+  when it is applied): an unknown column fails with SQLSTATE `42703`
+  (`sink key column "x" does not exist in "v"`), a repeated one with `42701`,
+  and a column of a type that cannot be part of a primary key (`json`,
+  `jsonpath`, or arrays of them) with `0A000`. Whether the key columns are
+  unique is not checked (see
+  [Requirements on the target](#requirements-on-the-target)).
 
 The sink starts as soon as the statement is applied, and again after every
-engine start.
+engine start. A sink whose relation is a broken materialized view is not
+started (its status says why).
 
 ## How a sink works
 
@@ -75,9 +83,8 @@ engine start.
      `INSERT` of the snapshot rows (each row repeated by its multiplicity, 500
      rows per statement), and the progress row set to the snapshot GSN. This
      happens only at the thread's first synchronisation; if on a later
-     reconnect the row is missing or behind what the thread has delivered,
-     the sink reports `error: sink progress row went backwards` and keeps
-     retrying.
+     reconnect the row is missing or behind the snapshot GSN, the sink
+     reports `error: sink progress row went backwards` and keeps retrying.
 
 ### Delivering changes
 
@@ -92,7 +99,7 @@ BEGIN;
 -- for each GSN in order:
 --   one DELETE per removed row instance, then
 --   INSERTs of the added rows (500 rows per statement)
-INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('<name>', <last gsn>)
+INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('<name>', <last gsn delivered>)
   ON CONFLICT (sink) DO UPDATE SET gsn = EXCLUDED.gsn;
 COMMIT;
 ```
@@ -108,7 +115,13 @@ With `KEY`:
 Without `KEY`:
 
 - a removed row deletes one matching row:
-  `DELETE FROM <target> WHERE ctid = (SELECT ctid FROM <target> WHERE c1 IS NOT DISTINCT FROM <v1> AND ... LIMIT 1)`;
+  `DELETE FROM <target> WHERE ctid = (SELECT ctid FROM <target> WHERE c1 IS NOT DISTINCT FROM <v1> AND ... LIMIT 1)`.
+  Columns of type `json`, `jsonb`, `jsonpath`, `numeric`, `real` or
+  `double precision` (and arrays of them) are matched by their text
+  (`c::text IS NOT DISTINCT FROM (<v>)::text`): PostgreSQL has no equality
+  for `json` and `jsonpath`, and for the others equality would also match
+  another representation of an equal value (`1.5` and `1.50`, `-0` and
+  `0`), deleting a row the view still has;
 - added rows are plain `INSERT`s.
 
 Values are written as typed literals, `'<text output>'::<type>`, or `NULL`.
@@ -116,11 +129,12 @@ Values are written as typed literals, `'<text output>'::<type>`, or `NULL`.
 ### Exactly-once delivery
 
 Each flush stores the data and the sink's progress GSN in the same
-transaction. If the connection fails or the commit's outcome is unknown, the
-thread reconnects (backoff from 100 ms, doubling, at most 10 s) and reads the
-progress row again: batches at or below the committed GSN are discarded,
-the rest are applied again. A batch is therefore applied exactly once while
-the engine keeps running.
+transaction. If the transaction fails or its outcome is unknown, the thread
+reconnects (failed connection attempts are retried after 100 ms, doubling up
+to 10 s) and reads the progress row again: batches at or below the committed
+GSN are discarded, the rest are applied again. Changes that arrive meanwhile
+are kept. A batch is therefore applied exactly once while the engine keeps
+running.
 
 The progress row records the last GSN the engine delivered to the sink —
 a change, or a GSN at which the relation did not change (clock ticks,
@@ -151,7 +165,8 @@ written when the engine stopped are written when it stops.
   primary key.
 - The key columns must be unique in the relation. Duplicate keys make the
   upsert fail (`ON CONFLICT DO UPDATE command cannot affect row a second
-  time`) or silently merge rows.
+  time`), which stops delivery (the batch is retried until it succeeds),
+  or silently merge rows.
 - Sink names must be unique among all engines writing into the same database:
   the progress row is keyed by the sink name only.
 - The role needs `CREATE` on the schema (the `CREATE TABLE IF NOT EXISTS`
@@ -162,16 +177,40 @@ written when the engine stopped are written when it stops.
 
 Only data changes. [Error records](temporal-filters-and-errors.md#errors-as-data)
 of a materialized view are not delivered; a group that turns into an error is
-removed from the view, so the sink deletes its row. When the relation is a
-materialized view that is replaced with `CREATE OR REPLACE`, the sink
-receives the difference between the old and the new contents at the
-replacement's GSN.
+removed from the view, so the sink deletes its row.
+
+## Schema changes and replacements
+
+- Replacing the relation (a materialized view) with
+  `CREATE OR REPLACE MATERIALIZED VIEW` keeps the sink if the new definition
+  has the same columns (names, types and type modifiers): the sink receives
+  the difference between the old and the new contents at the replacement's
+  GSN. A replacement that changes the columns, or makes the view a virtual
+  one, is rejected while a sink reads it
+  (`cannot replace view "v": sink "s" reads its columns`, SQLSTATE `2BP01`).
+- When the relation's columns change anyway — an upstream schema change of
+  a replicated table, or a materialized view re-planned after one
+  ([Sources](sources.md#upstream-schema-changes)) — the sink restarts with
+  the new columns, like a new sink: from a fresh snapshot, with a
+  resynchronisation (its progress is behind that snapshot). The target
+  table is never altered: until it has every new column, with a type the
+  values convert to, the resynchronisation fails (for example
+  `error: column "c" of relation "t" does not exist`) and is retried. Add
+  the columns to the target (or drop the target table, which the sink then
+  creates again). Columns that the relation lost stay in the target and are
+  left NULL (or at their default) by the inserts; if a `KEY` column is
+  gone, the sink cannot start again (`sink key column "k" does not
+  exist`): drop it.
+- A materialized view that an upstream change invalidates is dropped
+  together with its sinks.
 
 ## Monitoring and DROP SINK
 
 `SHOW SINKS` shows `name`, `from` (the relation), `table` (the target as
 given), and `status`: `starting`, `running (gsn <n>)` (the GSN up to which
-the target is current, as committed in the progress row), `error: <message>` while reconnecting, or `stopped`.
+the target is current, as committed in the progress row), `error: <message>`
+while reconnecting or retrying, `error: broken: <reason>` (the relation is a
+broken materialized view; the sink is not started), or `stopped`.
 
 ```sql
 DROP SINK [ IF EXISTS ] name
@@ -192,12 +231,15 @@ progress row, which only moves forward. At shutdown the engine waits up to
 
 ## Known problems
 
-- While a sink is reconnecting, each retry takes one queued message off its
-  channel to check for a stop request and discards it if it is a change, so
-  changes that arrive during a connection outage can be **lost** until the
-  affected rows change again. Concurrent sinks that create
-  `ivm_sink_progress` at the same moment can trigger this: PostgreSQL may
-  fail one of the concurrent `CREATE TABLE IF NOT EXISTS` statements with
-  `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`.
-  Create the progress table beforehand, or create sinks one at a time. See
-  [Troubleshooting](troubleshooting.md#known-problems).
+See also [Troubleshooting](troubleshooting.md#known-problems).
+
+- The queue of changes from the engine to each sink is unbounded: while a
+  sink cannot write (its target is down, or a batch keeps failing), the
+  changes it has not written accumulate in memory.
+- A batch or resynchronisation that the target rejects on a working
+  connection (duplicate `KEY` values, a missing column, a value that does
+  not convert) is retried about every 50–100 ms, reconnecting each time,
+  without a growing delay. For a failing batch, `SHOW SINKS` shows
+  `running (gsn <n>)` most of the time, with `<n>` no longer advancing:
+  check that `<n>` follows `SHOW GSN`; the failing statement is in the
+  target server's log.

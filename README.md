@@ -29,8 +29,9 @@ upstream PostgreSQL with a small shop schema, an engine with the web UI,
 a dozen maintained views, a sink, streaming changes and live subscriptions
 ([examples/demo](examples/demo/README.md)).
 
-The upstream needs `wal_level = logical`, a publication, and a primary key
-or `REPLICA IDENTITY FULL` on every published table
+The upstream (PostgreSQL 14 or newer) needs `wal_level = logical`, a
+publication, and a primary key, `REPLICA IDENTITY USING INDEX` or
+`REPLICA IDENTITY FULL` on every published table
 ([Sources](docs/user-guide/sources.md)).
 
 ```sql
@@ -62,7 +63,7 @@ The [documentation](docs/README.md) covers:
 
 | Crate | Contents |
 |---|---|
-| `crates/ivm` | the engine, the server binary `ivm`, and `ivm-difftest` |
+| `crates/ivm` | the engine, the server binary `ivm` (with the web UI in `crates/ivm/web`), the differential tester `ivm-difftest` and the benchmark `ivm-bench` |
 | `crates/pgproto` | PostgreSQL wire protocol: client with logical replication, server-side codec, temporary test clusters |
 | `crates/pgnumeric` | PostgreSQL-compatible `numeric` and float text conversions |
 | `crates/pgdatetime` | PostgreSQL-compatible date/time types and functions |

@@ -23,17 +23,19 @@ What runs:
   set-returning function, a virtual view, an index and a sink (into database
   `sinkdb`). `units_per_100` demonstrates errors as data: see below.
 - `loadgen.py` (needs `psycopg` 3): about 20 small transactions per second
-  (new orders, status changes, cancellations, restocks, events, customer
-  changes), a bulk import of 3000 orders every 2 minutes, and every 3
-  minutes a bad price update that sets a product's price to 0 for 20
-  seconds — while it lasts, reads of `units_per_100` fail with "division by
-  zero" and the Errors screen shows the error record.
+  (new orders, status changes, cancellations, purges of cancelled orders,
+  restocks, events, customer changes), a bulk import of 3000 orders every 2
+  minutes, and every 3 minutes a bad price update that sets a product's
+  price to 0 for 20 seconds — while it lasts, reads of `units_per_100` fail
+  with "division by zero" and the Errors screen shows the error record.
 - `psql` clients running `COPY (SUBSCRIBE TO top_products WITH (PROGRESS))`
   and the same for `order_status_counts`; their output goes to
   `subscribe-*.log`.
 
 Settings (environment variables): `DEMO_DIR` (default `.scratch/demo` in the
 repository), `PG_BIN` (default `/usr/lib/postgresql/17/bin`), `PG_PORT`
-(54600), `IVM` (path of the binary), `IVM_LISTEN` (127.0.0.1:6875),
-`HTTP_LISTEN` (127.0.0.1:6876), `RATE` (transactions per second, 20) and
-`LOADGEN_ARGS` (extra `loadgen.py` options, e.g. `--glitch-every 60`).
+(54600; the upstream listens on a Unix socket in `$DEMO_DIR/sock` only),
+`IVM` (path of the binary, default `target/release/ivm`), `IVM_LISTEN`
+(127.0.0.1:6875), `HTTP_LISTEN` (127.0.0.1:6876), `RATE` (transactions per
+second, 20) and `LOADGEN_ARGS` (extra `loadgen.py` options, e.g.
+`--glitch-every 60`).

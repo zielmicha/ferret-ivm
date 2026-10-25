@@ -11,11 +11,11 @@ chooses its GSN, the session settings, and `SUBSCRIBE`. Code:
 
 | Form | Reads the state at | Waits for |
 |---|---|---|
-| `SELECT ...` (session `read_mode = fresh`, the default) | the last durable GSN when the query arrives | the engine to apply that GSN; initial snapshots of the tables read |
+| `SELECT ...` (session `read_mode = fresh`, the default) | the last durable GSN when the query arrives | the engine to apply that GSN; the snapshots of the replicated tables read |
 | `SELECT ... AS OF FRESH` | same, regardless of `read_mode` | same |
 | `SELECT ...` with `read_mode = latest`, or `SELECT ... AS OF LATEST` | the last applied GSN | nothing |
 | `SELECT ... AS OF <gsn>` | `<gsn>` | the engine to apply `<gsn>` if it is in the future |
-| `SELECT ... AS OF AT LEAST LSN '<X/Y>'` | the last durable GSN once every source's frontier has reached the LSN | every source frontier ≥ LSN; initial snapshots of the tables read |
+| `SELECT ... AS OF AT LEAST LSN '<X/Y>'` | the last durable GSN once every source's frontier has reached the LSN | every source frontier ≥ LSN; the snapshots of the replicated tables read |
 
 All relations in one query are read at the same GSN, so a query never sees a
 half-applied upstream transaction or a mix of two points in time.
@@ -31,11 +31,13 @@ SELECT * FROM orders WHERE id = 7 AS OF AT LEAST LSN '0/16B3748';
 SELECT count(*) FROM orders AS OF LATEST;
 ```
 
-It is recognised as the last occurrence of ` as of ` (case-insensitive,
-surrounded by spaces) outside parentheses and quotes; anything after the
-clause is a syntax error (`unexpected tokens after AS OF clause`).
-Sub-selects cannot have their own `AS OF`; `FOR SYSTEM_TIME`-style table
-versions are rejected.
+It is recognised as the last `AS OF` (case-insensitive, the two words
+separated by whitespace, with whitespace before and after) at the top level
+of the statement: outside parentheses, string literals, quoted identifiers,
+comments and dollar-quoted strings. Anything after the clause is a syntax
+error (`unexpected tokens after AS OF clause`). Sub-selects cannot have
+their own `AS OF`; `FOR SYSTEM_TIME`-style table versions are rejected
+(`table versions are not supported; use AS OF on the query`).
 
 ### Fresh reads (default)
 
@@ -44,11 +46,13 @@ when the query arrives, and waits until the engine thread has applied it.
 This includes every local DML statement whose reply the client has already
 received, and every upstream transaction that has been logged. Fresh reads
 also wait while a replicated table that the query reads — directly or through
-views — is still loading its initial snapshot: a partially loaded table is no
-state the upstream ever had. A re-snapshot after an upstream schema change is
-only waited for once its first chunk has been logged; until then fresh reads
-return the table at once, with NULL in the new columns
-([Sources](sources.md#upstream-schema-changes)).
+views — is incomplete: a partially loaded table is no state the upstream ever
+had. A table is incomplete during its initial snapshot, from an upstream
+schema or key change until its re-snapshot has finished
+([Sources](sources.md#upstream-schema-changes)), and after a lost
+replication slot until it has been copied again ([Slots](sources.md#slots)).
+The wait is per table: a table that cannot be copied (for example for lack
+of `SELECT` upstream) holds back the fresh reads of that table only.
 
 ### Latest reads
 
@@ -74,28 +78,30 @@ the retention frontier. Note that every clock tick (by default one per
 second) consumes a GSN, so 1000 GSNs are at most about 17 minutes on an idle
 engine.
 
-Time-travel reads use the **current** catalog: a relation created after the
-GSN reads as empty (its index has no versions before its creation), and a
-virtual view is expanded with its current definition over the historical
-table contents.
+Time-travel reads use the **current** catalog: a virtual view is expanded
+with its current definition over the historical table contents.
 
-More generally, an index only has versions from the GSN at which it was
-built, and reads as of an earlier GSN silently return too few rows or none
-(a known problem):
+An index keeps history only from the GSN at which it was built, and an
+`AS OF` read uses only indexes whose history covers its GSN. A secondary
+index created after that GSN is simply not used. When a relation the read
+needs has no such index at all, the read fails with SQLSTATE `55000`:
 
-- a materialized view read as of a GSN before its current index was built —
-  before it was last replaced with `CREATE OR REPLACE`, or before a restart
-  that rebuilt the index because its structure no longer matched — returns
-  nothing;
-- point lookups (`WHERE column = constant`) use any index on the relation,
-  including a secondary index created after the read GSN: with an index on
-  `t(c)` created at GSN 95, `SELECT * FROM t WHERE c = 10 AS OF 92` returns
-  nothing, while a read of `t` without the condition (a scan of the primary
-  index) returns the rows.
+```
+ERROR:  AS OF 133 is before the history of a relation it reads, which starts at 134
+```
 
-Error records are not versioned either: a read of a materialized view as of
-any GSN fails if the view has error records *now*, and succeeds if it has
-none now, whatever its state at that GSN.
+This happens for a relation created after the GSN, and for one whose index
+was rebuilt since: a materialized view replaced with `CREATE OR REPLACE` or
+re-planned after a change to what it reads, a replicated table after an
+upstream schema change, and a materialized view whose dataflow a restart
+rebuilt (recovery plans every view again; when the plan comes out
+different, for example because join orders follow the current table sizes,
+the view's indexes are hydrated afresh; see
+[Known problems](troubleshooting.md#known-problems)).
+
+Error records are not versioned: a read of a materialized view as of any GSN
+fails if the view has error records *now*, and succeeds if it has none now,
+whatever its state at that GSN.
 
 ### Read-your-writes against PostgreSQL: AS OF AT LEAST LSN
 
@@ -114,14 +120,15 @@ waiting, sources ask the upstream for a keepalive so that the frontier
 advances even when no data flows. Because all sources are compared, this
 form is meant for sources that replicate from the same PostgreSQL cluster.
 
-A source's frontier does not advance while any of its tables is loading an
-initial snapshot, nor while the source is stuck in an error; a source that
-has not reported a frontier yet holds reads back too. A dropped source no
-longer holds reads back. If the engine has **no sources at all**, the read
-fails at once with SQLSTATE `55000` (`AS OF AT LEAST LSN '...' cannot be
-satisfied: there is no source`), also a waiting read when the last source
-is dropped: the LSN is a position in an upstream's WAL, so a read without
-sources could not show the commit it waits for.
+A source's frontier does not advance while any of its tables is incomplete
+(being copied, or failing to be copied; see above), nor while the source is
+stuck in an error; a source that has not reported a frontier yet holds
+reads back too. A dropped source no longer holds reads back. If the engine
+has **no sources at all**, the read fails at once with SQLSTATE `55000`
+(`AS OF AT LEAST LSN '...' cannot be satisfied: there is no source`), also a
+waiting read when the last source is dropped: the LSN is a position in an
+upstream's WAL, so a read without sources could not show the commit it
+waits for.
 
 A read that waits — for freshness, an LSN, a future GSN or an initial
 snapshot — ends with SQLSTATE `57014` (`canceling statement due to user
@@ -137,23 +144,28 @@ its read when it stops waiting (after 30 s).
 `transaction_timestamp()` and `statement_timestamp()` return the engine's
 **logical clock as of the read's GSN**: the value of the latest logged clock
 tick at or before that GSN. Reads are therefore repeatable — the same query
-`AS OF g` returns the same result every time. `clock_timestamp()` is the
-real wall clock. See [Temporal filters](temporal-filters-and-errors.md).
+`AS OF g` returns the same result every time, also after a restart
+(checkpoints keep the clock ticks). `clock_timestamp()` is the real wall
+clock. See [Temporal filters](temporal-filters-and-errors.md#the-logical-clock).
 
 ### Views with errors
 
 A read that references a materialized view that currently has
 [error records](temporal-filters-and-errors.md#errors-as-data) fails with
 that error (the error's SQLSTATE and message), regardless of the read point.
+A read that references a [broken](operations.md#recovery) materialized view
+(directly or through views) fails with SQLSTATE `55000`
+(`materialized view "v" is broken: <reason>`).
 
 ### How reads are executed
 
 Ad hoc queries do not create dataflow: they are planned like views and then
 evaluated once by a batch executor over the indexes (key lookups and
-ranges, index or hash joins, hash aggregation, sorting), at the chosen GSN. Reading a materialized view is a
-scan of its index (or a key range of it, see
-[Indexes](tables-and-views.md#indexes)); reading a virtual view evaluates its
-query. Expression errors make the query fail, as in PostgreSQL.
+ranges, index or hash joins, hash aggregation, sorting), at the chosen GSN.
+Reading a materialized view is a scan of its index (or a key range of it,
+see [Indexes](tables-and-views.md#indexes)); reading a virtual view
+evaluates its query. Expression errors make the query fail, as in
+PostgreSQL.
 
 ## Transactions
 
@@ -172,30 +184,51 @@ read chooses its own GSN. `SHOW transaction_isolation` reports
 | Setting | Values | Effect |
 |---|---|---|
 | `read_mode` (alias `ivm.read_mode`) | `fresh` (default), `latest` | default read point of `SELECT` (see above); other values fail with SQLSTATE `22023` |
-| `TimeZone` / `SET TIME ZONE` | `UTC`, `GMT`, `Z`, `+00`, `0`, `Etc/UTC`, `DEFAULT`, `LOCAL` (case-insensitive) | accepted; anything else fails: the session time zone is always UTC |
-| `client_encoding`, `SET NAMES` | `UTF8`, `UTF-8`, `UNICODE`, `DEFAULT` | anything else fails |
-| `DateStyle` | any value containing `ISO` | output is always `ISO, MDY`; other values fail |
+| `TimeZone` / `SET TIME ZONE` | `UTC`, `GMT`, `Z`, `+00`, `0`, `Etc/UTC`, `DEFAULT`, `LOCAL` (case-insensitive) | accepted; the session time zone is always UTC |
+| `client_encoding`, `SET NAMES` | `UTF8`, `UTF-8`, `UNICODE`, `DEFAULT` | accepted; the encoding is always UTF-8 |
+| `DateStyle` | `ISO`, `MDY` (or `US`, `NonEuropean`), `DEFAULT`, and combinations such as `ISO, MDY` | accepted; output is always `ISO, MDY` and input is read month first |
+| `IntervalStyle` | `postgres`, `DEFAULT` | accepted |
+| `bytea_output` | `hex`, `DEFAULT` | accepted |
+| `standard_conforming_strings` | `on` (`true`, `yes`, `1`, `DEFAULT`) | accepted; backslashes in string literals are never escapes |
 | `application_name` | any | stored and reported back with a `ParameterStatus` message |
 | anything else | any | stored for `SHOW`, no effect |
 
+For the fixed settings, any other value (another time zone or encoding,
+`DateStyle = 'ISO, DMY'` or `German`, `IntervalStyle = iso_8601`,
+`bytea_output = escape`, `standard_conforming_strings = off`) fails with
+SQLSTATE `0A000` (`... is not supported`) rather than being accepted without
+effect. `SET TRANSACTION ...`, `RESET` (also `RESET ALL`), `DISCARD` and
+`DEALLOCATE` are accepted and change nothing; in particular `RESET` does not
+undo a `SET`.
+
 `SHOW name` returns the value set in the session if there is one; otherwise
-the engine answers for:
+the session or the engine answers for:
 
 | Name | Value |
 |---|---|
 | `server_version` | `17.0` |
+| `server_version_num` | `170000` |
 | `server_encoding`, `client_encoding` | `UTF8` |
 | `TimeZone` (`time zone`) | `UTC` |
 | `DateStyle` | `ISO, MDY` |
 | `IntervalStyle` | `postgres` |
-| `transaction_isolation` (`transaction isolation level`) | `serializable` |
-| `standard_conforming_strings` | `on` |
+| `transaction_isolation` (`transaction isolation level`), `default_transaction_isolation` | `serializable` |
+| `transaction_read_only` | `off` |
+| `standard_conforming_strings`, `integer_datetimes`, `is_superuser` | `on` |
+| `search_path` | `"$user", public` |
+| `extra_float_digits` | `1` |
+| `bytea_output` | `hex` |
+| `max_identifier_length` | `63` |
+| `application_name` | the name the client sent at startup |
+| `read_mode`, `ivm.read_mode` | the session's read mode |
 | `gsn` | the last applied GSN |
 
 Any other name fails with `unrecognized configuration parameter` (SQLSTATE
-`42704`) — including `read_mode` until it has been `SET` in the session.
-`SHOW ALL` lists `server_version`, `timezone` and `datestyle`. `DISCARD` and
-`DEALLOCATE` are accepted and do nothing.
+`42704`). `SHOW ALL` lists only `server_version`, `timezone` and
+`datestyle`. For clients that use them, `current_setting(name [,
+missing_ok])` returns the server's fixed settings (the values above, not
+values changed with `SET`, and not `read_mode`), and `set_config(name,
+value, is_local)` returns `value` without changing or checking anything.
 
 ## SUBSCRIBE
 
@@ -216,12 +249,14 @@ and `1` mean true and anything else false; without `=`, only the words
 `true` and `false` are recognised as a value.
 
 - `name` may be a materialized view, a table, or a virtual view (which is
-  subscribed as its query; a column list given in `CREATE VIEW` is not
-  applied, so the columns have the query's names).
+  subscribed as the query `SELECT * FROM name`, so the columns are named as
+  in reads of the view, by its column list if it has one).
 - `( query )` may be any query that a materialized view could have (the same
   [determinism rules](../sql/maintained-views.md) apply). A private dataflow
   is built for it — sharing every operator and index that existing views
   already have — hydrated, and released when the subscription ends.
+- A [broken](operations.md#recovery) materialized view, or a query reading
+  one, cannot be subscribed to (SQLSTATE `55000`).
 - `AS OF gsn` is accepted but ignored: a subscription always starts at the
   last applied GSN.
 
@@ -264,7 +299,11 @@ Example (`COPY` form, `PROGRESS`):
 ```
 
 Values are always sent in text format (the PostgreSQL output format of each
-type), even when a client asks for binary results.
+type), even when a client asks for binary results. With the extended
+protocol the portal's row description still announces the requested binary
+format, so a client that asks for binary results misreads the rows: request
+text results for `SUBSCRIBE` (see
+[Known problems](troubleshooting.md#known-problems)).
 
 ### COPY form
 
@@ -276,9 +315,11 @@ are not supported.
 
 Use the `COPY` form from `psql`: psql collects the rows of an ordinary query
 until it completes, so a plain `SUBSCRIBE` shows nothing, while `COPY` output
-is printed as it arrives. Programmatic clients can use either form; with the
-extended protocol, `Describe` reports no columns for `SUBSCRIBE`, so the
-simple query protocol (or `COPY`) is preferable.
+is printed as it arrives. Programmatic clients can use either form, with the
+simple or the extended protocol: `Describe` of a `SUBSCRIBE` reports the
+streamed columns (`gsn`, `progressed` with `PROGRESS`, `diff`, then the
+relation's), and `Execute` of `COPY (SUBSCRIBE ...) TO STDOUT` streams in
+`COPY` format.
 
 ### Ending a subscription
 
@@ -289,19 +330,32 @@ A subscription runs until
 - the client disconnects (the session checks the connection every 200 ms);
 - a relation it reads — the subscribed table, view or materialized view,
   a relation a subscribed view or query reads, directly or through views —
-  is dropped (`table "x" was dropped`, `view "x" was dropped`,
-  `materialized view "x" was dropped`, SQLSTATE `42P01`);
-- the subscribed relation gets an error record: the subscription ends with
-  the error (the retraction of an error record does not end it). The
-  initial snapshot of a subscription leaves rows that fail out instead of
-  failing;
+  is dropped, or replaced by another kind of view (`table "x" was dropped`,
+  `view "x" was dropped`, `materialized view "x" was dropped`, SQLSTATE
+  `42P01`);
+- the subscribed materialized view gets other columns (names, types or type
+  modifiers), by `CREATE OR REPLACE` or when an upstream schema change
+  re-plans it: `materialized view "x" changed its columns` (SQLSTATE
+  `55000`);
+- a replicated table it reads (directly, or through virtual views) changes
+  its columns upstream: `table "x" changed its columns upstream` (SQLSTATE
+  `55000`);
+- the subscribed relation or query gets a new error record: the
+  subscription ends with the error (the retraction of an error record does
+  not end it). The initial snapshot of a subscription leaves rows that fail
+  out instead of failing;
 - the engine shuts down.
 
 If the subscribed materialized view is replaced with `CREATE OR REPLACE` by
-another materialized view, the subscription continues: it receives the
-difference between the old and the new contents at the replacement's GSN.
-Replacing it with a virtual view ends the subscription
-(`materialized view "x" was dropped`).
+a materialized view with the same columns, the subscription continues: it
+receives the difference between the old and the new contents at the
+replacement's GSN. A subscription to a query, by contrast, keeps the
+dataflow it was built with: when a materialized view it reads is replaced,
+or re-planned after an upstream schema change of a table under it, the
+subscription goes on with the view's old version — which no longer
+receives changes at all if the table under it changed shape (see
+[Known problems](troubleshooting.md#known-problems)). Subscribe to the view
+itself, or subscribe again after such changes.
 
 Changes are queued for each subscription without a bound; a client that
 reads more slowly than changes arrive makes the server's memory grow.
