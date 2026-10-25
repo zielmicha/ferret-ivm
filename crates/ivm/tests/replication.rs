@@ -271,10 +271,14 @@ fn resnapshots_resume_after_a_crash() {
     });
     wait_until("the re-snapshot to wait for the lock", || !chunk_waiting(&mut up).is_empty());
     // stop the engine: the source, once its chunk query fails, sees the
-    // stop request and logs nothing more
+    // stop request and logs nothing more (should it see the failure first,
+    // it retries, and its next chunk query waits for the lock again)
     let crashing = std::thread::spawn(move || running.crash());
-    for pid in chunk_waiting(&mut up) {
-        up.simple_query(&format!("SELECT pg_terminate_backend({pid})")).unwrap();
+    while !crashing.is_finished() {
+        for pid in chunk_waiting(&mut up) {
+            up.simple_query(&format!("SELECT pg_terminate_backend({pid})")).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     crashing.join().unwrap();
     locker.simple_query("ROLLBACK").unwrap();
