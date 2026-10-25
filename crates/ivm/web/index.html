@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ivm console</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="vendor/uPlot.min.css">
+  <link rel="stylesheet" href="css/app.css">
+  <script src="vendor/uPlot.iife.min.js" defer></script>
+  <script src="vendor/dagre.min.js" defer></script>
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="topbar">
+    <button class="icon-btn nav-toggle" id="nav-toggle" aria-label="Menu" aria-expanded="false" aria-controls="sidebar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <a class="brand" href="#overview" aria-label="ivm overview">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="8" cy="9" r="4"/><circle cx="8" cy="23" r="4"/><circle cx="24" cy="16" r="4.5"/>
+        <path d="M12 9.8 L19.6 14.4 M12 22.2 L19.6 17.6"/>
+      </svg>
+      <span class="brand-name">ivm</span>
+    </a>
+    <span class="brand-sub" id="server-info"></span>
+    <div class="topbar-spacer"></div>
+    <div class="live" id="live" role="status" aria-live="polite">
+      <span class="live-dot" aria-hidden="true"></span><span class="live-text">connecting</span>
+    </div>
+    <div class="gsn-pill" title="Last GSN applied by the engine">GSN <strong id="gsn-now">–</strong></div>
+    <button class="icon-btn" id="theme-toggle" aria-label="Toggle dark mode" title="Theme">
+      <svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+  </header>
+  <div class="shell">
+    <nav class="sidebar" id="sidebar" aria-label="Sections">
+      <a href="#overview" data-route="overview"><span class="nav-ico">◴</span>Overview</a>
+      <a href="#sources" data-route="sources"><span class="nav-ico">⇄</span>Sources</a>
+      <a href="#catalog" data-route="catalog"><span class="nav-ico">▤</span>Catalog</a>
+      <a href="#dataflow" data-route="dataflow"><span class="nav-ico">⌬</span>Dataflow</a>
+      <a href="#arrangements" data-route="arrangements"><span class="nav-ico">▦</span>Arrangements</a>
+      <a href="#activity" data-route="activity"><span class="nav-ico">↯</span>Activity</a>
+      <a href="#errors" data-route="errors"><span class="nav-ico">⚠</span>Errors<span class="nav-badge" id="error-badge" hidden></span></a>
+      <a href="#history" data-route="history"><span class="nav-ico">⧗</span>History</a>
+      <a href="#console" data-route="console"><span class="nav-ico">›_</span>SQL console</a>
+      <div class="sidebar-foot">
+        <a class="foot-link" href="vendor/dagre.LICENSE.txt" target="_blank" rel="noopener">dagre (MIT)</a>
+        <a class="foot-link" href="vendor/uPlot.LICENSE.txt" target="_blank" rel="noopener">uPlot (MIT)</a>
+      </div>
+    </nav>
+    <main id="main" class="main" tabindex="-1"></main>
+  </div>
+  <div class="toast" id="toast" role="alert" hidden></div>
+  <noscript><p class="noscript">This console needs JavaScript.</p></noscript>
+</body>
+</html>

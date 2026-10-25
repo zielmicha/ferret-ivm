@@ -576,6 +576,12 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
         g.summary.count += w;
         for (i, s) in specs.iter().enumerate() {
             let w_eff = if aggs[i].distinct {
+                // the FILTER applies before duplicates are removed
+                if let Some(f) = aggs[i].filter
+                    && !matches!(r[f], Datum::Bool(true))
+                {
+                    continue;
+                }
                 let args: Vec<Datum> = aggs[i].args.iter().map(|c| r[*c].clone()).collect();
                 let mut dk = k.clone();
                 dk.extend(key_bytes(&args));
@@ -610,16 +616,19 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
         let mut row = g.key_row.clone();
         for (i, s) in specs.iter().enumerate() {
             let v = if s.func.is_ordered() && aggs[i].distinct {
-                // deduplicate a copy: the aggregates after this one need every row
-                let mut rs = g.rows.clone();
-                let mut seen = FxHashMap::default();
+                // the FILTER applies before duplicates are removed, and the
+                // group's rows stay intact for the other aggregates
                 let a = &aggs[i].args;
-                rs.retain(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none());
-                for x in rs.iter_mut() {
-                    x.1 = 1;
-                }
+                let mut seen = FxHashMap::default();
+                let mut rs: Rows = g
+                    .rows
+                    .iter()
+                    .filter(|(r, _)| aggs[i].filter.is_none_or(|f| matches!(r[f], Datum::Bool(true))))
+                    .filter(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none())
+                    .map(|(r, _)| (r.clone(), 1))
+                    .collect();
                 sort_rows(&mut rs, &aggs[i].order);
-                s.finalize_ordered(&mut rs.iter().cloned())?
+                s.finalize_ordered(&mut rs.into_iter())?
             } else if s.func.is_ordered() {
                 let mut rs = std::mem::take(&mut g.rows);
                 sort_rows(&mut rs, &aggs[i].order);

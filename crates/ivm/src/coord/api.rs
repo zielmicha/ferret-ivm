@@ -67,6 +67,8 @@ pub enum Request {
     /// sequencer; this is for engine-originated records).
     Log { rec: LogRecord },
     Checkpoint { reply: Sender<Result<Gsn>> },
+    /// Introspection snapshot for the web UI (see `coord::inspect`).
+    Inspect(super::inspect::InspectRequest),
 }
 
 /// State shared between threads.
@@ -82,6 +84,8 @@ pub struct Shared {
     pub want_keepalive: AtomicBool,
     /// Reads are parked until a source frontier passes some LSN.
     pub lsn_waiters: AtomicBool,
+    /// Upstream position and ingest counters per source (web UI).
+    pub source_gauges: Mutex<HashMap<u64, Arc<crate::source::SourceGauges>>>,
     pub shutdown: AtomicBool,
     /// Stop without the final checkpoint (simulated crash, for tests).
     pub crash: AtomicBool,
