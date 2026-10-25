@@ -13,6 +13,7 @@ use crate::types::encoding::{self, SortSpec};
 use crate::types::{Datum, Row, SqlType};
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
+use std::ops::Bound;
 
 pub type Rows = Vec<(Row, i64)>;
 
@@ -74,7 +75,9 @@ impl<'a> ExecCtx<'a> {
                 Ok(out)
             }
             Rel::Filter { input, preds } => {
-                if let Some(rows) = self.indexed_filter(input, preds)? {
+                if let Some(b) = base_access(rel)
+                    && let Some(rows) = self.scan_base(&b)?
+                {
                     return Ok(rows);
                 }
                 let rows = self.execute(input)?;
@@ -90,6 +93,11 @@ impl<'a> ExecCtx<'a> {
                 Ok(out)
             }
             Rel::Project { input, cols } => {
+                if let Some(b) = base_access(rel)
+                    && let Some(rows) = self.scan_base(&b)?
+                {
+                    return Ok(rows);
+                }
                 let rows = self.execute(input)?;
                 Ok(rows.into_iter().map(|(r, w)| (cols.iter().map(|c| r[*c].clone()).collect(), w)).collect())
             }
@@ -218,77 +226,151 @@ impl<'a> ExecCtx<'a> {
         }
     }
 
-    /// Filter(Get) with equality predicates on an arrangement key prefix ->
-    /// index lookup instead of a scan.
-    fn indexed_filter(&mut self, input: &Rel, preds: &[Expr]) -> Result<Option<Rows>> {
-        let Rel::Get { id, .. } = input else { return Ok(None) };
-        let Some(node) = (self.objects)(*id) else { return Ok(None) };
-        // column = constant
-        let mut eqs: FxHashMap<usize, Datum> = FxHashMap::default();
-        for p in preds {
+    /// The arrangement and key range of `node` to read for rows passing
+    /// `preds`: equalities with constants on a key prefix, optionally
+    /// followed by a range on the next key column. None when no predicate
+    /// narrows any arrangement.
+    fn index_range(&self, node: NodeId, preds: &[Expr]) -> Option<(usize, Vec<u8>, Option<Vec<u8>>)> {
+        let mut conj: Vec<&Expr> = Vec::new();
+        fn flatten<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+            match e {
+                Expr::And(v) => v.iter().for_each(|x| flatten(x, out)),
+                e => out.push(e),
+            }
+        }
+        preds.iter().for_each(|p| flatten(p, &mut conj));
+        // column <op> constant, with the column on the left
+        let mut cmps: Vec<(usize, Cmp, &Datum)> = Vec::new();
+        for p in conj {
             if let Expr::Call(c) = p
-                && func_def(c.func).name == "="
                 && c.args.len() == 2
+                && let Some(op) = Cmp::of(func_def(c.func).name)
             {
                 match (&c.args[0], &c.args[1]) {
-                    (Expr::Column(col), Expr::Literal(d, _)) | (Expr::Literal(d, _), Expr::Column(col)) if !d.is_null() => {
-                        eqs.insert(*col, d.clone());
-                    }
+                    (Expr::Column(col), Expr::Literal(d, _)) if !d.is_null() => cmps.push((*col, op, d)),
+                    (Expr::Literal(d, _), Expr::Column(col)) if !d.is_null() => cmps.push((*col, op.flip(), d)),
                     _ => {}
                 }
             }
         }
-        if eqs.is_empty() {
-            return Ok(None);
+        if cmps.is_empty() {
+            return None;
         }
         let schema = &self.g.node(node).schema;
-        let mut best: Option<(usize, Vec<Datum>)> = None;
+        // per arrangement: equality values on a key prefix, then bounds on the next key column
+        let mut best: Option<IndexRange<'_>> = None;
         for &a in &self.g.node(node).arrangements {
             let arr = self.g.arr(a);
             // (an index built after the read's GSN lacks its history)
             if !arr.covers(self.at) {
                 continue;
             }
+            let usable = |c: usize, t: &SqlType, d: &Datum| schema[c].ty == *t && literal_matches(d, t);
             let mut vals = Vec::new();
-            for (k, t) in arr.layout.key.iter().zip(&arr.layout.key_types) {
-                match k {
-                    Expr::Column(c) if eqs.contains_key(c) && schema[*c].ty == *t => {
-                        let d = &eqs[c];
-                        // literal type must match exactly for a key lookup
-                        let lit_ok = match (d, t) {
-                            (Datum::Int2(_), SqlType::Int2) | (Datum::Int4(_), SqlType::Int4) | (Datum::Int8(_), SqlType::Int8) => true,
-                            (Datum::Text(_), SqlType::Text | SqlType::Varchar | SqlType::Bpchar | SqlType::Name) => true,
-                            (Datum::Numeric(_), SqlType::Numeric) => true,
-                            (Datum::Date(_), SqlType::Date) | (Datum::Timestamp(_), SqlType::Timestamp) | (Datum::TimestampTz(_), SqlType::TimestampTz) => true,
-                            (Datum::Uuid(_), SqlType::Uuid) | (Datum::Bool(_), SqlType::Bool) => true,
-                            _ => false,
-                        };
-                        if !lit_ok {
-                            break;
-                        }
-                        vals.push(d.clone());
-                    }
-                    _ => break,
+            let mut lo: Option<&Datum> = None;
+            let mut hi: Option<(&Datum, bool)> = None;
+            for (i, (k, t)) in arr.layout.key.iter().zip(&arr.layout.key_types).enumerate() {
+                let Expr::Column(c) = k else { break };
+                if let Some((_, _, d)) = cmps.iter().find(|(col, op, d)| col == c && *op == Cmp::Eq && usable(*c, t, d)) {
+                    vals.push((*d).clone());
+                    continue;
                 }
+                // a range on this column (ascending keys only), then stop
+                if !arr.layout.specs[i].desc {
+                    for (_, op, d) in cmps.iter().filter(|(col, op, d)| col == c && *op != Cmp::Eq && usable(*c, t, d)) {
+                        match op {
+                            Cmp::Gt | Cmp::Ge => {
+                                if lo.is_none_or(|l| d.sql_cmp(l) == Ordering::Greater) {
+                                    lo = Some(d);
+                                }
+                            }
+                            _ => {
+                                if hi.is_none_or(|(h, _)| d.sql_cmp(h) == Ordering::Less) {
+                                    hi = Some((d, *op == Cmp::Le));
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
             }
-            if !vals.is_empty() && best.as_ref().is_none_or(|(_, v)| vals.len() > v.len()) {
-                best = Some((a, vals));
+            let score = |v: &Vec<Datum>, l: &Option<&Datum>, h: &Option<(&Datum, bool)>| (v.len(), l.is_some() as usize + h.is_some() as usize);
+            if (!vals.is_empty() || lo.is_some() || hi.is_some())
+                && best.as_ref().is_none_or(|(_, v, l, h)| score(&vals, &lo, &hi) > score(v, l, h))
+            {
+                best = Some((a, vals, lo, hi));
             }
         }
-        let Some((arr, vals)) = best else { return Ok(None) };
-        let rows = self.g.lookup(self.env, arr, &vals, self.at)?;
+        let (arr, vals, lo, hi) = best?;
+        let layout = &self.g.arr(arr).layout;
+        let prefix = layout.encode_prefix(&vals);
+        let bound_key = |d: &Datum| {
+            let mut v = vals.clone();
+            v.push(d.clone());
+            layout.encode_prefix(&v)
+        };
+        // the range covers every match (predicates are checked on each row)
+        let lo_key = match lo {
+            Some(d) => bound_key(d),
+            None => prefix.clone(),
+        };
+        let hi_key = match hi {
+            Some((d, true)) => encoding::prefix_successor(&bound_key(d)),
+            Some((d, false)) => Some(bound_key(d)),
+            None => encoding::prefix_successor(&prefix),
+        };
+        Some((arr, lo_key, hi_key))
+    }
+
+    /// Read a base relation (a table or materialized view) through its
+    /// arrangements: an index range when the predicates allow one, and only
+    /// the columns the projection and the predicates need. None when the
+    /// relation has no arrangement to read.
+    fn scan_base(&mut self, b: &BaseAccess) -> Result<Option<Rows>> {
+        let Some(node) = (self.objects)(b.id) else { return Ok(None) };
+        let (arr, lo_key, hi_key) = match self.index_range(node, &b.preds) {
+            Some(r) => r,
+            // (the general path reports reads before an arrangement's history)
+            None => match self.g.arrangement_at(node, self.at) {
+                Some(a) => (a, Vec::new(), None),
+                None => return Ok(None),
+            },
+        };
+        let a = self.g.arr(arr);
+        let layout = &a.layout;
+        let plan = b.cols.as_ref().and_then(|cols| {
+            let needed: Vec<usize> = cols.iter().copied().chain(b.preds.iter().flat_map(|p| p.column_set())).collect();
+            layout.decode_plan(&needed)
+        });
+        let hi = match &hi_key {
+            Some(h) => Bound::Excluded(h.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let (at, preds, cols) = (self.at, &b.preds, &b.cols);
+        let distinct = cols.as_ref().is_some_and(|c| c.iter().enumerate().all(|(i, x)| !c[..i].contains(x)));
         let mut out = Vec::new();
-        'rows: for (r, w) in rows {
+        self.env.for_each(a.tree, Bound::Included(&lo_key), hi, &mut |k, h| {
+            let w = h.weight(at);
             if w <= 0 {
-                continue;
+                return Ok(true);
             }
+            let mut r = layout.decode_row_with(k, plan.as_ref())?;
             for p in preds {
                 if !p.eval_pred(&r)? {
-                    continue 'rows;
+                    return Ok(true);
                 }
             }
-            out.push((r, w));
-        }
+            out.push((
+                match cols {
+                    // distinct columns are moved out of the decoded row
+                    Some(cols) if distinct => cols.iter().map(|c| std::mem::replace(&mut r[*c], Datum::Null)).collect(),
+                    Some(cols) => cols.iter().map(|c| r[*c].clone()).collect(),
+                    None => r,
+                },
+                w,
+            ));
+            Ok(true)
+        })?;
         Ok(Some(out))
     }
 
@@ -296,7 +378,6 @@ impl<'a> ExecCtx<'a> {
         let nl = left.arity();
         let nr = right.arity();
         let l = self.execute(left)?;
-        let r = self.execute(right)?;
         // equi conditions (left expr, right expr, null_safe)
         let mut equi: Vec<(Expr, Expr, bool)> = Vec::new();
         let mut residual: Vec<Expr> = Vec::new();
@@ -321,6 +402,13 @@ impl<'a> ExecCtx<'a> {
             }
             residual.push(c.clone());
         }
+        // a few left rows probe an index of the right side instead of scanning it
+        if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Semi | JoinKind::Anti)
+            && let Some(rows) = self.index_join(&l, left, right, kind, &equi, &residual)?
+        {
+            return Ok(rows);
+        }
+        let r = self.execute(right)?;
         // hash the right side
         let mut table: FxHashMap<Vec<u8>, Vec<usize>> = FxHashMap::default();
         for (i, (row, _)) in r.iter().enumerate() {
@@ -397,6 +485,135 @@ impl<'a> ExecCtx<'a> {
         Ok(out)
     }
 
+    /// Join `l` (the rows of `left`) with `right`, a base relation (possibly
+    /// filtered), by looking up each left row's key in an arrangement of the
+    /// right relation keyed by columns it is equated with. None when there is
+    /// no such arrangement or the left side is not small compared to it.
+    #[allow(clippy::too_many_arguments)]
+    fn index_join(
+        &mut self,
+        l: &Rows,
+        left: &Rel,
+        right: &Rel,
+        kind: JoinKind,
+        equi: &[(Expr, Expr, bool)],
+        residual: &[Expr],
+    ) -> Result<Option<Rows>> {
+        let Some(b) = base_access(right) else { return Ok(None) };
+        if equi.is_empty() {
+            return Ok(None);
+        }
+        let Some(node) = (self.objects)(b.id) else { return Ok(None) };
+        let lschema = left.schema();
+        let rschema = &self.g.node(node).schema;
+        // the right side's equated expressions over the base relation's columns
+        let base_col = |re: &Expr| -> Option<usize> {
+            let c = re.as_column()?;
+            Some(match &b.cols {
+                Some(cols) => cols[c],
+                None => c,
+            })
+        };
+        // the arrangement keyed by the most equated columns (types must match
+        // exactly so that key encodings compare like the values)
+        let mut best: Option<(usize, Vec<usize>)> = None;
+        for &a in &self.g.node(node).arrangements {
+            let arr = self.g.arr(a);
+            // (an index built after the read's GSN lacks its history)
+            if !arr.covers(self.at) {
+                continue;
+            }
+            let mut used = Vec::new();
+            for (k, t) in arr.layout.key.iter().zip(&arr.layout.key_types) {
+                let Expr::Column(c) = k else { break };
+                match equi.iter().position(|(le, re, _)| base_col(re) == Some(*c) && rschema[*c].ty == *t && le.ty(&lschema) == *t) {
+                    Some(i) if !used.contains(&i) => used.push(i),
+                    _ => break,
+                }
+            }
+            if !used.is_empty() && best.as_ref().is_none_or(|(_, u)| used.len() > u.len()) {
+                best = Some((a, used));
+            }
+        }
+        let Some((arr, used)) = best else { return Ok(None) };
+        let a = self.g.arr(arr);
+        if (l.len() as i64).saturating_mul(64) >= self.env.tree_count(a.tree) {
+            return Ok(None);
+        }
+        let (layout, tree, at) = (a.layout.clone(), a.tree, self.at);
+        let plan = b.cols.as_ref().and_then(|cols| {
+            let needed: Vec<usize> = cols.iter().copied().chain(b.preds.iter().flat_map(|p| p.column_set())).collect();
+            layout.decode_plan(&needed)
+        });
+        let nr = right.arity();
+        let mut out = Vec::new();
+        for (lrow, lw) in l {
+            let mut kv = Vec::with_capacity(used.len());
+            for &i in &used {
+                let (le, _, ns) = &equi[i];
+                let v = le.eval(lrow)?;
+                if v.is_null() && !ns {
+                    break;
+                }
+                kv.push(v);
+            }
+            let mut matched = false;
+            if kv.len() == used.len() {
+                let mut cands = Vec::new();
+                self.env.for_each_prefix(tree, &layout.encode_prefix(&kv), &mut |k, h| {
+                    let w = h.weight(at);
+                    if w > 0 {
+                        cands.push((layout.decode_row_with(k, plan.as_ref())?, w));
+                    }
+                    Ok(true)
+                })?;
+                'cands: for (base, rw) in cands {
+                    // the right relation's own filter and projection
+                    for p in &b.preds {
+                        if !p.eval_pred(&base)? {
+                            continue 'cands;
+                        }
+                    }
+                    let rrow: Row = match &b.cols {
+                        Some(cols) => cols.iter().map(|c| base[*c].clone()).collect(),
+                        None => base,
+                    };
+                    // every equality holds as in the hash join (equal key
+                    // encodings), then the rest of the condition
+                    for (le, re, ns) in equi {
+                        let (x, y) = (le.eval(lrow)?, re.eval(&rrow)?);
+                        if (!ns && (x.is_null() || y.is_null())) || key_bytes(&[x]) != key_bytes(&[y]) {
+                            continue 'cands;
+                        }
+                    }
+                    let mut joined = lrow.clone();
+                    joined.extend(rrow.iter().cloned());
+                    for p in residual {
+                        if !p.eval_pred(&joined)? {
+                            continue 'cands;
+                        }
+                    }
+                    matched = true;
+                    match kind {
+                        JoinKind::Semi | JoinKind::Anti => break,
+                        _ => out.push((joined, lw * rw)),
+                    }
+                }
+            }
+            match kind {
+                JoinKind::Semi if matched => out.push((lrow.clone(), *lw)),
+                JoinKind::Anti if !matched => out.push((lrow.clone(), *lw)),
+                JoinKind::Left if !matched => {
+                    let mut joined = lrow.clone();
+                    joined.extend(std::iter::repeat_n(Datum::Null, nr));
+                    out.push((joined, *lw));
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(out))
+    }
+
     fn recursive(&mut self, id: u64, base: &Rel, step: &Rel, distinct: bool) -> Result<Rows> {
         let mut base_rows = self.execute(base)?;
         consolidate(&mut base_rows);
@@ -444,6 +661,97 @@ impl<'a> ExecCtx<'a> {
         self.rec.remove(&id);
         Ok(result)
     }
+}
+
+/// A read of a base relation: the rows of object `id` passing `preds`
+/// (over its columns), projected to `cols` (all columns for None).
+struct BaseAccess {
+    id: u64,
+    cols: Option<Vec<usize>>,
+    preds: Vec<Expr>,
+}
+
+/// The plan as a base relation read, if it is a table or view possibly
+/// filtered and projected.
+fn base_access(rel: &Rel) -> Option<BaseAccess> {
+    match rel {
+        Rel::Get { id, .. } => Some(BaseAccess { id: *id, cols: None, preds: vec![] }),
+        Rel::Project { input, cols } => {
+            let mut b = base_access(input)?;
+            b.cols = Some(match &b.cols {
+                None => cols.clone(),
+                Some(inner) => cols.iter().map(|c| inner[*c]).collect(),
+            });
+            Some(b)
+        }
+        Rel::Filter { input, preds } => {
+            let mut b = base_access(input)?;
+            for p in preds {
+                b.preds.push(match &b.cols {
+                    None => p.clone(),
+                    Some(cols) => p.remapped(&|c| cols[c]),
+                });
+            }
+            Some(b)
+        }
+        _ => None,
+    }
+}
+
+/// An arrangement with the values of the equalities on a prefix of its key,
+/// and the lower and upper bound (inclusive?) on the next key column.
+type IndexRange<'a> = (usize, Vec<Datum>, Option<&'a Datum>, Option<(&'a Datum, bool)>);
+
+/// A comparison of a column with a constant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cmp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Cmp {
+    fn of(op: &str) -> Option<Cmp> {
+        Some(match op {
+            "=" => Cmp::Eq,
+            "<" => Cmp::Lt,
+            "<=" => Cmp::Le,
+            ">" => Cmp::Gt,
+            ">=" => Cmp::Ge,
+            _ => return None,
+        })
+    }
+
+    /// The operator with its operands swapped.
+    fn flip(self) -> Cmp {
+        match self {
+            Cmp::Eq => Cmp::Eq,
+            Cmp::Lt => Cmp::Gt,
+            Cmp::Le => Cmp::Ge,
+            Cmp::Gt => Cmp::Lt,
+            Cmp::Ge => Cmp::Le,
+        }
+    }
+}
+
+/// Is a literal exactly of a key column's type (so that its key encoding
+/// orders and compares like the column's values)?
+fn literal_matches(d: &Datum, t: &SqlType) -> bool {
+    matches!(
+        (d, t),
+        (Datum::Int2(_), SqlType::Int2)
+            | (Datum::Int4(_), SqlType::Int4)
+            | (Datum::Int8(_), SqlType::Int8)
+            | (Datum::Text(_), SqlType::Text | SqlType::Varchar | SqlType::Bpchar | SqlType::Name)
+            | (Datum::Numeric(_), SqlType::Numeric)
+            | (Datum::Date(_), SqlType::Date)
+            | (Datum::Timestamp(_), SqlType::Timestamp)
+            | (Datum::TimestampTz(_), SqlType::TimestampTz)
+            | (Datum::Uuid(_), SqlType::Uuid)
+            | (Datum::Bool(_), SqlType::Bool)
+    )
 }
 
 /// Evaluate a dataflow Recursive node's definition against current state.
@@ -568,21 +876,27 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
     let mut order_keys: Vec<Vec<u8>> = Vec::new();
     // distinct aggregates: dedupe (group, args) first
     let mut distinct_seen: Vec<FxHashMap<Vec<u8>, ()>> = specs.iter().map(|_| FxHashMap::default()).collect();
+    // the group key of each row is encoded into one reused buffer; only a
+    // new group allocates
+    let mut k: Vec<u8> = Vec::new();
     for (r, w) in rows {
         if w == 0 {
             continue;
         }
-        let kv: Vec<Datum> = group.iter().map(|c| r[*c].clone()).collect();
-        let k = key_bytes(&kv);
-        let g = match groups.get_mut(&k) {
+        k.clear();
+        for c in group {
+            encoding::encode_key(&r[*c], SortSpec::ASC, &mut k);
+        }
+        let g = match groups.get_mut(k.as_slice()) {
             Some(g) => g,
             None => {
                 order_keys.push(k.clone());
-                groups.entry(k.clone()).or_insert(G { key_row: kv.clone(), summary: Summary::empty(&spec_kinds), rows: vec![] })
+                let key_row = group.iter().map(|c| r[*c].clone()).collect();
+                groups.entry(k.clone()).or_insert(G { key_row, summary: Summary::empty(&spec_kinds), rows: vec![] })
             }
         };
         g.summary.count += w;
-        for (i, s) in specs.iter().enumerate() {
+        for i in 0..specs.len() {
             let w_eff = if aggs[i].distinct {
                 // the FILTER applies before duplicates are removed
                 if let Some(f) = aggs[i].filter
@@ -602,10 +916,11 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
             };
             for &slot in &slots[i] {
                 let (kind, e) = &kinds[slot];
-                let v = e.eval(&r)?;
-                kind.add(&mut g.summary.aggs[slot], &v, w_eff)?;
+                match e {
+                    Expr::Column(c) => kind.add(&mut g.summary.aggs[slot], &r[*c], w_eff)?,
+                    e => kind.add(&mut g.summary.aggs[slot], &e.eval(&r)?, w_eff)?,
+                }
             }
-            let _ = s;
         }
         if any_ordered {
             g.rows.push((r, w));

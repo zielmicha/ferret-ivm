@@ -556,6 +556,7 @@ impl<'a> Lowerer<'a> {
                     null_safe: pairs.iter().map(|(_, _, ns)| *ns).collect(),
                     filters,
                     exact,
+                    decode: Default::default(),
                 });
             }
             paths.push(DeltaPath { source: src, source_filters, steps });

@@ -34,9 +34,13 @@ whether it has been attached after recovery.
 A child's separator is the lower bound of its key range (ignored for the
 first child); a key belongs to the last child whose separator is `<=` it.
 Nodes are split by size: the target is 16 KiB of estimated serialized size
-for leaves and for internal nodes. When a leaf splits, the separator of each
-new chunk is the shortest prefix of its first key that is greater than the
-previous chunk's last key (suffix truncation).
+for leaves and for internal nodes. A node whose contents after an update
+exceed twice the target (a bulk load, hydration) is split into chunks
+filled to 90% of it, so that the next inserts do not split every node right
+away. When a leaf splits, the separator of each new chunk is the shortest
+prefix of its first key that is greater than the previous chunk's last key
+(suffix truncation). The first chunk keeps the node's place (and separator)
+in its parent.
 
 Pointers are either `Disk(DiskLoc)` — segment id, offset and length of the
 node's frame in a segment file — or `Mem(slot)` — the node is loaded in the
@@ -114,7 +118,9 @@ changes at one GSN:
 | Operation | Algorithm |
 |---|---|
 | `get(key)` | descend to the leaf, binary search |
-| `cursor(lo, hi)` / `scan` / `scan_prefix` | a stateless range cursor: it buffers the matching entries of one leaf, then descends again from the root with the next separator as its new lower bound. It never pins nodes, so it tolerates eviction between leaves. A key prefix `p` is the range `[p, successor(p))` |
+| `for_each(lo, hi, f)` / `for_each_prefix(p, f)` | call `f` with each entry of the range in key order, where it lies in its leaf (nothing is copied), until `f` returns false. One leaf at a time: after a leaf it descends again from the root with the next separator as its new lower bound, so it never pins nodes and tolerates eviction between leaves. A key prefix `p` is the range `[p, successor(p))`. The dataflow's lookups and scans use these |
+| `scan` / `scan_prefix` | `for_each` collecting copies of the entries |
+| `cursor(lo, hi)` | a stateless range cursor with the same descent that buffers one leaf's entries at a time (for callers that interleave other work between entries) |
 | `range_summary(lo, hi)` | combine the stored summaries of children that lie entirely inside the range and recurse into the (at most two per level) partially covered children, folding leaf entries at the edges: O(log n) nodes. The whole-tree summary is stored |
 | `nth(lo, hi, n)` | find the entry holding the n-th unit of weight in the range by skipping fully covered children by their counts |
 | `tree_count(tree)` | the stored total count |
@@ -138,16 +144,21 @@ subtree (`storage::Summary`): the sum of the current weights of its entries
 | `SumFloat`, `SumSqFloat` | `SumFloat(FloatSum)` | exact float sum |
 | `Min`, `Max` | `Min(Option<Datum>)`, `Max(Option<Datum>)` | extreme value among entries with positive weight |
 
-The summarizer of an arrangement (`LayoutSummarizer`) decodes an entry's row
-and evaluates the aggregate argument expressions; trees without aggregates
-(`CountSummarizer` and layouts with no summaries) maintain only the count.
+The summarizer of an arrangement (`LayoutSummarizer`) decodes the columns of
+an entry that the aggregate argument expressions read (the others are
+skipped without being materialized) and evaluates the expressions; trees
+without aggregates (`CountSummarizer` and layouts with no summaries)
+maintain only the count.
 
 ### Incremental maintenance
 
 When a leaf entry's total weight changes from `before` to `after`, or a
 child's summary is replaced by the summaries of the nodes that took its
 place, the parent's summary is updated without looking at the other
-children:
+children. (A rebuilt leaf records its entries' weight changes and folds them
+into its old summary when it does not split and fewer of its entries
+changed than it holds; otherwise, or when folding is not exact as described
+below, its summary is computed from its entries once.)
 
 - counts and sums are invertible: subtract the old contribution, add the new;
 - `min`/`max`: a better new value replaces the extreme; a removal or a worse

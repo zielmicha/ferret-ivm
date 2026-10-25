@@ -48,7 +48,7 @@ created with `keep: true`.
 |---|---|
 | unit tests (`cargo test -p ivm --lib`) | input-log round trip and torn-tail truncation (`log.rs`); history compaction (`storage/history.rs`); exact float sums and min/max combination (`storage/summary.rs`); key encoding: order, prefix-freedom, NULL placement, round trips, successors (`types/encoding.rs`); row codec and varints (`types/codec.rs`); statement splitting and the engine's own statement parser (`sql/parser.rs`); transaction-id visibility across epochs (`source/postgres.rs`) |
 | storage model tests (`storage/tests.rs`) | random batches on a tree compared with a `BTreeMap` model — scans, point lookups, range summaries and `nth` — with checkpoints, garbage collection and re-opens in between, on tiny nodes, segments and cache; large batches; 100 KB keys with long shared prefixes; time-travel reads and consolidation behind the frontier; segment reclamation after dropping a tree; incrementally maintained summaries (`numeric` sum, min, max, count, sum of squares over equal values in several representations, NaN, infinities and NULLs) checked against recomputation (`Env::check_summaries`) and a fold over the model, with small and large nodes |
-| engine tests (`tests/engine.rs`) | through the public API, without PostgreSQL: temporal filters following the logged clock, across a restart, and with the clock never going backwards; rejection of invalid temporal filters; aggregates equal to a recomputation after random changes with mixed `numeric` representations; temporal views (joins, aggregates, outer joins, `date_trunc`) equal to a recomputation as random changes and ticks interleave; recovery after drops (checkpointed indexes are found again although node ids changed; a multiset table keeps its rows); jsonpath views; multi-dimensional arrays and lockstep set-returning functions |
+| engine tests (`tests/engine.rs`) | through the public API, without PostgreSQL: temporal filters following the logged clock, across a restart, and with the clock never going backwards; rejection of invalid temporal filters; aggregates equal to a recomputation after random changes with mixed `numeric` representations; temporal views (joins, aggregates, outer joins, `date_trunc`) equal to a recomputation as random changes and ticks interleave; recovery after drops (checkpointed indexes are found again although node ids changed; a multiset table keeps its rows); jsonpath views; multi-dimensional arrays and lockstep set-returning functions; ad hoc reads through index key ranges, partial decoding and index joins equal to the same queries written so that they cannot use them (`id + 0`), also `AS OF` an earlier GSN and across an index and a view rebuilt after it |
 
 The engine tests start an engine with `sync: false` and `tick: None` and log
 clock ticks themselves (`LogRecord::Tick`), so time is fully controlled.
@@ -258,3 +258,84 @@ OK (seed 7)
 To investigate a failure, re-run with the same `--seed` and
 `DIFFTEST_VERBOSE=1`, and add `--keep` to inspect the cluster and the
 engine's data directory afterwards.
+
+## ivm-bench
+
+`ivm-bench` (`crates/ivm/src/bin/ivm-bench.rs`) is a reproducible
+performance benchmark. It generates a deterministic data set in PostgreSQL,
+replicates it into an in-process engine and drives the engine's pgwire
+server like a client, measuring one phase after another.
+
+```sh
+cargo build --release
+target/release/ivm-bench [--accounts N] [--txns N] [--small N] [--large N]
+    [--point-reads N] [--sub-txns N] [--upstream CONNINFO] [--data-dir DIR]
+    [--cache-mb N] [--no-sync] [--skip PHASE,...] [--json FILE] [--keep-data]
+    [--repeat N]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--accounts N`, `--txns N` | 100,000, 2,000,000 | rows of the upstream tables `accounts` and `txns` |
+| `--small N` | 20,000 | single-statement transactions per small-transaction phase |
+| `--large N` | 500,000 | rows of the large `INSERT` and `UPDATE` transactions |
+| `--point-reads N` | 2,000 | queries per point-read phase |
+| `--sub-txns N` | 5,000 | upstream transactions delivered to a `SUBSCRIBE` |
+| `--upstream CONNINFO` | private cluster | use an existing cluster (`wal_level = logical`) |
+| `--data-dir DIR` | `TMPDIR` | parent of the engine's data directory |
+| `--cache-mb N` | 1024 | buffer pool size |
+| `--no-sync` | off | run the engine without `fsync` |
+| `--skip PHASE,...` | none | skip `small`, `recovery`, `large`, `reads` or `subscribe` |
+| `--json FILE` | none | also write the results to `FILE` as a JSON array |
+| `--keep-data` | off | keep the engine's data directory |
+| `--repeat N` | 1 | run hydration, the small-transaction phases and the large transactions N times (every run is recorded) |
+
+Without `--upstream` a private cluster is started (`TempCluster`, with
+`PG_BIN`) and the data generated in it. With `--upstream`, the data set is
+generated once into a template database `ivmbench_v2_<accounts>_<txns>` and
+every run works on a copy of it (`ivmbench_run_<pid>`, with a replication
+slot of its own), so runs start from identical data; run databases and
+slots left behind by crashed runs are dropped.
+
+The data: `accounts (id, region, name, balance)` with 20 regions, and
+`txns (id, account_id, kind, amount, created)` whose account, kind and
+amount are hashes of the id. The phases:
+
+| Phase | What is measured |
+|---|---|
+| `load` | initial snapshot of both tables (source parsing, table updates) |
+| `checkpoint_tables`, `checkpoint_views` | an explicit checkpoint; store size |
+| `hydrate_by_region`, `hydrate_acct_totals` | `CREATE MATERIALIZED VIEW` of a join aggregate (`by_region`) and of a `LEFT JOIN` aggregate per account (`acct_totals`) over the loaded data |
+| `small_live` | small transactions (inserts, updates and deletes of `txns`, updates of `accounts`) applied while the engine runs |
+| `shutdown`, `recovery_start` | wall time of the engine's shutdown and restart in between |
+| `small_catchup` | as many committed while the engine was down, caught up after the restart (cold cache) |
+| `large_insert`, `large_update` | one transaction inserting, then one updating, `--large` rows, live |
+| `read_*`, `adhoc_*` | point, range and scan reads of the views and tables; ad hoc aggregates and joins over the tables |
+| `subscribe_snapshot`, `subscribe_live` | a `SUBSCRIBE`'s snapshot and its delivery of live changes |
+| `recovery_shutdown`, `recovery` | a final shutdown, then a restart from its checkpoint until the first read |
+
+Each phase prints a line and a `RESULT {...}` JSON record with its wall
+time; CPU time per thread group, from `/proc/self/task/*/schedstat`
+(`engine_cpu_s`: the thread that owns storage and the dataflow;
+`source_cpu_s`: snapshot and replication decoding; `sequencer_cpu_s`;
+`session_cpu_s`: pgwire), the engine thread's run-queue wait; the
+upstream cluster's CPU time (when it runs on the same machine); the peak
+RSS during the phase (`VmHWM`, reset per phase); and phase-specific rates
+and latencies. The binary's global allocator counts allocations per
+thread (`engine_allocs`, `source_allocs`): unlike CPU time on a busy
+machine these are deterministic, a noise-free measure of allocation churn.
+Each phase's time window is printed as `WINDOW <phase> <start> <end>`
+(nanoseconds since the process started), to select it in a profile, e.g.
+`gprofng display text -filters 'TSTAMP>=<start> && TSTAMP<=<end>' -functions x.er`
+for an experiment recorded with `gprofng collect app -o x.er target/release/ivm-bench ...`.
+
+`bench/compare.py` summarizes `--json` files (minimum and median of every
+metric per phase) and compares two sets of runs:
+
+```sh
+bench/compare.py base-1.json base-2.json -- new-1.json new-2.json
+```
+
+CPU times on a shared machine vary by tens of percent between runs:
+interleave the runs of the variants being compared (A B A B ...), compare
+medians and minimums, and check allocation counts.

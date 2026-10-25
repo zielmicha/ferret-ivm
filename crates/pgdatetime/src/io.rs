@@ -10,7 +10,88 @@ use crate::{Date, Error, Interval, Result, Time, TimeZone, Timestamp, TimestampT
 /// SetEpochTimestamp(): 1970-01-01 00:00:00
 pub(crate) const EPOCH_TIMESTAMP: i64 = -946_684_800_000_000;
 
+/// The canonical ISO forms PostgreSQL prints with DateStyle ISO, parsed
+/// without the general machinery: "YYYY-MM-DD", optionally followed by
+/// " HH:MM:SS" and a fraction of 1 to 6 digits, with every field in its
+/// ordinary range (year 1-9999, hour 0-23, second 0-59). Returns the fields
+/// (time fields zero for a date) and the fraction in microseconds, or None
+/// for anything else, which the general parser then handles.
+fn iso_fields(s: &[u8], with_time: bool) -> Option<(Tm, i32)> {
+    fn num(b: &[u8]) -> Option<i32> {
+        let mut v = 0i32;
+        for &c in b {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (c - b'0') as i32;
+        }
+        Some(v)
+    }
+    if s.len() < 10 || s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let mut tm = Tm { year: num(&s[0..4])?, mon: num(&s[5..7])?, mday: num(&s[8..10])?, ..Default::default() };
+    if tm.year < 1 || !(1..=12).contains(&tm.mon) || tm.mday < 1 || tm.mday > days_in_month(tm.year, tm.mon) {
+        return None;
+    }
+    let mut fsec = 0;
+    if !with_time || s.len() == 10 {
+        return (s.len() == 10).then_some((tm, 0));
+    }
+    if s.len() < 19 || s[10] != b' ' || s[13] != b':' || s[16] != b':' {
+        return None;
+    }
+    tm.hour = num(&s[11..13])?;
+    tm.min = num(&s[14..16])?;
+    tm.sec = num(&s[17..19])?;
+    if tm.hour > 23 || tm.min > 59 || tm.sec > 59 {
+        return None;
+    }
+    if s.len() > 19 {
+        let frac = &s[20..];
+        if s[19] != b'.' || frac.is_empty() || frac.len() > 6 {
+            return None;
+        }
+        fsec = num(frac)? * 10i32.pow(6 - frac.len() as u32);
+    }
+    Some((tm, fsec))
+}
+
+/// `iso_fields` followed by a UTC offset "+HH" or "+HH:MM" (or "-"), as
+/// PostgreSQL prints timestamptz values: the fields, the fraction and the
+/// zone in PostgreSQL's convention (seconds west of UTC).
+fn iso_fields_tz(s: &[u8]) -> Option<(Tm, i32, i32)> {
+    let sign = s.iter().rposition(|c| *c == b'+' || *c == b'-')?;
+    if sign < 19 {
+        return None;
+    }
+    let (ts, zone) = s.split_at(sign);
+    let (hh, mm) = match zone.len() {
+        3 => (&zone[1..3], &b"00"[..]),
+        6 if zone[3] == b':' => (&zone[1..3], &zone[4..6]),
+        _ => return None,
+    };
+    if !hh.iter().chain(mm).all(u8::is_ascii_digit) {
+        return None;
+    }
+    let (h, m) = ((hh[0] - b'0') as i32 * 10 + (hh[1] - b'0') as i32, (mm[0] - b'0') as i32 * 10 + (mm[1] - b'0') as i32);
+    if h > 15 || m > 59 {
+        return None;
+    }
+    let east = h * 3600 + m * 60;
+    let tz = if zone[0] == b'+' { -east } else { east };
+    let (tm, fsec) = iso_fields(ts, true)?;
+    Some((tm, fsec, tz))
+}
+
 pub fn parse_date(s: &str) -> Result<Date> {
+    if let Some((tm, _)) = iso_fields(s.as_bytes(), false) {
+        return Ok(date2j(tm.year, tm.mon, tm.mday) - POSTGRES_EPOCH_JDATE);
+    }
+    parse_date_general(s)
+}
+
+fn parse_date_general(s: &str) -> Result<Date> {
     let (mut f, mut t) = parse_date_time(s, MAXDATELEN + 1).map_err(|e| e.to_error(s, "date"))?;
     let d = decode_date_time(&mut f, &mut t, None).map_err(|e| e.to_error(s, "date"))?;
     let tm = match d.dtype {
@@ -96,6 +177,15 @@ pub fn format_time(t: Time) -> String {
 }
 
 pub fn parse_timestamp(s: &str) -> Result<Timestamp> {
+    if let Some((tm, fsec)) = iso_fields(s.as_bytes(), true)
+        && let Ok(ts) = tm2timestamp(&tm, fsec, None)
+    {
+        return Ok(ts);
+    }
+    parse_timestamp_general(s)
+}
+
+fn parse_timestamp_general(s: &str) -> Result<Timestamp> {
     let (mut f, mut t) =
         parse_date_time(s, MAXDATELEN + MAXDATEFIELDS).map_err(|e| e.to_error(s, "timestamp"))?;
     let d = decode_date_time(&mut f, &mut t, None).map_err(|e| e.to_error(s, "timestamp"))?;
@@ -127,6 +217,15 @@ pub fn format_timestamp(ts: Timestamp) -> String {
 }
 
 pub fn parse_timestamptz(s: &str, tz: &TimeZone) -> Result<TimestampTz> {
+    if let Some((tm, fsec, off)) = iso_fields_tz(s.as_bytes())
+        && let Ok(ts) = tm2timestamp(&tm, fsec, Some(off))
+    {
+        return Ok(ts);
+    }
+    parse_timestamptz_general(s, tz)
+}
+
+fn parse_timestamptz_general(s: &str, tz: &TimeZone) -> Result<TimestampTz> {
     let dt = "timestamp with time zone";
     let zone = tz.zone_ref();
     let (mut f, mut t) =
@@ -415,4 +514,61 @@ pub fn adjust_interval_typmod(
         iv.micros -= iv.micros % SCALES[p];
     }
     Ok(iv)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ISO fast paths agree with the general parser on what they accept
+    /// and leave everything else to it.
+    #[test]
+    fn iso_fast_paths_match_general_parser() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for _ in 0..20000 {
+            let (y, m, d) = (next(10000), 1 + next(12), 1 + next(31));
+            let (h, mi, sec) = (next(25), next(61), next(61));
+            let date = format!("{y:04}-{m:02}-{d:02}");
+            let frac = match next(4) {
+                0 => String::new(),
+                1 => format!(".{}", next(10)),
+                2 => format!(".{:06}", next(1_000_000)),
+                _ => format!(".{:03}", next(1000)),
+            };
+            let ts = format!("{date} {h:02}:{mi:02}:{sec:02}{frac}");
+            let a = parse_date(&date).map_err(|e| e.message);
+            let b = parse_date_general(&date).map_err(|e| e.message);
+            assert_eq!(a, b, "{date}");
+            let a = parse_timestamp(&ts).map_err(|e| e.message);
+            let b = parse_timestamp_general(&ts).map_err(|e| e.message);
+            assert_eq!(a, b, "{ts}");
+        }
+        for s in ["2024-01-01 24:00:00", "2024-02-29 23:59:60", " 2024-01-01", "2024-1-01", "2024-01-01T00:00:00", "2024-01-01 00:00:00.1234567"] {
+            assert_eq!(parse_timestamp(s).map_err(|e| e.message), parse_timestamp_general(s).map_err(|e| e.message), "{s}");
+        }
+        let zone = TimeZone::Utc;
+        for _ in 0..20000 {
+            let (y, m, d) = (1 + next(9999), 1 + next(12), 1 + next(28));
+            let (h, mi, sec) = (next(24), next(60), next(60));
+            let zone_text = match next(4) {
+                0 => format!("+{:02}", next(17)),
+                1 => format!("-{:02}", next(17)),
+                2 => format!("+{:02}:{:02}", next(16), next(60)),
+                _ => format!("-{:02}:{:02}", next(16), [0, 15, 30, 45][next(4) as usize]),
+            };
+            let frac = if next(2) == 0 { String::new() } else { format!(".{}", next(1000)) };
+            let s = format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02}{frac}{zone_text}");
+            assert_eq!(
+                parse_timestamptz(&s, &zone).map_err(|e| e.message),
+                parse_timestamptz_general(&s, &zone).map_err(|e| e.message),
+                "{s}"
+            );
+        }
+    }
 }

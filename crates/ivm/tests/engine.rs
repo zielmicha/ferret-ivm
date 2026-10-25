@@ -350,3 +350,120 @@ fn multidimensional_arrays() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Reads through arrangements (key ranges, column subsets, index lookups
+/// for joins) return what a plain scan returns. The reference queries hide
+/// the columns behind `+ 0`, which no index can serve.
+#[test]
+fn indexed_reads_match_scans() {
+    let dir = tmpdir("indexed-reads");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE a (id int PRIMARY KEY, region text, v numeric)");
+    exec(&h, "CREATE TABLE t (id bigint PRIMARY KEY, a_id int, kind text, amount numeric)");
+    let mut vals = Vec::new();
+    for i in 1..=60 {
+        vals.push(format!("({i}, 'r{}', {}.{})", i % 5, i * 3, i % 4));
+    }
+    exec(&h, &format!("INSERT INTO a VALUES {}", vals.join(", ")));
+    let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+    let mut vals = Vec::new();
+    for i in 1..=600 {
+        // some rows reference no account, some a missing one
+        let a_id = if i % 37 == 0 { "NULL".to_string() } else { (1 + rng.below(70)).to_string() };
+        vals.push(format!("({i}, {a_id}, 'k{}', {}.{:02})", rng.below(4), rng.below(500), rng.below(100)));
+    }
+    exec(&h, &format!("INSERT INTO t VALUES {}", vals.join(", ")));
+    // arrangements: per_a by id, t by a_id (from the join), and an index
+    exec(
+        &h,
+        "CREATE MATERIALIZED VIEW per_a AS SELECT a.id, a.region, count(t.id) AS n, sum(t.amount) AS total \
+         FROM a LEFT JOIN t ON t.a_id = a.id GROUP BY a.id, a.region",
+    );
+    exec(&h, "CREATE INDEX t_kind ON t (kind)");
+    let sorted = |q: &str| {
+        let mut r = rows(&h, q);
+        r.sort();
+        r
+    };
+    let check = |fast: &str, slow: &str| {
+        let (x, y) = (sorted(fast), sorted(slow));
+        assert_eq!(x, y, "{fast}");
+        x.len()
+    };
+    let mut n = 0;
+    for (lo, hi) in [(10, 20), (0, 3), (55, 99), (7, 7), (30, 29)] {
+        n += check(
+            &format!("SELECT * FROM per_a WHERE id BETWEEN {lo} AND {hi}"),
+            &format!("SELECT * FROM per_a WHERE id + 0 BETWEEN {lo} AND {hi}"),
+        );
+        n += check(
+            &format!("SELECT id, kind FROM t WHERE id > {lo} AND id <= {hi} AND kind <> 'k1'"),
+            &format!("SELECT id, kind FROM t WHERE id + 0 > {lo} AND id + 0 <= {hi} AND kind <> 'k1'"),
+        );
+    }
+    for q in [
+        "SELECT * FROM per_a WHERE id < 4",
+        "SELECT * FROM per_a WHERE id >= 58",
+        "SELECT region, n FROM per_a WHERE id = 12",
+        "SELECT a_id, amount FROM t WHERE a_id = 9",
+        "SELECT id FROM t WHERE kind = 'k2' AND id < 100",
+    ] {
+        n += check(q, &q.replace("id ", "id + 0 ").replace("kind =", "kind || '' ="));
+    }
+    // joins probing an arrangement of the right side, against hash joins
+    for k in [1, 7, 33, 61, 70] {
+        n += check(
+            &format!("SELECT t.kind, count(*), sum(t.amount) FROM a JOIN t ON t.a_id = a.id WHERE a.id = {k} GROUP BY t.kind"),
+            &format!("SELECT t.kind, count(*), sum(t.amount) FROM a JOIN t ON t.a_id + 0 = a.id WHERE a.id = {k} GROUP BY t.kind"),
+        );
+        n += check(
+            &format!("SELECT a.id, t.id, t.kind FROM a LEFT JOIN t ON t.a_id = a.id AND t.kind <> 'k0' WHERE a.id IN ({k}, {})", k + 1),
+            &format!("SELECT a.id, t.id, t.kind FROM a LEFT JOIN t ON t.a_id + 0 = a.id AND t.kind <> 'k0' WHERE a.id IN ({k}, {})", k + 1),
+        );
+        n += check(
+            &format!("SELECT a.id FROM a WHERE a.id < {k} AND EXISTS (SELECT 1 FROM t WHERE t.a_id = a.id AND t.amount > 250)"),
+            &format!("SELECT a.id FROM a WHERE a.id < {k} AND EXISTS (SELECT 1 FROM t WHERE t.a_id + 0 = a.id AND t.amount > 250)"),
+        );
+        n += check(
+            &format!("SELECT a.id FROM a WHERE a.id < {k} AND NOT EXISTS (SELECT 1 FROM t WHERE t.a_id = a.id AND t.kind = 'k3')"),
+            &format!("SELECT a.id FROM a WHERE a.id < {k} AND NOT EXISTS (SELECT 1 FROM t WHERE t.a_id + 0 = a.id AND t.kind = 'k3')"),
+        );
+    }
+    assert!(n > 200, "the queries return rows ({n})");
+    // as of an earlier GSN
+    let gsn: u64 = rows(&h, "SHOW GSN")[0].parse().unwrap();
+    exec(&h, "DELETE FROM t WHERE id % 3 = 0");
+    exec(&h, "UPDATE a SET region = 'moved' WHERE id % 4 = 0");
+    let old = check(
+        &format!("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25 AS OF {gsn}"),
+        &format!("SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25 AS OF {gsn}"),
+    );
+    assert_eq!(old, 21);
+    check("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25", "SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25");
+    // arrangements built after the GSN lack the history before it: AS OF
+    // reads use neither their key ranges nor their lookups
+    exec(&h, "DROP INDEX t_kind");
+    exec(&h, "CREATE INDEX t_kind_a ON t (kind, a_id)");
+    let mut m = 0;
+    for k in [1, 2] {
+        m += check(
+            &format!("SELECT id FROM t WHERE kind = 'k{k}' AS OF {gsn}"),
+            &format!("SELECT id FROM t WHERE kind || '' = 'k{k}' AS OF {gsn}"),
+        );
+        m += check(
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind || '' = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
+        );
+    }
+    assert!(m > 100, "the AS OF queries return rows ({m})");
+    // a relation rebuilt after the GSN has no history before it
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW per_a AS SELECT a.id, a.region FROM a");
+    for q in [format!("SELECT region FROM per_a WHERE id = 5 AS OF {gsn}"), format!("SELECT id FROM per_a AS OF {gsn}")] {
+        let stmt = ivm::sql::parse_statement(&q).unwrap();
+        let err = h.execute(stmt, vec![], SessionVars::default(), String::new()).err().map(|e| e.message);
+        assert!(err.as_deref().is_some_and(|e| e.contains("before the history")), "{q}: {err:?}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

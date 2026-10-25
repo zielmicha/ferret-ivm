@@ -219,11 +219,18 @@ relation's existing index at the statement's GSN and maintained from then on.
 
 What indexes are used for:
 
-- **Point lookups in reads**: a query whose `WHERE` contains
-  `column = constant` conditions on a table or materialized view reads only
-  the matching key range of the index with the longest matching key prefix,
-  instead of scanning (the constant must have exactly the column's type).
-  The primary index of a table already serves primary-key lookups.
+- **Lookups and ranges in reads**: a query whose `WHERE` contains
+  `column = constant` conditions on a table or materialized view, optionally
+  followed by a range (`<`, `<=`, `>`, `>=`, `BETWEEN`) on the next key
+  column, reads only the matching key range of the index those conditions
+  narrow most, instead of scanning (the constant must have exactly the
+  column's type). The primary index of a table already serves primary-key
+  lookups and ranges.
+- **Index joins in reads**: when the left side of a join (inner, left, or
+  the semi- and anti-joins of `EXISTS`/`IN` subqueries) has few rows and the
+  right side is a table or materialized view (possibly filtered) with an
+  index whose leading columns are equated with the left side, each left row
+  is looked up in that index instead of scanning and hashing the right side.
 - **Sharing with maintained views**: arrangements are identified by their
   structure (the relation and the key). A materialized view whose join needs
   lookups on `t(c)` uses the existing index on `t(c)` instead of building
