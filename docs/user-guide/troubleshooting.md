@@ -272,7 +272,6 @@ Problems found while writing and checking this documentation (at commit
 | A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
 | The source reconnect delay is never reset | after a few failures every reconnect waits 10 s | none |
 | `SUBSCRIBE` ends when an error record is retracted; a subscription to a dropped table never ends | spurious errors; a subscription that never finishes | re-subscribe; end it from the client |
-| `CREATE SINK` does not check `KEY` columns | the sink fails every connection attempt (`sink key column "x" does not exist`) | check the names; drop and re-create the sink |
 | A listen address that cannot be bound | the server exits with status 0 after recovery | check the log; do not rely on the exit status |
 | `SHOW read_mode` before `SET read_mode` | `unrecognized configuration parameter` | `SET read_mode = fresh` first |
 | `current_user`, `session_user`, `user`, `current_catalog` | `function ...() does not exist` | use a literal |
