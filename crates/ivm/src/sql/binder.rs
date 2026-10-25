@@ -1443,7 +1443,13 @@ fn figure_colname(e: &ast::Expr) -> (String, u8) {
         ast::Expr::Exists { .. } => strong("exists"),
         ast::Expr::Array(_) => strong("array"),
         ast::Expr::Extract { .. } => strong("extract"),
-        ast::Expr::Substring { .. } => strong("substring"),
+        ast::Expr::Substring { shorthand, .. } => strong(if *shorthand { "substr" } else { "substring" }),
+        // subscripts keep the name of what they subscript; a field access
+        // is named after the field
+        ast::Expr::CompoundFieldAccess { root, access_chain } => match access_chain.last() {
+            Some(ast::AccessExpr::Dot(ast::Expr::Identifier(i))) => (ident(i), 2),
+            _ => figure_colname(root),
+        },
         ast::Expr::Position { .. } => strong("position"),
         ast::Expr::Trim { trim_where, .. } => strong(match trim_where {
             Some(ast::TrimWhereField::Leading) => "ltrim",

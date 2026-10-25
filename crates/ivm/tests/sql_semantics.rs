@@ -387,10 +387,11 @@ fn output_column_names_follow_postgresql() {
     setup_t1_t2(&h);
     let q = "SELECT CASE WHEN a > 1 THEN 1 ELSE b END, CASE WHEN a > 1 THEN b END, a::text::int, 1::text::int, '{}'::int[], \
              (SELECT b FROM t1 LIMIT 1)::text, true::int, date '2024-01-01'::text, coalesce(a, 1)::text, \
-             trim(leading 'x' from 'xa'), trim(trailing 'x' from 'ax'), x.y FROM t1, (SELECT 1 AS y) x LIMIT 1";
+             trim(leading 'x' from 'xa'), trim(trailing 'x' from 'ax'), x.y, substr('ab', 2), substring('ab', 2), \
+             (ARRAY[1, 2])[1], (ARRAY[s])[1:1] FROM t1, (SELECT 1 AS y) x LIMIT 1";
     assert_eq!(
         column_names(&h, q),
-        vec!["b", "case", "a", "int4", "int4", "b", "int4", "text", "coalesce", "ltrim", "rtrim", "y"]
+        vec!["b", "case", "a", "int4", "int4", "b", "int4", "text", "coalesce", "ltrim", "rtrim", "y", "substr", "substring", "array", "array"]
     );
     running.shutdown();
 }
