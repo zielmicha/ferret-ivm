@@ -23,7 +23,8 @@ protocol and replication client).
   logical slot and one walsender connection while running.
 - Each source additionally opens ordinary connections: one while
   `CREATE SOURCE` / `ALTER SOURCE ... REFRESH` discovers tables (from the
-  session that runs the statement) and one for snapshot queries.
+  session that runs the statement) and one for snapshot queries, which stays
+  open (idle between chunks) for as long as the source runs.
 - Consider **`max_slot_wal_keep_size`**: if the engine is stopped (or cannot
   start), its slot retains WAL without bound.
 
@@ -36,27 +37,38 @@ publish (`publish = 'insert'` etc.) never arrive.
 
 Not supported: publication column lists and row filters (discovery reads all
 columns of a table from `pg_attribute`, and the initial snapshot reads all
-rows), and partitioned tables (untested).
+rows), and partitioned tables (untested). With a column list, the table's
+first streamed change looks like a schema change that drops the unpublished
+columns; with a row filter, snapshots and re-snapshots copy rows the filter
+excludes.
 
 ### Primary keys and replica identity
 
 Every replicated table needs either
 
-- a **primary key** — the replica identity can stay `DEFAULT`; before-images
-  for updates and deletes come from the engine's stored copy of the row, not
-  from the WAL; or
-- **`REPLICA IDENTITY FULL`** — the table is then replicated as a multiset
-  (duplicates allowed), and updates/deletes are matched on all columns.
+- a **primary key** — the replica identity should stay `DEFAULT` (`FULL` also
+  works); before-images for updates and deletes come from the engine's stored
+  copy of the row, not from the WAL, and the old key the WAL carries for
+  deletes and key changes is the primary key; or
+- **`REPLICA IDENTITY FULL`** without a primary key — the table is then
+  replicated as a multiset (duplicates allowed), and updates/deletes are
+  matched on all columns. (A `FULL` table that has a primary key is keyed by
+  the primary key.)
 
-Anything else (no primary key, replica identity `DEFAULT`, `NOTHING` or
-`USING INDEX`) is refused when the source is created:
+A table with neither is refused when the source is created:
 
 ```
 ERROR:  table "public.nokey" has no primary key and REPLICA IDENTITY is not FULL
 ```
 
 The check covers every table of the publication (after the `FOR TABLES`
-filter), so one unsuitable table makes `CREATE SOURCE` fail.
+filter), so one unsuitable table makes `CREATE SOURCE` fail. A table with a
+primary key is accepted whatever its replica identity, but with
+`REPLICA IDENTITY USING INDEX` on an index other than the primary key, the
+WAL identifies deleted rows (and the old row of a key change) by that index's
+columns, the engine cannot find the row, and **the delete is silently lost**.
+(With `NOTHING`, PostgreSQL itself rejects updates and deletes of a table
+that is published for them.)
 
 ### Privileges
 
@@ -78,8 +90,9 @@ be single-quoted, with `\'` and `\\` escapes) or a `postgres://` /
 `postgresql://` URI. Implemented in `crates/pgproto/src/client.rs`:
 
 - Keywords used: `host` (a hostname, an IP address, a Unix-socket directory
-  starting with `/`, or `@name` for a Linux abstract socket), `hostaddr`,
-  `port` (default 5432), `user` (default `$USER`), `password`, `dbname`
+  starting with `/`, or `@name` for a Linux abstract socket; default
+  `localhost` over TCP), `hostaddr`, `port` (default 5432), `user` (default
+  `$USER`, else `$LOGNAME`, else `postgres`), `password`, `dbname`
   (default: the user name), `application_name`,
   `fallback_application_name`, `connect_timeout`, `options`,
   `client_encoding`.
@@ -90,8 +103,9 @@ be single-quoted, with `\'` and `\\` escapes) or a `postgres://` /
   connect without TLS. Many other libpq keywords are accepted and ignored;
   unknown keywords are an error. Multiple hosts are not supported.
 - `PG*` environment variables and `~/.pgpass` are **not** consulted.
-- The source adds `TimeZone=UTC` and `application_name=ivm` unless the
-  connection string sets them.
+- The source's sessions always use the time zone UTC (a `-c TimeZone=...`
+  in `options` does not change it), and `application_name` is `ivm` unless
+  the connection string sets it.
 
 The connection string is stored in the catalog in clear text (and is visible
 through `SHOW CREATE VIEW`, `ivm.objects` and `ivm.catalog_history`).
@@ -211,8 +225,11 @@ least once per second, and immediately when a read waits for an LSN
 (`AS OF AT LEAST LSN`).
 
 Consequently WAL is retained upstream only for the ingestion lag (usually
-milliseconds) while the engine runs. While the engine is stopped, or after it
-fails to start, the slot holds back WAL removal indefinitely.
+milliseconds) while the engine runs and the source is streaming. While the
+engine is stopped, after it fails to start, or while the source is stuck in
+an error (for example a table it cannot read, see
+[below](#tables-added-to-or-removed-from-the-publication)), the slot holds
+back WAL removal indefinitely.
 
 ## Initial snapshot
 
@@ -276,7 +293,9 @@ fixed once logged.
 
 - **Upstream restart or network failure**: the source thread logs a warning,
   shows `error: <message>` in `SHOW SOURCES`, and reconnects with exponential
-  backoff (200 ms, doubling, at most 10 s). It resumes streaming from the end
+  backoff (starting at 200 ms, doubling up to 10 s; the delay is never reset
+  after a successful reconnect, so once a source has had a few errors, every
+  later reconnect waits 10 s). It resumes streaming from the end
   LSN of the last commit that is durable in the input log; transactions at
   or below that LSN that the server sends again are skipped. An interrupted
   snapshot chunk is discarded and redone.
@@ -310,11 +329,16 @@ type at some position — the source:
 3. dependent materialized views are re-planned against the new definition
    and swapped at that GSN;
 4. the source re-snapshots the table from the beginning, which fills the new
-   columns of existing rows. Fresh reads wait for this snapshot.
+   columns of existing rows. Fresh reads wait for this snapshot only once its
+   first chunk has been logged; until then they return the table at once,
+   with NULL in the new columns (see the known problems below).
 
 Schema changes that do not change the column names or mapped types are
-invisible to the engine: new indexes, defaults, constraints, and typmod-only
-changes such as `varchar(10)` to `varchar(20)`. A renamed column is a
+invisible to the engine: new indexes, defaults, constraints, typmod-only
+changes such as `varchar(10)` to `varchar(20)`, and also changes of the
+primary key or the replica identity. After a primary-key or replica-identity
+change the engine keeps matching rows by the old key, so upstream deletes are
+**silently lost**; re-create the source after such a change. A renamed column is a
 dropped column plus a new one: its values are NULL until the re-snapshot
 fills them, and materialized views that use the old name cannot be
 re-planned (see below).
@@ -337,13 +361,27 @@ Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
   change`). After the next checkpoint the engine **fails to start** because
   the view cannot be planned during recovery. Drop such views before making
   breaking upstream changes.
+- Indexes created on a replicated table (`CREATE INDEX`) are not rebuilt when
+  the table changes shape; they keep referring to the table's old dataflow
+  node. `SHOW ARRANGEMENTS` then crashes the engine thread (`dangling node`;
+  afterwards every statement fails with `engine is shutting down`), and if
+  the change dropped the indexed column, the engine panics during recovery
+  after the next checkpoint and the data directory cannot be started. Drop
+  indexes on replicated tables before changing their upstream schema.
 
 ### Tables added to or removed from the publication
 
 Tables added to the publication later are not picked up automatically; use
 `ALTER SOURCE ... REFRESH`. Tables removed from the publication, or dropped
-upstream, simply stop receiving changes; the replicated table and its
-contents stay until the source is dropped.
+upstream, simply stop receiving changes once their snapshot (or re-snapshot)
+is complete; the replicated table and its contents stay until the source is
+dropped.
+
+If the source still has to copy a table that it can no longer read — removed
+from the publication, dropped, or without `SELECT` privilege — the failing
+chunk query is retried on every reconnect and the source never streams
+again: none of its tables receive changes, and the slot retains WAL. Drop
+and re-create the source (a single table cannot be removed from a source).
 
 ## ALTER SOURCE ... REFRESH
 

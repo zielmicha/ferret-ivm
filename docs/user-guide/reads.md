@@ -44,8 +44,11 @@ when the query arrives, and waits until the engine thread has applied it.
 This includes every local DML statement whose reply the client has already
 received, and every upstream transaction that has been logged. Fresh reads
 also wait while a replicated table that the query reads — directly or through
-views — is still loading its initial snapshot (or re-snapshotting after a
-schema change): a partially loaded table is no state the upstream ever had.
+views — is still loading its initial snapshot: a partially loaded table is no
+state the upstream ever had. A re-snapshot after an upstream schema change is
+only waited for once its first chunk has been logged; until then fresh reads
+return the table at once, with NULL in the new columns
+([Sources](sources.md#upstream-schema-changes)).
 
 ### Latest reads
 
@@ -64,7 +67,8 @@ the retention) fail with SQLSTATE `55000`:
 ERROR:  AS OF 2 is before the retention frontier 3
 ```
 
-A GSN in the future makes the read wait until the engine reaches it.
+A GSN in the future makes the read wait until the engine reaches it (such a
+wait cannot be cancelled).
 `SHOW GSN` returns the last applied GSN, and `SHOW FRONTIERS`
 the retention frontier. Note that every clock tick (by default one per
 second) consumes a GSN, so 1000 GSNs are at most about 17 minutes on an idle
@@ -74,6 +78,24 @@ Time-travel reads use the **current** catalog: a relation created after the
 GSN reads as empty (its index has no versions before its creation), and a
 virtual view is expanded with its current definition over the historical
 table contents.
+
+More generally, an index only has versions from the GSN at which it was
+built, and reads as of an earlier GSN silently return too few rows or none
+(a known problem):
+
+- a materialized view read as of a GSN before its current index was built —
+  before it was last replaced with `CREATE OR REPLACE`, or before a restart
+  that rebuilt the index because its structure no longer matched — returns
+  nothing;
+- point lookups (`WHERE column = constant`) use any index on the relation,
+  including a secondary index created after the read GSN: with an index on
+  `t(c)` created at GSN 95, `SELECT * FROM t WHERE c = 10 AS OF 92` returns
+  nothing, while a read of `t` without the condition (a scan of the primary
+  index) returns the rows.
+
+Error records are not versioned either: a read of a materialized view as of
+any GSN fails if the view has error records *now*, and succeeds if it has
+none now, whatever its state at that GSN.
 
 ### Read-your-writes against PostgreSQL: AS OF AT LEAST LSN
 
@@ -93,9 +115,11 @@ advances even when no data flows. Because all sources are compared, this
 form is meant for sources that replicate from the same PostgreSQL cluster.
 
 A source's frontier does not advance while any of its tables is loading an
-initial snapshot. If the engine has **no sources at all**, such a read waits
-forever (until the client cancels it or disconnects); a dropped source no
-longer holds reads back.
+initial snapshot, nor while the source is stuck in an error. If the engine
+has **no sources at all**, such a read waits until a source exists and
+reaches the LSN; a dropped source no longer holds reads back. Waiting reads
+cannot be cancelled (only `SUBSCRIBE` can); a client that disconnects is
+freed, but the read stays parked in the engine until its condition holds.
 
 ### now() in reads
 
@@ -182,7 +206,8 @@ and `1` mean true and anything else false; without `=`, only the words
 `true` and `false` are recognised as a value.
 
 - `name` may be a materialized view, a table, or a virtual view (which is
-  subscribed as its query).
+  subscribed as its query; a column list given in `CREATE VIEW` is not
+  applied, so the columns have the query's names).
 - `( query )` may be any query that a materialized view could have (the same
   [determinism rules](../sql/maintained-views.md) apply). A private dataflow
   is built for it — sharing every operator and index that existing views
@@ -256,14 +281,19 @@ A subscription runs until
   subscription, and the private dataflow of a query subscription, stay
   alive;
 - the subscribed materialized view is dropped
-  (`materialized view "x" was dropped`);
-- the subscribed relation produces an [error record](temporal-filters-and-errors.md#errors-as-data):
-  the subscription ends with that error;
+  (`materialized view "x" was dropped`); a subscription to a dropped *table*
+  does not end, and keeps sending progress rows;
+- the subscribed relation's error records change: the subscription ends with
+  the error — also when an error record is *retracted*, that is when the
+  relation has just become readable again (a known problem). The initial
+  snapshot of a subscription leaves rows that fail out instead of failing;
 - the engine shuts down.
 
-If the subscribed materialized view is replaced with `CREATE OR REPLACE`,
-the subscription continues: it receives the difference between the old and
-the new contents at the replacement's GSN.
+If the subscribed materialized view is replaced with `CREATE OR REPLACE` by
+another materialized view, the subscription continues: it receives the
+difference between the old and the new contents at the replacement's GSN.
+Replacing it with a virtual view ends the subscription
+(`materialized view "x" was dropped`).
 
 Changes are queued for each subscription without a bound; a client that
 reads more slowly than changes arrive makes the server's memory grow.

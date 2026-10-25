@@ -39,7 +39,9 @@ CREATE SINK events_out FROM events INTO POSTGRES
   case-sensitive and not lowercased.
 - `KEY` lists columns of `relation` that are unique in it. With a key, rows
   are upserted and deleted by key; without one, the target is maintained as a
-  multiset.
+  multiset. The key columns are not checked by `CREATE SINK`: a misspelled
+  column is accepted, and the sink then fails every connection attempt with
+  `error: sink key column "x" does not exist`.
 
 The sink starts as soon as the statement is applied, and again after every
 engine start.
@@ -68,7 +70,11 @@ engine start.
    - otherwise — no row yet, or the target is behind the snapshot — the
      target is **resynchronised** in one transaction: `DELETE FROM <target>`,
      `INSERT` of the snapshot rows (each row repeated by its multiplicity, 500
-     rows per statement), and the progress row set to the snapshot GSN.
+     rows per statement), and the progress row set to the snapshot GSN. This
+     happens only at the thread's first synchronisation; if on a later
+     reconnect the row is missing or behind what the thread has delivered,
+     the sink reports `error: sink progress row went backwards` and keeps
+     retrying.
 
 ### Delivering changes
 
@@ -166,6 +172,14 @@ place. A sink is a dependent object of its relation: `DROP TABLE` /
 `DROP MATERIALIZED VIEW` of the relation fails unless `CASCADE` is given,
 which drops the sink too, and `DROP SOURCE` of a replicated table's source
 drops the sink.
+
+The engine thread waits for the sink thread to stop. A sink that is
+retrying its connection handles one queued message per retry (up to 10 s
+each) and reaches the stop request only after every change queued before it,
+so dropping such a sink — directly, with `CASCADE` or through `DROP SOURCE` —
+can freeze the whole engine for a long time. If that happens, stop the
+engine with the stop file and start it again; the logged `DROP` is replayed
+without waiting.
 
 ## Known problems
 

@@ -8,8 +8,10 @@ view over it.
 
 `ivm` is a Cargo workspace (`Cargo.toml` at the repository root) with five
 crates: the engine (`crates/ivm`) and four supporting libraries
-(`pgnumeric`, `pgdatetime`, `pgfuncs`, `pgproto`). There are no C
-dependencies and no build scripts.
+(`pgnumeric`, `pgdatetime`, `pgfuncs`, `pgproto`). The workspace crates have
+no build scripts, but one dependency (`psm`, pulled in by `sqlparser` through
+`recursive` and `stacker`) compiles a small assembly file, so a C toolchain
+(`cc`) must be installed.
 
 Requirements:
 
@@ -79,7 +81,10 @@ Every flag is parsed in `crates/ivm/src/main.rs`; defaults come from
 Any unknown flag, a missing value or an unparsable number also prints the
 usage text and exits with status 2. If the engine cannot start (for example
 the data directory is locked or recovery fails) it prints
-`ivm: failed to start: <reason>` and exits with status 1.
+`ivm: failed to start: <reason>` and exits with status 1. The listen address
+is bound only after recovery: if that fails, the process prints
+`ivm: server error: <reason>` (for example `Address already in use`), shuts
+the engine down and exits with status **0**.
 
 There is no configuration file. Two environment variables affect the server:
 
@@ -130,7 +135,8 @@ psql -h 127.0.0.1 -p 6875 -U ivm
 - The server announces `server_version` `17.0`, `server_encoding` and
   `client_encoding` `UTF8`, `DateStyle` `ISO, MDY`, `IntervalStyle`
   `postgres`, `TimeZone` `UTC`, `integer_datetimes` `on`,
-  `standard_conforming_strings` `on`, and echoes `application_name`.
+  `standard_conforming_strings` `on`, `is_superuser` `on`,
+  `session_authorization` `ivm`, and echoes `application_name`.
 
 ### Drivers
 
@@ -143,7 +149,9 @@ Supported protocol features:
   and partial fetches with an `Execute` row limit (`PortalSuspended`);
 - `COPY (SUBSCRIBE ...) TO STDOUT` (CopyOut, text format);
 - query cancellation (`CancelRequest`) — it interrupts a running
-  `SUBSCRIBE`; ordinary queries run to completion.
+  `SUBSCRIBE` only. Other statements cannot be cancelled, including reads
+  that wait for a snapshot, an LSN or a GSN: such a read waits until its
+  condition holds, possibly forever; the client can only disconnect.
 
 Not supported: `DECLARE`/`FETCH` cursors (so named "server-side cursors" in
 psycopg and similar drivers fail; use the protocol-level row limit instead),
@@ -162,7 +170,7 @@ other than UTF-8, get an error.
 
 ## A first session
 
-The following example assumes a PostgreSQL 13+ server with
+The following example assumes a PostgreSQL 14+ server with
 `wal_level = logical` (see [Sources](sources.md#upstream-requirements)).
 Upstream:
 

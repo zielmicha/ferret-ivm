@@ -57,12 +57,15 @@ Prints the dataflow of a materialized view from its root down to the base
 tables:
 
 ```
- #5 Reduce group by [0], 2 aggregates arr#5[#0] arr#6[#2]
+ #5 Reduce group by [0], 2 aggregates arr#5[#0]
    #4 Mfp  arr#4[#0]
      #3 DeltaJoin 2 inputs, 2 delta paths
-       #0 Table orders shared x2 arr#0[#0] arr#3[#1]
-       #1 Table customers shared x2 arr#1[#0]
+       #1 Table orders shared x2 arr#1[#0] arr#3[#1]
+       #2 Table customers shared x2 arr#2[#0]
 ```
+
+(Here `arr#4` is the aggregation's input, arranged by the group key with
+per-node summaries, and `arr#5` its output.)
 
 Each line is `#<node id> <operator> <detail>`, followed by `shared x<n>` when
 the node has more than one reference (other consumers or pins — the node is
@@ -159,7 +162,7 @@ SELECT * FROM ivm.objects;
 
 | Relation | Columns | Contents |
 |---|---|---|
-| `ivm.catalog_history` | `gsn bigint`, `statement text` | every DDL statement that was applied successfully, with its GSN, in order — including statements of objects that have since been dropped. "What did the catalog look like at GSN g?" is a query over it. |
+| `ivm.catalog_history` | `gsn bigint`, `statement text` | every DDL statement that was applied successfully, with its GSN, in order — including statements of objects that have since been dropped. "What did the catalog look like at GSN g?" is a query over it, with two gaps: upstream schema changes rewrite table definitions without an entry, and a multi-object `DROP` that failed part-way (after dropping some objects) is missing. |
 | `ivm.objects` | `oid oid`, `name text`, `kind text`, `created_gsn bigint`, `definition text` | the current catalog objects: OID (`16384 + id`), name, kind (`table`, `view`, `materialized view`, `index`, `source`, `sink`), the GSN of the statement that created (or last replaced) the object, and its stored statement |
 
 Both are computed from the catalog when a query is planned; they are not
@@ -208,8 +211,10 @@ and the other `pg_get_*def` functions (NULL), `pg_table_size`,
 `pg_size_pretty`, `current_schemas`, `has_*_privilege` (always true),
 `pg_encoding_to_char` (`UTF8`), `pg_backend_pid`, `pg_is_in_recovery`
 (false), `pg_typeof`, `version()` (`PostgreSQL 17.0 (ivm)`),
-`current_database()` (`ivm`), `current_schema` (`public`), and casts to
-`regclass`, `regtype` and `regnamespace`, which print names.
+`current_database()` (`ivm`), `current_schema` (`public`), and casts of OIDs
+to `pg_catalog.regclass`, `regtype` and `regnamespace`, which print names (an
+unqualified `::regclass` prints the number, and names cannot be cast to
+these types: `'t'::regclass` fails with `invalid input syntax for type oid`).
 
 ### psql
 

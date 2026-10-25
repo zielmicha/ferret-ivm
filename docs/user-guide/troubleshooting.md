@@ -5,16 +5,26 @@
 ### A query hangs
 
 - **Initial snapshot in progress.** Fresh reads of a replicated table (and
-  of views over it) wait until its initial snapshot — or the re-snapshot
-  after an upstream schema change — is complete. `SHOW SOURCES` shows
-  `snapshotting <schema>.<table>`. Use `SET read_mode = latest` or
-  `AS OF LATEST` to read the partial state.
+  of views over it) wait until its initial snapshot is complete (and a
+  re-snapshot after an upstream schema change, once its first chunk has been
+  logged). `SHOW SOURCES` shows `snapshotting <schema>.<table>`. Use
+  `SET read_mode = latest` or `AS OF LATEST` to read the partial state.
 - **`AS OF AT LEAST LSN`.** The read waits until every source's frontier
   passes the LSN. It waits forever if there is no source at all, and as long
   as any source is snapshotting, disconnected (`error: ...`) or behind.
 - **`AS OF <gsn>` in the future** waits until the engine reaches that GSN.
 - **`SUBSCRIBE` in psql** never prints anything: psql waits for the end of
   the result. Use `COPY (SUBSCRIBE ...) TO STDOUT`.
+- **Every DML statement hangs**, and the server log shows
+  `failed to apply gsn ...`: a log record could not be processed (an error
+  inside `WITH RECURSIVE` maintenance or in an index key expression), and
+  the engine waits forever for its reply; see the last deviation in
+  [Errors as data](temporal-filters-and-errors.md#errors-as-data).
+- **`DROP SINK`, or a `DROP` that drops a sink, hangs**: the sink is
+  retrying its connection ([Sinks](sinks.md#monitoring-and-drop-sink)).
+
+Waiting statements cannot be cancelled (only `SUBSCRIBE` can); disconnect
+the client.
 
 ### CREATE SOURCE fails
 
@@ -42,6 +52,14 @@ errors:
   re-create the source (which takes a new initial snapshot).
 - authentication or permission errors: fix the role; the source picks the
   change up on its next attempt.
+- `relation "s.t" does not exist` or `permission denied for table t` while a
+  table still has to be copied: the source cannot continue at all until the
+  table is readable again; if it was removed from the publication or
+  dropped, drop and re-create the source
+  ([Sources](sources.md#tables-added-to-or-removed-from-the-publication)).
+
+The reconnect delay doubles up to 10 s and is never reset, so a source that
+has failed a few times retries only every 10 s.
 
 ### Reads of a view fail with an error
 
@@ -63,18 +81,27 @@ re-create the view (see [Known problems](#known-problems)).
 
 ### The engine does not start
 
-See the [startup failure table](operations.md#recovery). Two failures leave
-the data directory unusable without restoring a backup, because the
-checkpointed catalog contains a materialized view that can no longer be
-planned:
+See the [startup failure table](operations.md#recovery). Several problems
+leave the data directory unusable without restoring a backup, because the
+checkpointed catalog or the log contains something that can no longer be
+planned or applied:
 
 - a table with a quoted mixed-case name was dropped while views used it;
 - an upstream schema change removed or renamed a column a materialized view
-  uses.
+  uses, or a column an index on the replicated table uses;
+- `CREATE OR REPLACE` replaced a materialized view that has an index with a
+  version with fewer columns, replaced a materialized view that has an index
+  or a sink with a virtual view, or made a view read a relation created after
+  it (`relation "b" has no dataflow`);
+- a materialized view with a `DISTINCT` aggregate and `FILTER`, or with a
+  negative `GROUPS` frame offset, crashed the engine (the statement is
+  replayed and crashes again on every start);
+- a log record whose processing failed (see above) is replayed and fails
+  again, if no checkpoint was taken after it.
 
 Either restore a copy of the data directory taken before the problem, or
 start over with an empty data directory (and drop the old replication slots
-upstream). See [Known problems](#known-problems) for how to avoid both.
+upstream). See [Known problems](#known-problems) for how to avoid these.
 
 ### A sink shows `error: ...`
 
@@ -107,14 +134,19 @@ Use `EXPLAIN MAINTENANCE` and `EXPLAIN DATAFLOW`. Typical causes:
   as one step.
 
 Grouped `count`, `sum`, `avg`, `min`, `max`, `bool_and/or`, `stddev` and
-`variance` are cheap regardless of group size (range summaries).
+`variance` are cheap regardless of group size (range summaries) — unless the
+same query also has an ordered aggregate: then all of its aggregates are
+computed by one operator that rescans each changed group.
 
 ### Disk usage grows
 
 - The input log keeps segments back to `checkpoint GSN − --retention-gsns`
   (and always the current 64 MiB segment).
-- Dead index nodes are reclaimed only in sealed segments; the active segment
-  (up to 256 MiB) is not collected until it is full.
+- Dead index nodes are reclaimed only in sealed segments that are less than
+  half live, one segment at a time after each checkpoint (at most 1000 nodes
+  relocated per pass); up to half of any other sealed segment can stay
+  garbage, and the active segment (up to 256 MiB) is not collected until it
+  is full.
 - Large `--retention-gsns` keeps more versions in the indexes.
 
 ### Upstream WAL grows
@@ -182,9 +214,11 @@ See [Queries](../sql/queries.md) for the full list. Notable:
   and rounded once, so results can differ from PostgreSQL's sequential
   summation in the last bits.
 - When equal values have different representations (`1.0` and `1.00` in a
-  `numeric` group key, `DISTINCT`, `min`/`max`), the engine returns the one
-  that sorts first in its index, which may differ from the one PostgreSQL
-  happens to return.
+  `numeric` group key, `DISTINCT`, `min`/`max`), materialized views and
+  `DISTINCT` return the one that sorts first in the index, while ad hoc
+  `GROUP BY` and `min`/`max` return the first one in scan order. Either may
+  differ from PostgreSQL's choice, and an ad hoc query can disagree with the
+  same query as a materialized view (`1.000` versus `1`).
 - In maintained views, expression errors become error records instead of
   failing a statement.
 - `current_user`, `session_user`, `user` and `current_catalog` fail with
@@ -193,22 +227,54 @@ See [Queries](../sql/queries.md) for the full list. Notable:
 
 ## Known problems
 
-Problems found while writing this documentation (at commit `d80c7f2`), with
-workarounds:
+Problems found while writing and checking this documentation (at commit
+`d80c7f2`), with workarounds. Most were reproduced on a running engine.
+
+### Crashes and data directories that cannot start
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| Dependency detection lowercases view text (`catalog.rs`, `sql_mentions`) | Dropping a table/view with a quoted mixed-case name succeeds while views use it; the engine fails to start after the next checkpoint | avoid mixed-case quoted names; drop dependent views first |
-| Upstream schema change that breaks a materialized view | The view silently stops updating; the engine fails to start after the next checkpoint | drop affected views before dropping/renaming upstream columns |
-| Deletes during a re-snapshot after a schema change are skipped | Rows deleted upstream right after a schema change stay in the replica | re-create the source after the change if it matters |
-| A restart before a re-snapshot's first chunk completes forgets the re-snapshot | Existing rows keep NULL in columns added upstream | re-create the source |
-| A sink drops queued changes while reconnecting | Sink target misses changes after an outage, or after concurrent `CREATE SINK`s race on `ivm_sink_progress` | create `ivm_sink_progress` in advance; create sinks one at a time; resynchronise (see above) after outages |
-| Aggregate-group errors are not retracted after a restart | The view keeps failing although the data is fixed | drop and re-create the view |
-| Errors in join conditions and probed join inputs are dropped | Rows silently missing instead of an error | avoid expressions that can fail in join conditions |
-| A dropped slot is never re-created | Source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
+| A `DISTINCT` aggregate with `FILTER` (`count(DISTINCT v) FILTER (WHERE ...)`) in a materialized view or `SUBSCRIBE (query)` | the engine overflows its stack; for a materialized view the logged statement crashes every start | rewrite with a subquery or `CASE` |
+| A negative `GROUPS` frame offset (`GROUPS BETWEEN -1 PRECEDING ...`) | the engine thread panics (every statement then fails with `engine is shutting down`); in a materialized view it is replayed on every start. Negative `ROWS`/`RANGE` offsets give wrong results instead of an error | do not use negative offsets |
+| Indexes on a replicated table survive an upstream schema change pointing at the old table | `SHOW ARRANGEMENTS` crashes the engine thread; if the indexed column was dropped, start-up panics after the next checkpoint | drop indexes on replicated tables before changing their upstream schema |
+| An upstream schema change that breaks a materialized view (dropped or renamed column) | the view silently stops updating; the engine fails to start after the next checkpoint | drop affected views before such changes |
+| Dependency detection is textual (`catalog.rs`, `sql_mentions`) | dropping a quoted mixed-case table or view succeeds while views use it, and the engine fails to start after the next checkpoint; conversely a view that merely contains the name (a column alias, a string literal) blocks a `DROP`, and `CASCADE` drops it | avoid mixed-case quoted names; drop dependent views explicitly |
+| `CREATE OR REPLACE MATERIALIZED VIEW` does not switch dependents | materialized views over it read the old version until the next restart; its indexes keep the old version and make start-up panic if the new version has fewer columns | drop dependent views and indexes first |
+| `CREATE OR REPLACE` of a materialized view that has an index or a sink by a virtual view | the sink stops receiving changes; the next start fails (`index target without dataflow`, `sink source without dataflow`) | drop indexes and sinks first |
+| `CREATE OR REPLACE` that makes a view read a relation created after the view | the next start fails (`relation "b" has no dataflow`), because recovery rebuilds objects in creation order | drop and re-create the view instead of replacing it |
+| An error that escapes the dataflow (inside `WITH RECURSIVE` maintenance, or computing an index key such as a join on `a.x + 1`) | the change is half-applied, the statement never returns, every later DML statement hangs, and replaying the record fails at the next start unless a checkpoint followed it | avoid expressions that can fail in join keys and recursive queries |
+| `var_pop`/`var_samp`/`stddev*` over very large `bigint` values | the sum of squares overflows: the debug build panics the engine thread, a release build returns a wrong result | cast to `numeric` |
+
+### Lost or wrong data
+
+| Problem | Effect | Workaround |
+|---|---|---|
+| `REPLICA IDENTITY USING INDEX` (an index other than the primary key) is accepted | upstream deletes and primary-key changes are silently lost | use `DEFAULT` or `FULL` |
+| Upstream primary-key or replica-identity changes are not detected | afterwards upstream deletes are silently lost | re-create the source |
+| Deletes during a re-snapshot after a schema change are skipped | rows deleted upstream right after a schema change stay in the replica | re-create the source after the change if it matters |
+| The decision to re-snapshot after a schema change is not logged until the first chunk completes | until then fresh reads do not wait and show NULL in new columns; a restart in that window forgets the re-snapshot for good | check new columns after such changes; re-create the source |
+| A sink drops queued changes while reconnecting | the target misses changes after an outage, or after concurrent `CREATE SINK`s race on creating `ivm_sink_progress` | create `ivm_sink_progress` in advance; create sinks one at a time; resynchronise after outages |
+| Time-travel reads use indexes built after the read GSN | `AS OF` reads of a replaced (or re-indexed) materialized view, and point lookups through a newer index, return too few rows or none | read without the `WHERE column = constant` condition, or within the index's lifetime |
+| Error records: not retracted after a restart (aggregate groups) or when they existed at creation (aggregates without `GROUP BY`); errors below an index or of shared operators not counted at creation; not versioned for `AS OF`; errors in join conditions treated as no match | views fail although the data is fixed, or succeed although PostgreSQL would fail ([details](temporal-filters-and-errors.md#errors-as-data)) | drop and re-create the view |
+| `HAVING` with a constant condition over an aggregate without `GROUP BY` (`SELECT count(*) FROM t HAVING false`) | returns one row instead of none | use `WHERE` on a subquery |
+| Mixed `real` (`float4`) and `numeric`/`integer` arithmetic and comparisons use `real` | different results from PostgreSQL, which uses `double precision` (`0.1::float4 = 0.1` is true) | cast to `double precision` |
+| Ticks can be postponed under continuous input | `now()` and temporal filters lag | none |
+| `--no-sync` and operating-system crashes | lost records; GSN reuse with hanging clients, stale reads and lost upstream transactions | do not use `--no-sync` for real data |
+
+### Hangs and other problems
+
+| Problem | Effect | Workaround |
+|---|---|---|
+| Only `SUBSCRIBE` can be cancelled | reads waiting for a snapshot, an LSN or a GSN wait forever if the condition never holds | disconnect |
 | `AS OF AT LEAST LSN` without sources | waits forever | do not use it without sources |
+| `DROP SINK` of a sink that is retrying its connection | the engine thread waits for the sink, possibly for a long time | stop and restart the engine; the drop is replayed |
+| A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
+| A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
+| The source reconnect delay is never reset | after a few failures every reconnect waits 10 s | none |
+| `SUBSCRIBE` ends when an error record is retracted; a subscription to a dropped table never ends | spurious errors; a subscription that never finishes | re-subscribe; end it from the client |
+| A multi-object `DROP` that fails part-way | the earlier objects are dropped anyway, and the statement is missing from `ivm.catalog_history` | drop objects one at a time |
+| `CREATE SINK` does not check `KEY` columns | the sink fails every connection attempt (`sink key column "x" does not exist`) | check the names; drop and re-create the sink |
+| A listen address that cannot be bound | the server exits with status 0 after recovery | check the log; do not rely on the exit status |
 | `SHOW read_mode` before `SET read_mode` | `unrecognized configuration parameter` | `SET read_mode = fresh` first |
 | `current_user`, `session_user`, `user`, `current_catalog` | `function ...() does not exist` | use a literal |
-| Ticks can be postponed under continuous input | `now()` and temporal filters lag | none |
-| Stop file / signals | no final checkpoint; replay on next start (harmless) | none needed |
-| `--no-sync` and OS crashes | lost records, GSN reuse | do not use `--no-sync` for real data |
+| Stop file | no final checkpoint; the log is replayed on the next start (harmless) | none needed |

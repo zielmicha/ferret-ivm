@@ -72,9 +72,9 @@ the data directory ([Stopping](getting-started.md#stopping-the-server)).
 
 On start the engine creates `LOCK` (if missing) and takes an exclusive
 advisory lock on it (`flock` through `File::try_lock`), held until the
-process exits — also when it crashes. A second process fails with SQLSTATE
-`55006`: `data directory <dir> is in use by another ivm process`. The file is
-never deleted and has no contents.
+process exits — also when it crashes. A second process prints
+`ivm: failed to start: data directory <dir> is in use by another ivm process`
+and exits with status 1. The file is never deleted and has no contents.
 
 Do not delete `LOCK` while a process runs: a new process would create a new
 file, lock it, and run on the same directory concurrently.
@@ -112,6 +112,8 @@ Startup failures and what they mean:
 | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | the table's primary index cannot be found by its structural fingerprint — usually an incompatible version |
 | `node checksum mismatch at ...`, `cannot open segment ...` | damaged or missing store files |
 | any planning error (`relation "x" does not exist`, `column "b" does not exist`) | a materialized view in the catalog can no longer be planned; see [Troubleshooting](troubleshooting.md#the-engine-does-not-start) |
+| `index target without dataflow`, `sink source without dataflow` | a materialized view with an index or a sink was replaced by a virtual view ([Known problems](troubleshooting.md#known-problems)) |
+| a panic (`thread 'main' panicked at ...`, `has overflowed its stack`) | a bug triggered by the catalog or the log, for example an index whose columns no longer exist after an upstream schema change or a `CREATE OR REPLACE`, or a `DISTINCT` aggregate with `FILTER` ([Known problems](troubleshooting.md#known-problems)) |
 
 ## Checkpoints and garbage collection
 
@@ -160,9 +162,13 @@ disk. A crash of the `ivm` process alone loses nothing, but an operating
 system crash or power loss can lose records that were already acknowledged —
 including upstream transactions whose WAL the source has already released.
 Worse, checkpoints are always `fsync`ed, so after such a crash the last
-checkpoint can be newer than the end of the surviving log; the next start
-then assigns GSNs that the checkpoint already covers, and those records are
-silently ignored. Use `--no-sync` only for disposable data.
+checkpoint can be newer than the end of the surviving log. This is not
+detected: the next start assigns GSNs that the checkpoint already covers, and
+the engine skips records with such GSNs. DML and DDL statements in that window
+never get a reply (the client hangs), upstream transactions in it are
+acknowledged to the slot but lost, and fresh reads, which read at the durable
+GSN, see an older state until the log has caught up with the checkpoint. Use
+`--no-sync` only for disposable data.
 
 ## Stopping and restarting
 
@@ -183,7 +189,7 @@ While it is stopped:
 | `store/MANIFEST.new` | yes — a leftover of an interrupted manifest rewrite; it is never read |
 | `store/seg-*.dat` not referenced by the last checkpoint | they are deleted automatically on the next start |
 | other `store/` files | **no** — the checkpoint refers to them |
-| `log/*.ivl` | **no** — the engine deletes old segments itself. Removing a segment that still holds records after the last checkpoint silently loses them; removing the newest segments makes the engine reuse GSNs that the checkpoint covers |
+| `log/*.ivl` | **no** — the engine deletes old segments itself. Removing a segment that still holds records after the last checkpoint silently loses them; removing the newest segments makes the engine reuse GSNs that the checkpoint covers (see [Durability](#durability-and---no-sync)) |
 | the whole data directory | yes, to start from scratch — then drop the upstream slots and, if needed, the sink targets |
 
 ## Backups

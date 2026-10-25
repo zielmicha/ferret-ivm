@@ -32,7 +32,7 @@ Where the clock is used:
 | Context | `now()` (and `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date`) |
 |---|---|
 | materialized views, `SUBSCRIBE (query)` | only in temporal filters (below), evaluated against the logical clock |
-| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN |
+| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN (except across a restart: reads as of a GSN older than the last checkpoint then see the checkpoint's clock) |
 | `INSERT`/`UPDATE`/`DELETE` | the wall clock when the statement runs (the resulting values are logged) |
 
 `clock_timestamp()` always returns the wall clock and is rejected in
@@ -91,14 +91,17 @@ interval), and
 
 `BETWEEN now() - x AND now()` works because it is two such conjuncts.
 Inner-join `ON` conditions on one input are accepted when the optimizer
-pushes them into a filter on that input.
+pushes them into a filter on that input, and so are conditions in the `ON`
+clause of a `LEFT`/`RIGHT JOIN` that only use the nullable input.
 
 Rejected, with
 `now() is only supported in temporal filters of maintained views`
 (SQLSTATE `0A000`):
 
 - the clock in the select list, `GROUP BY`, `ORDER BY`, a window, a
-  function argument other than the forms above, or an outer-join condition;
+  function argument other than the forms above, or an outer-join condition
+  that cannot be pushed into the nullable input (a condition on the
+  preserved side, or any condition of a `FULL JOIN`);
 - conditions combining the clock with `OR`, `NOT` or `<>`;
 - clock expressions that are not monotone (`extract(hour from now()) = 3`)
   or that mix the clock with columns (`now() - ts < interval '1 minute'`; write
@@ -110,8 +113,10 @@ Virtual views and ad hoc queries may use `now()` anywhere.
 
 For each row, the operator computes the interval of logical time
 `[lo, hi)` during which every temporal conjunct holds, by bisecting the
-condition over clock values between 1900-01-01 and 2200-01-01 (a bound
-outside that range means "always" on that side). Because the clock side is
+condition over clock values between 1900-01-01 and 2200-01-01: a row whose
+validity starts before 1900 is valid from the beginning, and one whose
+validity ends after 2200 never expires, but a row that would only become
+valid after 2200, or that expired before 1900, is never valid. Because the clock side is
 non-decreasing, each conjunct changes value at most once, and bisection keeps
 calendar arithmetic (months, time zones, `date_trunc`) exact.
 
@@ -162,7 +167,7 @@ Rules:
 - Grouped aggregates: if an aggregate of a group fails (for example
   `sum(float8)` overflowing to `value out of range: overflow`), the group's
   row is removed and one error record is kept for the group until the group
-  computes again.
+  computes again (with exceptions, see the deviations below).
 - Window functions: if computing a partition fails (for example
   `ntile(0)`), the partition contributes an error record instead of rows.
 - Errors are part of the checkpointed state and are not delivered to sinks.
@@ -171,9 +176,10 @@ Rules:
 In aggregates and temporal filters, errors that are not caused by data —
 internal errors (`XX...` SQLSTATEs) and I/O errors (`58...`) — are not turned
 into records. Such an error while applying a log record stops the engine
-thread (other errors are logged and the record is skipped); the server then
-answers every statement with `engine is shutting down` until it is
-restarted.
+thread; the server then answers every statement with
+`engine is shutting down` until it is restarted. Any other error that
+escapes the dataflow is logged, and the record stays half-applied (see the
+last deviation below).
 
 Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
 
@@ -185,3 +191,24 @@ Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
 - After a **restart**, error records of aggregate groups that existed before
   the restart are never retracted, so the view keeps failing even after the
   data is fixed. Dropping and re-creating the view recomputes its errors.
+- The error of an aggregate **without `GROUP BY`** that exists when the view
+  is created is never retracted either.
+- When a view is **created**, its initial error records come only from the
+  computation of its root operator. Errors of rows that sit below an index
+  the plan reads from (inside `DISTINCT`, `GROUP BY`, set operations, top-k,
+  windows, join lookups), and errors already held by an existing view whose
+  operators the new view shares (an identical query, or a view over another
+  materialized view), are not counted: the view reads successfully although
+  PostgreSQL would fail. When the offending row is later deleted, the view's
+  count for that error drops below zero, which masks the next occurrence of
+  the same error.
+- Error records are **not versioned**: an `AS OF` read checks the view's
+  current error records, whatever they were at the read's GSN.
+- Errors inside **`WITH RECURSIVE`** maintenance and errors computing an
+  **index key** (for example a join on `a.x + 1 = b.y` when `a.x + 1`
+  overflows) do not become error records; they abort the processing of the
+  log record. The change is then half-applied (the base table is updated,
+  downstream views are not), the DML statement never gets a reply, and every
+  later DML statement waits forever; restarting replays the record and fails
+  again (`ivm: failed to start: ...`) unless a checkpoint was taken after
+  it.
