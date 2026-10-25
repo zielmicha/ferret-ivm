@@ -650,3 +650,22 @@ fn invalid_window_frames_are_rejected() {
     );
     running.shutdown();
 }
+
+#[test]
+fn bool_casts_to_text_and_case_typing() {
+    let running = start("bool-text");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE f1 (id int PRIMARY KEY, b bool, c char(4), s text)");
+    exec(&h, "INSERT INTO f1 VALUES (1, true, 'ab', 'x')");
+    // the cast is booltext() (true/false), the output function writes t/f
+    assert_eq!(
+        rows(&h, "SELECT true::text, false::varchar, true::char(5) || '#', (array[true, null])::text[], array[true]::text, format('%s', true), concat(false)"),
+        vec!["true|false|true#|{true,NULL}|{t}|t|f"]
+    );
+    // CASE takes the type of its ELSE first: text here, not character
+    assert_eq!(
+        rows(&h, "SELECT pg_typeof(CASE WHEN b THEN c ELSE s END), (CASE WHEN id = 1 THEN c ELSE s END)::text || '|' FROM f1"),
+        vec!["text|ab|"]
+    );
+    running.shutdown();
+}

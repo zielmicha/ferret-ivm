@@ -173,6 +173,8 @@ fn convert(d: &Datum, to: &SqlType) -> Result<Datum> {
         }
         // strings
         (Datum::Text(s), T::Text | T::Varchar | T::Bpchar | T::Name) => Datum::Text(s.clone()),
+        // booltext(), unlike the output function, spells the words out
+        (Datum::Bool(b), T::Text | T::Varchar | T::Bpchar) => Datum::text(if *b { "true" } else { "false" }),
         (_, T::Text | T::Varchar | T::Bpchar | T::Name) => Datum::text_owned(format_datum(d)),
         (Datum::Text(s), _) => parse_datum(s, to, -1)?,
         // arrays

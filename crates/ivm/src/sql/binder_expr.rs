@@ -1351,7 +1351,11 @@ impl<'a> Binder<'a> {
         };
         results.push(else_);
         let types: Vec<SqlType> = results.iter().map(|r| self.ty_of(r, ctx)).collect();
-        let t = common_type(&types, "CASE")?;
+        // PostgreSQL resolves CASE with the ELSE result as the first input
+        let mut order = Vec::with_capacity(types.len());
+        order.push(types[types.len() - 1].clone());
+        order.extend(types[..types.len() - 1].iter().cloned());
+        let t = common_type(&order, "CASE")?;
         let mut coerced = Vec::with_capacity(results.len());
         for (r, rt) in results.into_iter().zip(types) {
             coerced.push(self.coerce(r, &rt, &t, CastContext::Implicit, "CASE")?);
