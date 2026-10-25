@@ -371,3 +371,23 @@ fn distinct_on_infinite_intervals() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Ad hoc execution deduplicated a group's rows for a DISTINCT ordered
+/// aggregate in place, so ordered aggregates after it saw only the distinct
+/// rows (here mode() saw x = 17 alone). Expected values are PostgreSQL's.
+#[test]
+fn distinct_ordered_aggregates_leave_other_aggregates_alone() {
+    let dir = tmpdir("distinct-ordered-aggs");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, s text, x int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 'a', 17), (2, 1, 'a', 7), (3, 2, 'a', 1), (4, 2, 'b', NULL)");
+    let q = "SELECT g, string_agg(DISTINCT s, '|' ORDER BY s) AS s, mode() WITHIN GROUP (ORDER BY x) AS m, \
+             array_agg(x ORDER BY x) AS xs, count(DISTINCT s) AS n FROM t GROUP BY g";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    let want = ["1|a|7|{7,17}|1", "2|a|b|1|{1,NULL}|2"];
+    assert_eq!(rows(&h, &format!("{q} ORDER BY g")), want);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY g"), want);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

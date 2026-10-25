@@ -609,16 +609,19 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
         }
         let mut row = g.key_row.clone();
         for (i, s) in specs.iter().enumerate() {
-            let v = if s.func.is_ordered() {
-                let mut rs = std::mem::take(&mut g.rows);
-                if aggs[i].distinct {
-                    let mut seen = FxHashMap::default();
-                    let a = aggs[i].args.clone();
-                    rs.retain(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none());
-                    for x in rs.iter_mut() {
-                        x.1 = 1;
-                    }
+            let v = if s.func.is_ordered() && aggs[i].distinct {
+                // deduplicate a copy: the aggregates after this one need every row
+                let mut rs = g.rows.clone();
+                let mut seen = FxHashMap::default();
+                let a = &aggs[i].args;
+                rs.retain(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none());
+                for x in rs.iter_mut() {
+                    x.1 = 1;
                 }
+                sort_rows(&mut rs, &aggs[i].order);
+                s.finalize_ordered(&mut rs.iter().cloned())?
+            } else if s.func.is_ordered() {
+                let mut rs = std::mem::take(&mut g.rows);
                 sort_rows(&mut rs, &aggs[i].order);
                 let v = s.finalize_ordered(&mut rs.iter().cloned())?;
                 g.rows = rs;
