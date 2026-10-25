@@ -63,3 +63,56 @@ fn malformed_hex_literal_is_an_error_not_a_crash() {
     assert_eq!(rows(&h, "SELECT 1"), vec!["1"]);
     running.shutdown();
 }
+
+/// t1 / t2 with NULLs, duplicates and numerics of differing scale.
+fn setup_t1_t2(h: &EngineHandle) {
+    exec(h, "CREATE TABLE t1 (id int PRIMARY KEY, a int, b int, c numeric, s text, d date, ts timestamp)");
+    exec(h, "CREATE TABLE t2 (id int PRIMARY KEY, x int, y int, c numeric, s text)");
+    exec(
+        h,
+        "INSERT INTO t1 VALUES (1, 1, 10, 1.0, 'a', '2024-01-01', '2024-01-01 10:00'), \
+         (2, 2, NULL, 1.00, 'b', '2024-01-02', '2024-01-01 00:00'), (3, NULL, 30, 2.5, NULL, NULL, '2024-01-02 12:00'), \
+         (4, 2, 20, NULL, 'a', '2024-01-01', NULL), (5, 3, 30, 3, 'c', '2024-01-03', '2024-01-03 00:00')",
+    );
+    exec(
+        h,
+        "INSERT INTO t2 VALUES (1, 1, 100, 1.000, 'a'), (2, 2, NULL, 2.5, 'x'), (3, 2, 200, 1, NULL), \
+         (4, NULL, 300, NULL, 'b'), (5, 5, 500, 3.0, 'c')",
+    );
+}
+
+#[test]
+fn having_without_group_by_filters_the_single_row() {
+    let running = start("having-global");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // a constant HAVING used to be pushed below the aggregate, which then
+    // produced its row for the (now empty) input anyway
+    assert_eq!(rows(&h, "SELECT count(*) FROM t1 HAVING false"), Vec::<String>::new());
+    assert_eq!(rows(&h, "SELECT count(*) FROM t1 HAVING 1 = 0"), Vec::<String>::new());
+    assert_eq!(rows(&h, "SELECT a, count(*) FROM t1 GROUP BY ROLLUP (a) HAVING false"), Vec::<String>::new());
+    assert_eq!(rows(&h, "SELECT count(*) FROM t1 HAVING true"), vec!["5"]);
+    assert_eq!(rows(&h, "SELECT count(*), sum(a) FROM t1 WHERE false"), vec!["0|"]);
+    exec(&h, "CREATE MATERIALIZED VIEW hv AS SELECT count(*) AS n FROM t1 HAVING 1 > 2");
+    assert_eq!(rows(&h, "SELECT * FROM hv"), Vec::<String>::new());
+    running.shutdown();
+}
+
+#[test]
+fn outer_join_kept_for_any_all_over_empty_arrays() {
+    let running = start("anyall-outer");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // NULL = ALL('{}') is true and NULL = ANY('{}') is false, so these WHERE
+    // clauses do not reject the null-extended rows of the LEFT JOIN
+    let all = "SELECT t1.id, t2.id FROM t1 LEFT JOIN t2 ON t1.a = t2.x AND t2.y > 150 \
+               WHERE t2.y = ALL ('{}'::int[]) ORDER BY 1, 2";
+    assert_eq!(rows(&h, all), vec!["1|", "2|3", "3|", "4|3", "5|"]);
+    let not_any = "SELECT t1.id, t2.id FROM t1 LEFT JOIN t2 ON t1.a = t2.x AND t2.y > 150 \
+                   WHERE NOT (t2.y = ANY ('{}'::int[])) ORDER BY 1, 2";
+    assert_eq!(rows(&h, not_any), vec!["1|", "2|3", "3|", "4|3", "5|"]);
+    // a NULL array still makes the comparison NULL: the join may become inner
+    let null_arr = "SELECT t1.id, t2.id FROM t1 LEFT JOIN t2 ON t1.a = t2.x WHERE t2.y = ANY (NULL::int[]) ORDER BY 1";
+    assert_eq!(rows(&h, null_arr), Vec::<String>::new());
+    running.shutdown();
+}
