@@ -32,6 +32,19 @@ fn lit(d: &Datum, c: &Column) -> String {
     format!("'{}'::{}", format_datum(d).replace('\'', "''"), format_type(&c.ty.ty, c.ty.typmod))
 }
 
+/// Columns a retraction must match by text: types PostgreSQL has no
+/// equality for (json, jsonpath), and types whose equal values differ in
+/// representation (numeric scales, -0, jsonb numbers), where equality could
+/// delete a row holding another representation than the retracted one.
+fn compare_as_text(ty: &crate::types::SqlType) -> bool {
+    use crate::types::SqlType;
+    match ty {
+        SqlType::Json | SqlType::JsonPath | SqlType::Jsonb | SqlType::Numeric | SqlType::Float4 | SqlType::Float8 => true,
+        SqlType::Array(e) => compare_as_text(e),
+        _ => false,
+    }
+}
+
 fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -137,9 +150,9 @@ impl Writer {
                     .iter()
                     .zip(r)
                     .map(|(c, d)| {
-                        if c.ty.ty == crate::types::SqlType::Json {
-                            // json has no equality operator; its text is kept as written
-                            format!("{}::text IS NOT DISTINCT FROM {}::text", qident(&c.name), lit(d, c))
+                        if compare_as_text(&c.ty.ty) {
+                            // the text identifies the value exactly
+                            format!("{}::text IS NOT DISTINCT FROM ({})::text", qident(&c.name), lit(d, c))
                         } else {
                             format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c))
                         }

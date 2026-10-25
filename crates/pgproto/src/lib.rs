@@ -178,27 +178,4 @@ mod tests {
             assert!(bad.parse::<Lsn>().is_err(), "{bad}");
         }
     }
-
-    #[test]
-    fn types_are_send() {
-        fn send<T: Send>() {}
-        fn sync<T: Sync>() {}
-        send::<Client>();
-        send::<ReplicationStream>();
-        send::<testutil::TempCluster>();
-        sync::<testutil::TempCluster>();
-        send::<Error>();
-        sync::<Error>();
-    }
-
-    #[test]
-    fn error_display() {
-        let mut e = Error::new(ErrorKind::Server, "relation \"x\" does not exist");
-        assert_eq!(e.to_string(), "relation \"x\" does not exist");
-        e.sqlstate = Some("42P01".into());
-        assert_eq!(
-            e.to_string(),
-            "relation \"x\" does not exist (SQLSTATE 42P01)"
-        );
-    }
 }

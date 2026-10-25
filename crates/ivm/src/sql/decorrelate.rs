@@ -517,6 +517,11 @@ fn mark_join(left: Rel, r2: Rel, k: usize, dkeys: &[Expr], sk: SubqueryKind) -> 
 /// Quantified comparison mark join: per left row, ANY (or ALL) of `pred`
 /// between its `lhs` values and the subquery rows of its D value, with SQL's
 /// three-valued logic (an empty subquery gives false for ANY, true for ALL).
+///
+/// The mark depends on nothing but a row's D and `lhs` values, so it is
+/// computed once per distinct pair of those and joined back on them: left
+/// rows can be wide (keeping whole rows as grouping keys arranged every
+/// column of a join, TOASTed text included, several times over).
 fn quantified_join(
     left: Rel,
     r2: Rel,
@@ -529,14 +534,17 @@ fn quantified_join(
     let nl = left.arity();
     let m = lhs.len();
     let w = r2.arity() - k;
-    // left rows with their compared values; subquery rows with a marker that
-    // is NULL only when the left join found no row at all
-    let lm = left.clone().map(lhs);
+    let nd = dkeys.len();
+    // distinct (D values, compared values) of the left rows
+    let keyexprs: Vec<Expr> = dkeys.iter().cloned().chain(lhs).collect();
+    let n1 = nd + m;
+    let keys = Rel::Distinct { input: Box::new(left.clone().map(keyexprs.clone()).project((nl..nl + n1).collect())) };
+    // the subquery rows of each, with a marker that is NULL only when the
+    // left join found no row at all
     let rm = r2.map(vec![Expr::bool(true)]);
-    let n1 = nl + m;
-    let on: Vec<Expr> = dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(n1 + i))).collect();
-    let j = Rel::Join { left: Box::new(lm), right: Box::new(rm), kind: JoinKind::Left, on };
-    let lcols: Vec<Expr> = (nl..nl + m).map(Expr::Column).collect();
+    let on: Vec<Expr> = (0..nd).map(|i| nd_eq(Expr::Column(i), Expr::Column(n1 + i))).collect();
+    let j = Rel::Join { left: Box::new(keys), right: Box::new(rm), kind: JoinKind::Left, on };
+    let lcols: Vec<Expr> = (nd..n1).map(Expr::Column).collect();
     let rcols: Vec<Expr> = (n1 + k..n1 + k + w).map(Expr::Column).collect();
     let cmp = pred(&lcols, &rcols)?;
     let present = Expr::IsNotNull(Box::new(Expr::Column(n1 + k + w)));
@@ -544,17 +552,16 @@ fn quantified_join(
     let jm = j.map(vec![test(crate::expr::BoolTest::IsTrue), test(crate::expr::BoolTest::IsUnknown), test(crate::expr::BoolTest::IsFalse)]);
     let base = jm.arity() - 3;
     let b = ColumnType::new(SqlType::Bool);
-    // per distinct left row (multiplicity is restored by joining back)
     let grouped = Rel::Aggregate {
         input: Box::new(jm),
-        group: (0..nl).collect(),
+        group: (0..n1).collect(),
         aggs: vec![
             agg(AggFunc::BoolOr, vec![base], b.clone()),
             agg(AggFunc::BoolOr, vec![base + 1], b.clone()),
             agg(AggFunc::BoolOr, vec![base + 2], b),
         ],
     };
-    let (any_true, any_null, any_false) = (Expr::Column(nl), Expr::Column(nl + 1), Expr::Column(nl + 2));
+    let (any_true, any_null, any_false) = (Expr::Column(n1), Expr::Column(n1 + 1), Expr::Column(n1 + 2));
     let mark = if all {
         // ALL: false if any false; else null if any null; else true
         Expr::Case(Box::new(crate::expr::CaseExpr {
@@ -572,10 +579,12 @@ fn quantified_join(
     };
     let gm = grouped.map(vec![mark]);
     let ga = gm.arity();
-    let on: Vec<Expr> = (0..nl).map(|i| nd_eq(Expr::Column(i), Expr::Column(nl + i))).collect();
-    let back = Rel::Join { left: Box::new(left), right: Box::new(gm), kind: JoinKind::Inner, on };
+    // back to the left rows (each matches the one group of its values)
+    let lk = left.map(keyexprs);
+    let on: Vec<Expr> = (0..n1).map(|i| nd_eq(Expr::Column(nl + i), Expr::Column(nl + n1 + i))).collect();
+    let back = Rel::Join { left: Box::new(lk), right: Box::new(gm), kind: JoinKind::Inner, on };
     let mut proj: Vec<usize> = (0..nl).collect();
-    proj.push(nl + ga - 1);
+    proj.push(nl + n1 + ga - 1);
     Ok(back.project(proj))
 }
 

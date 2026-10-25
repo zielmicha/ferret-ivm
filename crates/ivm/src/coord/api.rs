@@ -90,6 +90,8 @@ pub struct Shared {
     /// checkpoints).
     pub slot_drops: Mutex<std::collections::BTreeSet<crate::source::SlotDrop>>,
     pub shutdown: AtomicBool,
+    /// Stop without the final checkpoint (simulated crash, for tests).
+    pub crash: AtomicBool,
 }
 
 impl Shared {

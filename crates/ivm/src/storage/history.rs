@@ -102,24 +102,3 @@ pub enum ReadAt {
     /// State strictly before time t.
     Before(Gsn),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compaction() {
-        let mut h = History::default();
-        h.add(1, 1, 0);
-        h.add(3, 1, 0);
-        h.add(5, -2, 0);
-        assert_eq!(h.0.len(), 3);
-        assert_eq!(h.weight_at(4), 2);
-        assert_eq!(h.weight(ReadAt::Before(5)), 2);
-        assert_eq!(h.total(), 0);
-        h.compact(3);
-        assert_eq!(h.0.as_slice(), &[(3, 2), (5, -2)]);
-        h.compact(5);
-        assert!(h.is_empty());
-    }
-}

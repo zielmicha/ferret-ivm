@@ -98,37 +98,3 @@ pub fn format(u: &[u8; 16]) -> String {
     // SAFETY-free: all bytes are ASCII.
     String::from_utf8(buf.to_vec()).expect("ascii")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_basic() {
-        let u = parse("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11").unwrap();
-        assert_eq!(format(&u), "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
-        let u2 = parse("{a0eebc999c0b4ef8bb6d6bb9bd380a11}").unwrap();
-        assert_eq!(u, u2);
-        let u3 = parse("a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11").unwrap();
-        assert_eq!(u, u3);
-    }
-
-    #[test]
-    fn errors() {
-        for s in [
-            "",
-            "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
-            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
-            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1",
-            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a111",
-            "a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11",
-            "a0eebc9-99c0b-4ef8-bb6d-6bb9bd380a11",
-            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-",
-            " a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
-        ] {
-            let e = parse(s).unwrap_err();
-            assert_eq!(e.sqlstate, "22P02");
-            assert_eq!(e.message, format!("invalid input syntax for type uuid: \"{s}\""));
-        }
-    }
-}

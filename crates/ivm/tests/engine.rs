@@ -1,10 +1,14 @@
-//! Engine-level tests through the public API (no Postgres needed).
+//! Engine-level tests through the public API (no PostgreSQL needed): exact
+//! semantics of temporal filters, recovery, specific features, and
+//! regression tests for bugs (some `#[ignore]`d with the bug described, for
+//! bugs that are still open). Randomized comparisons of views with their
+//! queries are in selfdiff.rs.
 
-use ivm::coord::api::{ExecResult, SessionVars};
+use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
 use ivm::log::LogRecord;
 use ivm::types::text::format_datum;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
@@ -13,8 +17,8 @@ fn tmpdir(name: &str) -> PathBuf {
     d
 }
 
-fn start(dir: &PathBuf) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+fn start(dir: &Path) -> coord::Running {
+    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
     coord::start(cfg).expect("engine starts")
 }
 
@@ -98,6 +102,7 @@ fn temporal_filters_follow_the_logged_clock() {
     tick(&h, 0);
     assert_eq!(rows(&h, "SELECT now()"), vec!["2026-01-02 00:00:50+00".to_string()]);
     running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -118,6 +123,7 @@ fn temporal_filter_errors() {
         assert!(r.is_err(), "{sql} should be rejected");
     }
     running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 struct Rng(u64);
@@ -128,63 +134,6 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0 % n
     }
-}
-
-/// Maintained aggregates must equal a recompute, including when equal group
-/// keys and arguments come in several representations (numeric scales).
-#[test]
-fn aggregates_match_recompute_with_mixed_representations() {
-    let dir = tmpdir("mixed-repr");
-    let running = start(&dir);
-    let h = running.handle.clone();
-    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, k numeric, g int, v numeric, b bool)");
-    let views = [
-        "SELECT k, count(*) AS n, sum(v) AS s, min(v) AS mn, max(v) AS mx, avg(v) AS a FROM t GROUP BY k",
-        "SELECT g, k, count(DISTINCT v) AS d, count(*) AS n FROM t GROUP BY g, k",
-        "SELECT (id % 3) AS m, k, max(g) AS mg, min(k) AS mk FROM t WHERE b GROUP BY (id % 3), k",
-        "SELECT sum(v) AS s, count(v) AS c, min(k) AS mk, max(k) AS xk FROM t",
-    ];
-    for (i, v) in views.iter().enumerate() {
-        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {v}"));
-    }
-    let reprs = ["1", "1.0", "1.00", "2", "2.0", "-0.5", "-0.50", "NULL", "3.000", "3"];
-    let mut rng = Rng(0x2545F4914F6CDD1D);
-    for step in 0..300 {
-        let id = rng.below(40);
-        let sql = match rng.below(4) {
-            0 => format!("DELETE FROM t WHERE id = {id}"),
-            1 => format!("UPDATE t SET v = {} WHERE id = {id}", reprs[rng.below(10) as usize]),
-            _ => format!(
-                "INSERT INTO t VALUES ({id}, {}, {}, {}, {}) ON CONFLICT DO NOTHING",
-                reprs[rng.below(10) as usize],
-                rng.below(3),
-                reprs[rng.below(10) as usize],
-                rng.below(2) == 0
-            ),
-        };
-        exec(&h, &sql);
-        for (i, v) in views.iter().enumerate() {
-            // values must agree; representations of keys may differ only where
-            // several are present, so compare by value with trailing zeros
-            let norm = |rows: Vec<String>| {
-                let mut r: Vec<String> = rows
-                    .into_iter()
-                    .map(|row| {
-                        row.split('|')
-                            .map(|f| if f.contains('.') { f.trim_end_matches('0').trim_end_matches('.').to_string() } else { f.to_string() })
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    })
-                    .collect();
-                r.sort();
-                r
-            };
-            let got = norm(rows(&h, &format!("SELECT * FROM v{i}")));
-            let want = norm(rows(&h, v));
-            assert_eq!(got, want, "step {step} after {sql}: view v{i} = {v}");
-        }
-    }
-    running.shutdown();
 }
 
 /// Temporal filters anywhere in a plan (joined, aggregated, mixed with
@@ -256,6 +205,7 @@ fn temporal_views_match_recompute_as_time_passes() {
         }
     }
     running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -347,6 +297,321 @@ fn multidimensional_arrays() {
     assert_eq!(rows(&h, "SELECT * FROM z ORDER BY id, k"), ["3|1|1", "3|2|2", "3||3", "4|1|1", "4|2|2", "4||3"]);
     exec(&h, "UPDATE m SET a = '{7}' WHERE id = 3");
     assert_eq!(rows(&h, "SELECT * FROM z ORDER BY id, k"), ["3|7|1", "3||2", "3||3", "4|1|1", "4|2|2", "4||3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Hydrating a top-k (DISTINCT ON) view re-encodes the group keys it decodes
+/// from the input index; decoding clamped infinite intervals, so their groups
+/// went missing.
+#[test]
+fn distinct_on_infinite_intervals() {
+    let dir = tmpdir("distinct-on-intervals");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, iv interval)");
+    exec(&h, "INSERT INTO t VALUES (1, 'infinity'), (2, 'infinity'), (3, '-infinity'), (4, '1 mon'), (5, '30 days'), (6, NULL)");
+    let q = "SELECT DISTINCT ON (iv) iv, id FROM t ORDER BY iv, id";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    let want = ["-infinity|3", "1 mon|4", "infinity|1", "|6"];
+    assert_eq!(rows(&h, q), want);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), want);
+    exec(&h, "DELETE FROM t WHERE id IN (1, 4)");
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), ["-infinity|3", "30 days|5", "infinity|2", "|6"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recovery re-plans every view, and delta join paths are ordered by the
+/// current sizes of their inputs. When the sizes changed since the view was
+/// created, the re-planned joins look up other indexes, the view's
+/// arrangements no longer match the checkpointed ones and are hydrated
+/// afresh: their history is gone, so reads AS OF a GSN before the restart
+/// fail ("before the history of a relation it reads"; they used to return
+/// the hydrated state) instead of returning what the view held.
+#[test]
+#[ignore = "bug: recovery re-plans joins from current table sizes; changed plans re-hydrate views, whose AS OF history then starts at the restart"]
+fn as_of_history_survives_restart_after_table_sizes_change() {
+    let dir = tmpdir("replan-history");
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, retention_gsns: 100_000, ..Default::default() };
+    let running = coord::start(cfg.clone()).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE a (id int PRIMARY KEY, k1 int, k3 int)");
+    exec(&h, "CREATE TABLE b (id int PRIMARY KEY, k1 int, k2 int)");
+    exec(&h, "CREATE TABLE c (id int PRIMARY KEY, k2 int, k3 int)");
+    exec(&h, "INSERT INTO a SELECT g, g % 3, g % 5 FROM generate_series(1, 10) g");
+    exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(1, 5) g");
+    exec(&h, "INSERT INTO c SELECT g, g % 4, g % 5 FROM generate_series(1, 50) g");
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT count(*) AS n FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3");
+    let gsn = rows(&h, "SHOW GSN")[0].clone();
+    let then = rows(&h, "SELECT * FROM v");
+    // b grows, c shrinks: the join order flips
+    exec(&h, "DELETE FROM c WHERE id > 3");
+    exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(6, 200) g");
+    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then);
+    running.shutdown();
+    let running = coord::start(cfg).unwrap();
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT * FROM v"), rows(&h, "SELECT count(*) FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3"));
+    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then, "view v AS OF {gsn} after the restart");
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Identical aggregate calls in a query are computed once, but percentiles
+/// differing only in their fraction counted as identical: every one
+/// returned the first one's percentile (ad hoc and in views).
+#[test]
+fn percentiles_with_different_fractions() {
+    let dir = tmpdir("percentiles");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+    exec(&h, "INSERT INTO t SELECT i, i % 2, i * 10 FROM generate_series(1, 11) i");
+    let q = "SELECT g, percentile_cont(0) WITHIN GROUP (ORDER BY v), percentile_cont(0.25) WITHIN GROUP (ORDER BY v), \
+             percentile_disc(0.5) WITHIN GROUP (ORDER BY v), percentile_disc(1) WITHIN GROUP (ORDER BY v) FROM t GROUP BY g";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    assert_eq!(rows(&h, &format!("{q} ORDER BY g")), ["0|20|40|60|100", "1|10|35|50|110"]);
+    exec(&h, "DELETE FROM t WHERE id IN (1, 2)");
+    assert_eq!(rows(&h, &format!("{q} ORDER BY g")), ["0|40|55|60|100", "1|30|50|70|110"]);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY g"), rows(&h, &format!("{q} ORDER BY g")));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A set-returning function after an explicit LATERAL dropped its WITH
+/// ORDINALITY column (the column list then named one column too many).
+#[test]
+fn lateral_functions_with_ordinality() {
+    let dir = tmpdir("lateral-ordinality");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int[])");
+    exec(&h, "INSERT INTO t VALUES (1, '{5,6}'), (2, '{7}')");
+    let q = "SELECT t.id, x.v, x.n FROM t, LATERAL unnest(t.a) WITH ORDINALITY AS x(v, n)";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    assert_eq!(rows(&h, &format!("{q} ORDER BY 1, 3")), ["1|5|1", "1|6|2", "2|7|1"]);
+    exec(&h, "UPDATE t SET a = '{8,9,10}' WHERE id = 2");
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY 1, 3"), ["1|5|1", "1|6|2", "2|8|1", "2|9|2", "2|10|3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A predicate on a derived table's columns stayed above the projection
+/// computing them, so every column was computed for rows the predicate
+/// then dropped: an expression failing on such a row failed the query (and
+/// the view), where PostgreSQL pushes the predicate into the subquery and
+/// never evaluates the column for it.
+#[test]
+fn predicates_on_derived_columns_filter_before_other_columns() {
+    let dir = tmpdir("pushdown");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, c0 int[], c1 float8, c2 int)");
+    // || fails for the two-dimensional arrays, which the predicates drop
+    exec(&h, "INSERT INTO t VALUES (1, '{{1,2},{3,4}}', 0, NULL), (2, '{5}', 0, 7), (3, '{{6}}', 100, 9), (4, '{8}', 1, 3)");
+    let q1 = "SELECT d.*, 1 AS one FROM (SELECT a0.c2 AS x0, array_ndims(a0.c0) AS x1, (a0.c0 || ARRAY[9]) AS x2 FROM t a0 \
+              WHERE a0.c1 IN (0::float8, 100::float8)) d WHERE d.x0 IS NOT NULL AND d.x1 = 1";
+    let q2 = "SELECT * FROM (SELECT id + 1 AS x, c0 || ARRAY[9] AS y FROM t) d WHERE d.x IN (3, 5)";
+    for (i, (q, want)) in [(q1, vec!["7|1|{5,9}|1"]), (q2, vec!["3|{5,9}", "5|{8,9}"])].into_iter().enumerate() {
+        assert_eq!(rows(&h, &format!("{q} ORDER BY 1")), want, "{q}");
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+        assert_eq!(rows(&h, &format!("SELECT * FROM v{i} ORDER BY 1")), want, "view {q}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A quantified comparison with a correlated subquery (`x <> ANY (...)`,
+/// `x > ALL (...)`) was decorrelated into a mark computed per distinct
+/// outer row: whole rows became grouping and join keys, so a view over a
+/// wide join (TOASTed text in it) kept several arrangements of every
+/// column; one in ivm-difftest grew to gigabytes and never finished
+/// hydrating. The mark is now computed per distinct correlation and
+/// compared values. Three-valued logic, empty subqueries, duplicate outer
+/// rows and exact correlation values (1.0 and 1.00) must come out as in
+/// PostgreSQL, ad hoc and maintained.
+#[test]
+fn quantified_subqueries() {
+    let dir = tmpdir("quantified");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE qa (id int PRIMARY KEY, k numeric, x int, big text)");
+    exec(&h, "CREATE TABLE qb (id int PRIMARY KEY, k numeric, y int)");
+    exec(
+        &h,
+        "INSERT INTO qa VALUES (1, 1.0, 5, repeat('a', 3000)), (2, 1.00, 5, repeat('b', 3000)), (3, 2, NULL, 'c'), \
+         (4, 3, 7, 'd'), (5, 1.0, 9, 'e'), (6, 4, 5, 'f'), (7, 1.0, 5, 'g')",
+    );
+    exec(&h, "INSERT INTO qb VALUES (1, 1, 5), (2, 1, 6), (3, 2, 1), (4, 3, NULL), (5, 3, 7)");
+    let marks = "SELECT a.id, a.x <> ANY (SELECT b.y FROM qb b WHERE b.k = a.k), a.x = ANY (SELECT b.y FROM qb b WHERE b.k = a.k), \
+                 a.x > ALL (SELECT b.y FROM qb b WHERE b.k = a.k), a.x + 4 <= ALL (SELECT b.y + length(a.k::text) FROM qb b WHERE b.k = a.k) \
+                 FROM qa a";
+    let wide = "SELECT count(*), sum(length(big)) FROM qa a WHERE a.x <> ANY (SELECT b.y FROM qb b WHERE b.k = a.k)";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW marks AS {marks}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW wide AS {wide}"));
+    let check = |want: &[&str], want_wide: &str| {
+        assert_eq!(rows(&h, &format!("{marks} ORDER BY 1")), want);
+        assert_eq!(rows(&h, "SELECT * FROM marks ORDER BY 1"), want);
+        assert_eq!(rows(&h, wide), [want_wide]);
+        assert_eq!(rows(&h, "SELECT * FROM wide"), [want_wide]);
+    };
+    check(&["1|t|t|f|f", "2|t|t|f|t", "3||||", "4||t|f|f", "5|t|f|t|f", "6|f|f|t|t", "7|t|t|f|f"], "4|6002");
+    exec(&h, "UPDATE qb SET y = 9 WHERE id = 2");
+    exec(&h, "DELETE FROM qb WHERE id = 4");
+    check(&["1|t|t|f|f", "2|t|t|f|t", "3||||", "4|f|t|f|f", "5|t|t|f|f", "6|f|f|t|t", "7|t|t|f|f"], "4|6002");
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ad hoc execution deduplicated a group's rows for a DISTINCT ordered
+/// aggregate in place, so ordered aggregates after it saw only the distinct
+/// rows (here mode() saw x = 17 alone). Expected values are PostgreSQL's.
+#[test]
+fn distinct_ordered_aggregates_leave_other_aggregates_alone() {
+    let dir = tmpdir("distinct-ordered-aggs");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, s text, x int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 'a', 17), (2, 1, 'a', 7), (3, 2, 'a', 1), (4, 2, 'b', NULL)");
+    let q = "SELECT g, string_agg(DISTINCT s, '|' ORDER BY s) AS s, mode() WITHIN GROUP (ORDER BY x) AS m, \
+             array_agg(x ORDER BY x) AS xs, count(DISTINCT s) AS n FROM t GROUP BY g";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    let want = ["1|a|7|{7,17}|1", "2|a|b|1|{1,NULL}|2"];
+    assert_eq!(rows(&h, &format!("{q} ORDER BY g")), want);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY g"), want);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A join seeded by a presence change (here the decorrelated EXISTS, whose
+/// presence index is keyed by the whole outer row) took the outer row's
+/// columns from the canonically decoded key: c0 = 0 instead of 0.000. Rows
+/// derived that way did not retract the ones derived from the stored rows,
+/// so the renamed row 58 lived on in the view (found by ivm-difftest).
+#[test]
+fn presence_changes_keep_exact_representations() {
+    let dir = tmpdir("presence-repr");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t2 (id int PRIMARY KEY, c0 numeric, r0 int, pr int)");
+    exec(&h, "CREATE TABLE t3 (id int PRIMARY KEY)");
+    exec(&h, "INSERT INTO t2 VALUES (43, 0.000, 35, 24), (58, 0.000, 5, 16)");
+    exec(&h, "INSERT INTO t3 VALUES (4)");
+    let q = "SELECT (SELECT count(*) FROM t2 sq WHERE sq.pr = a1.id) AS n, a1.id AS a, a2.id AS b, a1.c0 AS c \
+             FROM t2 a1 LEFT JOIN t2 a2 ON a2.r0 = a1.r0 + 30 \
+             WHERE a1.c0 IS DISTINCT FROM a2.c0 AND EXISTS (SELECT 1 FROM t3 sq WHERE sq.id < a1.r0 AND sq.id > a1.r0 - 3)";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    for sql in ["UPDATE t2 SET r0 = 2 WHERE id = 43", "UPDATE t2 SET id = id + 1000000 WHERE id = 58", "INSERT INTO t2 VALUES (75, 10, 44, 58)"] {
+        exec(&h, sql);
+        assert_eq!(rows(&h, "SELECT * FROM v ORDER BY a"), rows(&h, &format!("{q} ORDER BY a")), "after {sql}");
+    }
+    assert_eq!(rows(&h, "SELECT * FROM v"), ["0|1000058||0.000"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dropping a view cancelled every subscription on its dataflow node, also
+/// those to other views sharing the node (here an identical view): they got
+/// a "was dropped" error and no further changes.
+#[test]
+fn dropping_a_view_leaves_subscriptions_to_its_twin_alone() {
+    let dir = tmpdir("subscribe-twin");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1), (2, 2)");
+    exec(&h, "CREATE MATERIALIZED VIEW a AS SELECT DISTINCT a FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW b AS SELECT DISTINCT a FROM t");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO a") else { panic!("not a subscription") };
+    exec(&h, "DROP VIEW b");
+    exec(&h, "INSERT INTO t VALUES (3, 3)");
+    exec(&h, "DELETE FROM t WHERE id = 1");
+    let mut acc = std::collections::BTreeMap::new();
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            SubEvent::Data { rows, .. } => {
+                for (r, w) in rows {
+                    *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
+                }
+            }
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => panic!("subscription failed: {e}"),
+        }
+    }
+    acc.retain(|_, w| *w != 0);
+    assert_eq!(acc.keys().cloned().collect::<Vec<_>>(), rows(&h, "SELECT * FROM a ORDER BY 1"));
+    assert_eq!(rows(&h, "SELECT * FROM a ORDER BY 1"), ["2", "3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Subscriptions to a view go on across a replacement that keeps its
+/// columns, with the change to the new contents. One changing them went on
+/// too, streaming rows of the new shape under the old column list (wider
+/// rows, text where an int was announced); it now ends with an error, as
+/// subscriptions to a table that changes its columns upstream do.
+#[test]
+fn replacing_a_view_with_other_columns_ends_its_subscriptions() {
+    let dir = tmpdir("replace-columns");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int, b text)");
+    exec(&h, "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')");
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO v") else { panic!("not a subscription") };
+    // same columns: the subscription follows
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT id, a * 2 AS a FROM t");
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT b, id, a FROM t");
+    exec(&h, "INSERT INTO t VALUES (3, 30, 'z')");
+    let mut acc = std::collections::BTreeMap::new();
+    let mut error = None;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            SubEvent::Data { rows, .. } => {
+                assert!(error.is_none(), "rows after the error");
+                for (r, w) in rows {
+                    assert_eq!(r.len(), 2, "a row of another shape: {r:?}");
+                    *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
+                }
+            }
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => error = Some(e.code),
+        }
+    }
+    acc.retain(|_, w| *w != 0);
+    assert_eq!(acc.keys().cloned().collect::<Vec<_>>(), ["1|20", "2|40"], "the stream before the second replacement");
+    assert_eq!(error.as_deref(), Some("55000"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Replacing a view moved every subscription on its dataflow node to the
+/// new definition, also those to another view sharing the node (here an
+/// identical view b): they then streamed the replacement's changes.
+#[test]
+fn replacing_a_view_leaves_subscriptions_to_its_twin_alone() {
+    let dir = tmpdir("replace-twin");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1), (2, 2)");
+    exec(&h, "CREATE MATERIALIZED VIEW a AS SELECT DISTINCT a FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW b AS SELECT DISTINCT a FROM t");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO b") else { panic!("not a subscription") };
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW a AS SELECT DISTINCT a + 10 AS a FROM t");
+    exec(&h, "INSERT INTO t VALUES (3, 3)");
+    let mut acc = std::collections::BTreeMap::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let SubEvent::Data { rows, .. } = ev {
+            for (r, w) in rows {
+                *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
+            }
+        }
+    }
+    acc.retain(|_, w| *w != 0);
+    assert_eq!(acc.keys().cloned().collect::<Vec<_>>(), ["1", "2", "3"]);
+    assert_eq!(rows(&h, "SELECT * FROM a ORDER BY 1"), ["11", "12", "13"]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

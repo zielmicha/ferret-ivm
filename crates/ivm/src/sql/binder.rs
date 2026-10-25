@@ -1280,9 +1280,9 @@ impl<'a> Binder<'a> {
                 }
                 Ok((rel, scope, false))
             }
-            ast::TableFactor::Function { name, args, alias, .. } => {
+            ast::TableFactor::Function { name, args, alias, with_ordinality, .. } => {
                 let (_, fname) = object_name(name)?;
-                self.bind_table_function(&fname, args, alias.as_ref(), left_scope, false)
+                self.bind_table_function(&fname, args, alias.as_ref(), left_scope, *with_ordinality)
             }
             ast::TableFactor::UNNEST { alias, array_exprs, with_offset, with_ordinality, .. } => {
                 if *with_offset {

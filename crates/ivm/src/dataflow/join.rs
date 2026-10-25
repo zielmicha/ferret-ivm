@@ -342,9 +342,34 @@ pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all:
         // changes that cancel after the input's MFP (e.g. updates of
         // columns the join does not use) need no lookups
         consolidate(&mut start);
-        run_path(env, &cx, path, start, Some(gsn), &mut out.data)?;
+        match src.presence.and_then(|_| presence_key_exprs(p, path.source)) {
+            Some(keys) => {
+                // The presence input's columns hold its key as decoded from
+                // the index: canonical, without numeric scales, -0 and the
+                // like. Paths that look the input up compute them from the
+                // other inputs' rows instead; recompute them that way, or
+                // rows derived here would not retract rows derived there.
+                let mut rows = Vec::new();
+                run_path(env, &cx, path, start, Some(gsn), &mut rows)?;
+                for (row, _) in rows.iter_mut() {
+                    for (j, e) in keys.iter().enumerate() {
+                        if let Ok(v) = e.eval(row) {
+                            row[src.offset + j] = v;
+                        }
+                    }
+                }
+                out.data.extend(rows);
+            }
+            None => run_path(env, &cx, path, start, Some(gsn), &mut out.data)?,
+        }
     }
     Ok(())
+}
+
+/// The key expressions with which another path looks up presence input `i`:
+/// its columns in terms of the other inputs' columns.
+fn presence_key_exprs(p: &JoinPlan, i: usize) -> Option<&[Expr]> {
+    p.paths.iter().filter(|pa| pa.source != i).flat_map(|pa| pa.steps.iter()).find(|s| s.input == i).map(|s| s.key.as_slice())
 }
 
 fn first_path_of(_p: &JoinPlan, source: usize) -> usize {

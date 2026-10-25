@@ -730,24 +730,43 @@ impl Engine {
         let mut diff: Vec<(crate::types::Row, i64)> = new_rows;
         diff.extend(old_rows.into_iter().map(|(r, w)| (r, -w)));
         crate::dataflow::consolidate(&mut diff);
+        // (by view: other views and ad hoc subscriptions may share the old node)
+        let same = same_columns(&def.columns, &old_cols);
         for s in self.subs.iter_mut() {
-            if s.node == old.node {
+            if s.view != Some(id) {
+                continue;
+            }
+            if same {
                 s.node = new_node;
                 if !diff.is_empty() {
                     let _ = s.tx.send(SubEvent::Data { gsn, rows: diff.clone() });
                 }
+            } else {
+                // they were promised the old columns
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                    codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{name}\" changed its columns"),
+                )));
+                s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        if same_columns(&def.columns, &old_cols) {
-            for sink in self.sink_handles.values_mut() {
-                if sink.node == old.node {
+        // the view's sinks (not those of other views sharing the old node)
+        let sinks: Vec<ObjectId> = self
+            .sink_handles
+            .keys()
+            .copied()
+            .filter(|sid| matches!(self.catalog.get(*sid).map(|o| &o.kind), Some(ObjectKind::Sink(sd)) if sd.from == id))
+            .collect();
+        if same {
+            for sid in &sinks {
+                if let Some(sink) = self.sink_handles.get_mut(sid) {
                     sink.node = new_node;
                     sink.send(gsn, &diff);
                 }
             }
         } else {
             // (re-planned after an upstream change) new rows, new columns
-            self.restart_sinks_on(old.node)?;
+            self.restart_sinks(sinks)?;
         }
         for a in old_index_arrs {
             self.graph.release_arr(&mut self.env, a)?;
@@ -843,7 +862,7 @@ impl Engine {
             ObjectKind::MaterializedView(_) => {
                 if let Some(v) = self.rt.views.remove(&id) {
                     for s in self.subs.iter() {
-                        if s.node == v.node {
+                        if s.view == Some(id) {
                             let _ = s.tx.send(SubEvent::Error(SqlError::new(
                                 codes::UNDEFINED_TABLE,
                                 format!("materialized view \"{}\" was dropped", obj.name),
@@ -970,6 +989,11 @@ impl Engine {
     /// rebuilt with other columns) from their relation's current version.
     fn restart_sinks_on(&mut self, node: NodeId) -> Result<()> {
         let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == node).map(|(id, _)| *id).collect();
+        self.restart_sinks(sinks)
+    }
+
+    /// Restart sinks from their relation's current version.
+    fn restart_sinks(&mut self, sinks: Vec<ObjectId>) -> Result<()> {
         for id in sinks {
             if let Some(h) = self.sink_handles.remove(&id) {
                 h.stop();

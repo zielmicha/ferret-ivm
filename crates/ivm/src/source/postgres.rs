@@ -192,6 +192,14 @@ pub struct SourceState {
     pub tables: BTreeMap<ObjectId, SnapState>,
 }
 
+/// A source's logged `state` with the snapshot of `table` to be done again
+/// (as the source does on a schema change).
+pub fn snapshot_again(state: &str, table: ObjectId) -> String {
+    let mut s: SourceState = serde_json::from_str(state).unwrap_or_default();
+    s.tables.insert(table, SnapState::default());
+    serde_json::to_string(&s).unwrap()
+}
+
 /// Mapping of an upstream relation onto a catalog table.
 struct RelMap {
     table: ObjectId,
@@ -417,6 +425,7 @@ impl PgSource {
                     return Ok(());
                 }
                 // key change: delete the old key first
+                let mut moved = None;
                 if let Some(o) = &old_row
                     && (old_is_key || !o.is_empty())
                 {
@@ -424,13 +433,19 @@ impl PgSource {
                     let nk: Row = pk.iter().map(|c| row[*c].clone()).collect();
                     if pk_bytes(o, &pk) != pk_bytes(&row, &pk) && !ok.iter().any(|d| d.is_null()) {
                         let kb = pk_bytes(o, &pk);
-                        // deletes always apply (see the Delete case)
-                        let _ = self.snapshot_filter(table, &kb);
+                        // deletes always apply (see the Delete case); where the
+                        // stream wins over the chunk, its row of the old key
+                        // has the values of the new row's unchanged columns
+                        moved = self.snapshot_filter(table, &kb).flatten();
                         self.push_change(table, TableChange::Delete { key: ok });
                     }
                     let _ = nk;
                 }
-                self.push_upsert(table, row, unchanged, old_row)?;
+                // a key-only old tuple (a key change under REPLICA IDENTITY
+                // DEFAULT) has no values for unchanged TOAST columns: they
+                // come from the old key's row, in the chunk in flight or else
+                // (filled in by the engine) the row stored under the old key
+                self.push_upsert(table, row, unchanged, if old_is_key { moved } else { old_row })?;
             }
             LogicalMessage::Delete { relation_id, old, .. } => {
                 let Some(rm) = self.rels.get(&relation_id) else { return Ok(()) };

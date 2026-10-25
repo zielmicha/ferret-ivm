@@ -82,6 +82,9 @@ pub(crate) struct Subscription {
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
     pub progress: bool,
+    /// The materialized view subscribed to by name (its node may be shared
+    /// with other views, so dropping it is matched by view, not by node).
+    pub view: Option<ObjectId>,
 }
 
 /// A read waiting for the engine to reach a GSN.
@@ -251,6 +254,14 @@ impl Running {
         for t in self.threads {
             let _ = t.join();
         }
+    }
+
+    /// Stop without the final checkpoint, as if the process had died right
+    /// after its last log write: the next start recovers the last
+    /// checkpoint and replays the log after it (for tests).
+    pub fn crash(self) {
+        self.handle.shared.crash.store(true, Ordering::Release);
+        self.shutdown();
     }
 }
 
@@ -515,7 +526,9 @@ impl Engine {
             s.stop();
         }
         let _ = self.seq.send(SeqMsg::Shutdown);
-        self.checkpoint()?;
+        if !self.shared.crash.load(Ordering::Acquire) {
+            self.checkpoint()?;
+        }
         Ok(())
     }
 
@@ -646,9 +659,17 @@ impl Engine {
                 self.source_states.insert(source, state);
                 self.snap_epoch += 1;
             }
-            LogRecord::Schema { source: _, table, columns, pk } => {
+            LogRecord::Schema { source, table, columns, pk } => {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
                 self.processed = gsn;
+                // The source snapshots the table again to fill in the new
+                // columns, and logs its reset state right after this record;
+                // a restart in between would take the snapshot as done and
+                // never redo it, so the record resets the state as well.
+                if let Some(state) = self.source_states.get_mut(&source) {
+                    *state = crate::source::postgres::snapshot_again(state, table);
+                }
+                self.snap_epoch += 1;
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }
