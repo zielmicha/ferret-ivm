@@ -685,3 +685,20 @@ fn cbrt_matches_postgresql_bit_for_bit() {
     assert_eq!(rows(&h, q), vec!["0d12115ba9db9890a67ac84d017eac9b"]);
     running.shutdown();
 }
+
+#[test]
+fn constant_folding_skips_unreachable_branches() {
+    let running = start("lazy-fold");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // used to fail with division by zero while folding at plan time
+    assert_eq!(
+        rows(&h, "SELECT CASE WHEN false THEN 1/0 END, coalesce(1, 1/0), false AND 1/0 = 1, true OR 1/0 = 1, \
+                  CASE WHEN true THEN 2 ELSE 1/0 END, CASE WHEN NULL THEN 1/0 ELSE 3 END"),
+        vec!["|1|f|t|2|3"]
+    );
+    // reachable constant errors still surface at plan time, as in PostgreSQL
+    assert!(try_rows(&h, "SELECT CASE WHEN a > 0 THEN 1/0 END FROM t1").unwrap_err().contains("division by zero"));
+    assert!(try_rows(&h, "SELECT 1/0 = 1 AND false").unwrap_err().contains("division by zero"));
+    running.shutdown();
+}
