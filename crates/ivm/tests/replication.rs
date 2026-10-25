@@ -397,3 +397,31 @@ fn sinks_keep_their_columns_across_view_replacements() {
     let want = vec![vec![Some("1".to_string()), Some("110".to_string())], vec![Some("2".to_string()), Some("220".to_string())]];
     eventually("replacement delivered", || copy(&mut up) == want);
 }
+
+/// Changes produced while a sink cannot connect yet are delivered once it
+/// can; retrying the connection used to read (and drop) a queued change
+/// each time.
+#[test]
+fn sink_keeps_changes_while_its_target_is_unreachable() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, a int)");
+    up.exec("INSERT INTO t VALUES (1, 1)");
+    up.exec("CREATE PUBLICATION p FOR TABLE t");
+    let dir = tmpdir("sink-unreachable");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    let _ = caught_up(&mut ivm, &mut up, "SELECT * FROM t");
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t");
+    let target = up.conninfo.replace("dbname=postgres", "dbname=later");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{target}' TABLE 'v_copy' KEY (id)"));
+    for i in 2..=6 {
+        up.exec(&format!("INSERT INTO t VALUES ({i}, {i})"));
+        let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t");
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    up.exec("CREATE DATABASE later");
+    let mut later = connect(&target);
+    eventually("sink", || {
+        later.query("SELECT count(*) FROM v_copy").map(|r| r.rows[0][0].clone()).ok().flatten() == Some("6".to_string())
+    });
+}
