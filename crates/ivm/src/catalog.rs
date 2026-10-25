@@ -121,6 +121,16 @@ impl Catalog {
         self.objects.remove(&id)
     }
 
+    /// (Non-materialized) views whose names `sql` mentions: queries inline
+    /// them, so their planned form no longer shows them.
+    pub fn mentioned_views(&self, sql: &str) -> Vec<ObjectId> {
+        self.objects
+            .values()
+            .filter(|o| matches!(o.kind, ObjectKind::View(_)) && sql_mentions(sql, &o.name))
+            .map(|o| o.id)
+            .collect()
+    }
+
     /// Objects that depend on `id` (views referencing it, indexes on it,
     /// sinks from it, tables of a source).
     pub fn dependents(&self, id: ObjectId) -> Vec<ObjectId> {
@@ -146,7 +156,7 @@ impl Catalog {
 }
 
 /// Conservative test whether a view's SQL references a relation name.
-fn sql_mentions(sql: &str, name: &str) -> bool {
+pub(crate) fn sql_mentions(sql: &str, name: &str) -> bool {
     let lower = sql.to_lowercase();
     lower.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).any(|w| w.trim_matches('"') == name)
 }

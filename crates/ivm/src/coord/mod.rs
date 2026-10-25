@@ -349,7 +349,7 @@ impl Engine {
         }
         // views and indexes after the views they read (id order is not a
         // dependency order: CREATE OR REPLACE keeps a view's id)
-        for obj in self.recovery_order(&objects) {
+        for (obj, _) in self.dependency_order(&objects) {
             match &obj.kind {
                 ObjectKind::MaterializedView(v) => self.create_view_rt(obj.id, &v.sql)?,
                 ObjectKind::Index(i) => self.create_index_rt(obj.id, i)?,
@@ -373,8 +373,14 @@ impl Engine {
     }
 
     /// Materialized views and indexes of `objects`, each after the
-    /// materialized views and indexes it depends on.
-    fn recovery_order<'a>(&self, objects: &'a [crate::catalog::CatalogObject]) -> Vec<&'a crate::catalog::CatalogObject> {
+    /// materialized views and indexes it depends on, with those
+    /// dependencies (the relations a view's query reads, including the
+    /// views it mentions; an index's target; an error for a view that does
+    /// not plan).
+    pub(crate) fn dependency_order<'a>(
+        &self,
+        objects: &'a [crate::catalog::CatalogObject],
+    ) -> Vec<(&'a crate::catalog::CatalogObject, Result<Vec<ObjectId>>)> {
         fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
             if let crate::sql::Rel::Get { id, .. } = r {
                 out.push(*id);
@@ -383,20 +389,17 @@ impl Engine {
                 gets(i, out);
             }
         }
-        let mut pending: Vec<(&crate::catalog::CatalogObject, Vec<ObjectId>)> = Vec::new();
+        let mut pending: Vec<(&crate::catalog::CatalogObject, Result<Vec<ObjectId>>)> = Vec::new();
         for o in objects {
             let deps = match &o.kind {
-                ObjectKind::Index(i) => vec![i.on],
-                ObjectKind::MaterializedView(v) => {
-                    let mut ids = Vec::new();
-                    // a view that does not plan is created in id order and reports the error
-                    if let Ok(q) = crate::sql::parser::parse_single_query(&v.sql)
-                        && let Ok(bq) = crate::sql::plan_query(&self.catalog, &q, vec![])
-                    {
+                ObjectKind::Index(i) => Ok(vec![i.on]),
+                ObjectKind::MaterializedView(v) => crate::sql::parser::parse_single_query(&v.sql)
+                    .and_then(|q| crate::sql::plan_query(&self.catalog, &q, vec![]))
+                    .map(|bq| {
+                        let mut ids = self.catalog.mentioned_views(&v.sql);
                         gets(&bq.rel, &mut ids);
-                    }
-                    ids
-                }
+                        ids
+                    }),
                 _ => continue,
             };
             pending.push((o, deps));
@@ -406,18 +409,24 @@ impl Engine {
         let mut out = Vec::with_capacity(pending.len());
         while !pending.is_empty() {
             let before = out.len();
-            pending.retain(|(o, deps)| {
-                if deps.iter().all(|d| *d == o.id || done.contains(d) || !ordered.contains(d)) {
+            let mut rest = Vec::new();
+            for (o, deps) in pending {
+                // a view that does not plan has no known dependencies
+                let ready = match &deps {
+                    Ok(d) => d.iter().all(|x| *x == o.id || done.contains(x) || !ordered.contains(x)),
+                    Err(_) => true,
+                };
+                if ready {
                     done.insert(o.id);
-                    out.push(*o);
-                    false
+                    out.push((o, deps));
                 } else {
-                    true
+                    rest.push((o, deps));
                 }
-            });
+            }
+            pending = rest;
             if out.len() == before {
                 // no progress (cannot happen for a valid catalog)
-                out.extend(pending.drain(..).map(|(o, _)| o));
+                out.append(&mut pending);
             }
         }
         out
