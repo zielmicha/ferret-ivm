@@ -187,13 +187,23 @@ fn views_invalidated_upstream_are_dropped() {
     ivm.exec("CREATE MATERIALIZED VIEW vv AS SELECT count(*) FROM v");
     ivm.exec("CREATE INDEX vb ON v (b)");
     ivm.exec("CREATE MATERIALIZED VIEW ok AS SELECT id, a FROM t");
+    // virtual views over the view go with it (they used to stay, and their
+    // reads failed with `relation "v" does not exist`); those over others stay
+    ivm.exec("CREATE VIEW over_v AS SELECT id, b FROM v");
+    ivm.exec("CREATE VIEW over_over_v AS SELECT count(*) FROM over_v");
+    ivm.exec("CREATE MATERIALIZED VIEW m_over_v AS SELECT id FROM over_v");
+    ivm.exec("CREATE VIEW over_ok AS SELECT id FROM ok");
     up.exec("ALTER TABLE t DROP COLUMN b");
     up.exec("INSERT INTO t VALUES (2, 2)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), ["1|1", "2|2"]);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM ok ORDER BY id"), ["1|1", "2|2"]);
-    for gone in ["v", "vv"] {
-        assert!(ivm.client.query(&format!("SELECT * FROM {gone}")).is_err(), "{gone} should be gone");
+    for gone in ["v", "vv", "over_v", "over_over_v", "m_over_v"] {
+        let err = ivm.client.query(&format!("SELECT * FROM {gone}")).expect_err(gone);
+        assert_eq!(err.message, format!("relation \"{gone}\" does not exist"));
     }
+    let views: Vec<String> = ivm.rows("SHOW VIEWS").into_iter().map(|r| r.split('|').next().unwrap().to_string()).collect();
+    assert_eq!(views, ["ok", "over_ok"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM over_ok ORDER BY id"), ["1", "2"]);
     assert!(ivm.rows("SHOW INDEXES").is_empty());
     ivm.shutdown();
     let mut ivm = Ivm::start(&dir);

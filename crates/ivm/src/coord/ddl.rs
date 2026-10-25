@@ -740,8 +740,25 @@ impl Engine {
         Ok(())
     }
 
-    /// Drop a view with the indexes on it and the sinks reading it.
+    /// Drop a view that is no longer valid with the indexes on it, the sinks
+    /// reading it and the virtual views reading it (which no longer plan
+    /// either), with what depends on those, as DROP ... CASCADE would.
+    /// (Materialized views reading it are re-planned after it, and dropped
+    /// then.)
     fn drop_view_and_attachments(&mut self, id: ObjectId) -> Result<()> {
+        let name = self.catalog.get(id).map(|o| o.name.clone()).unwrap_or_default();
+        let views: Vec<ObjectId> = self
+            .catalog
+            .dependents(id)
+            .into_iter()
+            .filter(|d| matches!(self.catalog.get(*d).map(|o| &o.kind), Some(ObjectKind::View(_))))
+            .collect();
+        for v in views {
+            if let Some(o) = self.catalog.get(v) {
+                log::error!("view {} is dropped: it reads {name}, which is no longer valid", o.name);
+                self.drop_with_dependents(v, true)?;
+            }
+        }
         let attached: Vec<ObjectId> = self
             .catalog
             .objects

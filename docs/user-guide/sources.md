@@ -396,15 +396,17 @@ and receive the difference; if they change (a `SELECT *` view, say), its
 subscriptions end with `materialized view "v" changed its columns` and its
 sinks restart with the new columns. A view that no longer plans — it uses
 a dropped or renamed column, or an expression no longer fits a new type —
-is **dropped**, together with its indexes, its sinks and the materialized
-views reading it (logged as `materialized view v is dropped: it is no
-longer valid after a change to object <id>: <reason>`). A view that is
-already [broken](operations.md#recovery) is built again if it plans now,
-and stays broken otherwise. Replaying the log repeats all of this
-identically. Virtual views are not re-planned: they stay in the catalog,
-are expanded when read, and fail then if they no longer plan (a virtual
-view over a dropped materialized view fails with `relation "m" does not
-exist`); drop or replace them.
+is **dropped**, together with its indexes, its sinks, the virtual views
+reading it (directly or through other virtual views, as `DROP ... CASCADE`
+would; logged as `view w is dropped: it reads v, which is no longer valid`)
+and the materialized views reading it (logged as `materialized view v is
+dropped: it is no longer valid after a change to object <id>: <reason>`).
+A view that is already [broken](operations.md#recovery) is built again if
+it plans now, and stays broken otherwise. Replaying the log repeats all of
+this identically. Other virtual views are not re-planned: they stay in the
+catalog, are expanded when read, and fail then if they no longer plan (one
+that uses a dropped column fails with `column "c" does not exist`); drop or
+replace them.
 
 The key comes from the replica identity the Relation message describes: with
 `DEFAULT` the primary key's columns (the table becomes a keyless multiset if
