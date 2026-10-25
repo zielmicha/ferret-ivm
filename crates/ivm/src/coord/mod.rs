@@ -5,6 +5,7 @@ pub mod api;
 pub mod ddl;
 mod dml;
 pub mod inspect;
+pub mod meta;
 mod read;
 pub mod seq;
 
@@ -113,42 +114,9 @@ pub(crate) enum Wait {
     Snapshot,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-pub(crate) struct AppState {
-    pub catalog: Catalog,
-    pub trees: Vec<(Vec<u8>, TreeId)>,
-    pub view_errors: Vec<(ObjectId, Vec<((String, String), i64)>)>,
-    pub source_states: Vec<(ObjectId, String)>,
-    #[serde(default)]
-    pub source_lsns: Vec<(ObjectId, u64)>,
-    pub next_req: u64,
-    /// Logical clock (timestamptz microseconds) at the checkpoint.
-    #[serde(default)]
-    pub clock: i64,
-    /// Error records of arranged dataflow nodes (absent in older checkpoints).
-    #[serde(default)]
-    pub errors: crate::dataflow::ErrorState,
-    /// GSN from which each tree's history is complete (by fingerprint).
-    #[serde(default)]
-    pub arr_since: Vec<(Vec<u8>, Gsn)>,
-    /// Recent (gsn, clock) ticks (`Engine::ticks`, the last MAX_SAVED_TICKS
-    /// of the retention window), for now() in reads as of earlier GSNs
-    /// (absent in older checkpoints).
-    #[serde(default)]
-    pub ticks: Vec<(Gsn, i64)>,
-    /// Replication slots of dropped sources still to be dropped.
-    #[serde(default)]
-    pub slot_drops: Vec<crate::source::SlotDrop>,
-}
-
 /// DDL statements kept in the catalog history (`ivm.catalog_history`), the
-/// most recent ones: the history is part of every checkpoint.
+/// most recent ones (the engine keeps them in memory).
 pub const MAX_HISTORY: usize = 10_000;
-
-/// Most clock ticks kept in a checkpoint: a day of ticks at the default
-/// interval. now() in a read as of an older GSN (within a larger retention
-/// window) after a restart is the oldest kept tick's clock.
-const MAX_SAVED_TICKS: usize = 100_000;
 
 pub struct Engine {
     pub cfg: Config,
@@ -171,6 +139,8 @@ pub struct Engine {
     deferred: Vec<Request>,
     last_checkpoint: Instant,
     records_since_checkpoint: u64,
+    /// What the metadata tree holds.
+    pub(crate) meta: meta::Meta,
     pub(crate) replaying: bool,
     /// Bumped by source progress and DDL: parked reads waiting for initial
     /// snapshots are re-run when it moves.
@@ -352,6 +322,17 @@ pub fn start(cfg: Config) -> Result<Running> {
             format!("data directory {} is in use by another ivm process", cfg.data_dir.display()),
         ));
     }
+    // before anything is opened (and a torn log tail truncated): a newer
+    // format is refused untouched; a directory without a format version is
+    // new, or of format 1, migrated below
+    let migrate = match meta::read_format(&cfg.data_dir)? {
+        Some(v) => v < meta::FORMAT_VERSION,
+        None if meta::holds_data(&cfg.data_dir)? => true,
+        None => {
+            meta::write_format(&cfg.data_dir)?;
+            false
+        }
+    };
     let shared = Arc::new(Shared::default());
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
@@ -386,6 +367,13 @@ pub fn start(cfg: Config) -> Result<Running> {
     shared.durable_gsn.store(writer.last_gsn(), Ordering::Release);
     engine.replaying = false;
     engine.shared.processed_gsn.store(engine.processed, Ordering::Release);
+    if migrate {
+        // the recovered state in the current format; until FORMAT records
+        // it, a restart migrates again (from whichever record is last)
+        engine.checkpoint()?;
+        meta::write_format(&cfg.data_dir)?;
+        log::info!("migrated the data directory to format {}", meta::FORMAT_VERSION);
+    }
     engine.start_sources(&handle)?;
     // slot drops left from before the restart (or replayed DROP SOURCEs)
     crate::source::resume_slot_drops(&shared);
@@ -433,6 +421,7 @@ impl Engine {
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),
             records_since_checkpoint: 0,
+            meta: meta::Meta::default(),
             replaying: true,
             snap_epoch: 0,
             snap_epoch_seen: 0,
@@ -449,8 +438,10 @@ impl Engine {
 
     fn recover(&mut self, recovered: Option<crate::storage::Recovered>) -> Result<()> {
         let Some(rec) = recovered else { return Ok(()) };
-        let app: AppState = serde_json::from_slice(&rec.app)
-            .map_err(|e| SqlError::corrupt(format!("cannot decode checkpoint state: {e}")))?;
+        let (app, meta) = meta::load(&mut self.env, &rec.app)?;
+        // (format 1 kept the state in the record: the tree holds nothing yet)
+        let mirrored = meta.tree.is_some();
+        self.meta = meta;
         log::info!("recovering checkpoint at gsn {}", rec.gsn);
         self.catalog = app.catalog;
         self.next_req = app.next_req;
@@ -491,15 +482,19 @@ impl Engine {
                 self.rt.broken.insert(obj.id, e.message);
             }
         }
+        self.graph.restore_error_state(app.errors, mirrored);
         for (id, errs) in app.view_errors {
-            if let Some(v) = self.rt.views.get_mut(&id) {
-                v.errors = errs.into_iter().collect();
+            if let Some(v) = self.rt.views.get(&id) {
+                self.graph.restore_view_errors(v.node, &errs);
             }
         }
-        self.graph.restore_error_state(app.errors);
         // anything that could not be matched to a recovered tree is rebuilt
         // from the recovered state
         self.graph.hydrate(&mut self.env, self.processed)?;
+        // a view's error records are those of its root
+        for v in self.rt.views.values_mut() {
+            v.errors = self.graph.errors_of(v.node).into_iter().collect();
+        }
         for t in self.env.unattached_trees() {
             self.env.drop_tree(t)?;
         }
@@ -758,12 +753,14 @@ impl Engine {
                 self.snap_epoch += 1;
                 if res.is_ok() {
                     self.catalog.history.push((gsn, sql.clone()));
-                    // (every checkpoint saves it; trimmed in steps)
+                    // (trimmed in steps)
                     if self.catalog.history.len() > MAX_HISTORY + MAX_HISTORY / 10 {
                         let excess = self.catalog.history.len() - MAX_HISTORY;
                         self.catalog.history.drain(..excess);
                     }
                 }
+                // the catalog in the metadata tree as of this GSN
+                self.persist_meta(gsn)?;
                 if let Err(e) = &res
                     && self.replaying
                 {
@@ -796,6 +793,7 @@ impl Engine {
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }
+                self.persist_meta(gsn)?;
             }
             LogRecord::Tick { micros } => {
                 // monotonic even if the wall clock steps back
@@ -894,21 +892,11 @@ impl Engine {
     }
 
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
-        let app = AppState {
-            catalog: self.catalog.clone(),
-            trees: self.graph.arrangement_trees().into_iter().collect(),
-            view_errors: self.rt.views.iter().map(|(id, v)| (*id, v.errors.clone().into_iter().collect())).collect(),
-            source_states: self.source_states.iter().map(|(k, v)| (*k, v.clone())).collect(),
-            source_lsns: self.source_lsns.iter().map(|(k, v)| (*k, *v)).collect(),
-            next_req: self.next_req,
-            clock: self.clock,
-            errors: self.graph.error_state(),
-            arr_since: self.graph.arrangement_since().into_iter().collect(),
-            ticks: self.ticks.iter().skip(self.ticks.len().saturating_sub(MAX_SAVED_TICKS)).copied().collect(),
-            slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
-        self.env.checkpoint(self.processed, &bytes)?;
+        // what changed since the last one goes into the metadata tree; the
+        // manifest record names that tree in a small header
+        self.persist_meta(self.processed)?;
+        let header = meta::encode_header(&self.meta, self.next_req);
+        self.env.checkpoint(self.processed, &header)?;
         self.env.gc(1000)?;
         let keep_from = self.processed.saturating_sub(self.cfg.retention_gsns);
         let _ = self.seq.send(SeqMsg::Truncate(keep_from));

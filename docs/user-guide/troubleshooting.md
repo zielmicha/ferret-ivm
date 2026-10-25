@@ -124,8 +124,8 @@ view or index that can no longer be built does not stop the start: it is
 marked broken ([Recovery](operations.md#recovery)). What still keeps a data
 directory from starting: a missing or damaged manifest or segment file, a
 damaged or deleted input-log segment holding records after the last
-checkpoint, a checkpoint written by an incompatible version
-([Compatibility](../on-disk-format.md#compatibility)), and a log record
+checkpoint, a data directory or checkpoint written by an incompatible (or
+newer) version ([Compatibility](../on-disk-format.md#compatibility)), and a log record
 other than DDL that fails to apply again during replay (a bug: such a
 record was skipped while the engine ran, and fails again on replay unless
 a checkpoint was taken after it).

@@ -19,8 +19,8 @@ gets a GSN.
 - The engine's **logical clock** is the time of the latest applied tick. It
   never goes backwards: a tick older than the current clock (wall clock
   stepped back, or a restart) leaves it unchanged.
-- The clock is saved with every checkpoint and rebuilt from the log on
-  recovery, so it survives restarts.
+- The clock's ticks are part of the checkpointed state and rebuilt from the
+  log on recovery, so the clock survives restarts.
 - With `--tick-ms 0` no ticks are written: the clock stays at the last logged
   tick, which is 2000-01-01 00:00:00+00 on a data directory that never had
   one.
@@ -34,7 +34,7 @@ Where the clock is used:
 | Context | `now()` (and `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date`) |
 |---|---|
 | materialized views, `SUBSCRIBE (query)` | only in temporal filters (below), evaluated against the logical clock |
-| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN, also across restarts (the checkpoint keeps the last 100,000 clock ticks of the retention window; a read as of an older GSN after a restart sees the oldest kept tick's clock) |
+| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN, also across restarts (checkpoints keep the clock ticks of the retention window) |
 | `INSERT`/`UPDATE`/`DELETE` | the wall clock when the statement runs (the resulting values are logged) |
 
 `clock_timestamp()` always returns the wall clock and is rejected in

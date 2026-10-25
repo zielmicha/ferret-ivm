@@ -26,7 +26,7 @@ Where the ideas of the design live in the code (paths relative to
 | Augmented summaries; aggregates as range queries | `storage/summary.rs`, `dataflow/reduce.rs`, `Env::nth` (percentiles) |
 | Shared, reference-counted arrangements; the primary index as a table's first arrangement | `dataflow/mod.rs` (hash-consed nodes and arrangements) |
 | Delta joins; anti-joins for outer joins and `NOT EXISTS` | `dataflow/join.rs`, `dataflow/lower.rs` |
-| Changing views: shared fragments, hydration from arrangements, catalog in storage | `dataflow/mod.rs` (`Graph::hydrate`), `coord/ddl.rs`, the catalog in every checkpoint |
+| Changing views: shared fragments, hydration from arrangements, catalog in storage | `dataflow/mod.rs` (`Graph::hydrate`), `coord/ddl.rs`; the catalog and its DDL history in a storage tree, versioned by GSN (`coord/meta.rs`) |
 | Outputs: `AS OF`, `SUBSCRIBE` with progress, idempotent sinks, read modes | `coord/read.rs`, `server/`, `sink/postgres.rs` |
 | `EXPLAIN MAINTENANCE` | `coord/read.rs` |
 | Expression semantics exactly PostgreSQL's | `expr/`, and the ports `crates/pgnumeric`, `crates/pgdatetime`, `crates/pgfuncs` |
@@ -61,7 +61,7 @@ Where the implementation differs from the design:
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
 | `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, removes it and requests a shutdown |
 | `ivm-http` (with `--http-listen`: a driver thread and the two worker threads of its own tokio runtime) | the HTTP listener | the web UI's server, its once-a-second metrics sampler and the SQL console ([Web UI](../web-ui.md)); engine snapshots are requested with a callback, so no async thread blocks on the engine |
-| `ivm-slot-drop-<slot>` | | drop the replication slot of a dropped source, retrying with a delay doubling from 250 ms to 10 s (also while the stopping source's session still holds it) until it is dropped or gone; pending drops are saved in checkpoints and started again after recovery |
+| `ivm-slot-drop-<slot>` | | drop the replication slot of a dropped source, retrying with a delay doubling from 250 ms to 10 s (also while the stopping source's session still holds it) until it is dropped or gone; pending drops are part of the checkpointed state and started again after recovery |
 
 There is exactly one engine thread: all dataflow maintenance, all index
 reads and writes, and all query execution happen on it. Everything that
@@ -86,7 +86,7 @@ snapshot requests queued at the engine.
 | `lsn_waiters` | some read is waiting for an LSN frontier |
 | `want_keepalive` | ask sources to request a keepalive (to move their frontier) |
 | `source_gauges` | per-source upstream position and ingest counters (web UI) |
-| `slot_drops` | replication slots of dropped sources still to be dropped (saved in checkpoints) |
+| `slot_drops` | replication slots of dropped sources still to be dropped (checkpointed) |
 | `shutdown` | stop flag |
 | `failed` | the engine or sequencer thread stopped with an error (also a failed final checkpoint or a panic); the process then exits with status 1 |
 | `crash` | stop without the final checkpoint (a simulated crash, for tests) |
@@ -227,9 +227,9 @@ takes a checkpoint if one is due, and removes cancelled subscriptions.
 | Record | Effect |
 |---|---|
 | `Commit` | group the changes by table (changes to tables that no longer exist are skipped), `Graph::step` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
-| `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); reply |
+| `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); write the catalog's changes into the metadata tree at the record's GSN (`persist_meta`); reply |
 | `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
-| `Schema` | rebuild the table in its new shape and re-plan dependent views ([Sources](../user-guide/sources.md#upstream-schema-changes)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged |
+| `Schema` | rebuild the table in its new shape and re-plan dependent views ([Sources](../user-guide/sources.md#upstream-schema-changes)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
 Delivering outputs (`deliver`): the error records of each materialized
@@ -306,6 +306,6 @@ The engine's logical clock (`Engine::clock`, PostgreSQL epoch microseconds)
 is the maximum of the tick times applied so far. A deque of recent
 (GSN, clock) pairs lets a read at GSN *g* evaluate `now()` as the clock at
 *g* (`clock_at`); pairs older than the retention frontier are dropped.
-Checkpoints save the deque (at most its last 100,000 pairs; `AppState::ticks`),
-so reads as of earlier GSNs see the same clock after a restart. The dataflow sees
+Checkpoints save the deque (the metadata tree's tick records), so reads as of
+earlier GSNs see the same clock after a restart. The dataflow sees
 the clock as `Graph::now`; temporal-filter operators run whenever it moves.

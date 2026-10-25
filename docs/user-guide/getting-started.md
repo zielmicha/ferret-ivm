@@ -73,7 +73,7 @@ Every flag is parsed in `crates/ivm/src/main.rs`; defaults come from
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--data-dir DIR` | `ivm-data` (relative to the working directory) | Data directory: input log, storage segments, manifest, lock file. Created if missing. See [Operations](operations.md#the-data-directory). |
+| `--data-dir DIR` | `ivm-data` (relative to the working directory) | Data directory: input log, storage segments, manifest, format version, lock file. Created if missing. See [Operations](operations.md#the-data-directory). |
 | `--listen ADDR` | `127.0.0.1:6875` | TCP address of the PostgreSQL-protocol server (`host:port`, passed to `TcpListener::bind`). There is no Unix-socket listener. |
 | `--password PW` | none | If given, every client must send this password (cleartext password authentication; the user name is not checked). Without it, any user name and password are accepted. |
 | `--cache-mb N` | `1024` | Target size of the node cache (buffer pool) in MiB. Clean tree nodes are evicted above it; a checkpoint is also forced when dirty nodes exceed half of it. See [Configuration and tuning](operations.md#configuration-and-tuning). |
