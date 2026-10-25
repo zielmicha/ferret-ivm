@@ -136,3 +136,37 @@ fn distinct_aggregates_with_filter() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The batch executor (ad hoc queries) applies FILTER before removing
+/// duplicates of DISTINCT aggregates, and a DISTINCT ordered aggregate no
+/// longer hands its deduplicated rows to the group's other aggregates.
+/// Expected rows are PostgreSQL's; the maintained views must agree.
+#[test]
+fn adhoc_distinct_aggregates() {
+    let dir = tmpdir("adhoc-distinct");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, x int, y int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 1, -1), (2, 1, 1, 5), (3, 1, 2, 5), (4, 1, NULL, 1), (5, 2, NULL, 1), (6, 2, 7, 1), (7, 1, 9, 0), (8, 3, 4, -1)");
+    let cases: [(&str, &[&str]); 2] = [
+        (
+            "SELECT g, count(DISTINCT x) FILTER (WHERE y > 0) AS c, count(DISTINCT x) AS d, \
+             sum(DISTINCT x) FILTER (WHERE y <= 0) AS s, array_agg(DISTINCT x ORDER BY x) FILTER (WHERE y > 0) AS a, count(*) AS n \
+             FROM t GROUP BY g",
+            &["1|2|3|10|{1,2,NULL}|5", "2|1|1||{7,NULL}|2", "3|0|1|4||1"],
+        ),
+        (
+            "SELECT g, array_agg(DISTINCT x ORDER BY x) AS a, array_agg(x ORDER BY x) AS b, \
+             string_agg(DISTINCT x::text, ',' ORDER BY x::text) FILTER (WHERE y > 0) AS c, string_agg(x::text, ',' ORDER BY x) AS d \
+             FROM t GROUP BY g",
+            &["1|{1,2,9,NULL}|{1,1,2,9,NULL}|1,2|1,1,2,9", "2|{7,NULL}|{7,NULL}|7|7", "3|{4}|{4}||4"],
+        ),
+    ];
+    for (i, (q, want)) in cases.iter().enumerate() {
+        assert_eq!(rows(&h, &format!("{q} ORDER BY g")), *want, "{q}");
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+        assert_eq!(rows(&h, &format!("SELECT * FROM v{i} ORDER BY g")), *want, "{q}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
