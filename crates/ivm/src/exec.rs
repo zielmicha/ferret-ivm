@@ -338,13 +338,14 @@ impl<'a> ExecCtx<'a> {
             None => Bound::Unbounded,
         };
         let (at, preds, cols) = (self.at, &b.preds, &b.cols);
+        let distinct = cols.as_ref().is_some_and(|c| c.iter().enumerate().all(|(i, x)| !c[..i].contains(x)));
         let mut out = Vec::new();
         self.env.for_each(a.tree, Bound::Included(&lo_key), hi, &mut |k, h| {
             let w = h.weight(at);
             if w <= 0 {
                 return Ok(true);
             }
-            let r = layout.decode_row_with(k, plan.as_ref())?;
+            let mut r = layout.decode_row_with(k, plan.as_ref())?;
             for p in preds {
                 if !p.eval_pred(&r)? {
                     return Ok(true);
@@ -352,6 +353,8 @@ impl<'a> ExecCtx<'a> {
             }
             out.push((
                 match cols {
+                    // distinct columns are moved out of the decoded row
+                    Some(cols) if distinct => cols.iter().map(|c| std::mem::replace(&mut r[*c], Datum::Null)).collect(),
                     Some(cols) => cols.iter().map(|c| r[*c].clone()).collect(),
                     None => r,
                 },
@@ -859,21 +862,27 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
     let mut order_keys: Vec<Vec<u8>> = Vec::new();
     // distinct aggregates: dedupe (group, args) first
     let mut distinct_seen: Vec<FxHashMap<Vec<u8>, ()>> = specs.iter().map(|_| FxHashMap::default()).collect();
+    // the group key of each row is encoded into one reused buffer; only a
+    // new group allocates
+    let mut k: Vec<u8> = Vec::new();
     for (r, w) in rows {
         if w == 0 {
             continue;
         }
-        let kv: Vec<Datum> = group.iter().map(|c| r[*c].clone()).collect();
-        let k = key_bytes(&kv);
-        let g = match groups.get_mut(&k) {
+        k.clear();
+        for c in group {
+            encoding::encode_key(&r[*c], SortSpec::ASC, &mut k);
+        }
+        let g = match groups.get_mut(k.as_slice()) {
             Some(g) => g,
             None => {
                 order_keys.push(k.clone());
-                groups.entry(k.clone()).or_insert(G { key_row: kv.clone(), summary: Summary::empty(&spec_kinds), rows: vec![] })
+                let key_row = group.iter().map(|c| r[*c].clone()).collect();
+                groups.entry(k.clone()).or_insert(G { key_row, summary: Summary::empty(&spec_kinds), rows: vec![] })
             }
         };
         g.summary.count += w;
-        for (i, s) in specs.iter().enumerate() {
+        for i in 0..specs.len() {
             let w_eff = if aggs[i].distinct {
                 let args: Vec<Datum> = aggs[i].args.iter().map(|c| r[*c].clone()).collect();
                 let mut dk = k.clone();
@@ -887,10 +896,11 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
             };
             for &slot in &slots[i] {
                 let (kind, e) = &kinds[slot];
-                let v = e.eval(&r)?;
-                kind.add(&mut g.summary.aggs[slot], &v, w_eff)?;
+                match e {
+                    Expr::Column(c) => kind.add(&mut g.summary.aggs[slot], &r[*c], w_eff)?,
+                    e => kind.add(&mut g.summary.aggs[slot], &e.eval(&r)?, w_eff)?,
+                }
             }
-            let _ = s;
         }
         if any_ordered {
             g.rows.push((r, w));
