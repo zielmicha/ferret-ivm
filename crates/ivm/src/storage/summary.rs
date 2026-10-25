@@ -704,14 +704,4 @@ mod tests {
         assert_eq!(s.value(), 3.0 * 5e-324);
         assert_eq!(s.div_value(3), 5e-324);
     }
-
-    #[test]
-    fn min_max_combine() {
-        let mut a = AggState::Min(Some(Datum::Int4(5)));
-        a.combine(&AggState::Min(Some(Datum::Int4(3))));
-        assert_eq!(a, AggState::Min(Some(Datum::Int4(3))));
-        let mut a = AggState::Max(None);
-        a.combine(&AggState::Max(Some(Datum::Int4(3))));
-        assert_eq!(a, AggState::Max(Some(Datum::Int4(3))));
-    }
 }

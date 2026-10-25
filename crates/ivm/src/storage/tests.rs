@@ -1,237 +1,89 @@
+//! Storage model test: random operation sequences checked against an
+//! in-memory model of every tree's (key, GSN, weight) history.
+//!
+//! The operations are weighted inserts and deletes on several trees (plain
+//! counts, and numeric / float / integer summaries over a value embedded in
+//! the key) at increasing GSNs, retention frontier advances, tree creation
+//! and drops, checkpoints, GC, clean reopens and simulated crashes:
+//! - no final checkpoint;
+//! - garbage after the durable end of the manifest or of the active segment,
+//!   and stray segment files;
+//! - a crash in the middle of a checkpoint: its nodes (partly) written but
+//!   the manifest record missing or torn, or the record written but the
+//!   segments it freed not yet deleted.
+//!
+//! Node sizes, segment size, retention and the buffer pool (down to a few
+//! KB, so nodes are evicted all the time) vary per seed. Point lookups are
+//! checked after every step; full verification compares scans (current and
+//! AS OF retained GSNs), range and prefix scans, range summaries, `nth`, the
+//! tree structure (key ranges, parent links, `min_seg`) and the segment
+//! liveness accounting with the model. After a crash the recovered state must
+//! equal the model as of the last checkpoint; the operations since then are
+//! then replayed (as the engine replays its input log) and must reproduce the
+//! state before the crash.
+//!
+//! `IVM_TEST_SEED=N cargo test -p ivm storage::tests` reproduces a seed (a
+//! failing run prints its seed). Long variant with fresh seeds:
+//! `cargo test -p ivm --release storage::tests -- --ignored`
+//! (`IVM_TEST_ITERATIONS` seeds, default 20).
+
 use super::*;
+use crate::testkit::{run_seeds, seeds, Rng, TempDir};
+use crate::types::Datum;
 use std::collections::BTreeMap;
+use std::os::unix::fs::FileExt;
 
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+// ---------------------------------------------------------------------------
+// trees and their summarizers
+
+/// What a tree's keys look like and which summary it maintains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Binary keys (with 0x00 / 0xFF bytes), entry counts only.
+    Count,
+    /// Keys `ggg:uuuuu:<value>:<padding>`, summaries over the value.
+    Numeric,
+    Float,
+    Int,
+}
+
+const KINDS: [Kind; 4] = [Kind::Count, Kind::Numeric, Kind::Float, Kind::Int];
+
+/// Values in several representations of equal numbers, specials and NULLs.
+const NUMERIC_VALUES: &[&str] = &[
+    "1", "1.0", "1.00", "2.5", "2.50", "-3.125", "-3.1250", "0", "0.000", "-0.00", "7", "1000000000000.0001", "-1",
+    "-1.0", "NULL", "NaN", "Infinity", "-Infinity",
+];
+const FLOAT_VALUES: &[&str] =
+    &["0", "-0", "1.5", "-2.25", "0.1", "3", "1e308", "-1e308", "5e-324", "NULL", "NaN", "inf", "-inf"];
+const INT_VALUES: &[&str] = &["0", "1", "-1", "42", "1000000", "-1099511627776", "1099511627776", "NULL"];
+
+fn value_of(kind: Kind, key: &[u8]) -> Datum {
+    let s = std::str::from_utf8(key).expect("utf8 key");
+    let text = s.split(':').nth(2).expect("value field");
+    if text == "NULL" {
+        return Datum::Null;
     }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+    match kind {
+        Kind::Numeric => Datum::numeric(pgnumeric::Numeric::parse(text).unwrap()),
+        Kind::Float => Datum::Float8(text.parse().unwrap()),
+        Kind::Int => Datum::Int8(text.parse().unwrap()),
+        Kind::Count => unreachable!(),
     }
 }
 
-fn key(i: u64) -> Vec<u8> {
-    // variable-length keys sharing prefixes
-    let mut k = format!("k{:06}", i).into_bytes();
-    if i % 3 == 0 {
-        k.extend_from_slice(b"-padding-padding");
-    }
-    k
-}
-
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-storage-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
-
-fn check_equal(env: &mut Env, tree: TreeId, model: &BTreeMap<Vec<u8>, i64>) {
-    let all = env.scan(tree, Bound::Unbounded, Bound::Unbounded).unwrap();
-    let got: Vec<(Vec<u8>, i64)> =
-        all.iter().map(|(k, h)| (k.to_vec(), h.total())).filter(|(_, w)| *w != 0).collect();
-    let want: Vec<(Vec<u8>, i64)> = model.iter().filter(|(_, w)| **w != 0).map(|(k, w)| (k.clone(), *w)).collect();
-    assert_eq!(got.len(), want.len(), "entry count mismatch");
-    assert_eq!(got, want);
-    let total: i64 = want.iter().map(|(_, w)| w).sum();
-    assert_eq!(env.tree_count(tree), total);
-    // validates the incrementally maintained dirty byte count (debug)
-    let _ = env.dirty_bytes();
-}
-
-#[test]
-fn random_ops_against_model() {
-    let dir = tmpdir("random");
-    let opts = EnvOptions { cache_bytes: 64 << 10, leaf_bytes: 512, internal_bytes: 512, segment_bytes: 64 << 10 };
-    let (mut env, rec) = Env::open(&dir, opts.clone()).unwrap();
-    assert!(rec.is_none());
-    let tree = env.create_tree(Arc::new(CountSummarizer));
-    let mut model: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    let mut rng = Rng(0x9E3779B97F4A7C15);
-    let mut gsn = 0;
-    for round in 0..300 {
-        gsn += 1;
-        env.set_frontier(gsn - 1);
-        let n = 1 + rng.below(if round % 50 == 0 { 400 } else { 30 });
-        let mut ups = Vec::new();
-        for _ in 0..n {
-            let k = key(rng.below(2000));
-            let cur = *model.get(&k).unwrap_or(&0);
-            let w = if cur > 0 && rng.below(2) == 0 { -cur } else { 1 + rng.below(2) as i64 };
-            *model.entry(k.clone()).or_insert(0) += w;
-            ups.push((k, w));
-        }
-        env.apply(tree, &mut ups, gsn).unwrap();
-        model.retain(|_, w| *w != 0);
-        if round % 37 == 0 {
-            check_equal(&mut env, tree, &model);
-            // point lookups
-            for _ in 0..20 {
-                let k = key(rng.below(2000));
-                let got = env.get(tree, &k).unwrap().map(|h| h.total()).unwrap_or(0);
-                assert_eq!(got, *model.get(&k).unwrap_or(&0));
-            }
-            // range summary and nth vs model
-            let a = key(rng.below(2000));
-            let b = key(rng.below(2000));
-            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            let s = env.range_summary(tree, Bound::Included(&lo), Bound::Excluded(&hi)).unwrap();
-            let want: i64 = model.range(lo.clone()..hi.clone()).map(|(_, w)| *w).sum();
-            assert_eq!(s.count, want);
-            if want > 0 {
-                let target = rng.below(want as u64) as i64;
-                let (k, _, off) = env.nth(tree, Bound::Included(&lo), Bound::Excluded(&hi), target).unwrap().unwrap();
-                // expected: walk the model
-                let mut rem = target;
-                let mut expect = None;
-                for (mk, w) in model.range(lo.clone()..hi.clone()) {
-                    if *w > rem {
-                        expect = Some((mk.clone(), rem));
-                        break;
-                    }
-                    rem -= w;
-                }
-                assert_eq!(Some((k.to_vec(), off)), expect);
-            }
-        }
-        if round % 23 == 0 {
-            env.checkpoint(gsn, b"app").unwrap();
-            env.gc(50).unwrap();
-        }
-        if round % 97 == 96 {
-            env.checkpoint(gsn, format!("app{gsn}").as_bytes()).unwrap();
-            drop(env);
-            let (e2, rec) = Env::open(&dir, opts.clone()).unwrap();
-            env = e2;
-            let rec = rec.unwrap();
-            assert_eq!(rec.gsn, gsn);
-            assert_eq!(rec.app, format!("app{gsn}").into_bytes());
-            env.attach_tree(tree, Arc::new(CountSummarizer)).unwrap();
-            check_equal(&mut env, tree, &model);
-        }
-    }
-    check_equal(&mut env, tree, &model);
-    let st = env.stats();
-    assert!(st.mem_bytes < 1 << 20);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn large_batches() {
-    let dir = tmpdir("large");
-    let (mut env, _) = Env::open(&dir, EnvOptions::default()).unwrap();
-    let t = env.create_tree(Arc::new(CountSummarizer));
-    let mut model: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    for (g, range) in [(1u64, 0u64..10_000), (2, 10_000..20_000), (3, 20_000..25_000)] {
-        let mut ups: Vec<(Vec<u8>, i64)> = range
-            .map(|i| {
-                let mut k = (i as u32).to_be_bytes().to_vec();
-                k.extend_from_slice(b"some-payload-bytes-to-make-entries-bigger");
-                (k, 1)
-            })
-            .collect();
-        for (k, w) in &ups {
-            model.insert(k.clone(), *w);
-        }
-        env.apply(t, &mut ups, g).unwrap();
-        check_equal(&mut env, t, &model);
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn huge_keys() {
-    let dir = tmpdir("huge");
-    let opts = EnvOptions { cache_bytes: 1 << 20, leaf_bytes: 4096, internal_bytes: 4096, segment_bytes: 1 << 20 };
-    let (mut env, _) = Env::open(&dir, opts).unwrap();
-    let t = env.create_tree(Arc::new(CountSummarizer));
-    let mut model: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    let mut ups = Vec::new();
-    for i in 0..200u32 {
-        let mut k = i.to_be_bytes().to_vec();
-        // every 7th key is 100KB, some share long prefixes
-        if i % 7 == 0 {
-            k = vec![b'x'; 100_000];
-            k.extend_from_slice(&i.to_be_bytes());
-        }
-        model.insert(k.clone(), 1);
-        ups.push((k, 1));
-    }
-    env.apply(t, &mut ups, 1).unwrap();
-    check_equal(&mut env, t, &model);
-    env.checkpoint(1, b"").unwrap();
-    let mut ups: Vec<(Vec<u8>, i64)> = model.keys().take(50).map(|k| (k.clone(), -1)).collect();
-    for (k, _) in &ups {
-        model.remove(k);
-    }
-    env.set_frontier(1);
-    env.apply(t, &mut ups, 2).unwrap();
-    check_equal(&mut env, t, &model);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn time_travel_reads() {
-    let dir = tmpdir("history");
-    let (mut env, _) = Env::open(&dir, EnvOptions::default()).unwrap();
-    let t = env.create_tree(Arc::new(CountSummarizer));
-    env.apply(t, &mut vec![(b"a".to_vec(), 1)], 1).unwrap();
-    env.apply(t, &mut vec![(b"a".to_vec(), -1), (b"b".to_vec(), 1)], 2).unwrap();
-    let a = env.get(t, b"a").unwrap().unwrap();
-    assert_eq!(a.weight(ReadAt::AsOf(1)), 1);
-    assert_eq!(a.weight(ReadAt::Before(2)), 1);
-    assert_eq!(a.weight(ReadAt::Latest), 0);
-    env.set_frontier(2);
-    env.apply(t, &mut vec![(b"c".to_vec(), 1)], 3).unwrap();
-    // "a" consolidated away once the frontier passed its retraction
-    assert!(env.get(t, b"a").unwrap().is_none());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn drop_tree_reclaims_segments() {
-    let dir = tmpdir("drop");
-    let opts = EnvOptions { cache_bytes: 1 << 20, leaf_bytes: 256, internal_bytes: 256, segment_bytes: 4096 };
-    let (mut env, _) = Env::open(&dir, opts).unwrap();
-    let t = env.create_tree(Arc::new(CountSummarizer));
-    let mut ups: Vec<(Vec<u8>, i64)> = (0..2000).map(|i| (key(i), 1)).collect();
-    env.apply(t, &mut ups, 1).unwrap();
-    env.checkpoint(1, b"").unwrap();
-    let before: u64 = env.stats().segments.iter().map(|s| s.2).sum();
-    assert!(before > 0);
-    env.drop_tree(t).unwrap();
-    env.checkpoint(2, b"").unwrap();
-    let after: u64 = env.stats().segments.iter().map(|s| s.2).sum();
-    assert_eq!(after, 0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Entries `ggg:uuuuu:<numeric text or NULL>`; summaries over the numeric.
-struct NumSummarizer {
+struct ValueSummarizer {
+    kind: Kind,
     spec: Vec<AggKind>,
 }
 
-fn num_of(key: &[u8]) -> crate::types::Datum {
-    let s = std::str::from_utf8(key).unwrap();
-    let text = s.splitn(3, ':').nth(2).unwrap();
-    if text == "NULL" {
-        crate::types::Datum::Null
-    } else {
-        crate::types::Datum::numeric(pgnumeric::Numeric::parse(text).unwrap())
-    }
-}
-
-impl Summarizer for NumSummarizer {
+impl Summarizer for ValueSummarizer {
     fn spec(&self) -> &[AggKind] {
         &self.spec
     }
     fn add_entry(&self, acc: &mut Summary, key: &[u8], weight: i64) -> Result<()> {
         acc.count += weight;
-        let v = num_of(key);
+        let v = value_of(self.kind, key);
         for (i, k) in self.spec.iter().enumerate() {
             k.add(&mut acc.aggs[i], &v, weight)?;
         }
@@ -239,7 +91,7 @@ impl Summarizer for NumSummarizer {
     }
     fn update_entry(&self, acc: &mut Summary, key: &[u8], before: i64, after: i64) -> Result<bool> {
         acc.count += after - before;
-        let v = num_of(key);
+        let v = value_of(self.kind, key);
         for (i, k) in self.spec.iter().enumerate() {
             if !k.update(&mut acc.aggs[i], &v, before, after)? {
                 return Ok(false);
@@ -249,70 +101,820 @@ impl Summarizer for NumSummarizer {
     }
 }
 
-#[test]
-fn incremental_summaries_match_recomputation() {
-    let opts = EnvOptions { cache_bytes: 1 << 20, leaf_bytes: 300, internal_bytes: 400, segment_bytes: 64 << 10 };
-    summaries_case("summaries-small", opts, 0);
-    // larger leaves (in-place edits) with checkpoints (clean nodes merge)
-    let opts = EnvOptions { cache_bytes: 1 << 20, leaf_bytes: 4096, internal_bytes: 600, segment_bytes: 1 << 20 };
-    summaries_case("summaries-large", opts, 25);
+fn summarizer(kind: Kind) -> Arc<dyn Summarizer> {
+    use AggKind::*;
+    let spec = match kind {
+        Kind::Count => return Arc::new(CountSummarizer),
+        Kind::Numeric => vec![SumNumeric, Min, Max, CountNonNull, SumSqNumeric],
+        Kind::Float => vec![SumFloat, SumSqFloat, Min, Max],
+        Kind::Int => vec![SumInt, SumSqInt, Max, CountNonNull, Min],
+    };
+    Arc::new(ValueSummarizer { kind, spec })
 }
 
-fn summaries_case(name: &str, opts: EnvOptions, checkpoint_every: u64) {
-    let dir = tmpdir(name);
-    let (mut env, _) = Env::open(&dir, opts).unwrap();
-    let spec = vec![AggKind::SumNumeric, AggKind::Min, AggKind::Max, AggKind::CountNonNull, AggKind::SumSqNumeric];
-    let summ = Arc::new(NumSummarizer { spec: spec.clone() });
-    let tree = env.create_tree(summ.clone());
-    // equal values in several representations, specials and NULLs
-    let values = [
-        "1", "1.0", "1.00", "2.5", "2.50", "-3.125", "-3.1250", "0", "0.000", "7", "1000000000000.0001", "NaN",
-        "Infinity", "-Infinity", "NULL", "-1", "-1.0",
-    ];
-    let mut model: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
-    let mut rng = Rng(0xD1B54A32D192ED03);
-    for gsn in 1..=400u64 {
-        env.set_frontier(gsn - 1);
-        let mut ups = Vec::new();
-        let n = 1 + rng.below(if gsn % 40 == 0 { 120 } else { 12 });
-        for _ in 0..n {
-            let k = if !model.is_empty() && rng.below(3) == 0 {
-                // touch an existing entry (often removing it)
-                let i = rng.below(model.len() as u64) as usize;
-                model.keys().nth(i).unwrap().clone()
-            } else {
-                // few values: skip the specials most of the time
-                let mut v = values[rng.below(values.len() as u64) as usize];
-                if matches!(v, "NaN" | "Infinity" | "-Infinity") && rng.below(4) != 0 {
-                    v = "1.0";
-                }
-                format!("{:03}:{:05}:{}", rng.below(4), rng.below(400), v).into_bytes()
-            };
-            let cur = *model.get(&k).unwrap_or(&0);
-            let w = if cur > 0 && rng.below(2) == 0 { -cur } else { 1 + rng.below(3) as i64 };
-            *model.entry(k.clone()).or_insert(0) += w;
-            ups.push((k, w));
-        }
-        env.apply(tree, &mut ups, gsn).unwrap();
-        model.retain(|_, w| *w != 0);
-        env.check_summaries(tree).unwrap();
-        let _ = env.dirty_bytes();
-        if checkpoint_every > 0 && gsn % checkpoint_every == 0 {
-            env.checkpoint(gsn, b"").unwrap();
-        }
-        // the whole tree and random ranges against a fold over the model
-        let fold = |lo: &[u8], hi: &[u8]| {
-            let mut s = Summary::empty(&spec);
-            for (k, w) in model.range(lo.to_vec()..hi.to_vec()) {
-                summ.add_entry(&mut s, k, *w).unwrap();
-            }
-            s
-        };
-        assert!(env.tree_summary(tree).exact_eq(&fold(b"", b"\xff")), "tree summary at gsn {gsn}");
-        let a = format!("{:03}:{:05}", rng.below(4), rng.below(400)).into_bytes();
-        let b = format!("{:03}:{:05}", rng.below(4), rng.below(400)).into_bytes();
-        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-        let got = env.range_summary(tree, Bound::Included(&lo), Bound::Excluded(&hi)).unwrap();
-        assert!(got.exact_eq(&fold(&lo, &hi)), "range summary at gsn {gsn}: {got:?} vs {:?}", fold(&lo, &hi));
+// ---------------------------------------------------------------------------
+// the model
+
+/// Weight changes of one entry, in GSN order (never compacted).
+type Hist = Vec<(Gsn, i64)>;
+
+fn weight_of(h: &Hist, at: ReadAt) -> i64 {
+    h.iter()
+        .filter(|(g, _)| match at {
+            ReadAt::Latest => true,
+            ReadAt::AsOf(t) => *g <= t,
+            ReadAt::Before(t) => *g < t,
+        })
+        .map(|(_, w)| *w)
+        .sum()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TreeModel {
+    kind: Kind,
+    /// Size of the key space new keys are drawn from.
+    universe: u64,
+    entries: BTreeMap<Vec<u8>, Hist>,
+    /// Every key in `entries` (for picking random ones).
+    keys: Vec<Vec<u8>>,
+}
+
+impl TreeModel {
+    fn weight(&self, key: &[u8], at: ReadAt) -> i64 {
+        self.entries.get(key).map(|h| weight_of(h, at)).unwrap_or(0)
     }
+
+    fn add(&mut self, key: &[u8], gsn: Gsn, w: i64) {
+        if !self.entries.contains_key(key) {
+            self.keys.push(key.to_vec());
+        }
+        let h = self.entries.entry(key.to_vec()).or_default();
+        match h.last_mut() {
+            Some((g, x)) if *g == gsn => *x += w,
+            _ => h.push((gsn, w)),
+        }
+    }
+
+    fn random_key(&self, rng: &mut Rng) -> Option<&Vec<u8>> {
+        if self.keys.is_empty() { None } else { Some(&self.keys[rng.index(self.keys.len())]) }
+    }
+
+    /// Entries with a non-zero current weight.
+    fn current(&self) -> impl Iterator<Item = (&Vec<u8>, i64)> {
+        self.entries.iter().map(|(k, h)| (k, weight_of(h, ReadAt::Latest))).filter(|(_, w)| *w != 0)
+    }
+
+    fn total(&self) -> i64 {
+        self.current().map(|(_, w)| w).sum()
+    }
+}
+
+type Model = BTreeMap<TreeId, TreeModel>;
+
+#[derive(Clone, Debug)]
+enum Op {
+    Apply { tree: TreeId, ups: Vec<(Vec<u8>, i64)>, gsn: Gsn },
+    Frontier(Gsn),
+    Create { id: TreeId, kind: Kind, universe: u64 },
+    Drop(TreeId),
+}
+
+/// Apply `op` to the environment and the model alike.
+fn apply_op(env: &mut Env, model: &mut Model, frontier: &mut Gsn, op: &Op) {
+    match op {
+        Op::Apply { tree, ups, gsn } => {
+            env.apply(*tree, &mut ups.clone(), *gsn).unwrap();
+            let m = model.get_mut(tree).unwrap();
+            for (k, w) in ups {
+                m.add(k, *gsn, *w);
+            }
+        }
+        Op::Frontier(f) => {
+            env.set_frontier(*f);
+            *frontier = (*frontier).max(*f);
+        }
+        Op::Create { id, kind, universe } => {
+            assert_eq!(env.next_tree_id(), *id, "tree ids must be deterministic");
+            assert_eq!(env.create_tree(summarizer(*kind)), *id);
+            model.insert(*id, TreeModel { kind: *kind, universe: *universe, entries: BTreeMap::new(), keys: vec![] });
+        }
+        Op::Drop(id) => {
+            env.drop_tree(*id).unwrap();
+            model.remove(id);
+        }
+    }
+}
+
+/// The durable state: the last checkpoint and the model as of it.
+#[derive(Clone)]
+struct Ckpt {
+    /// False before the first checkpoint (recovery finds nothing).
+    durable: bool,
+    gsn: Gsn,
+    app: Vec<u8>,
+    model: Model,
+    frontier: Gsn,
+}
+
+// ---------------------------------------------------------------------------
+// verification
+
+fn in_range(k: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
+    let lo_ok = match lo {
+        Bound::Unbounded => true,
+        Bound::Included(a) => k >= a.as_slice(),
+        Bound::Excluded(a) => k > a.as_slice(),
+    };
+    lo_ok && below_hi(k, borrow_bound(hi))
+}
+
+/// A random range bound: often an existing key or a truncation of one (which
+/// tends to coincide with node separators), sometimes a fresh key.
+fn random_bound(rng: &mut Rng, m: &TreeModel) -> Bound<Vec<u8>> {
+    if rng.chance(15) {
+        return Bound::Unbounded;
+    }
+    let key = match m.random_key(rng).cloned() {
+        Some(k) if rng.chance(70) => {
+            if rng.chance(40) { k[..rng.index(k.len() + 1)].to_vec() } else { k }
+        }
+        _ => gen_key(rng, m),
+    };
+    if rng.chance(50) { Bound::Included(key) } else { Bound::Excluded(key) }
+}
+
+fn fold(m: &TreeModel, lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> Summary {
+    let summ = summarizer(m.kind);
+    let mut s = Summary::empty(summ.spec());
+    for (k, w) in m.current() {
+        if in_range(k, lo, hi) {
+            summ.add_entry(&mut s, k, w).unwrap();
+        }
+    }
+    s
+}
+
+/// Retained times worth reading at: the frontier, `now` and a few between.
+fn sample_times(rng: &mut Rng, frontier: Gsn, now: Gsn) -> Vec<ReadAt> {
+    let mut v = vec![ReadAt::Latest, ReadAt::AsOf(now), ReadAt::AsOf(frontier)];
+    if now > frontier {
+        v.push(ReadAt::AsOf(frontier + rng.below(now - frontier)));
+        v.push(ReadAt::Before(frontier + 1 + rng.below(now - frontier)));
+    }
+    v
+}
+
+/// Compare one tree with its model (`frontier`: reads at or after it are
+/// exact; `now`: the latest GSN applied).
+fn verify_tree(env: &mut Env, rng: &mut Rng, id: TreeId, m: &TreeModel, frontier: Gsn, now: Gsn) {
+    let ctx = |what: &str| format!("tree {id} ({:?}): {what}", m.kind);
+    let all = env.scan(id, Bound::Unbounded, Bound::Unbounded).unwrap();
+    for w in all.windows(2) {
+        assert!(w[0].0 < w[1].0, "{}", ctx("scan out of order"));
+    }
+    for (k, h) in &all {
+        let ok = !h.0.is_empty() && h.0.windows(2).all(|p| p[0].0 < p[1].0) && h.0.iter().all(|(_, w)| *w != 0);
+        assert!(ok, "{}", ctx(&format!("malformed history {h:?} of {k:?}")));
+    }
+    let stored: BTreeMap<&[u8], &History> = all.iter().map(|(k, h)| (&**k, h)).collect();
+    for at in sample_times(rng, frontier, now) {
+        for (k, h) in &all {
+            assert_eq!(h.weight(at), m.weight(k, at), "{}", ctx(&format!("weight of {k:?} at {at:?}")));
+        }
+        for (k, h) in &m.entries {
+            if !stored.contains_key(k.as_slice()) {
+                assert_eq!(weight_of(h, at), 0, "{}", ctx(&format!("missing {k:?} at {at:?} (history {h:?})")));
+            }
+        }
+    }
+    assert_eq!(env.tree_count(id), m.total(), "{}", ctx("count"));
+    // range and prefix scans agree with the full scan
+    for _ in 0..2 {
+        let (lo, hi) = (random_bound(rng, m), random_bound(rng, m));
+        let got = env.scan(id, borrow_bound(&lo), borrow_bound(&hi)).unwrap();
+        let want: Vec<_> = all.iter().filter(|(k, _)| in_range(k, &lo, &hi)).cloned().collect();
+        assert!(got == want, "{}", ctx(&format!("range scan {lo:?}..{hi:?}")));
+    }
+    if let Some(k) = m.random_key(rng) {
+        let prefix = &k[..rng.index(k.len().min(8) + 1)];
+        let got = env.scan_prefix(id, prefix).unwrap();
+        let want: Vec<_> = all.iter().filter(|(k, _)| k.starts_with(prefix)).cloned().collect();
+        assert!(got == want, "{}", ctx(&format!("prefix scan {prefix:?}")));
+    }
+    // summaries: stored ones are exact, and range queries equal a fold
+    env.check_summaries(id).unwrap_or_else(|e| panic!("{}", ctx(&e.to_string())));
+    let whole = fold(m, &Bound::Unbounded, &Bound::Unbounded);
+    assert!(env.tree_summary(id).exact_eq(&whole), "{}", ctx(&format!("tree summary {:?} vs {whole:?}", env.tree_summary(id))));
+    for _ in 0..3 {
+        let (lo, hi) = (random_bound(rng, m), random_bound(rng, m));
+        let got = env.range_summary(id, borrow_bound(&lo), borrow_bound(&hi)).unwrap();
+        let want = fold(m, &lo, &hi);
+        assert!(got.exact_eq(&want), "{}", ctx(&format!("range summary {lo:?}..{hi:?}: {got:?} vs {want:?}")));
+        // nth unit of weight in the range
+        let n = rng.below(want.count.max(0) as u64 + 2) as i64;
+        let mut rem = n;
+        let mut expect = None;
+        for (k, w) in m.current() {
+            if in_range(k, &lo, &hi) {
+                if w > rem {
+                    expect = Some((k.clone(), rem));
+                    break;
+                }
+                rem -= w;
+            }
+        }
+        let got = env.nth(id, borrow_bound(&lo), borrow_bound(&hi), n).unwrap().map(|(k, _, off)| (k.to_vec(), off));
+        assert_eq!(got, expect, "{}", ctx(&format!("nth {n} in {lo:?}..{hi:?}")));
+    }
+}
+
+fn verify_all(env: &mut Env, rng: &mut Rng, model: &Model, frontier: Gsn, now: Gsn) {
+    assert_eq!(env.tree_ids(), model.keys().copied().collect::<Vec<_>>(), "tree set");
+    for (id, m) in model {
+        verify_tree(env, rng, *id, m, frontier, now);
+    }
+    check_structure(env);
+}
+
+/// Point lookups of present and absent keys, now and at a retained time.
+fn verify_points(env: &mut Env, rng: &mut Rng, model: &Model, frontier: Gsn, now: Gsn) {
+    for (id, m) in model {
+        for _ in 0..2 {
+            let key = match m.random_key(rng).cloned() {
+                Some(k) if rng.chance(70) => k,
+                _ => gen_key(rng, m),
+            };
+            let got = env.get(*id, &key).unwrap();
+            let times = sample_times(rng, frontier, now);
+            let at = *rng.pick(&times);
+            let w = got.as_ref().map(|h| h.weight(at)).unwrap_or(0);
+            assert_eq!(w, m.weight(&key, at), "tree {id}: get {key:?} at {at:?} (stored {got:?})");
+        }
+    }
+}
+
+/// Read a node straight from its segment file (without loading it).
+fn read_disk_node(files: &mut BTreeMap<u32, std::fs::File>, dir: &Path, loc: DiskLoc) -> Node {
+    let f = files.entry(loc.seg).or_insert_with(|| {
+        std::fs::File::open(segment::segment_path(dir, loc.seg)).unwrap_or_else(|e| panic!("segment {} of {loc:?}: {e}", loc.seg))
+    });
+    let mut frame = vec![0u8; loc.len as usize];
+    f.read_exact_at(&mut frame, loc.off).unwrap();
+    let len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+    assert_eq!(len + 8, frame.len(), "frame length at {loc:?}");
+    assert_eq!(crc32fast::hash(&frame[8..]), crc, "frame checksum at {loc:?}");
+    Node::decode(&frame[8..]).unwrap()
+}
+
+struct Walk {
+    /// Bytes of reachable on-disk node images per segment.
+    live: BTreeMap<u32, u64>,
+    /// Reachable in-memory nodes.
+    slots: usize,
+    files: BTreeMap<u32, std::fs::File>,
+}
+
+/// Check the subtree at `ptr` (keys within [lo, hi), parent links, loaded
+/// children counts, stored counts and `min_seg`). Returns its smallest
+/// segment and its total weight.
+fn walk(env: &Env, w: &mut Walk, ptr: NodePtr, parent: u32, tree: TreeId, lo: Option<&[u8]>, hi: Option<&[u8]>) -> (u32, i64) {
+    let disk_node;
+    let (node, loc, slot_id) = match ptr {
+        NodePtr::Mem(id) => {
+            let s = env.slots[id as usize].as_ref().expect("dangling child pointer");
+            assert_eq!(s.parent, parent, "parent link of slot {id}");
+            assert_eq!(s.tree, tree, "tree of slot {id}");
+            assert_eq!(s.dirty, s.disk.is_none(), "a node is dirty iff it has no disk location");
+            assert_eq!(s.bytes, s.node.as_ref().unwrap().byte_size(), "cached size of slot {id}");
+            w.slots += 1;
+            (s.node.as_ref().unwrap(), s.disk, Some(id))
+        }
+        NodePtr::Disk(loc) => {
+            disk_node = read_disk_node(&mut w.files, &env.dir, loc);
+            (&disk_node, Some(loc), None)
+        }
+    };
+    if let Some(l) = loc {
+        *w.live.entry(l.seg).or_default() += l.len as u64;
+    }
+    let mut min_seg = loc.map(|l| l.seg).unwrap_or(u32::MAX);
+    let in_bounds = |k: &[u8]| lo.is_none_or(|lo| k >= lo) && hi.is_none_or(|hi| k < hi);
+    let mut count = 0i64;
+    match node {
+        Node::Leaf(entries) => {
+            assert!(!entries.is_empty(), "empty leaf in tree {tree}");
+            for e in entries {
+                assert!(in_bounds(&e.key), "leaf key {:?} outside [{lo:?}, {hi:?})", e.key);
+                count += e.hist.total();
+            }
+            assert!(entries.windows(2).all(|p| p[0].key < p[1].key), "leaf keys out of order");
+        }
+        Node::Internal(children) => {
+            assert!(!children.is_empty(), "empty internal node in tree {tree}");
+            if let Some(id) = slot_id {
+                let loaded = children.iter().filter(|c| matches!(c.ptr, NodePtr::Mem(_))).count() as u32;
+                assert_eq!(env.slots[id as usize].as_ref().unwrap().loaded_children, loaded, "loaded children of slot {id}");
+            } else {
+                assert!(children.iter().all(|c| matches!(c.ptr, NodePtr::Disk(_))), "on-disk node with in-memory child");
+            }
+            for i in 0..children.len() {
+                let c = &children[i];
+                let clo = if i == 0 { lo } else { Some(&*c.sep) };
+                let chi = children.get(i + 1).map(|n| &*n.sep).or(hi);
+                if i > 0 {
+                    assert!(in_bounds(&c.sep), "separator {:?} outside [{lo:?}, {hi:?})", c.sep);
+                    assert!(children[i - 1].sep < c.sep || i == 1, "separators out of order");
+                }
+                let (m, n) = walk(env, w, c.ptr, slot_id.unwrap_or(NONE), tree, clo, chi);
+                assert!(c.min_seg <= m, "stale min_seg {} of a subtree with a node in segment {m}", c.min_seg);
+                assert_eq!(c.summary.count, n, "stored count of a child in tree {tree}");
+                min_seg = min_seg.min(m);
+                count += n;
+            }
+        }
+    }
+    (min_seg, count)
+}
+
+/// Structural invariants and the accounting of memory and segment liveness.
+fn check_structure(env: &mut Env) {
+    let mut w = Walk { live: BTreeMap::new(), slots: 0, files: BTreeMap::new() };
+    for tid in env.tree_ids() {
+        let t = &env.trees[&tid];
+        assert!(t.attached, "tree {tid} not attached");
+        if let Some(root) = t.root {
+            let (m, n) = walk(env, &mut w, root, NONE, tid, None, None);
+            assert!(t.min_seg <= m, "stale min_seg {} of tree {tid} (node in segment {m})", t.min_seg);
+            assert_eq!(t.summary.count, n, "summary count of tree {tid}");
+        } else {
+            assert_eq!(t.summary.count, 0);
+        }
+    }
+    let occupied = env.slots.iter().flatten().count();
+    assert_eq!(w.slots, occupied, "in-memory nodes unreachable from any root");
+    let mem: usize = env.slots.iter().flatten().map(|s| s.bytes).sum();
+    assert_eq!(env.mem_bytes, mem, "mem_bytes");
+    let _ = env.dirty_bytes(); // debug-asserts the dirty byte count
+    for (seg, (total, live)) in &env.seg_live {
+        assert_eq!(*live, w.live.get(seg).copied().unwrap_or(0), "live bytes of segment {seg}");
+        assert!(live <= total, "segment {seg}: live {live} > total {total}");
+    }
+    for seg in w.live.keys() {
+        assert!(env.seg_live.contains_key(seg), "segment {seg} holds live nodes but is not tracked");
+    }
+}
+
+/// Segment files on disk match the accounting (call when no checkpoint is in
+/// progress). `after_checkpoint`: dead segments must be gone.
+fn check_segment_files(env: &Env, after_checkpoint: bool) {
+    let mut files = BTreeMap::new();
+    for e in std::fs::read_dir(&env.dir).unwrap() {
+        let e = e.unwrap();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(id) = name.strip_prefix("seg-").and_then(|s| s.strip_suffix(".dat")) {
+            files.insert(id.parse::<u32>().unwrap(), e.metadata().unwrap().len());
+        }
+    }
+    let active = env.segs.active_id();
+    for (seg, (total, live)) in &env.seg_live {
+        if *live > 0 || *seg == active {
+            assert_eq!(files.get(seg), Some(total), "size of segment file {seg}");
+        }
+        if after_checkpoint && *seg != active {
+            assert!(*live > 0, "dead segment {seg} survived a checkpoint");
+        }
+    }
+    for seg in files.keys() {
+        assert!(env.seg_live.contains_key(seg), "stray segment file {seg}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// generation
+
+fn gen_key(rng: &mut Rng, m: &TreeModel) -> Vec<u8> {
+    let g = rng.below(4);
+    let u = rng.below(m.universe);
+    if m.kind == Kind::Count {
+        // binary keys: memcomparable encodings are full of 0x00 and 0xFF
+        let mut k = vec![g as u8];
+        k.extend_from_slice(&(u as u32).to_be_bytes());
+        let n = match rng.below(100) {
+            0 => rng.range(2000, 30000) as usize,
+            1..=10 => rng.range(1, 40) as usize,
+            _ => 0,
+        };
+        k.extend((0..n).map(|i| [0x00, 0xFF, 0x01, b'a', 0xFE][(u as usize + i) % 5]));
+        return k;
+    }
+    let values = match m.kind {
+        Kind::Numeric => NUMERIC_VALUES,
+        Kind::Float => FLOAT_VALUES,
+        _ => INT_VALUES,
+    };
+    // specials and NULLs less often
+    let v = if rng.chance(70) { values[rng.index(values.len().min(8))] } else { *rng.pick(values) };
+    let pad = match rng.below(1000) {
+        // huge keys sharing a long prefix (long separators)
+        0..=2 => return format!("001:00007:{v}:{}{u}", "x".repeat(rng.range(5000, 60000) as usize)).into_bytes(),
+        3..=20 => "p".repeat(rng.range(100, 2500) as usize),
+        21..=120 => "-padding".repeat(rng.range(1, 4) as usize),
+        _ => String::new(),
+    };
+    format!("{g:03}:{u:05}:{v}:{pad}").into_bytes()
+}
+
+/// A batch of updates for one tree that keeps every weight non-negative.
+fn gen_batch(rng: &mut Rng, m: &TreeModel) -> Vec<(Vec<u8>, i64)> {
+    let n = match rng.below(100) {
+        0 => rng.range(1000, 3000),
+        1..=5 => rng.range(100, 400),
+        _ => rng.range(1, 20),
+    } as usize;
+    let mut cur: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    let mut ups: Vec<(Vec<u8>, i64)> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let k = if !m.keys.is_empty() && rng.chance(40) {
+            m.random_key(rng).unwrap().clone()
+        } else if !ups.is_empty() && rng.chance(5) {
+            // the same key twice in one batch
+            ups[rng.index(ups.len())].0.clone()
+        } else {
+            gen_key(rng, m)
+        };
+        let total = *cur.entry(k.clone()).or_insert_with(|| m.weight(&k, ReadAt::Latest));
+        let w = if total > 0 && rng.chance(50) { -rng.range(1, total) } else { rng.range(1, 3) };
+        *cur.get_mut(&k).unwrap() += w;
+        ups.push((k, w));
+    }
+    ups
+}
+
+// ---------------------------------------------------------------------------
+// the harness
+
+struct Harness {
+    rng: Rng,
+    _tmp: TempDir,
+    dir: PathBuf,
+    opts: EnvOptions,
+    env: Option<Env>,
+    model: Model,
+    gsn: Gsn,
+    retention: u64,
+    /// Highest frontier set so far: reads at or after it are exact.
+    frontier: Gsn,
+    ckpt: Ckpt,
+    /// Operations since the last checkpoint (the "input log").
+    since: Vec<Op>,
+    checkpoints: u64,
+    events: BTreeMap<&'static str, u64>,
+}
+
+impl Harness {
+    fn new(seed: u64) -> Harness {
+        let mut rng = Rng::new(seed);
+        let tmp = TempDir::new(&format!("storage-model-{seed}"));
+        let dir = tmp.path().join("store");
+        let opts = EnvOptions {
+            cache_bytes: *rng.pick(&[2 << 10, 8 << 10, 32 << 10, 256 << 10, 64 << 20]),
+            leaf_bytes: *rng.pick(&[128, 512, 2048, 16 << 10]),
+            internal_bytes: *rng.pick(&[128, 512, 4096, 16 << 10]),
+            segment_bytes: *rng.pick(&[2 << 10, 8 << 10, 64 << 10, 1 << 20]),
+        };
+        let retention = *rng.pick(&[0, 1, 3, 10, 50]);
+        let (env, rec) = Env::open(&dir, opts.clone()).unwrap();
+        assert!(rec.is_none());
+        let ckpt = Ckpt { durable: false, gsn: 0, app: vec![], model: Model::new(), frontier: 0 };
+        Harness {
+            rng,
+            _tmp: tmp,
+            dir,
+            opts,
+            env: Some(env),
+            model: Model::new(),
+            gsn: 0,
+            retention,
+            frontier: 0,
+            ckpt,
+            since: vec![],
+            checkpoints: 0,
+            events: BTreeMap::new(),
+        }
+    }
+
+    fn env(&mut self) -> &mut Env {
+        self.env.as_mut().unwrap()
+    }
+
+    fn event(&mut self, name: &'static str) {
+        *self.events.entry(name).or_default() += 1;
+    }
+
+    fn op(&mut self, op: Op) {
+        apply_op(self.env.as_mut().unwrap(), &mut self.model, &mut self.frontier, &op);
+        self.since.push(op);
+    }
+
+    fn create_tree(&mut self) {
+        let id = self.env().next_tree_id();
+        let kind = *self.rng.pick(&KINDS);
+        let universe = *self.rng.pick(&[30, 200, 3000]);
+        self.op(Op::Create { id, kind, universe });
+    }
+
+    fn step(&mut self) {
+        if self.model.is_empty() {
+            self.create_tree();
+        }
+        self.gsn += if self.rng.chance(10) { self.rng.range(2, 5) as u64 } else { 1 };
+        let ids: Vec<TreeId> = self.model.keys().copied().collect();
+        let n = 1 + self.rng.index(ids.len().min(3));
+        for _ in 0..n {
+            let id = *self.rng.pick(&ids);
+            let ups = gen_batch(&mut self.rng, &self.model[&id]);
+            self.op(Op::Apply { tree: id, ups, gsn: self.gsn });
+        }
+        let f = self.gsn.saturating_sub(self.retention);
+        if f > self.frontier {
+            self.op(Op::Frontier(f));
+        }
+    }
+
+    fn checkpoint(&mut self) {
+        if self.rng.chance(30) {
+            let budget = self.rng.range(1, 300) as usize;
+            self.env().gc(budget).unwrap();
+        }
+        self.checkpoint_now();
+    }
+
+    fn checkpoint_now(&mut self) {
+        self.checkpoints += 1;
+        let (gsn, app) = (self.gsn, format!("checkpoint {} at {}", self.checkpoints, self.gsn).into_bytes());
+        self.env().checkpoint(gsn, &app).unwrap();
+        self.ckpt = Ckpt { durable: true, gsn, app, model: self.model.clone(), frontier: self.frontier };
+        self.since.clear();
+        check_segment_files(self.env.as_ref().unwrap(), true);
+    }
+
+    /// One GC round with an unlimited budget must evacuate the oldest sparse
+    /// segment completely (rounds need not converge: with segments not much
+    /// larger than nodes, moving a leaf rewrites its path, which can make the
+    /// previous round's segments sparse again).
+    fn gc_round(&mut self) {
+        // flushing dirty nodes turns their previous images into garbage
+        self.checkpoint_now();
+        let env = self.env.as_ref().unwrap();
+        let active = env.segs.active_id();
+        let victim = env.seg_live.iter().find(|(id, (total, live))| **id != active && *total > 0 && live * 2 < *total).map(|(id, _)| *id);
+        let n = self.env().gc(usize::MAX).unwrap();
+        self.checkpoint_now();
+        match victim {
+            None => assert_eq!(n, 0, "GC without a sparse segment"),
+            Some(v) => {
+                assert!(n > 0, "GC found no live node in sparse segment {v}");
+                let env = self.env.as_ref().unwrap();
+                assert!(!env.seg_live.contains_key(&v), "GC did not evacuate segment {v}: {:?}", env.seg_live.get(&v));
+            }
+        }
+    }
+
+    fn verify(&mut self) {
+        let (frontier, now) = (self.frontier, self.gsn);
+        verify_all(self.env.as_mut().unwrap(), &mut self.rng, &self.model, frontier, now);
+    }
+
+    fn reopen(&mut self) {
+        self.checkpoint();
+        self.env = None;
+        let ckpt = self.ckpt.clone();
+        self.recover(ckpt);
+    }
+
+    /// Reopen after a simulated crash (the environment is already dropped and
+    /// the files are as the crash left them), expecting `expect` to be the
+    /// recovered checkpoint, then replay the operations since it.
+    fn recover(&mut self, expect: Ckpt) {
+        let (env, rec) = Env::open(&self.dir, self.opts.clone()).unwrap();
+        self.env = Some(env);
+        match rec {
+            None => assert!(!expect.durable, "checkpoint at gsn {} lost", expect.gsn),
+            Some(r) => {
+                assert!(expect.durable, "recovered a checkpoint at gsn {} that never completed", r.gsn);
+                assert_eq!((r.gsn, &r.app), (expect.gsn, &expect.app), "recovered checkpoint");
+            }
+        }
+        let env = self.env.as_mut().unwrap();
+        assert_eq!(env.unattached_trees(), expect.model.keys().copied().collect::<Vec<_>>(), "recovered trees");
+        for (id, m) in &expect.model {
+            env.attach_tree(*id, summarizer(m.kind)).unwrap();
+        }
+        env.set_frontier(expect.frontier);
+        check_segment_files(env, false);
+        verify_all(env, &mut self.rng, &expect.model, expect.frontier, expect.gsn);
+        // replay the log since the checkpoint
+        let mut model = expect.model.clone();
+        let mut frontier = expect.frontier;
+        for op in &self.since {
+            apply_op(env, &mut model, &mut frontier, op);
+        }
+        assert!(model == self.model, "replay diverged from the state before the crash");
+        assert_eq!(frontier, self.frontier);
+        self.ckpt = expect;
+        self.verify();
+    }
+
+    fn crash(&mut self) {
+        let variant = self.rng.below(6);
+        if variant >= 4 && self.ckpt.durable {
+            return self.crash_in_checkpoint(variant == 5);
+        }
+        let env = self.env.take().unwrap();
+        let active = segment::segment_path(&self.dir, env.segs.active_id());
+        let next = segment::segment_path(&self.dir, env.segs.active_id() + 1);
+        drop(env);
+        let garbage: Vec<u8> = (0..self.rng.range(1, 300)).map(|_| self.rng.next() as u8).collect();
+        let append = |path: &Path, bytes: &[u8]| {
+            let mut data = std::fs::read(path).unwrap_or_default();
+            data.extend_from_slice(bytes);
+            std::fs::write(path, data).unwrap();
+        };
+        match variant {
+            1 => {
+                self.event("crash: torn manifest");
+                let tail = match self.rng.below(3) {
+                    0 => garbage,
+                    // a frame header promising more bytes than follow
+                    1 => [&(garbage.len() as u32 + 10).to_le_bytes()[..], &[0; 4], &garbage].concat(),
+                    // a complete frame with a bad checksum
+                    _ => [&(garbage.len() as u32).to_le_bytes()[..], &[1, 2, 3, 4], &garbage].concat(),
+                };
+                append(&self.dir.join("MANIFEST"), &tail);
+            }
+            2 => {
+                self.event("crash: segment garbage");
+                append(&active, &garbage);
+            }
+            3 => {
+                self.event("crash: stray segment");
+                append(&next, &garbage);
+            }
+            _ => self.event("crash"),
+        }
+        let ckpt = self.ckpt.clone();
+        self.recover(ckpt);
+    }
+
+    /// Crash during a checkpoint: before its manifest record is complete
+    /// (the previous checkpoint must be recovered), or after the record but
+    /// before freed segments are deleted (the new one must be recovered).
+    fn crash_in_checkpoint(&mut self, record_written: bool) {
+        let files = |dir: &Path| -> BTreeMap<String, Vec<u8>> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap())
+                })
+                .collect()
+        };
+        let before = files(&self.dir);
+        let old_active = format!("seg-{:08}.dat", self.env().segs.active_id());
+        self.checkpoints += 1;
+        let (gsn, app) = (self.gsn, format!("checkpoint {} at {}", self.checkpoints, self.gsn).into_bytes());
+        self.env().checkpoint(gsn, &app).unwrap();
+        let after = files(&self.dir);
+        self.env = None;
+        let mut image: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for (name, data) in &after {
+            if name.starts_with("seg-") {
+                if let Some(old) = before.get(name) {
+                    assert!(data.starts_with(old), "segment {name} changed other than by appending");
+                }
+                image.insert(name.clone(), data.clone());
+            }
+        }
+        for (name, data) in &before {
+            if name.starts_with("seg-") {
+                // freed by the checkpoint, but the crash came first
+                image.entry(name.clone()).or_insert_with(|| data.clone());
+            }
+        }
+        let old_manifest = before.get("MANIFEST").cloned().unwrap_or_default();
+        let new_manifest = after["MANIFEST"].clone();
+        if record_written {
+            self.event("crash: after checkpoint record");
+            image.insert("MANIFEST".into(), new_manifest);
+            self.ckpt = Ckpt { durable: true, gsn, app, model: self.model.clone(), frontier: self.frontier };
+            self.since.clear();
+        } else {
+            self.event("crash: inside checkpoint");
+            // the new nodes may be partly written...
+            for (name, data) in image.iter_mut() {
+                let old_len = before.get(name).map(|d| d.len()).unwrap_or(0);
+                if (name == &old_active || !before.contains_key(name)) && data.len() > old_len && self.rng.chance(50) {
+                    data.truncate(old_len + self.rng.index(data.len() - old_len));
+                }
+            }
+            // ...and so may the manifest record
+            let mut m = old_manifest.clone();
+            if new_manifest.len() > m.len() && new_manifest.starts_with(&m) && self.rng.chance(60) {
+                let extra = &new_manifest[m.len()..];
+                m.extend_from_slice(&extra[..self.rng.index(extra.len())]);
+            }
+            image.insert("MANIFEST".into(), m);
+        }
+        for name in after.keys() {
+            std::fs::remove_file(self.dir.join(name)).unwrap();
+        }
+        for (name, data) in &image {
+            std::fs::write(self.dir.join(name), data).unwrap();
+        }
+        let ckpt = self.ckpt.clone();
+        self.recover(ckpt);
+    }
+
+    /// Drop every tree: all space must be reclaimed.
+    fn finish(&mut self) {
+        for _ in 0..3 {
+            self.gc_round();
+        }
+        for id in self.model.keys().copied().collect::<Vec<_>>() {
+            self.op(Op::Drop(id));
+        }
+        self.checkpoint();
+        let env = self.env.as_ref().unwrap();
+        let active = env.segs.active_id();
+        assert_eq!(env.stats().segments.iter().map(|s| s.2).sum::<u64>(), 0, "live bytes after dropping every tree");
+        assert!(env.seg_live.keys().all(|s| *s == active), "segments left after dropping every tree: {:?}", env.seg_live);
+        self.verify();
+    }
+}
+
+fn run(seed: u64, steps: usize) {
+    let mut h = Harness::new(seed);
+    for _ in 0..steps {
+        match h.rng.below(1000) {
+            0..=629 => h.step(),
+            630..=669 => h.create_tree(),
+            670..=684 => {
+                if h.model.len() > 1 {
+                    let id = *h.rng.pick(&h.model.keys().copied().collect::<Vec<_>>());
+                    h.op(Op::Drop(id));
+                }
+            }
+            685..=774 => {
+                h.event("checkpoint");
+                h.checkpoint()
+            }
+            775..=799 => {
+                let budget = h.rng.range(1, 500) as usize;
+                h.env().gc(budget).unwrap();
+            }
+            800..=809 => h.gc_round(),
+            810..=829 => {
+                h.event("reopen");
+                h.reopen()
+            }
+            830..=874 => h.crash(),
+            875..=919 => h.verify(),
+            _ => h.step(),
+        }
+        let (frontier, now) = (h.frontier, h.gsn);
+        verify_points(h.env.as_mut().unwrap(), &mut h.rng, &h.model, frontier, now);
+    }
+    h.verify();
+    h.finish();
+    eprintln!("seed {seed}: gsn {} opts {:?} retention {} {:?}", h.gsn, h.opts, h.retention, h.events);
+}
+
+#[test]
+fn random_ops_against_model() {
+    run_seeds("random_ops_against_model", &seeds(&[1, 2, 3, 4], false), |seed| run(seed, 250));
+}
+
+#[test]
+#[ignore = "long-running; see the module docs"]
+fn random_ops_against_model_long() {
+    run_seeds("random_ops_against_model_long", &seeds(&[], true), |seed| run(seed, 3000));
+}
+
+/// Retracted entries disappear once the frontier passes the retraction (and
+/// not before: until then they are needed for time travel).
+#[test]
+fn retracted_entries_are_consolidated_behind_the_frontier() {
+    let tmp = TempDir::new("storage-history");
+    let (mut env, _) = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    env.apply(t, &mut vec![(b"a".to_vec(), 1)], 1).unwrap();
+    env.apply(t, &mut vec![(b"a".to_vec(), -1), (b"b".to_vec(), 1)], 2).unwrap();
+    let a = env.get(t, b"a").unwrap().unwrap();
+    assert_eq!(a.weight(ReadAt::AsOf(1)), 1);
+    assert_eq!(a.weight(ReadAt::Before(2)), 1);
+    assert_eq!(a.weight(ReadAt::Latest), 0);
+    env.set_frontier(2);
+    env.apply(t, &mut vec![(b"c".to_vec(), 1)], 3).unwrap();
+    assert!(env.get(t, b"a").unwrap().is_none());
 }
