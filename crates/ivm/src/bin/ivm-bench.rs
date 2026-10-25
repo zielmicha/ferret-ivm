@@ -35,7 +35,10 @@
 //! ./target/release/ivm-bench --skip reads,subscribe --json out.json
 //! ```
 //!
-//! Every measurement is also printed as a `RESULT {...}` JSON line.
+//! Every measurement is also printed as a `RESULT {...}` JSON line, and its
+//! time window (nanoseconds since the start of the process) as a `WINDOW`
+//! line, to select it in a profile, e.g. under `gprofng collect app`:
+//! `gprofng display text -filters 'TSTAMP>=START && TSTAMP<=END' -functions x.er`.
 
 use ivm::coord::{self, Config};
 use ivm::server::{self, ServerConfig};
@@ -211,7 +214,16 @@ fn reset_peak_rss() {
     let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
 
+/// When the process started, the origin of the measurement windows printed
+/// for profilers (gprofng's timestamps count from about the same moment).
+static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn since_origin(t: Instant) -> f64 {
+    t.saturating_duration_since(*ORIGIN.get_or_init(Instant::now)).as_secs_f64()
+}
+
 struct Meter {
+    name: String,
     t0: Instant,
     cpu0: HashMap<u32, (String, u64, u64)>,
     proc0: f64,
@@ -230,9 +242,9 @@ struct Measure {
 }
 
 impl Meter {
-    fn start() -> Meter {
+    fn start(name: &str) -> Meter {
         reset_peak_rss();
-        Meter { t0: Instant::now(), cpu0: thread_cpu(), proc0: process_cpu_s(), up0: upstream_cpu_s() }
+        Meter { name: name.to_string(), t0: Instant::now(), cpu0: thread_cpu(), proc0: process_cpu_s(), up0: upstream_cpu_s() }
     }
 
     fn stop(&self) -> Measure {
@@ -241,6 +253,8 @@ impl Meter {
 
     /// Wall time up to `end`; CPU up to now.
     fn stop_at(&self, end: Instant) -> Measure {
+        // the window for profilers, e.g. gprofng display text -filters 'TSTAMP>=a && TSTAMP<=b'
+        println!("WINDOW {} {:.0} {:.0}", self.name, since_origin(self.t0) * 1e9, since_origin(end) * 1e9);
         let now = thread_cpu();
         let mut cpu: BTreeMap<&'static str, f64> = BTreeMap::new();
         let mut engine_wait = 0.0;
@@ -422,6 +436,28 @@ fn generate_data(c: &mut Client, accounts: u64, txns: u64) {
     eprintln!("generated upstream data ({accounts} accounts, {txns} txns) in {:.1?}", t0.elapsed());
 }
 
+/// Drop run databases (and their replication slots) left behind by runs
+/// whose process is gone, e.g. after a crash.
+fn cleanup_stale_runs(c: &mut Client) {
+    let dbs = c.query("SELECT datname FROM pg_database WHERE datname LIKE 'ivmbench_run_%'").unwrap();
+    for row in dbs.rows {
+        let Some(db) = row[0].clone() else { continue };
+        let pid: u32 = db.trim_start_matches("ivmbench_run_").parse().unwrap_or(0);
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|n| n.trim() == "ivm-bench");
+        if alive {
+            continue;
+        }
+        let slots = c.query(&format!("SELECT slot_name FROM pg_replication_slots WHERE database = '{db}' AND NOT active")).unwrap();
+        for s in slots.rows {
+            let _ = c.execute(&format!("SELECT pg_drop_replication_slot('{}')", s[0].clone().unwrap_or_default()));
+        }
+        match c.execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)")) {
+            Ok(_) => eprintln!("dropped stale run database {db}"),
+            Err(e) => eprintln!("could not drop stale run database {db}: {e}"),
+        }
+    }
+}
+
 /// Remember the upstream postmaster (for its CPU time), if it is local.
 fn set_upstream_pid(data_dir: &Path) {
     let pid = std::fs::read_to_string(data_dir.join("postmaster.pid"))
@@ -481,6 +517,7 @@ fn setup_upstream(o: &Opts) -> Upstream {
                 }
                 c.execute(&format!("ALTER DATABASE {tmp} RENAME TO {template}")).unwrap();
             }
+            cleanup_stale_runs(&mut c);
             let run_db = format!("ivmbench_run_{}", std::process::id());
             let t0 = Instant::now();
             c.execute(&format!("CREATE DATABASE {run_db} TEMPLATE {template}")).expect("copy template database");
@@ -699,7 +736,7 @@ fn latency_stats(mut v: Vec<f64>) -> (f64, f64, f64) {
 
 /// Run `n` queries produced by `q(i)`; report latency and CPU.
 fn read_bench(rep: &mut Report, c: &mut Client, phase: &str, n: u64, q: &dyn Fn(u64) -> String) -> u64 {
-    let m = Meter::start();
+    let m = Meter::start(phase);
     let mut lat = Vec::with_capacity(n as usize);
     let mut rows = 0u64;
     for i in 0..n {
@@ -728,6 +765,7 @@ fn read_bench(rep: &mut Report, c: &mut Client, phase: &str, n: u64, q: &dyn Fn(
 
 fn main() {
     let o = parse_opts();
+    ORIGIN.get_or_init(Instant::now);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let mut rep = Report::default();
     let up = setup_upstream(&o);
@@ -756,8 +794,10 @@ fn main() {
     let mut c = eng.client();
 
     // ---- (c) initial snapshot
-    let m = Meter::start();
-    c.execute(&format!("CREATE SOURCE b FROM POSTGRES CONNECTION '{}' PUBLICATION 'bench_pub'", up.conninfo))
+    let m = Meter::start("load");
+    // a slot name of our own: slot names are per cluster
+    let slot = format!("ivmbench_{}", std::process::id());
+    c.execute(&format!("CREATE SOURCE b FROM POSTGRES CONNECTION '{}' PUBLICATION 'bench_pub' SLOT '{slot}'", up.conninfo))
         .expect("create source");
     c.query("SELECT id FROM accounts WHERE id = 1").expect("accounts loaded");
     c.query("SELECT id FROM txns WHERE id = 1").expect("txns loaded");
@@ -767,7 +807,7 @@ fn main() {
 
     // ---- (e) checkpoint of the loaded tables
     let checkpoint = |rep: &mut Report, c: &mut Client, phase: &str| {
-        let m = Meter::start();
+        let m = Meter::start(phase);
         c.execute("CHECKPOINT").expect("checkpoint");
         let meas = m.stop();
         let store = dir_bytes(&data.join("store")) as f64 / 1e6;
@@ -778,7 +818,7 @@ fn main() {
 
     // ---- (c) hydration of new views over existing data
     for (name, sql) in [("hydrate_by_region", BY_REGION), ("hydrate_acct_totals", ACCT_TOTALS)] {
-        let m = Meter::start();
+        let m = Meter::start(name);
         c.execute(sql).expect("create view");
         rep.record(name, &m.stop(), &[]);
     }
@@ -788,8 +828,37 @@ fn main() {
     let mut next_id = o.txns + 1;
     let mut del_from = o.txns;
 
-    // ---- (a) small transactions: generated while the engine is down, then caught up
+    // ---- (a) small transactions, first live (warm cache, right after a
+    // checkpoint), then generated while the engine is down and caught up
+    // after a restart (cold cache)
     if !o.skip.iter().any(|s| s == "small") {
+        let (batches, nid) = small_txns(&mut rng, o.small, o.accounts, o.txns, next_id, &mut del_from);
+        next_id = nid;
+        let m = Meter::start("small_live");
+        let mon = Monitor::start(eng.shared());
+        let t = Instant::now();
+        for b in &batches {
+            upc.simple_query(b).expect("small txn batch");
+        }
+        let up_done = Instant::now();
+        let lsn = up.current_lsn(&mut upc);
+        wait_lsn(&mut c, &lsn);
+        let (_, last) = mon.finish();
+        let meas = m.stop_at(last);
+        let n = o.small as f64;
+        rep.record(
+            "small_live",
+            &meas,
+            &[
+                ("txns", n),
+                ("txns_per_s", n / meas.wall),
+                ("upstream_s", (up_done - t).as_secs_f64()),
+                ("engine_us_per_txn", meas.cpu["engine"] * 1e6 / n),
+                ("source_us_per_txn", meas.cpu.get("source").copied().unwrap_or(0.0) * 1e6 / n),
+                ("seq_us_per_txn", meas.cpu.get("sequencer").copied().unwrap_or(0.0) * 1e6 / n),
+            ],
+        );
+
         let t = Instant::now();
         eng.shutdown();
         rep.note("shutdown", &[("wall_s", t.elapsed().as_secs_f64())]);
@@ -805,7 +874,7 @@ fn main() {
         let t = Instant::now();
         eng = Engine::start(cfg.clone());
         rep.note("recovery_start", &[("wall_s", t.elapsed().as_secs_f64())]);
-        let m = Meter::start();
+        let m = Meter::start("small_catchup");
         let mon = Monitor::start(eng.shared());
         c = eng.client();
         wait_lsn(&mut c, &lsn);
@@ -844,7 +913,7 @@ fn main() {
             ("large_update", format!("UPDATE txns SET amount = amount + 0.01 WHERE id BETWEEN 1 AND {}", o.large)),
         ];
         for (phase, sql) in stmts {
-            let m = Meter::start();
+            let m = Meter::start(phase);
             let mon = Monitor::start(eng.shared());
             let t = Instant::now();
             let n = upc.execute(&sql).expect("large transaction");
@@ -905,7 +974,7 @@ fn main() {
         let last_row = Arc::new(Mutex::new(Instant::now()));
         let stop = Arc::new(AtomicBool::new(false));
         let (sd, dr, lr, st) = (snap_done.clone(), data_rows.clone(), last_row.clone(), stop.clone());
-        let m = Meter::start();
+        let m = Meter::start("subscribe_snapshot");
         let t0 = Instant::now();
         let sub = std::thread::spawn(move || {
             let mut rc = RawConn::connect(port);
@@ -941,7 +1010,7 @@ fn main() {
         }
         let snap_meas = m.stop();
         // live: single-row inserts, each changes one acct_totals row (-old, +new)
-        let m = Meter::start();
+        let m = Meter::start("subscribe_live");
         let n = o.sub_txns;
         let mut batches = Vec::new();
         let mut cur = String::new();
@@ -997,7 +1066,7 @@ fn main() {
         let t = Instant::now();
         eng.shutdown();
         rep.note("recovery_shutdown", &[("wall_s", t.elapsed().as_secs_f64())]);
-        let m = Meter::start();
+        let m = Meter::start("recovery");
         eng = Engine::start(cfg.clone());
         let started = m.stop();
         c = eng.client();
