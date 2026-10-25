@@ -99,7 +99,7 @@ pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache
     }
     if let Some(a) = g.any_arrangement(id) {
         let data = g.scan_arr(env, a, ReadAt::Latest)?;
-        return Ok(Arc::new(Output { data, errs: vec![] }));
+        return Ok(Arc::new(Output { data, errs: g.errors_of(id) }));
     }
     let node = g.node(id);
     let mut out = Output::default();
@@ -195,11 +195,11 @@ pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache
     Ok(out)
 }
 
-/// Errors present in a node's snapshot (only nodes without arrangements
-/// recompute; arranged nodes have no stored errors).
+/// Errors present in a node's snapshot (arranged nodes keep theirs in the
+/// graph; the others recompute).
 fn snapshot_errs(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache) -> Result<ErrDelta> {
     if g.any_arrangement(id).is_some() {
-        return Ok(vec![]);
+        return Ok(g.errors_of(id));
     }
     Ok(snapshot_node(g, env, id, cache)?.errs.clone())
 }

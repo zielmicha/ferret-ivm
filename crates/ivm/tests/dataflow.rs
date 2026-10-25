@@ -243,3 +243,53 @@ fn general_semijoins_keep_representations_apart() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn read_error(h: &EngineHandle, sql: &str) -> Option<String> {
+    rows_of(h, sql).err()
+}
+
+/// A view created over existing dataflow (an identical view, or a query
+/// sharing an arranged node of another view) sees the error records already
+/// in it, also after a restart; their retraction then clears the view
+/// instead of driving its error count negative (which hid later errors).
+#[test]
+fn errors_of_shared_nodes() {
+    let dir = tmpdir("shared-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, x int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1), (2, 0)");
+    exec(&h, "CREATE MATERIALIZED VIEW v1 AS SELECT id, 10 / x AS q FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW v2 AS SELECT id, 10 / x AS q FROM t"); // the same root node
+    exec(&h, "CREATE MATERIALIZED VIEW v3 AS SELECT count(q) AS n FROM v1"); // reads v1's arranged node
+    let div0 = Some("22012 division by zero".to_string());
+    for v in ["v1", "v2", "v3"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), div0, "{v}");
+    }
+    exec(&h, "DELETE FROM t WHERE id = 2");
+    assert_eq!(rows(&h, "SELECT * FROM v2"), ["1|10"]);
+    assert_eq!(rows(&h, "SELECT * FROM v3"), ["1"]);
+    exec(&h, "INSERT INTO t VALUES (3, 0)");
+    for v in ["v1", "v2", "v3"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), div0, "{v}");
+    }
+    // after a restart, new views over the recovered nodes see their errors
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE MATERIALIZED VIEW v4 AS SELECT id, 10 / x AS q FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW v5 AS SELECT sum(q) AS s FROM v1");
+    for v in ["v1", "v2", "v3", "v4", "v5"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), div0, "{v}");
+    }
+    exec(&h, "UPDATE t SET x = 5 WHERE id = 3");
+    assert_eq!(rows(&h, "SELECT * FROM v4 ORDER BY id"), ["1|10", "3|2"]);
+    assert_eq!(rows(&h, "SELECT * FROM v5"), ["12"]);
+    assert_eq!(rows(&h, "SELECT * FROM v3"), ["2"]);
+    exec(&h, "INSERT INTO t VALUES (4, 0)");
+    for v in ["v1", "v2", "v3", "v4", "v5"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), div0, "{v}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -149,6 +149,18 @@ pub struct Graph {
     pub now: i64,
     /// `now` as of the previous step (temporal filters run when it moves).
     stepped_now: i64,
+    /// Error records currently in each node's contents (its accumulated
+    /// output errors). Authoritative for nodes with a hydrated arrangement:
+    /// their snapshots read the arrangement, which holds rows only.
+    node_errors: FxHashMap<NodeId, BTreeMap<(String, String), i64>>,
+}
+
+/// Error state that must survive restarts, by node fingerprint: the error
+/// records in the contents of arranged nodes (views created later over
+/// them must see them).
+#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ErrorState {
+    pub nodes: Vec<(Vec<u8>, Vec<((String, String), i64)>)>,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -471,6 +483,7 @@ impl Graph {
         }
         let node = self.nodes[id].take().unwrap();
         self.node_by_fp.remove(&node.fp);
+        self.node_errors.remove(&id);
         self.topo_dirty = true;
         // arrangements used by this operator
         for a in operator_arrangements(&node.kind) {
@@ -534,6 +547,56 @@ impl Graph {
         self.node(node).arrangements.iter().copied().find(|a| self.arr(*a).hydrated)
     }
 
+    /// Error records in a node's contents (exact for arranged nodes).
+    pub fn errors_of(&self, node: NodeId) -> ErrDelta {
+        self.node_errors.get(&node).map(|m| m.iter().map(|(e, w)| (e.clone(), *w)).collect()).unwrap_or_default()
+    }
+
+    fn add_errors(&mut self, node: NodeId, errs: &ErrDelta) {
+        if errs.is_empty() {
+            return;
+        }
+        let m = self.node_errors.entry(node).or_default();
+        for (e, w) in errs {
+            let v = m.entry(e.clone()).or_default();
+            *v += w;
+            if *v == 0 {
+                m.remove(e);
+            }
+        }
+        if m.is_empty() {
+            self.node_errors.remove(&node);
+        }
+    }
+
+    fn set_errors(&mut self, node: NodeId, errs: &ErrDelta) {
+        self.node_errors.remove(&node);
+        self.add_errors(node, errs);
+    }
+
+    /// Error state for a checkpoint.
+    pub fn error_state(&self) -> ErrorState {
+        let mut st = ErrorState::default();
+        for n in self.live_nodes() {
+            if let Some(m) = self.node_errors.get(&n.id)
+                && self.any_arrangement(n.id).is_some()
+            {
+                st.nodes.push((n.fp.clone(), m.iter().map(|(e, w)| (e.clone(), *w)).collect()));
+            }
+        }
+        st
+    }
+
+    /// Restore checkpointed error state into a graph rebuilt for recovery
+    /// (before hydrating whatever could not be recovered).
+    pub fn restore_error_state(&mut self, st: ErrorState) {
+        for (fp, errs) in st.nodes {
+            if let Some(&id) = self.node_by_fp.get(&fp) {
+                self.set_errors(id, &errs);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ ticks
 
     /// Process one GSN. `changes` holds base table changes keyed by table node.
@@ -570,6 +633,7 @@ impl Graph {
             if out.is_empty() {
                 continue;
             }
+            self.add_errors(id, &out.errs);
             self.apply_to_arrangements(env, id, &out.data, gsn)?;
             let st = self.stats.entry(id).or_default();
             st.ticks += 1;
@@ -653,14 +717,17 @@ impl Graph {
                     }
                     self.arrs[a].as_mut().unwrap().hydrated = true;
                 }
+                // the arrangement holds the rows; the errors are kept here
+                self.set_errors(id, &snap.errs);
                 if !snap.errs.is_empty() {
                     errors.insert(id, snap.errs.clone());
                 }
-            } else if needs_node
-                && let Some(s) = cache.get(&id)
-                && !s.errs.is_empty()
-            {
-                errors.insert(id, s.errs.clone());
+            } else if needs_node && let Some(s) = cache.get(&id) {
+                let errs = s.errs.clone();
+                self.set_errors(id, &errs);
+                if !errs.is_empty() {
+                    errors.insert(id, errs);
+                }
             }
             self.node_mut(id).hydrated = true;
             // drop snapshots nobody further down will read (including those
