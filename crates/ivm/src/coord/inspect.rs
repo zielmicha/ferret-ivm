@@ -1106,7 +1106,12 @@ impl Engine {
             refs: node.refs,
             hydrated: node.hydrated,
             arrangements: owned.to_vec(),
-            reads: operator_arrangements(&node.kind),
+            reads: {
+                let mut r = operator_arrangements(&node.kind);
+                r.sort_unstable();
+                r.dedup();
+                r
+            },
             records: owned.iter().filter_map(|a| self.live_arr(*a)).map(|a| self.env.tree_count(a.tree)).sum(),
             users,
             counters: self.graph.counters.get(&node.id).copied().unwrap_or_default(),
@@ -1122,7 +1127,10 @@ impl Engine {
         let mut readers: FxHashMap<ArrId, Vec<NodeId>> = FxHashMap::default();
         for n in self.graph.live_nodes() {
             for a in operator_arrangements(&n.kind) {
-                readers.entry(a).or_default().push(n.id);
+                let r = readers.entry(a).or_default();
+                if r.last() != Some(&n.id) {
+                    r.push(n.id);
+                }
             }
         }
         (owned, readers)
