@@ -76,9 +76,23 @@ fn group_range(prefix: &[u8]) -> (Bound<&[u8]>, Option<Vec<u8>>) {
 
 type GroupResult = std::result::Result<Option<Row>, SqlError>;
 
+/// A group's summary and key values, as kept in the group cache.
+type GroupState = (Summary, Vec<Datum>);
+
 /// Compute the output row of one group (None if the group is empty), with
 /// the group's summary and key values for the cache.
-fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Result<(GroupResult, Option<(Summary, Vec<Datum>)>)> {
+///
+/// `exact_kv`, when given, are the group's key values exactly as in its
+/// first live entry (already read, or the key types have no
+/// representations beyond the canonical key encoding), so that entry need
+/// not be read again.
+fn compute_group(
+    g: &Graph,
+    env: &mut Env,
+    p: &ReducePlan,
+    prefix: &[u8],
+    exact_kv: Option<&[Datum]>,
+) -> Result<(GroupResult, Option<GroupState>)> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
     let tree = a.tree;
@@ -94,15 +108,19 @@ fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Res
     }
     // group key values from the first live entry (exact representation)
     let mut kv: Vec<Datum> = Vec::with_capacity(ng);
-    if ng > 0 {
-        let mut c = env.cursor(tree, lo, hib);
+    if let Some(exact) = exact_kv
+        && summary.count > 0
+    {
+        kv.extend_from_slice(exact);
+    } else if ng > 0 {
         let mut first = None;
-        while let Some((k, h)) = env.cursor_next(&mut c)? {
+        env.for_each(tree, lo, hib, &mut |k, h| {
             if h.total() > 0 {
-                first = Some(layout.decode_row(&k)?);
-                break;
+                first = Some(layout.decode_row(k)?);
+                return Ok(false);
             }
-        }
+            Ok(true)
+        })?;
         let Some(first) = first else { return Ok((Ok(None), None)) };
         for c in &p.group_key {
             kv.push(first[*c].clone());
@@ -112,13 +130,13 @@ fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Res
     let mut scanned: Option<Vec<(Row, i64)>> = None;
     if p.ordered() {
         let mut rows = Vec::new();
-        let mut c = env.cursor(tree, lo, hib);
-        while let Some((k, h)) = env.cursor_next(&mut c)? {
+        env.for_each(tree, lo, hib, &mut |k, h| {
             let w = h.total();
             if w > 0 {
-                rows.push((layout.decode_row(&k)?, w));
+                rows.push((layout.decode_row(k)?, w));
             }
-        }
+            Ok(true)
+        })?;
         scanned = Some(rows);
     }
     let mut row: Row = kv.clone();
@@ -238,7 +256,8 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mu
         let prefix = layout.encode_prefix(&kv);
         groups.entry(prefix).or_insert_with(|| (kv, Vec::new())).1.push((row, *w));
     }
-    let cacheable = !p.ordered() && std::env::var("IVM_NO_GROUP_CACHE").is_err();
+    static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cacheable = !p.ordered() && !*NO_CACHE.get_or_init(|| std::env::var("IVM_NO_GROUP_CACHE").is_ok());
     let fidelity_key = layout.key_types[..ng].iter().any(crate::types::encoding::has_fidelity);
     let mut errors = p.errors.lock();
     let mut cache = p.cache.0.lock();
@@ -273,7 +292,7 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mu
         let result = match result {
             Some(r) => r,
             None => {
-                let (r, state) = compute_group(g, env, p, &prefix)?;
+                let (r, state) = compute_group(g, env, p, &prefix, (!fidelity_key).then_some(&kv[..]))?;
                 if cacheable && let Some(state) = state {
                     if cache.len() >= GROUP_CACHE_CAP {
                         // evict about half (hash order is effectively random)
@@ -332,7 +351,7 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
     let mut errors = p.errors.lock();
     errors.clear();
     if ng == 0 {
-        match compute_group(g, env, p, &[])?.0 {
+        match compute_group(g, env, p, &[], None)?.0 {
             Ok(Some(r)) => out.data.push((r, 1)),
             Ok(None) => {}
             Err(e) => {
@@ -344,22 +363,34 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
         }
         return Ok(());
     }
-    // enumerate groups in key order
-    let mut prefixes: Vec<Vec<u8>> = Vec::new();
-    let mut c = env.cursor(tree, Bound::Unbounded, Bound::Unbounded);
-    while let Some((k, h)) = env.cursor_next(&mut c)? {
-        if h.total() <= 0 {
-            continue;
-        }
-        let row = layout.decode_row(&k)?;
-        let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
-        let prefix = layout.encode_prefix(&kv);
-        if prefixes.last() != Some(&prefix) {
-            prefixes.push(prefix);
+    // Enumerate groups in key order, seeking past each group's entries
+    // instead of visiting them. The first live entry of a group gives its
+    // key prefix and its exact key values.
+    let mut groups: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+    let mut from: Option<Vec<u8>> = None;
+    loop {
+        let lo = match &from {
+            Some(f) => Bound::Included(f.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let mut next = None;
+        env.for_each(tree, lo, Bound::Unbounded, &mut |k, h| {
+            if h.total() <= 0 {
+                return Ok(true);
+            }
+            let row = layout.decode_row(k)?;
+            next = Some((k[..layout.prefix_len(k, ng)?].to_vec(), p.group_key.iter().map(|c| row[*c].clone()).collect()));
+            Ok(false)
+        })?;
+        let Some((prefix, kv)) = next else { break };
+        from = crate::types::encoding::prefix_successor(&prefix);
+        groups.push((prefix, kv));
+        if from.is_none() {
+            break;
         }
     }
-    for prefix in prefixes {
-        match compute_group(g, env, p, &prefix)?.0 {
+    for (prefix, kv) in groups {
+        match compute_group(g, env, p, &prefix, Some(&kv))?.0 {
             Ok(Some(r)) => out.data.push((r, 1)),
             Ok(None) => {}
             Err(e) => {

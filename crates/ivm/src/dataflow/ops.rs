@@ -90,7 +90,8 @@ pub fn owned(s: Arc<Output>) -> Output {
     Arc::try_unwrap(s).unwrap_or_else(|a| (*a).clone())
 }
 
-/// Full contents of a node (latest), computed from arrangements or inputs.
+/// Contents of a node (latest), computed from arrangements or inputs, as
+/// weighted rows that need not be consolidated (see [`Graph::snapshot`]).
 /// Only snapshots of nodes with several consumers are kept in `cache`; the
 /// rest are handed to their one reader and freed as soon as it is done.
 pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache) -> Result<Arc<Output>> {
@@ -190,7 +191,18 @@ pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache
             temporal::snapshot(g, p, input, &mut out);
         }
     }
-    consolidate(&mut out.data);
+    // Row-wise operators pass multiplicities through, and the rows of a
+    // snapshot are consolidated where that is needed: arrangements
+    // consolidate entries when they are applied, Graph::snapshot its result.
+    // (Sorting millions of hydrated rows at every level was a large part of
+    // creating a view.)
+    let row_wise = matches!(
+        node.kind,
+        NodeKind::Mfp { .. } | NodeKind::Union { .. } | NodeKind::Negate | NodeKind::FlatMap { .. } | NodeKind::Join(_) | NodeKind::Temporal(_)
+    );
+    if !row_wise {
+        consolidate(&mut out.data);
+    }
     consolidate_errs(&mut out.errs);
     let out = Arc::new(out);
     if node.refs > 1 {
@@ -242,37 +254,37 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
         consolidate(&mut out.data);
         return Ok(out);
     }
-    // keyed upserts
-    let mut stored: FxHashMap<Vec<u8>, Option<Row>> = FxHashMap::default();
-    let mut current: FxHashMap<Vec<u8>, Option<Row>> = FxHashMap::default();
-    let mut order: Vec<Vec<u8>> = Vec::new();
-    let fetch = |env: &mut Env, key: &[u8], stored: &mut FxHashMap<Vec<u8>, Option<Row>>| -> Result<Option<Row>> {
-        if let Some(v) = stored.get(key) {
-            return Ok(v.clone());
+    // keyed upserts: every key touched (in first-touch order) with its
+    // stored row and its row after this tick's changes
+    let mut index: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
+    let mut touched: Vec<(Option<Row>, After)> = Vec::new();
+    let touch = |env: &mut Env, index: &mut FxHashMap<Vec<u8>, usize>, touched: &mut Vec<(Option<Row>, After)>, key: Vec<u8>| {
+        if let Some(&i) = index.get(&key) {
+            return Ok::<usize, SqlError>(i);
         }
         let mut found = None;
-        for (k, h) in env.scan_prefix(tree, key)? {
+        env.for_each_prefix(tree, &key, &mut |k, h| {
             if h.total() > 0 {
-                found = Some(layout.decode_row(&k)?);
+                found = Some(layout.decode_row(k)?);
             }
-        }
-        stored.insert(key.to_vec(), found.clone());
-        Ok(found)
+            Ok(true)
+        })?;
+        touched.push((found, After::Stored));
+        index.insert(key, touched.len() - 1);
+        Ok(touched.len() - 1)
     };
     for ch in changes {
         match ch {
             TableChange::Upsert { mut row, unchanged } => {
-                let kv: Vec<Datum> = pk.iter().map(|c| row[*c].clone()).collect();
-                let key = layout.encode_prefix(&kv);
-                let old = match current.get(&key) {
-                    Some(v) => v.clone(),
-                    None => {
-                        order.push(key.clone());
-                        fetch(env, &key, &mut stored)?
-                    }
-                };
+                let i = touch(env, &mut index, &mut touched, layout.encode_prefix_of(&row, pk))?;
                 if !unchanged.is_empty() {
-                    if let Some(o) = &old {
+                    let (stored, after) = &touched[i];
+                    let old = match after {
+                        After::Stored => stored.as_ref(),
+                        After::Row(r) => Some(r),
+                        After::Absent => None,
+                    };
+                    if let Some(o) = old {
                         for c in &unchanged {
                             row[*c] = o[*c].clone();
                         }
@@ -283,64 +295,64 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
                         }
                     }
                 }
-                current.insert(key, Some(row));
+                touched[i].1 = After::Row(row);
             }
             TableChange::Delete { key: kv } => {
-                let key = layout.encode_prefix(&kv);
-                if !current.contains_key(&key) {
-                    order.push(key.clone());
-                    fetch(env, &key, &mut stored)?;
-                }
-                current.insert(key, None);
+                let i = touch(env, &mut index, &mut touched, layout.encode_prefix(&kv))?;
+                touched[i].1 = After::Absent;
             }
             TableChange::Insert { row } => {
-                let kv: Vec<Datum> = pk.iter().map(|c| row[*c].clone()).collect();
-                let key = layout.encode_prefix(&kv);
-                if !current.contains_key(&key) {
-                    order.push(key.clone());
-                    fetch(env, &key, &mut stored)?;
-                }
-                current.insert(key, Some(row));
+                let i = touch(env, &mut index, &mut touched, layout.encode_prefix_of(&row, pk))?;
+                touched[i].1 = After::Row(row);
             }
             TableChange::Remove { row } => {
-                let kv: Vec<Datum> = pk.iter().map(|c| row[*c].clone()).collect();
-                let key = layout.encode_prefix(&kv);
-                if !current.contains_key(&key) {
-                    order.push(key.clone());
-                    fetch(env, &key, &mut stored)?;
-                }
-                current.insert(key, None);
+                let i = touch(env, &mut index, &mut touched, layout.encode_prefix_of(&row, pk))?;
+                touched[i].1 = After::Absent;
             }
             TableChange::Truncate => {
                 // every stored row and every row touched so far goes away
                 let all = g.scan_arr(env, *primary, ReadAt::Latest)?;
                 for (row, _) in all {
-                    let kv: Vec<Datum> = pk.iter().map(|c| row[*c].clone()).collect();
-                    let key = layout.encode_prefix(&kv);
-                    if !current.contains_key(&key) {
-                        order.push(key.clone());
+                    if let std::collections::hash_map::Entry::Vacant(e) = index.entry(layout.encode_prefix_of(&row, pk)) {
+                        e.insert(touched.len());
+                        touched.push((Some(row), After::Absent));
                     }
-                    stored.entry(key.clone()).or_insert(Some(row));
-                    current.insert(key, None);
                 }
-                for v in current.values_mut() {
-                    *v = None;
+                for t in touched.iter_mut() {
+                    t.1 = After::Absent;
                 }
             }
         }
     }
-    for key in order {
-        let old = stored.get(&key).cloned().flatten();
-        let new = current.get(&key).cloned().flatten();
-        if let Some(o) = &old {
-            out.data.push((o.clone(), -1));
+    // Rows of different keys differ (in their key columns), so the delta is
+    // consolidated once unchanged rows are left out.
+    for (stored, after) in touched {
+        let new = match after {
+            After::Stored => continue,
+            After::Row(r) => Some(r),
+            After::Absent => None,
+        };
+        if let (Some(o), Some(n)) = (&stored, &new)
+            && crate::types::datum::exact_row_cmp(o, n) == std::cmp::Ordering::Equal
+        {
+            continue;
+        }
+        if let Some(o) = stored {
+            out.data.push((o, -1));
         }
         if let Some(n) = new {
             out.data.push((n, 1));
         }
     }
-    consolidate(&mut out.data);
     Ok(out)
+}
+
+/// A base table row after the changes of one tick.
+enum After {
+    /// As stored (not changed).
+    Stored,
+    Row(Row),
+    Absent,
 }
 
 // ---------------------------------------------------------------- distinct
@@ -360,13 +372,14 @@ fn affected_prefixes(layout: &Layout, delta: &Delta) -> Result<Vec<Vec<u8>>> {
 fn representative(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], at: ReadAt) -> Result<(Option<Row>, i64)> {
     let mut rep = None;
     let mut total = 0;
-    for (k, h) in env.scan_prefix(tree, prefix)? {
+    env.for_each_prefix(tree, prefix, &mut |k, h| {
         let w = h.weight(at);
         if w > 0 && rep.is_none() {
-            rep = Some(layout.decode_row(&k)?);
+            rep = Some(layout.decode_row(k)?);
         }
         total += w;
-    }
+        Ok(true)
+    })?;
     Ok((rep, total))
 }
 
@@ -531,45 +544,41 @@ fn topk_rows(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], at: Re
     if limit == 0 {
         return Ok(out);
     }
-    let hi = crate::types::encoding::prefix_successor(prefix);
-    let mut c = match &hi {
-        Some(h) => env.cursor(tree, Bound::Included(prefix), Bound::Excluded(h)),
-        None => env.cursor(tree, Bound::Included(prefix), Bound::Unbounded),
-    };
     let mut last_key: Option<Vec<u8>> = None;
-    while let Some((k, h)) = env.cursor_next(&mut c)? {
+    env.for_each_prefix(tree, prefix, &mut |k, h| {
         let mut w = h.weight(at);
         if w <= 0 {
-            continue;
+            return Ok(true);
         }
         if taken >= limit {
             // past the limit only rows tied with the last one remain
-            match &last_key {
-                Some(lk) if p.with_ties && layout.key_bytes(&k)? == lk.as_slice() => {
-                    out.push((layout.decode_row(&k)?, w));
-                    continue;
+            return match &last_key {
+                Some(lk) if p.with_ties && layout.key_bytes(k)? == lk.as_slice() => {
+                    out.push((layout.decode_row(k)?, w));
+                    Ok(true)
                 }
-                _ => break,
-            }
+                _ => Ok(false),
+            };
         }
         if skipped < p.offset {
             let s = (p.offset - skipped).min(w as u64);
             skipped += s;
             w -= s as i64;
             if w == 0 {
-                continue;
+                return Ok(true);
             }
         }
         // with ties, the rest of an entry's multiplicity is tied too
         let take = if p.with_ties { w as u64 } else { (limit - taken).min(w as u64) };
-        out.push((layout.decode_row(&k)?, take as i64));
+        out.push((layout.decode_row(k)?, take as i64));
         taken += take;
         if p.with_ties {
-            last_key = Some(layout.key_bytes(&k)?.to_vec());
-        } else if taken >= limit {
-            break;
+            last_key = Some(layout.key_bytes(k)?.to_vec());
+            Ok(true)
+        } else {
+            Ok(taken < limit)
         }
-    }
+    })?;
     Ok(out)
 }
 

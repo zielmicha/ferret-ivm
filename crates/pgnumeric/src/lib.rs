@@ -1065,6 +1065,18 @@ impl Numeric {
         encoding::decode_key(buf)
     }
 
+    /// Length of the key encoding at the start of `buf` (bytes inverted when
+    /// `complemented`), without decoding it.
+    pub fn key_len(buf: &[u8], complemented: bool) -> Result<usize> {
+        encoding::key_len(buf, complemented)
+    }
+
+    /// Length of the [`Numeric::encode_binary`] encoding at the start of
+    /// `buf`, without decoding it.
+    pub fn binary_len(buf: &[u8]) -> Result<usize> {
+        encoding::binary_len(buf)
+    }
+
     /// Compact exact binary encoding preserving dscale; self-delimiting.
     pub fn encode_binary(&self, out: &mut Vec<u8>) {
         encoding::encode_binary(self, out)

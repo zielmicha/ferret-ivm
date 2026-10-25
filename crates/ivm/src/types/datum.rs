@@ -442,6 +442,13 @@ pub fn exact_cmp(a: &Datum, b: &Datum) -> Ordering {
         }
     }
     match (a, b) {
+        // common types first, compared directly
+        (Int4(x), Int4(y)) | (Date(x), Date(y)) => x.cmp(y),
+        (Int8(x), Int8(y)) | (Time(x), Time(y)) | (Timestamp(x), Timestamp(y)) | (TimestampTz(x), TimestampTz(y)) => x.cmp(y),
+        (Text(x), Text(y)) | (Json(x), Json(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Null, Null) => Ordering::Equal,
+        (Bool(x), Bool(y)) => x.cmp(y),
+        (Int2(x), Int2(y)) => x.cmp(y),
         (Float4(x), Float4(y)) => x.to_bits().cmp(&y.to_bits()),
         (Float8(x), Float8(y)) => x.to_bits().cmp(&y.to_bits()),
         (Numeric(x), Numeric(y)) => x.cmp(y).then_with(|| x.dscale().cmp(&y.dscale())),

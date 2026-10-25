@@ -160,3 +160,30 @@ fn public_results_are_normalized() {
         assert_normalized(&Numeric::factorial(n).unwrap(), "factorial");
     }
 }
+
+#[test]
+fn encoding_lengths_without_decoding() {
+    let mut r = Rng(0x5EED_1E57);
+    let mut vals: Vec<Numeric> = (0..5000).map(|_| random_numeric(&mut r)).collect();
+    vals.extend([Numeric::nan(), Numeric::infinity(), Numeric::neg_infinity(), Numeric::zero()]);
+    vals.push(Numeric::from_i128(i128::MAX));
+    vals.push(Numeric::from_i128(i128::MIN));
+    vals.push(Numeric::parse("1e1000").unwrap());
+    vals.push(Numeric::parse("-1e-1000").unwrap());
+    for a in &vals {
+        let mut k = Vec::new();
+        a.encode_key(&mut k);
+        let n = k.len();
+        // followed by other data, as inside a composite key
+        k.extend_from_slice(&[0x00, 0x01, 0xFF]);
+        assert_eq!(Numeric::key_len(&k, false).unwrap(), n, "key_len of {a}");
+        let inv: Vec<u8> = k.iter().map(|b| !b).collect();
+        assert_eq!(Numeric::key_len(&inv, true).unwrap(), n, "complemented key_len of {a}");
+        let mut b = Vec::new();
+        a.encode_binary(&mut b);
+        let n = b.len();
+        b.extend_from_slice(&[0x80, 0x00]);
+        assert_eq!(Numeric::binary_len(&b).unwrap(), n, "binary_len of {a}");
+        assert!(Numeric::binary_len(&b[..n - 1]).is_err() || n == 1);
+    }
+}
