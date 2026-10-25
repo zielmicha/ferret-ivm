@@ -220,7 +220,12 @@ impl LogWriter {
     /// Open the log, truncating a torn tail. Returns the writer; `last_gsn()`
     /// is the last durable GSN (0 if empty).
     pub fn open(dir: &Path, sync: bool) -> Result<LogWriter> {
-        std::fs::create_dir_all(dir)?;
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            if sync && let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                File::open(parent)?.sync_all()?;
+            }
+        }
         let segs = list_segments(dir)?;
         let (cur_first, last_gsn, cur_len) = match segs.last() {
             None => (1, 0, 0),
@@ -254,7 +259,13 @@ impl LogWriter {
                 (first, last, valid as u64)
             }
         };
-        let file = OpenOptions::new().create(true).append(true).open(seg_path(dir, cur_first))?;
+        let path = seg_path(dir, cur_first);
+        let created = !path.exists();
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        if created && sync {
+            // (later segments: roll)
+            File::open(dir)?.sync_all()?;
+        }
         Ok(LogWriter { dir: dir.to_path_buf(), file, cur_first, cur_len, buf: Vec::new(), last_gsn, sync })
     }
 

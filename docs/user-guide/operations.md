@@ -89,7 +89,8 @@ Every start is a recovery:
 3. Open the store: read the manifest, take its last valid record as the
    checkpoint, truncate the active segment to the length recorded in it, and
    delete segment files the checkpoint does not reference (written after
-   it).
+   it). A store whose manifest is missing (while segment files hold data)
+   or has no valid record stops the start, untouched.
 4. Restore the catalog and engine state from the checkpoint, rebuild the
    dataflow from the catalog, and attach every index whose structure matches
    one in the checkpoint. A table whose primary index is not in the
@@ -115,6 +116,7 @@ Startup failures and what they mean:
 | `cannot decode checkpoint state: ...` | the checkpoint was written by an incompatible version ([Compatibility](../on-disk-format.md#compatibility)) |
 | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | the table's primary index cannot be found by its structural fingerprint — usually an incompatible version |
 | `node checksum mismatch at ...`, `cannot open segment ...` | damaged or missing store files |
+| `.../MANIFEST has no valid checkpoint record ...`, `.../MANIFEST is missing but segment files hold data ...` | the manifest is damaged or was deleted; nothing was modified. Restore it (or the data directory) from a backup. If the engine crashed during its very first checkpoint, removing `store/` is safe: the store is rebuilt from the log (start-up refuses if the log no longer starts at GSN 1) |
 | a panic (`thread 'main' panicked at ...`, `has overflowed its stack`) | a bug triggered by the catalog or the log, for example an index whose columns no longer exist after an upstream schema change or a `CREATE OR REPLACE`, or a `DISTINCT` aggregate with `FILTER` ([Known problems](troubleshooting.md#known-problems)) |
 
 A broken object is not maintained. Reading it, or anything reading it,

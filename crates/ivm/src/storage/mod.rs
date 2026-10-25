@@ -263,7 +263,34 @@ impl Env {
     /// checkpoint (if any). Trees from the checkpoint must be re-attached with
     /// their summarizers via [`Env::attach_tree`] before use.
     pub fn open(dir: &Path, opts: EnvOptions) -> Result<(Env, Option<Recovered>)> {
-        std::fs::create_dir_all(dir)?;
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+        }
+        // Without a checkpoint record, opening deletes every segment file but
+        // the first and truncates that one: refuse, leaving every file as it
+        // is, when segment files hold data that a lost manifest may have
+        // described (a manifest without a valid record: Manifest::open).
+        if !dir.join("MANIFEST").exists() {
+            let mut with_data = Vec::new();
+            for e in std::fs::read_dir(dir)? {
+                let e = e?;
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("seg-") && name.ends_with(".dat") && e.metadata()?.len() > 0 {
+                    with_data.push(name);
+                }
+            }
+            if !with_data.is_empty() {
+                with_data.sort();
+                return Err(SqlError::corrupt(format!(
+                    "{} is missing but segment files hold data ({}); refusing to start, the store is left untouched",
+                    dir.join("MANIFEST").display(),
+                    with_data.join(", ")
+                )));
+            }
+        }
         let (manifest, rec) = Manifest::open(dir)?;
         let (active_seg, active_len) = rec.as_ref().map(|r| (r.active_seg, r.active_len)).unwrap_or((1, 0));
         let segs = SegmentStore::open(dir, active_seg, active_len, opts.segment_bytes)?;

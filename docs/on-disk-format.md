@@ -388,7 +388,10 @@ a7 00 00 00  78 16 b4 e1     len 167, crc
   that is incomplete or fails its CRC, and the file is truncated to the end of
   the last valid frame (without `fsync`). The last valid record is the
   recovered checkpoint; a record that passes its CRC but does not decode
-  aborts start-up.
+  aborts start-up. A non-empty manifest without any valid record, and a
+  missing manifest while segment files hold data, also abort start-up,
+  modifying nothing (opening would otherwise delete the segments). A new
+  manifest is created empty and the directory `fsync`ed.
 - **Append** (the checkpoint's commit point): the frame is written at the end
   of the file with a positioned write and the file is `fdatasync`ed. Before
   that, all nodes the record refers to have been written and `fsync`ed.
@@ -407,6 +410,10 @@ a7 00 00 00  78 16 b4 e1     len 167, crc
    `fsync`ed.
 3. The checkpoint record is appended to the manifest.
 4. Sealed segments whose `live_bytes` is 0 are deleted.
+
+Creating a segment file (the first one, and each new active segment) is
+followed by an `fsync` of the store directory, so that a checkpoint never
+refers to a file whose directory entry a crash could lose.
 
 ## Checkpoint application state (AppState)
 

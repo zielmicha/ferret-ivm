@@ -34,6 +34,10 @@ implementation checkpoints everything together).
    whose CRC is valid, and truncate a torn tail. Re-open the active segment
    truncated to the recorded length, delete segment files the record does
    not list, and register every tree root as *recovered but not attached*.
+   A manifest that has contents but no valid record, or a missing manifest
+   while segment files hold data, stops the start before anything is
+   modified: the checkpoint may have existed, and the log may already be
+   truncated after it.
 4. **Restore the engine state** (`Engine::recover`) from the record's
    application state (JSON `AppState`): catalog, the map from arrangement
    fingerprint to tree id, view error counts, source states and resume LSNs,

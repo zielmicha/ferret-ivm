@@ -256,3 +256,54 @@ fn now_as_of_earlier_gsns_after_a_restart() {
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Names and sizes of the files in a directory.
+fn files(dir: &Path) -> Vec<(String, u64)> {
+    let mut v: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len())
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A store whose MANIFEST is missing or has no valid record, but whose
+/// segment files hold data, is refused, and every file is left as it is.
+/// Opening it used to delete the segments the manifest did not list (all
+/// of them) and truncate the rest, destroying the checkpoint.
+#[test]
+fn a_store_without_its_manifest_is_refused_untouched() {
+    let dir = tmpdir("manifest");
+    let e = Engine::start(&dir);
+    e.exec("CREATE TABLE t (id int PRIMARY KEY)");
+    e.exec("INSERT INTO t VALUES (1), (2)");
+    e.exec("CHECKPOINT");
+    e.shutdown();
+    let store = dir.join("store");
+    let manifest = std::fs::read(store.join("MANIFEST")).unwrap();
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    // unreadable: the checksum of its first record fails (a later record
+    // after a valid one would be a torn tail, dropped)
+    let mut bad = manifest.clone();
+    bad[8] ^= 0xFF;
+    std::fs::write(store.join("MANIFEST"), &bad).unwrap();
+    let before = files(&store);
+    let err = coord::start(cfg.clone()).err().expect("refused");
+    assert!(err.message.contains("no valid checkpoint record"), "{err}");
+    assert_eq!(files(&store), before);
+    // missing
+    std::fs::remove_file(store.join("MANIFEST")).unwrap();
+    let before = files(&store);
+    let err = coord::start(cfg.clone()).err().expect("refused");
+    assert!(err.message.contains("MANIFEST is missing"), "{err}");
+    assert_eq!(files(&store), before);
+    // restored, nothing was lost
+    std::fs::write(store.join("MANIFEST"), &manifest).unwrap();
+    let e = Engine::start(&dir);
+    assert_eq!(e.rows("SELECT count(*) FROM t"), ["2"]);
+    e.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
