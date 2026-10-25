@@ -41,7 +41,74 @@
 //! `gprofng display text -filters 'TSTAMP>=START && TSTAMP<=END' -functions x.er`.
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+/// mimalloc, counting allocations per thread: allocation counts are a
+/// deterministic measure of allocation churn, unlike CPU time on a busy
+/// machine.
+struct CountingAlloc;
+
+struct AllocSlot {
+    tid: AtomicU32,
+    count: AtomicU64,
+    bytes: AtomicU64,
+}
+
+const ALLOC_SLOTS: usize = 4096;
+static SLOTS: [AllocSlot; ALLOC_SLOTS] =
+    [const { AllocSlot { tid: AtomicU32::new(0), count: AtomicU64::new(0), bytes: AtomicU64::new(0) } }; ALLOC_SLOTS];
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+unsafe extern "C" {
+    fn gettid() -> i32;
+}
+
+fn count_alloc(size: usize) {
+    let _ = SLOT.try_with(|s| {
+        let mut i = s.get();
+        if i == usize::MAX {
+            i = NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % ALLOC_SLOTS;
+            SLOTS[i].count.store(0, Ordering::Relaxed);
+            SLOTS[i].bytes.store(0, Ordering::Relaxed);
+            SLOTS[i].tid.store(unsafe { gettid() } as u32, Ordering::Relaxed);
+            s.set(i);
+        }
+        SLOTS[i].count.fetch_add(1, Ordering::Relaxed);
+        SLOTS[i].bytes.fetch_add(size as u64, Ordering::Relaxed);
+    });
+}
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_alloc(layout.size());
+        unsafe { mimalloc::MiMalloc.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_alloc(layout.size());
+        unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count_alloc(new_size);
+        unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+    }
+}
+
+/// Allocations (count, bytes) per thread id so far.
+fn thread_allocs() -> HashMap<u32, (u64, u64)> {
+    let n = NEXT_SLOT.load(Ordering::Relaxed).min(ALLOC_SLOTS);
+    let mut m = HashMap::with_capacity(n);
+    for s in &SLOTS[..n] {
+        m.insert(s.tid.load(Ordering::Relaxed), (s.count.load(Ordering::Relaxed), s.bytes.load(Ordering::Relaxed)));
+    }
+    m
+}
 
 use ivm::coord::{self, Config};
 use ivm::server::{self, ServerConfig};
@@ -51,7 +118,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,14 +139,16 @@ struct Opts {
     skip: Vec<String>,
     json: Option<PathBuf>,
     keep_data: bool,
+    repeat: usize,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: ivm-bench [--accounts N] [--txns N] [--small N] [--large N] [--point-reads N]\n\
          \x20                [--sub-txns N] [--upstream CONNINFO] [--data-dir DIR] [--cache-mb N]\n\
-         \x20                [--no-sync] [--skip PHASE,...] [--json FILE] [--keep-data]\n\
-         phases: small, recovery, large, reads, subscribe (load, checkpoint and hydrate always run)"
+         \x20                [--no-sync] [--skip PHASE,...] [--json FILE] [--keep-data] [--repeat N]\n\
+         phases: small, recovery, large, reads, subscribe (load, checkpoint and hydrate always run)\n\
+         --repeat N: run hydration, small and large transactions N times each"
     );
     std::process::exit(2)
 }
@@ -99,6 +168,7 @@ fn parse_opts() -> Opts {
         skip: vec![],
         json: None,
         keep_data: false,
+        repeat: 1,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -117,6 +187,7 @@ fn parse_opts() -> Opts {
             "--skip" => o.skip = val().split(',').map(|s| s.trim().to_string()).collect(),
             "--json" => o.json = Some(PathBuf::from(val())),
             "--keep-data" => o.keep_data = true,
+            "--repeat" => o.repeat = val().parse::<usize>().unwrap_or_else(|_| usage()).max(1),
             _ => usage(),
         }
     }
@@ -229,6 +300,7 @@ struct Meter {
     name: String,
     t0: Instant,
     cpu0: HashMap<u32, (String, u64, u64)>,
+    allocs0: HashMap<u32, (u64, u64)>,
     proc0: f64,
     up0: f64,
 }
@@ -239,6 +311,8 @@ struct Measure {
     cpu: BTreeMap<&'static str, f64>,
     /// Time the engine thread waited for a CPU (contention on a busy machine).
     engine_wait: f64,
+    /// Allocations (count, bytes) of the engine thread.
+    engine_allocs: (u64, u64),
     process_cpu: f64,
     upstream_cpu: f64,
     peak_rss_mb: f64,
@@ -247,7 +321,8 @@ struct Measure {
 impl Meter {
     fn start(name: &str) -> Meter {
         reset_peak_rss();
-        Meter { name: name.to_string(), t0: Instant::now(), cpu0: thread_cpu(), proc0: process_cpu_s(), up0: upstream_cpu_s() }
+        let allocs0 = thread_allocs();
+        Meter { name: name.to_string(), t0: Instant::now(), cpu0: thread_cpu(), allocs0, proc0: process_cpu_s(), up0: upstream_cpu_s() }
     }
 
     fn stop(&self) -> Measure {
@@ -259,14 +334,20 @@ impl Meter {
         // the window for profilers, e.g. gprofng display text -filters 'TSTAMP>=a && TSTAMP<=b'
         println!("WINDOW {} {:.0} {:.0}", self.name, since_origin(self.t0) * 1e9, since_origin(end) * 1e9);
         let now = thread_cpu();
+        let allocs = thread_allocs();
         let mut cpu: BTreeMap<&'static str, f64> = BTreeMap::new();
         let mut engine_wait = 0.0;
+        let mut engine_allocs = (0, 0);
         for (tid, (name, ns, wait)) in &now {
             let (b, bw) = self.cpu0.get(tid).filter(|(n, _, _)| n == name).map(|(_, b, w)| (*b, *w)).unwrap_or((0, 0));
             let g = group_of(name);
             *cpu.entry(g).or_default() += ns.saturating_sub(b) as f64 / 1e9;
             if g == "engine" {
                 engine_wait += wait.saturating_sub(bw) as f64 / 1e9;
+                let (c, by) = allocs.get(tid).copied().unwrap_or((0, 0));
+                let (c0, by0) = self.allocs0.get(tid).copied().unwrap_or((0, 0));
+                engine_allocs.0 += c.saturating_sub(c0);
+                engine_allocs.1 += by.saturating_sub(by0);
             }
         }
         cpu.entry("engine").or_default();
@@ -274,6 +355,7 @@ impl Meter {
             wall: end.saturating_duration_since(self.t0).as_secs_f64(),
             cpu,
             engine_wait,
+            engine_allocs,
             process_cpu: process_cpu_s() - self.proc0,
             upstream_cpu: upstream_cpu_s() - self.up0,
             peak_rss_mb: status_kb("VmHWM:") as f64 / 1024.0,
@@ -303,6 +385,8 @@ impl Report {
             }
         }
         parts.push(format!("\"engine_wait_s\":{:.4}", m.engine_wait));
+        parts.push(format!("\"engine_allocs\":{}", m.engine_allocs.0));
+        parts.push(format!("\"engine_alloc_mb\":{:.1}", m.engine_allocs.1 as f64 / 1e6));
         parts.push(format!("\"process_cpu_s\":{:.3}", m.process_cpu));
         parts.push(format!("\"upstream_cpu_s\":{:.3}", m.upstream_cpu));
         parts.push(format!("\"peak_rss_mb\":{:.1}", m.peak_rss_mb));
@@ -311,6 +395,9 @@ impl Report {
         }
         if m.upstream_cpu >= 0.01 {
             human.push_str(&format!(" | upstream {:.2} s", m.upstream_cpu));
+        }
+        if m.engine_allocs.0 > 0 {
+            human.push_str(&format!(" | engine allocs {:.2}M", m.engine_allocs.0 as f64 / 1e6));
         }
         human.push_str(&format!(" | rss peak {:.0} MB", m.peak_rss_mb));
         for (k, v) in extra {
@@ -420,6 +507,19 @@ fn with_dbname(conninfo: &str, db: &str) -> String {
     format!("{} dbname={db}", kept.join(" "))
 }
 
+/// SELECT producing the txns rows with ids lo..=hi: account, kind and amount
+/// come from multiplicative hashes of the id, so that they are spread and
+/// independent of each other (about 100 (region, kind) groups of distinct
+/// amounts), deterministically.
+fn txns_rows(accounts: u64, lo: u64, hi: u64, start: &str) -> String {
+    format!(
+        "SELECT g, 1 + h1 % {accounts}, (ARRAY['deposit','withdrawal','transfer','fee','refund'])[1 + (h1 / 65536) % 5],
+           ((h2 / 4096) % 100000) / 100.0, timestamp '{start}' + g * interval '1 second'
+         FROM (SELECT g, (g * 2654435761) % 4294967296 AS h1, (g * 3266489917) % 4294967296 AS h2
+               FROM generate_series({lo}::bigint, {hi}) g) s"
+    )
+}
+
 fn generate_data(c: &mut Client, accounts: u64, txns: u64) {
     let t0 = Instant::now();
     let sql = format!(
@@ -427,11 +527,9 @@ fn generate_data(c: &mut Client, accounts: u64, txns: u64) {
          INSERT INTO accounts SELECT g, 'region-' || lpad((g % 20)::text, 2, '0'), 'account ' || g, (g % 1000)::numeric
            FROM generate_series(1, {accounts}) g;
          CREATE TABLE txns (id bigint PRIMARY KEY, account_id int, kind text, amount numeric(12,2), created timestamp);
-         INSERT INTO txns SELECT g, 1 + (g * 7919) % {accounts},
-             (ARRAY['deposit','withdrawal','transfer','fee','refund'])[1 + (g * 31) % 5],
-             ((g * 104729) % 100000) / 100.0, timestamp '2024-01-01' + g * interval '1 second'
-           FROM generate_series(1::bigint, {txns}) g;
-         CREATE PUBLICATION bench_pub FOR TABLE accounts, txns;"
+         INSERT INTO txns {};
+         CREATE PUBLICATION bench_pub FOR TABLE accounts, txns;",
+        txns_rows(accounts, 1, txns, "2024-01-01")
     );
     c.simple_query(&sql).expect("generate data");
     c.simple_query("VACUUM ANALYZE accounts").expect("vacuum");
@@ -507,7 +605,8 @@ fn setup_upstream(o: &Opts) -> Upstream {
             {
                 set_upstream_pid(Path::new(&d));
             }
-            let template = format!("ivmbench_{}_{}", o.accounts, o.txns);
+            // (v2: hashed account, kind and amount columns)
+            let template = format!("ivmbench_v2_{}_{}", o.accounts, o.txns);
             let exists = !c.query(&format!("SELECT 1 FROM pg_database WHERE datname = '{template}'")).unwrap().rows.is_empty();
             if !exists {
                 // generated under a temporary name: a template exists only when complete
@@ -820,10 +919,16 @@ fn main() {
     checkpoint(&mut rep, &mut c, "checkpoint_tables");
 
     // ---- (c) hydration of new views over existing data
-    for (name, sql) in [("hydrate_by_region", BY_REGION), ("hydrate_acct_totals", ACCT_TOTALS)] {
-        let m = Meter::start(name);
-        c.execute(sql).expect("create view");
-        rep.record(name, &m.stop(), &[]);
+    for r in 0..o.repeat {
+        if r > 0 {
+            c.execute("DROP MATERIALIZED VIEW acct_totals").expect("drop view");
+            c.execute("DROP MATERIALIZED VIEW by_region").expect("drop view");
+        }
+        for (name, sql) in [("hydrate_by_region", BY_REGION), ("hydrate_acct_totals", ACCT_TOTALS)] {
+            let m = Meter::start(name);
+            c.execute(sql).expect("create view");
+            rep.record(name, &m.stop(), &[]);
+        }
     }
     checkpoint(&mut rep, &mut c, "checkpoint_views");
 
@@ -834,7 +939,8 @@ fn main() {
     // ---- (a) small transactions, first live (warm cache, right after a
     // checkpoint), then generated while the engine is down and caught up
     // after a restart (cold cache)
-    if !o.skip.iter().any(|s| s == "small") {
+    let reps = |phase: &str| if o.skip.iter().any(|s| s == phase) { 0 } else { o.repeat };
+    for _ in 0..reps("small") {
         let (batches, nid) = small_txns(&mut rng, o.small, o.accounts, o.txns, next_id, &mut del_from);
         next_id = nid;
         let m = Meter::start("small_live");
@@ -857,6 +963,7 @@ fn main() {
                 ("txns_per_s", n / meas.wall),
                 ("upstream_s", (up_done - t).as_secs_f64()),
                 ("engine_us_per_txn", meas.cpu["engine"] * 1e6 / n),
+                ("engine_allocs_per_txn", meas.engine_allocs.0 as f64 / n),
                 ("source_us_per_txn", meas.cpu.get("source").copied().unwrap_or(0.0) * 1e6 / n),
                 ("seq_us_per_txn", meas.cpu.get("sequencer").copied().unwrap_or(0.0) * 1e6 / n),
             ],
@@ -891,6 +998,7 @@ fn main() {
                 ("txns", n),
                 ("txns_per_s", n / meas.wall),
                 ("engine_us_per_txn", meas.cpu["engine"] * 1e6 / n),
+                ("engine_allocs_per_txn", meas.engine_allocs.0 as f64 / n),
                 ("source_us_per_txn", meas.cpu.get("source").copied().unwrap_or(0.0) * 1e6 / n),
                 ("seq_us_per_txn", meas.cpu.get("sequencer").copied().unwrap_or(0.0) * 1e6 / n),
             ],
@@ -898,7 +1006,7 @@ fn main() {
     }
 
     // ---- (b) large transactions, engine live
-    if !o.skip.iter().any(|s| s == "large") {
+    for _ in 0..reps("large") {
         let lo = next_id;
         let hi = next_id + o.large - 1;
         next_id = hi + 1;
@@ -906,12 +1014,7 @@ fn main() {
         let stmts = [
             (
                 "large_insert",
-                format!(
-                    "INSERT INTO txns SELECT g, 1 + (g * 7919) % {accounts},
-                       (ARRAY['deposit','withdrawal','transfer','fee','refund'])[1 + (g * 31) % 5],
-                       ((g * 104729) % 100000) / 100.0, timestamp '2025-06-01' + g * interval '1 second'
-                     FROM generate_series({lo}::bigint, {hi}) g"
-                ),
+                format!("INSERT INTO txns {}", txns_rows(accounts, lo, hi, "2025-06-01")),
             ),
             ("large_update", format!("UPDATE txns SET amount = amount + 0.01 WHERE id BETWEEN 1 AND {}", o.large)),
         ];
@@ -934,6 +1037,7 @@ fn main() {
                     ("upstream_s", up_s),
                     ("catchup_after_commit_s", last.saturating_duration_since(committed).as_secs_f64()),
                     ("engine_us_per_row", meas.cpu["engine"] * 1e6 / n as f64),
+                    ("engine_allocs_per_row", meas.engine_allocs.0 as f64 / n as f64),
                 ],
             );
         }
