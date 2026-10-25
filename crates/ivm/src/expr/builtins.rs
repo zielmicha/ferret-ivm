@@ -654,6 +654,33 @@ fn null_text(_: &[Datum]) -> Result<Datum> {
 fn owner_name(_: &Datum) -> Result<Datum> {
     Ok(Datum::text("ivm"))
 }
+/// current_setting(name [, missing_ok]): the server's fixed settings (as
+/// reported by SHOW and the startup ParameterStatus messages).
+fn current_setting(args: &[Datum]) -> Result<Datum> {
+    let name = s(&args[0]).to_ascii_lowercase();
+    let v = match name.as_str() {
+        "server_version" => "17.0",
+        "server_version_num" => "170000",
+        "server_encoding" | "client_encoding" => "UTF8",
+        "timezone" => "UTC",
+        "datestyle" => "ISO, MDY",
+        "intervalstyle" => "postgres",
+        "transaction_isolation" | "default_transaction_isolation" => "serializable",
+        "standard_conforming_strings" | "integer_datetimes" | "is_superuser" => "on",
+        "transaction_read_only" | "default_transaction_read_only" => "off",
+        "search_path" => "\"$user\", public",
+        "max_identifier_length" => "63",
+        "extra_float_digits" => "1",
+        "bytea_output" => "hex",
+        "lc_collate" | "lc_ctype" | "lc_messages" | "lc_monetary" | "lc_numeric" | "lc_time" => "C",
+        "application_name" => "",
+        _ if args.get(1).and_then(|d| d.as_bool()) == Some(true) => return Ok(Datum::Null),
+        _ => {
+            return Err(SqlError::new(codes::UNDEFINED_OBJECT, format!("unrecognized configuration parameter \"{}\"", s(&args[0]))));
+        }
+    };
+    Ok(txt(v.to_string()))
+}
 fn encoding_name(_: &Datum) -> Result<Datum> {
     Ok(Datum::text("UTF8"))
 }
@@ -1518,6 +1545,11 @@ pub fn register(b: &mut Builder) {
         b.poly(name, vec![P::Any, P::Any, P::Any], Ret::T(T::Bool), Imp::FN(always_true));
     }
     b.f1("pg_encoding_to_char", T::Int4, T::Name, encoding_name);
+    for params in [vec![T::Text], vec![T::Text, T::Bool]] {
+        b.fnn("current_setting", params, T::Text, current_setting);
+        b.last().volatility = Volatility::Stable;
+        b.last().can_return_null = true;
+    }
     b.fnn("pg_backend_pid", vec![], T::Int4, backend_pid);
     b.fnn("pg_is_in_recovery", vec![], T::Bool, always_false);
     {

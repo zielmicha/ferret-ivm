@@ -504,3 +504,15 @@ fn reg_types_accept_names() {
     assert_eq!(rows(&h, "SELECT (SELECT oid FROM pg_class WHERE relname = 't2')::regclass"), vec!["t2"]);
     running.shutdown();
 }
+
+#[test]
+fn current_setting_reports_server_settings() {
+    let running = start("current-setting");
+    let h = running.handle.clone();
+    assert_eq!(
+        rows(&h, "SELECT current_setting('server_version_num'), current_setting('TimeZone'), current_setting('DateStyle'), current_setting('nope', true)"),
+        vec!["170000|UTC|ISO, MDY|"]
+    );
+    assert!(try_rows(&h, "SELECT current_setting('nope')").unwrap_err().contains("unrecognized configuration parameter"));
+    running.shutdown();
+}
