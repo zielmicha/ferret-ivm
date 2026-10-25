@@ -601,3 +601,21 @@ fn offset_with_fetch() {
     assert!(try_rows(&h, "SELECT id FROM t1 LIMIT 1 FETCH FIRST 1 ROW ONLY").is_err());
     running.shutdown();
 }
+
+#[test]
+fn like_any_multi_unnest_and_row_any() {
+    let running = start("like-any");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // all three used to be rejected
+    assert_eq!(rows(&h, "SELECT id FROM t1 WHERE s LIKE ANY (ARRAY['a%', 'b%']) ORDER BY 1"), vec!["1", "2", "4"]);
+    assert_eq!(
+        rows(&h, "SELECT id, s NOT LIKE ANY (ARRAY['a%', 'b%']), s ILIKE ANY ('{A%}') FROM t1 ORDER BY 1"),
+        vec!["1|t|t", "2|t|f", "3||", "4|t|t", "5|t|f"]
+    );
+    assert_eq!(rows(&h, "SELECT * FROM unnest(ARRAY[1, 2], ARRAY['a', 'b', 'c']) AS u(n, s) ORDER BY s"), vec!["1|a", "2|b", "|c"]);
+    assert_eq!(rows(&h, "SELECT * FROM unnest(ARRAY[1, 2], ARRAY['x']) WITH ORDINALITY ORDER BY 3"), vec!["1|x|1", "2||2"]);
+    assert_eq!(rows(&h, "SELECT a, b FROM t1 WHERE (a, b) = ANY (SELECT x, y / 10 FROM t2) ORDER BY 1"), vec!["1|10", "2|20"]);
+    assert_eq!(rows(&h, "SELECT 'a_c' ~~ 'a\\_c', 'abc' ~~* 'A%', 'abc' !~~ 'b%'"), vec!["t|t|t"]);
+    running.shutdown();
+}

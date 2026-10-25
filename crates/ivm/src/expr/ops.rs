@@ -389,6 +389,23 @@ pub fn regex(pattern: &str, flags: &str) -> Result<Arc<pgfuncs::pattern::Regex>>
     })
 }
 
+/// The ~~ operator family: LIKE / ILIKE (escape \\), and their negations.
+fn like_op(a: &Datum, b: &Datum, ci: bool) -> Result<bool> {
+    pgfuncs::pattern::LikePattern::new_lenient(b.as_str().unwrap(), Some('\\'), ci).try_matches(a.as_str().unwrap()).map_err(Into::into)
+}
+fn like_match(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(like_op(a, b, false)?))
+}
+fn ilike_match(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(like_op(a, b, true)?))
+}
+fn like_nmatch(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(!like_op(a, b, false)?))
+}
+fn ilike_nmatch(a: &Datum, b: &Datum) -> Result<Datum> {
+    Ok(Datum::Bool(!like_op(a, b, true)?))
+}
+
 fn re_match(a: &Datum, b: &Datum) -> Result<Datum> {
     Ok(Datum::Bool(regex(b.as_str().unwrap(), "")?.is_match(a.as_str().unwrap())))
 }
@@ -772,6 +789,10 @@ pub fn register(b: &mut Builder) {
     b.op2p("||", P::T(T::Text), P::AnyNonArray, Ret::T(T::Text), textcat);
     b.op2p("||", P::AnyNonArray, P::T(T::Text), Ret::T(T::Text), textcat);
     b.op2("||", T::Bytea, T::Bytea, T::Bytea, byteacat);
+    b.op2("~~", T::Text, T::Text, T::Bool, like_match);
+    b.op2("~~*", T::Text, T::Text, T::Bool, ilike_match);
+    b.op2("!~~", T::Text, T::Text, T::Bool, like_nmatch);
+    b.op2("!~~*", T::Text, T::Text, T::Bool, ilike_nmatch);
     // character(n) matches with its padding (bpcharregexeq etc.)
     for t in [T::Text, T::Bpchar] {
         b.op2("~", t.clone(), T::Text, T::Bool, re_match);

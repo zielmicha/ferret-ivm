@@ -480,42 +480,7 @@ impl<'a> Binder<'a> {
                 }
                 Ok(Expr::InList(Box::new(x), out, *negated))
             }
-            E::InSubquery { expr, subquery, negated } => {
-                // a row constructor compares several columns at once
-                let lhs: Vec<Expr> = match &**expr {
-                    E::Tuple(items) => items.iter().map(|i| self.bind_expr(i, ctx)).collect::<Result<_>>()?,
-                    other => vec![self.bind_expr(other, ctx)?],
-                };
-                let rel = self.bind_subquery(subquery, ctx)?;
-                let sub_types = rel.schema();
-                if sub_types.len() != lhs.len() {
-                    sql_bail!(
-                        codes::SYNTAX_ERROR,
-                        "subquery has too {} columns",
-                        if sub_types.len() > lhs.len() { "many" } else { "few" }
-                    );
-                }
-                let mut ls = Vec::with_capacity(lhs.len());
-                let mut targets = Vec::with_capacity(lhs.len());
-                for (x, st) in lhs.into_iter().zip(&sub_types) {
-                    let xt = self.ty_of(&x, ctx);
-                    let res = resolve("=", &[xt.clone(), st.ty.clone()])?;
-                    let x = self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IN")?;
-                    // character(n) is compared as text without trailing spaces
-                    ls.push(if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] { bpchar_to_text(x) } else { x });
-                    targets.push(ColumnType::new(res.arg_types[1].clone()));
-                }
-                let mut rel = self.coerce_rel(rel, &targets, "IN")?;
-                if targets.iter().any(|t| t.ty == SqlType::Bpchar) {
-                    let text: Vec<ColumnType> = targets
-                        .iter()
-                        .map(|t| if t.ty == SqlType::Bpchar { ColumnType::new(SqlType::Text) } else { t.clone() })
-                        .collect();
-                    rel = self.coerce_rel(rel, &text, "IN")?;
-                }
-                let sq = Expr::Subquery(Box::new(SubqueryExpr { kind: SubqueryKind::In(ls), rel, ty: SqlType::Bool }));
-                Ok(if *negated { Expr::Not(Box::new(sq)) } else { sq })
-            }
+            E::InSubquery { expr, subquery, negated } => self.bind_in_subquery(expr, subquery, *negated, ctx),
             E::Exists { subquery, negated } => {
                 let rel = self.bind_subquery(subquery, ctx)?;
                 let sq = Expr::Subquery(Box::new(SubqueryExpr { kind: SubqueryKind::Exists, rel, ty: SqlType::Bool }));
@@ -531,6 +496,14 @@ impl<'a> Binder<'a> {
             }
             E::AnyOp { left, compare_op, right, .. } | E::AllOp { left, compare_op, right } => {
                 let all = matches!(e, E::AllOp { .. });
+                // rows: (a, b) = ANY (subquery) is IN, (a, b) <> ALL is NOT IN
+                if let (E::Tuple(_), E::Subquery(q)) = (&**left, &**right) {
+                    return match (compare_op, all) {
+                        (ast::BinaryOperator::Eq, false) => self.bind_in_subquery(left, q, false, ctx),
+                        (ast::BinaryOperator::NotEq, true) => self.bind_in_subquery(left, q, true, ctx),
+                        _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "row comparisons with {compare_op} ANY/ALL are not supported"),
+                    };
+                }
                 let opname =
                     binop_name(compare_op).ok_or_else(|| SqlError::unsupported(format!("operator {compare_op} in ANY/ALL")))?;
                 let x = self.bind_expr(left, ctx)?;
@@ -569,10 +542,10 @@ impl<'a> Binder<'a> {
             }
             E::Like { negated, expr, pattern, escape_char, any, .. }
             | E::ILike { negated, expr, pattern, escape_char, any, .. } => {
-                if *any {
-                    sql_bail!(codes::FEATURE_NOT_SUPPORTED, "LIKE ANY is not supported");
-                }
                 let ci = matches!(e, E::ILike { .. });
+                if *any {
+                    return self.bind_like_any(expr, pattern, escape_char.is_some(), ci, *negated, ctx);
+                }
                 self.bind_like(expr, pattern, escape_char.as_deref(), ci, *negated, ctx)
             }
             E::SimilarTo { negated, expr, pattern, escape_char } => {
@@ -847,6 +820,47 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// `expr [NOT] IN (subquery)`; `expr` may be a row constructor.
+    fn bind_in_subquery(&mut self, expr: &ast::Expr, subquery: &ast::Query, negated: bool, ctx: &Ctx) -> Result<Expr> {
+        use ast::Expr as E;
+        {
+                // a row constructor compares several columns at once
+                let lhs: Vec<Expr> = match expr {
+                    E::Tuple(items) => items.iter().map(|i| self.bind_expr(i, ctx)).collect::<Result<_>>()?,
+                    other => vec![self.bind_expr(other, ctx)?],
+                };
+                let rel = self.bind_subquery(subquery, ctx)?;
+                let sub_types = rel.schema();
+                if sub_types.len() != lhs.len() {
+                    sql_bail!(
+                        codes::SYNTAX_ERROR,
+                        "subquery has too {} columns",
+                        if sub_types.len() > lhs.len() { "many" } else { "few" }
+                    );
+                }
+                let mut ls = Vec::with_capacity(lhs.len());
+                let mut targets = Vec::with_capacity(lhs.len());
+                for (x, st) in lhs.into_iter().zip(&sub_types) {
+                    let xt = self.ty_of(&x, ctx);
+                    let res = resolve("=", &[xt.clone(), st.ty.clone()])?;
+                    let x = self.coerce(x, &xt, &res.arg_types[0], CastContext::Implicit, "IN")?;
+                    // character(n) is compared as text without trailing spaces
+                    ls.push(if res.arg_types == [SqlType::Bpchar, SqlType::Bpchar] { bpchar_to_text(x) } else { x });
+                    targets.push(ColumnType::new(res.arg_types[1].clone()));
+                }
+                let mut rel = self.coerce_rel(rel, &targets, "IN")?;
+                if targets.iter().any(|t| t.ty == SqlType::Bpchar) {
+                    let text: Vec<ColumnType> = targets
+                        .iter()
+                        .map(|t| if t.ty == SqlType::Bpchar { ColumnType::new(SqlType::Text) } else { t.clone() })
+                        .collect();
+                    rel = self.coerce_rel(rel, &text, "IN")?;
+                }
+                let sq = Expr::Subquery(Box::new(SubqueryExpr { kind: SubqueryKind::In(ls), rel, ty: SqlType::Bool }));
+                Ok(if negated { Expr::Not(Box::new(sq)) } else { sq })
+        }
+    }
+
     fn bool_test(&mut self, x: &ast::Expr, t: BoolTest, ctx: &Ctx) -> Result<Expr> {
         let e = self.bind_expr(x, ctx)?;
         let e = self.coerce_bool(e, "IS TRUE")?;
@@ -904,6 +918,42 @@ impl<'a> Binder<'a> {
             _ => None,
         };
         Ok(Expr::Like(Box::new(LikeExpr { expr: x, pattern: p, escape, case_insensitive: ci, negated, bytea, compiled })))
+    }
+
+    /// `x [NOT] [I]LIKE ANY (array)`: the ~~ operators applied to the
+    /// elements (NOT LIKE ANY is !~~ ANY: some pattern does not match).
+    fn bind_like_any(&mut self, expr: &ast::Expr, pattern: &ast::Expr, escape: bool, ci: bool, negated: bool, ctx: &Ctx) -> Result<Expr> {
+        if escape {
+            sql_bail!(codes::FEATURE_NOT_SUPPORTED, "LIKE ANY with ESCAPE is not supported");
+        }
+        let op = match (negated, ci) {
+            (false, false) => "~~",
+            (false, true) => "~~*",
+            (true, false) => "!~~",
+            (true, true) => "!~~*",
+        };
+        let x = self.bind_expr(expr, ctx)?;
+        let xt = self.ty_of(&x, ctx);
+        // like PostgreSQL's LIKE, character(n) matches with its padding
+        let x = if xt == SqlType::Bpchar {
+            Expr::Cast(Box::new(x), SqlType::Text, -1, false)
+        } else {
+            self.coerce(x, &xt, &SqlType::Text, CastContext::Implicit, "LIKE")?
+        };
+        let pat = match pattern {
+            ast::Expr::Nested(inner) => &**inner,
+            ast::Expr::Tuple(items) if items.len() == 1 => &items[0],
+            other => other,
+        };
+        let arr = self.bind_expr(pat, ctx)?;
+        let at = self.ty_of(&arr, ctx);
+        let text_arr = SqlType::Array(Box::new(SqlType::Text));
+        let arr = match &at {
+            SqlType::Array(_) | SqlType::Unknown => self.coerce(arr, &at, &text_arr, CastContext::Implicit, "LIKE ANY")?,
+            other => sql_bail!(codes::DATATYPE_MISMATCH, "op ANY/ALL (array) requires array on right side, got {other}"),
+        };
+        let func = resolve(op, &[SqlType::Text, SqlType::Text])?.func;
+        Ok(Expr::AnyAll { expr: Box::new(x), array: Box::new(arr), func, all: false })
     }
 
     fn explicit_cast(&mut self, x: Expr, t: &SqlType, tm: i32, ctx: &Ctx) -> Result<Expr> {
@@ -2249,7 +2299,14 @@ impl<'a> Binder<'a> {
         }
         let lateral = pushed && bound.iter().any(|b| b.has_outer());
         let types: Vec<SqlType> = bound.iter().map(|b| b.ty(&[])).collect();
-        let (func, bound, mut out, mut names) = self.resolve_table_function(name, bound, types)?;
+        // unnest(a, b, ...): one unnest per array, zipped (as ROWS FROM)
+        let calls: Vec<(TableFunc, Vec<Expr>, Vec<ColumnType>, Vec<String>)> = if name == "unnest" && bound.len() > 1 {
+            bound.into_iter().zip(types).map(|(b, t)| self.resolve_table_function(name, vec![b], vec![t])).collect::<Result<_>>()?
+        } else {
+            vec![self.resolve_table_function(name, bound, types)?]
+        };
+        let mut out: Vec<ColumnType> = calls.iter().flat_map(|c| c.2.iter().cloned()).collect();
+        let mut names: Vec<String> = calls.iter().flat_map(|c| c.3.iter().cloned()).collect();
         if ordinality {
             out.push(ColumnType::new(SqlType::Int8).not_null());
             names.push("ordinality".into());
@@ -2269,13 +2326,8 @@ impl<'a> Binder<'a> {
         for c in out.iter_mut() {
             c.typmod = -1;
         }
-        let arity = out.len() - ordinality as usize;
-        let rel = Rel::FlatMap {
-            input: Box::new(Rel::unit()),
-            funcs: vec![crate::sql::plan::SrfCall { func, args: bound, arity }],
-            out: out.clone(),
-            ordinality,
-        };
+        let funcs = calls.into_iter().map(|(func, args, out, _)| crate::sql::plan::SrfCall { func, args, arity: out.len() }).collect();
+        let rel = Rel::FlatMap { input: Box::new(Rel::unit()), funcs, out: out.clone(), ordinality };
         Ok((rel, Scope::from_table(&tname, &names, &out), lateral))
     }
 }
