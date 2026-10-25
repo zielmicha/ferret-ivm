@@ -210,6 +210,12 @@ Column types are mapped by upstream type OID (`map_type` in
 
 Values arrive in text format and are parsed with the engine's input
 functions (which follow PostgreSQL 17). Nullability comes from `attnotnull`.
+A streamed change with a value that cannot be converted fails its table,
+not the source: the table's changes in that transaction are dropped and it
+is copied again from an empty table (logged as `a change to table s.t
+cannot be applied: <message>; copying the table again, streaming the other
+tables`); while the value stays upstream, the copy fails too and is retried
+like that of an [unreadable table](#tables-added-to-or-removed-from-the-publication).
 
 ### Slots
 
@@ -439,8 +445,10 @@ is complete; the replicated table and its contents stay until the source is
 dropped.
 
 If the source has to copy a table whose chunk query fails — the table was
-dropped upstream, the role lacks `SELECT` on it, a value does not parse, or
-any other error that leaves the connection usable — that table alone is
+dropped upstream, the role lacks `SELECT` on it, a value does not parse (a
+streamed change with such a value makes the table be copied again, see
+[type mapping](#type-mapping)), or any other error that leaves the connection
+usable — that table alone is
 retried, after 1 s, doubling up to 60 s, while the source copies its other
 tables and keeps streaming. `SHOW SOURCES` shows
 `error: cannot copy table <schema>.<table>: <message>; retrying every <n>s,

@@ -60,11 +60,13 @@ errors:
   ([Slots](sources.md#slots)).
 - authentication or permission errors: fix the role; the source picks the
   change up on its next attempt.
-- `cannot copy table s.t: relation "s.t" does not exist` or
-  `... permission denied for table t`: the table still has to be copied but
-  cannot be read. The source retries it (up to every 60 s) and streams the
-  other tables meanwhile; fix the privilege, or, if the table was dropped,
-  drop and re-create the source
+- `cannot copy table s.t: relation "s.t" does not exist`,
+  `... permission denied for table t` or the error of a value that does not
+  parse (after a streamed change with such a value, the table is copied
+  again): the table still has to be copied but cannot be read. The source
+  retries it (up to every 60 s) and streams the other tables meanwhile; fix
+  the privilege or the value, or, if the table was dropped, drop and
+  re-create the source
   ([Sources](sources.md#tables-added-to-or-removed-from-the-publication)).
 
 The reconnect delay doubles up to 10 s while sessions keep failing, and is
