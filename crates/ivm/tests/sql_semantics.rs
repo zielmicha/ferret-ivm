@@ -561,6 +561,32 @@ fn reg_values_compare_as_oids() {
     running.shutdown();
 }
 
+/// A NULL key in json_object_agg and jsonb_object_agg fails as in
+/// PostgreSQL 17, whose two aggregates word the error differently (and with
+/// different SQLSTATEs); both used to say "field name must not be null"
+/// with 22004. A materialized view gets the same error record.
+#[test]
+fn object_aggregates_reject_null_keys_as_postgresql() {
+    let running = start("object-agg-null");
+    let h = running.handle.clone();
+    let error = |sql: &str| -> (String, String) {
+        let stmt = ivm::sql::parse_statement(sql).unwrap();
+        let e = h.execute(stmt, vec![], SessionVars::default(), String::new()).expect_err(sql);
+        (e.code, e.message)
+    };
+    let json = ("22004".to_string(), "null value not allowed for object key".to_string());
+    let jsonb = ("22023".to_string(), "field name must not be null".to_string());
+    assert_eq!(error("SELECT json_object_agg(k, v) FROM (VALUES ('a', 1), (NULL, 2)) s(k, v)"), json);
+    assert_eq!(error("SELECT jsonb_object_agg(k, v) FROM (VALUES ('a', 1), (NULL, 2)) s(k, v)"), jsonb);
+    exec(&h, "CREATE TABLE kv (id int PRIMARY KEY, k text, v int)");
+    exec(&h, "INSERT INTO kv VALUES (1, 'a', 1), (2, NULL, 2)");
+    exec(&h, "CREATE MATERIALIZED VIEW j AS SELECT json_object_agg(k, v) AS o FROM kv");
+    exec(&h, "CREATE MATERIALIZED VIEW jb AS SELECT jsonb_object_agg(k, v) AS o FROM kv");
+    assert_eq!(error("SELECT * FROM j"), json);
+    assert_eq!(error("SELECT * FROM jb"), jsonb);
+    running.shutdown();
+}
+
 #[test]
 fn current_setting_reports_server_settings() {
     let running = start("current-setting");

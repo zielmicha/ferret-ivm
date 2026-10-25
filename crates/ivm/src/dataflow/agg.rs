@@ -231,7 +231,12 @@ impl AggSpec {
                         continue;
                     }
                     if r[arg].is_null() {
-                        return Err(SqlError::new(codes::NULL_VALUE_NOT_ALLOWED, "field name must not be null"));
+                        // (PostgreSQL 17's wording and codes differ between the two)
+                        return Err(if self.func == A::JsonbObjectAgg {
+                            SqlError::new(codes::INVALID_PARAMETER_VALUE, "field name must not be null")
+                        } else {
+                            SqlError::new(codes::NULL_VALUE_NOT_ALLOWED, "null value not allowed for object key")
+                        });
                     }
                     let k: String = crate::expr::ops_as_text(&r[arg]);
                     let v = crate::expr::builtins_datum_to_jsonb(&r[vcol])?;
