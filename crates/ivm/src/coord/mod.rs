@@ -118,6 +118,11 @@ pub(crate) enum Wait {
 /// most recent ones (the engine keeps them in memory).
 pub const MAX_HISTORY: usize = 10_000;
 
+/// Clock ticks that change nothing but the clock only cost replay time: they
+/// make a checkpoint due once this many records were applied since the last
+/// one (an hour of ticks at the default interval).
+const MAX_TICKS_WITHOUT_CHECKPOINT: u64 = 3600;
+
 pub struct Engine {
     pub cfg: Config,
     pub env: Env,
@@ -139,6 +144,9 @@ pub struct Engine {
     deferred: Vec<Request>,
     last_checkpoint: Instant,
     records_since_checkpoint: u64,
+    /// Records since the last checkpoint other than clock ticks that changed
+    /// nothing but the clock (and nodes relocated by garbage collection).
+    changes_since_checkpoint: u64,
     /// What the metadata tree holds.
     pub(crate) meta: meta::Meta,
     pub(crate) replaying: bool,
@@ -421,6 +429,7 @@ impl Engine {
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),
             records_since_checkpoint: 0,
+            changes_since_checkpoint: 0,
             meta: meta::Meta::default(),
             replaying: true,
             snap_epoch: 0,
@@ -716,6 +725,8 @@ impl Engine {
         if gsn <= self.processed {
             return Ok(());
         }
+        // (false for a tick that changed nothing but the clock)
+        let mut changed = true;
         match rec {
             LogRecord::Commit { source, lsn, changes } => {
                 // local DML is planned when it arrives, but DDL logged before
@@ -808,10 +819,12 @@ impl Engine {
                 let outputs = self.graph.step(&mut self.env, gsn, FxHashMap::default())?;
                 self.processed = gsn;
                 self.deliver(gsn, &outputs);
+                changed = !outputs.is_empty();
             }
         }
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
         self.records_since_checkpoint += 1;
+        self.changes_since_checkpoint += changed as u64;
         Ok(())
     }
 
@@ -880,8 +893,13 @@ impl Engine {
         }
     }
 
+    /// A checkpoint is due every `checkpoint_interval` (or as soon as dirty
+    /// nodes exceed half the cache) once something durable changed: records
+    /// other than clock ticks that changed nothing but the clock, or nodes
+    /// relocated by garbage collection. Ticks alone only add replay work:
+    /// they make one due after MAX_TICKS_WITHOUT_CHECKPOINT of them.
     fn maybe_checkpoint(&mut self) -> Result<()> {
-        if self.records_since_checkpoint == 0 {
+        if self.changes_since_checkpoint == 0 && self.records_since_checkpoint < MAX_TICKS_WITHOUT_CHECKPOINT {
             return Ok(());
         }
         let dirty = self.env.dirty_bytes();
@@ -897,11 +915,13 @@ impl Engine {
         self.persist_meta(self.processed)?;
         let header = meta::encode_header(&self.meta, self.next_req);
         self.env.checkpoint(self.processed, &header)?;
-        self.env.gc(1000)?;
+        let relocated = self.env.gc(1000)?;
         let keep_from = self.processed.saturating_sub(self.cfg.retention_gsns);
         let _ = self.seq.send(SeqMsg::Truncate(keep_from));
         self.last_checkpoint = Instant::now();
         self.records_since_checkpoint = 0;
+        // (the next checkpoint writes the relocated nodes)
+        self.changes_since_checkpoint = (relocated > 0) as u64;
         Ok(())
     }
 
@@ -1037,5 +1057,47 @@ mod tests {
         assert!(err.message.contains("has no dataflow"), "{}", err.message);
         assert_eq!((e.graph.live_nodes().count(), e.graph.live_arrangements().count()), (nodes, arrs));
         assert!(e.subs.is_empty());
+    }
+
+    /// Clock ticks that change nothing but the clock do not make a
+    /// checkpoint due: an idle engine took one every interval, rewriting its
+    /// whole state each time. A tick that changes a view does, and so does
+    /// a long run of ticks (which bounds the replay of an idle engine).
+    #[test]
+    fn ticks_alone_do_not_make_a_checkpoint_due() {
+        use crate::types::Datum;
+        let tmp = crate::testkit::TempDir::new("coord-idle-ticks");
+        let mut e = engine(tmp.path());
+        e.cfg.checkpoint_interval = Duration::ZERO;
+        // 2026-01-01T00:00:00Z in Unix and in PostgreSQL-epoch microseconds
+        let (unix, pg) = (1_767_225_600_000_000i64, 1_767_225_600_000_000i64 - 946_684_800_000_000);
+        let mut gsn = 0;
+        let mut apply = |e: &mut Engine, rec: LogRecord| {
+            gsn += 1;
+            e.apply_record(gsn, rec).unwrap();
+            e.maybe_checkpoint().unwrap();
+            gsn
+        };
+        let ddl = |sql: &str| LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() };
+        let tick = |secs: i64| LogRecord::Tick { micros: unix + secs * 1_000_000 };
+        apply(&mut e, ddl("CREATE TABLE t (id int PRIMARY KEY, until timestamptz)"));
+        apply(&mut e, ddl("CREATE MATERIALIZED VIEW live AS SELECT id FROM t WHERE until > now()"));
+        let t = e.catalog.by_name("t").unwrap().id;
+        let row = vec![Datum::Int4(1), Datum::TimestampTz(pg + 10_000_000)];
+        let g = apply(&mut e, LogRecord::Commit { source: 0, lsn: 0, changes: vec![(t, TableChange::Upsert { row, unchanged: vec![] })] });
+        assert_eq!(e.env.checkpoint_gsn(), g);
+        for s in 1..=5 {
+            apply(&mut e, tick(s));
+        }
+        assert_eq!(e.env.checkpoint_gsn(), g, "ticks that change nothing else");
+        // the row expires: the view changes
+        let g = apply(&mut e, tick(11));
+        assert_eq!(e.env.checkpoint_gsn(), g, "a tick that changes a view");
+        for s in 12..12 + MAX_TICKS_WITHOUT_CHECKPOINT as i64 - 1 {
+            apply(&mut e, tick(s));
+        }
+        assert_eq!(e.env.checkpoint_gsn(), g);
+        let g = apply(&mut e, tick(100_000));
+        assert_eq!(e.env.checkpoint_gsn(), g, "a long run of ticks");
     }
 }

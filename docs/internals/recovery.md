@@ -14,7 +14,7 @@ Code: `crates/ivm/src/coord/mod.rs` (`start`, `recover`, `checkpoint`),
 | Store | Written | Contents |
 |---|---|---|
 | input log (`log/`) | by the sequencer, before anything is applied or acknowledged | every input with its GSN |
-| checkpoint (`store/`) | by the engine every few seconds | all index trees as of the checkpoint GSN, among them the *metadata tree*, which holds the catalog with its DDL history and the engine state |
+| checkpoint (`store/`) | by the engine, every few seconds while something changes | all index trees as of the checkpoint GSN, among them the *metadata tree*, which holds the catalog with its DDL history and the engine state |
 
 The input log is the source of truth. A checkpoint is an optimisation: it
 bounds replay. Checkpoints are *atomic*: all trees, the metadata tree
@@ -156,8 +156,18 @@ fingerprint mismatch only costs a rebuild.
 
 ## Checkpoints
 
-`Engine::checkpoint` (every `--checkpoint-secs` if anything changed, when
-dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
+A checkpoint is taken on `CHECKPOINT`, on shutdown, and when one is due
+(`Engine::maybe_checkpoint`, after every message the engine handles): every
+`--checkpoint-secs`, or as soon as dirty nodes exceed half the cache, once
+something durable changed since the last one — a record was applied other
+than a clock tick that changed nothing but the clock (a tick that releases
+temporal-filter events counts), or garbage collection relocated nodes that
+the next checkpoint must write. Ticks alone only add replay work (and 25
+bytes of log each): they make a checkpoint due after 3,600 of them (an hour
+at the default `--tick-ms`), which bounds the replay of an idle engine. An
+engine that is idle takes no checkpoints otherwise.
+
+`Engine::checkpoint`:
 
 1. `persist_meta(processed GSN)`: write what changed since the last time
    into the metadata tree — catalog objects changed by DDL since (normally

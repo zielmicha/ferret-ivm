@@ -220,7 +220,8 @@ handles:
 | `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
-takes a checkpoint if one is due, and removes cancelled subscriptions.
+takes a checkpoint if one is due ([Recovery](recovery.md#checkpoints): clock
+ticks alone rarely make one due), and removes cancelled subscriptions.
 
 `apply_record` dispatches on the record kind:
 

@@ -12,7 +12,7 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 | Knob | Default | Trade-off |
 |---|---|---|
 | `--cache-mb` | 1024 | Target size of the node cache. Clean index nodes beyond it are evicted (CLOCK) and re-read from segment files on demand; dirty nodes stay until the next checkpoint, and a checkpoint is forced when dirty nodes exceed half of it. Working sets that fit run from memory; larger ones degrade gradually. |
-| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. A checkpoint writes what changed since the previous one. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
+| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
 | `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes, more input-log segments on disk, and more clock ticks. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
 | `--no-sync` | off | Skips `fsync` of the input log. Only for tests and benchmarks; see [Durability](#durability-and---no-sync). |
@@ -33,6 +33,7 @@ Fixed internal parameters (not configurable):
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
 | clock ticks kept | those of the retention window |
+| clock ticks that make a checkpoint due without other changes | 3,600 |
 | source reconnect delay | 200 ms, doubling up to 10 s |
 | retry of a table that cannot be copied | 1 s, doubling up to 60 s |
 | sink reconnect delay | 100 ms, doubling up to 10 s |
@@ -174,10 +175,15 @@ view).
 
 ## Checkpoints and garbage collection
 
-A checkpoint is taken every `--checkpoint-secs` seconds if anything was
-applied since the last one, when dirty index nodes exceed half of
-`--cache-mb` (also only if something was applied), on the `CHECKPOINT`
-statement, and as the final step of a requested shutdown. It:
+A checkpoint is taken every `--checkpoint-secs` seconds, or as soon as
+dirty index nodes exceed half of `--cache-mb`, if something durable changed
+since the last one: anything applied but clock ticks that changed nothing
+but the clock (a tick that changes a view through a temporal filter
+counts), or nodes the last garbage-collection pass relocated. Clock ticks
+alone make one due only after 3,600 of them (an hour at the default
+`--tick-ms`), so an idle engine writes nothing but its ticks to the log, and
+a restart replays at most that many. A checkpoint is also taken on the
+`CHECKPOINT` statement and as the final step of a requested shutdown. It:
 
 1. writes what changed in the catalog and the engine state since the last
    one (DDL history entries, source states and LSNs, index fingerprints →
@@ -285,7 +291,9 @@ slot; a slot whose engine is gone retains WAL indefinitely.
 ## Monitoring checklist
 
 - `SHOW FRONTIERS`: `durable_gsn` − `processed_gsn` is the apply backlog;
-  `checkpoint_gsn` should advance every `--checkpoint-secs`.
+  `checkpoint_gsn` should advance every `--checkpoint-secs` while anything
+  but clock ticks is applied (an idle engine checkpoints once per 3,600
+  ticks).
 - `SHOW SOURCES`: `status` (`streaming`, `snapshotting ...`, `error: ...`,
   `error: cannot copy table ...`) and `lsn`; upstream,
   `pg_replication_slots.confirmed_flush_lsn` should track

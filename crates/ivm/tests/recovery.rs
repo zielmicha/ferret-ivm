@@ -366,7 +366,8 @@ fn insert_checkpoint_cost(h: &EngineHandle, dir: &Path, id: i32) -> (u64, u64) {
 /// history or the error records of a view over dirty data. Every
 /// checkpoint used to write the whole catalog with its history (up to
 /// 11,000 statements), every error record and the rest of the engine state
-/// as JSON into its manifest record.
+/// as JSON into its manifest record, and an idle engine took one every
+/// interval.
 #[test]
 fn checkpoint_cost_does_not_grow_with_the_catalog_history_or_the_errors() {
     let dir = tmpdir("checkpoint-cost");
@@ -398,6 +399,41 @@ fn checkpoint_cost_does_not_grow_with_the_catalog_history_or_the_errors() {
     assert_eq!(rows(&h, "SELECT statement FROM ivm.catalog_history ORDER BY gsn DESC LIMIT 1"), ["DROP TABLE x999"]);
     assert_eq!(rows(&h, "SELECT * FROM t ORDER BY id"), ["1", "2"]);
     assert_eq!(rows(&h, "SHOW VIEWS"), ["parsed|materialized|0|2000|ok"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn frontier(h: &EngineHandle, name: &str) -> u64 {
+    let row = rows(h, "SHOW FRONTIERS").into_iter().find(|r| r.starts_with(&format!("{name}|"))).unwrap();
+    row[name.len() + 1..].parse().unwrap()
+}
+
+/// An idle engine takes no checkpoints: clock ticks that change nothing but
+/// the clock do not make one due.
+#[test]
+fn an_idle_engine_takes_no_checkpoints() {
+    let dir = tmpdir("idle");
+    let tick = Some(std::time::Duration::from_millis(2));
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick, checkpoint_interval: std::time::Duration::from_millis(10), ..Default::default() };
+    let running = coord::start(cfg).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    exec(&h, "CHECKPOINT");
+    let before = frontier(&h, "checkpoint_gsn");
+    // a change makes one due
+    exec(&h, "INSERT INTO t VALUES (1)");
+    let t0 = std::time::Instant::now();
+    while frontier(&h, "checkpoint_gsn") == before {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "no checkpoint after the INSERT");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (checkpoint, sizes) = (frontier(&h, "checkpoint_gsn"), store_sizes(&dir));
+    // fifty ticks later
+    while frontier(&h, "processed_gsn") < checkpoint + 50 {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the clock does not tick");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!((frontier(&h, "checkpoint_gsn"), store_sizes(&dir)), (checkpoint, sizes));
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

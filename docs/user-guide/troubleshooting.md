@@ -195,7 +195,9 @@ stream until it catches up (`SHOW FRONTIERS`: `durable_gsn` −
 ### Disk usage grows
 
 - The input log keeps segments back to `checkpoint GSN − --retention-gsns`
-  (and always the current 64 MiB segment).
+  (and always the current 64 MiB segment). An engine that applies nothing
+  but clock ticks checkpoints only every 3,600 ticks, so its log segment
+  fills slowly (25 bytes per tick).
 - Dead index nodes are reclaimed only in sealed segments that are less than
   half live, one segment at a time after each checkpoint (at most 1000 nodes
   relocated per pass); up to half of any other sealed segment can stay
