@@ -531,3 +531,44 @@ fn abstract_unix_socket() {
         Some("t")
     );
 }
+
+#[test]
+fn simple_query_rows_borrows_values() {
+    let pg = cluster();
+    let mut c = connect(&pg.conninfo("postgres"));
+    let sql = "BEGIN; SELECT 1 AS a, NULL::text AS b, '' AS c; \
+               SELECT g, repeat('x', g) FROM generate_series(1, 3000) g; COMMIT";
+    let mut seen: Vec<(usize, Vec<Option<String>>)> = Vec::new();
+    let tags = c
+        .simple_query_rows(sql, &mut |cols, r| {
+            assert_eq!(cols.len(), r.len());
+            let row = (0..r.len()).map(|i| r.get(i).map(|b| String::from_utf8(b.to_vec()).unwrap())).collect();
+            seen.push((cols.len(), row));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(tags, vec!["BEGIN", "SELECT 1", "SELECT 3000", "COMMIT"]);
+    let owned: Vec<(usize, Vec<Option<String>>)> = c
+        .simple_query(sql)
+        .unwrap()
+        .into_iter()
+        .flat_map(|res| res.rows.into_iter().map(move |r| (r.len(), r)))
+        .collect();
+    assert_eq!(seen, owned);
+    assert!(seen[0].1[1].is_none() && seen[0].1[2].as_deref() == Some(""));
+    // an error from the callback is returned after the responses are drained
+    let mut n = 0;
+    let err = c
+        .simple_query_rows("SELECT g FROM generate_series(1, 10) g", &mut |_, _| {
+            n += 1;
+            if n == 3 { Err("stop".into()) } else { Ok(()) }
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("stop"), "{err}");
+    assert_eq!(n, 3);
+    assert_eq!(c.query("select 42").unwrap().get(0, 0), Some("42"));
+    // server errors behave as in simple_query
+    let err = c.simple_query_rows("SELECT 1/0", &mut |_, _| Ok(())).unwrap_err();
+    assert_eq!(err.code(), Some("22012"));
+    assert_eq!(c.query("select 7").unwrap().get(0, 0), Some("7"));
+}
