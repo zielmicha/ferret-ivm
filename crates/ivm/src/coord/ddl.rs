@@ -1040,6 +1040,10 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
     if ct.query.is_some() {
         sql_bail!(codes::FEATURE_NOT_SUPPORTED, "CREATE TABLE AS is not supported");
     }
+    let (_, table) = object_name(&ct.name)?;
+    let multiple_keys = || {
+        Err(SqlError::new(codes::INVALID_TABLE_DEFINITION, format!("multiple primary keys for table \"{table}\" are not allowed")))
+    };
     let mut columns = Vec::new();
     let mut pk: Vec<usize> = Vec::new();
     for (i, c) in ct.columns.iter().enumerate() {
@@ -1050,6 +1054,11 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
                 ast::ColumnOption::NotNull => nullable = false,
                 ast::ColumnOption::Null => nullable = true,
                 ast::ColumnOption::PrimaryKey(_) => {
+                    // one column-level key is the whole key: a second one
+                    // is a second primary key, not a composite one
+                    if !pk.is_empty() {
+                        return multiple_keys();
+                    }
                     pk.push(i);
                     nullable = false;
                 }
@@ -1067,7 +1076,7 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
     for con in &ct.constraints {
         if let ast::TableConstraint::PrimaryKey(p) = con {
             if !pk.is_empty() {
-                sql_bail!(codes::INVALID_COLUMN_REFERENCE, "multiple primary keys for table are not allowed");
+                return multiple_keys();
             }
             for ic in &p.columns {
                 let ast::Expr::Identifier(id) = &ic.column.expr else {
@@ -1077,6 +1086,9 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
                 let pos = columns.iter().position(|c| c.name == n).ok_or_else(|| {
                     SqlError::new(codes::UNDEFINED_COLUMN, format!("column \"{n}\" named in key does not exist"))
                 })?;
+                if pk.contains(&pos) {
+                    sql_bail!(codes::DUPLICATE_COLUMN, "column \"{n}\" appears twice in primary key constraint");
+                }
                 columns[pos].ty.nullable = false;
                 pk.push(pos);
             }

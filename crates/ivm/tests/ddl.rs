@@ -1,0 +1,93 @@
+//! DDL semantics through the public API (no PostgreSQL needed): validation
+//! of definitions, DROP and its dependencies, the catalog history.
+
+use ivm::coord::api::{ExecResult, SessionVars};
+use ivm::coord::{self, EngineHandle};
+use ivm::error::SqlError;
+use ivm::types::text::format_datum;
+use std::path::{Path, PathBuf};
+
+fn tmpdir(name: &str) -> PathBuf {
+    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+    let d = PathBuf::from(base).join(format!("ivm-ddl-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+/// A running engine whose data directory is removed at shutdown.
+struct Engine {
+    running: coord::Running,
+    dir: PathBuf,
+    h: EngineHandle,
+}
+
+impl Engine {
+    fn start(name: &str) -> Engine {
+        let dir = tmpdir(name);
+        let running = start_in(&dir);
+        let h = running.handle.clone();
+        Engine { running, dir, h }
+    }
+
+    fn shutdown(self) {
+        self.running.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+
+    fn try_exec(&self, sql: &str) -> Result<ExecResult, SqlError> {
+        let stmt = ivm::sql::parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        self.h.execute(stmt, vec![], SessionVars::default(), String::new())
+    }
+
+    fn exec(&self, sql: &str) -> ExecResult {
+        self.try_exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    /// The error of a statement that must fail: (SQLSTATE, message).
+    fn err(&self, sql: &str) -> (String, String) {
+        match self.try_exec(sql) {
+            Ok(r) => panic!("{sql}: expected an error, got {r:?}"),
+            Err(e) => (e.code, e.message),
+        }
+    }
+
+    /// Result rows as text, in result order.
+    fn rows(&self, sql: &str) -> Vec<String> {
+        match self.exec(sql) {
+            ExecResult::Query { rows, .. } => rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect(),
+            other => panic!("{sql}: expected rows, got {other:?}"),
+        }
+    }
+}
+
+fn start_in(dir: &Path) -> coord::Running {
+    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
+    coord::start(cfg).expect("engine starts")
+}
+
+fn err(code: &str, msg: &str) -> (String, String) {
+    (code.to_string(), msg.to_string())
+}
+
+/// Two column-level PRIMARY KEYs are two primary keys (an error in
+/// PostgreSQL), not one composite key.
+#[test]
+fn a_table_has_at_most_one_primary_key() {
+    let e = Engine::start("two-pks");
+    assert_eq!(
+        e.err("CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)"),
+        err("42P16", "multiple primary keys for table \"t\" are not allowed")
+    );
+    assert_eq!(
+        e.err("CREATE TABLE t (a int PRIMARY KEY, b int, PRIMARY KEY (b))"),
+        err("42P16", "multiple primary keys for table \"t\" are not allowed")
+    );
+    assert_eq!(e.err("CREATE TABLE t (a int, PRIMARY KEY (a, a))"), err("42701", "column \"a\" appears twice in primary key constraint"));
+    assert_eq!(e.err("CREATE TABLE t (a int, PRIMARY KEY (b))"), err("42703", "column \"b\" named in key does not exist"));
+    // nothing was created by the failed statements
+    e.exec("CREATE TABLE t (a int, b int, PRIMARY KEY (b, a))");
+    assert_eq!(e.rows("SHOW COLUMNS FROM t"), ["a|integer|false|true", "b|integer|false|true"]);
+    e.exec("INSERT INTO t VALUES (1, 1), (2, 1)");
+    assert_eq!(e.rows("SELECT a, b FROM t ORDER BY a"), ["1|1", "2|1"]);
+    e.shutdown();
+}
