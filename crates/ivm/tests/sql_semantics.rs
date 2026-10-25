@@ -421,3 +421,20 @@ fn binder_name_resolution_corner_cases() {
     assert!(try_rows(&h, "WITH RECURSIVE r AS (SELECT * FROM r) SELECT * FROM r").is_err());
     running.shutdown();
 }
+
+#[test]
+fn interval_field_qualifiers_and_int2_shifts() {
+    let running = start("interval-fields");
+    let h = running.handle.clone();
+    // the fields restrict the value (they used to be ignored but for
+    // unit-less numbers)
+    assert_eq!(
+        rows(&h, "SELECT interval '1 day 2 hours' day, interval '2 years 3 months' year, interval '1:30' hour to minute, \
+                  interval '100' minute, interval '1 day 02:03:04.5678' day to second(2)"),
+        vec!["1 day|2 years|01:30:00|01:40:00|1 day 02:03:04.57"]
+    );
+    assert_eq!(rows(&h, "SELECT '1 day 2 hours'::interval day, '1 year 2 months'::interval month"), vec!["1 day|1 year 2 mons"]);
+    // smallint shifts like C ints (1 << 16 used to give 1)
+    assert_eq!(rows(&h, "SELECT 1::int2 << 16, 1::int2 << 15, (-8)::int2 >> 1, 1 << 33"), vec!["0|-32768|-4|2"]);
+    running.shutdown();
+}

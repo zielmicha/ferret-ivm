@@ -58,7 +58,25 @@ pub fn sql_type_of(dt: &ast::DataType) -> Result<(SqlType, i32)> {
             ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz => (SqlType::TimestampTz, ts_prec(p)),
             _ => (SqlType::Timestamp, ts_prec(p)),
         },
-        D::Interval { precision, .. } => (SqlType::Interval, precision.map(|p| (0x7FFF << 16) | p as i32).unwrap_or(-1)),
+        D::Interval { fields, precision } => {
+            use ast::IntervalFields as F;
+            let range = fields.as_ref().map(|f| match f {
+                F::Year => interval_range(&[YEAR]),
+                F::Month => interval_range(&[MONTH]),
+                F::Day => interval_range(&[DAY]),
+                F::Hour => interval_range(&[HOUR]),
+                F::Minute => interval_range(&[MINUTE]),
+                F::Second => interval_range(&[SECOND]),
+                F::YearToMonth => interval_range(&[YEAR, MONTH]),
+                F::DayToHour => interval_range(&[DAY, HOUR]),
+                F::DayToMinute => interval_range(&[DAY, HOUR, MINUTE]),
+                F::DayToSecond => interval_range(&[DAY, HOUR, MINUTE, SECOND]),
+                F::HourToMinute => interval_range(&[HOUR, MINUTE]),
+                F::HourToSecond => interval_range(&[HOUR, MINUTE, SECOND]),
+                F::MinuteToSecond => interval_range(&[MINUTE, SECOND]),
+            });
+            (SqlType::Interval, interval_typmod(range, *precision))
+        }
         D::Uuid => (SqlType::Uuid, -1),
         D::JSON => (SqlType::Json, -1),
         D::JSONB => (SqlType::Jsonb, -1),
@@ -109,6 +127,26 @@ pub fn sql_type_of(dt: &ast::DataType) -> Result<(SqlType, i32)> {
         D::Regclass => (SqlType::Oid, -1),
         other => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "type {other} is not supported"),
     })
+}
+
+// interval field bits (PostgreSQL's datetime.h)
+const MONTH: i32 = 1;
+const YEAR: i32 = 2;
+const DAY: i32 = 3;
+const HOUR: i32 = 10;
+const MINUTE: i32 = 11;
+const SECOND: i32 = 12;
+
+fn interval_range(fields: &[i32]) -> i32 {
+    fields.iter().fold(0, |m, b| m | (1 << b))
+}
+
+/// PostgreSQL's interval typmod: (field range << 16) | precision.
+fn interval_typmod(range: Option<i32>, precision: Option<u64>) -> i32 {
+    if range.is_none() && precision.is_none() {
+        return -1;
+    }
+    (range.unwrap_or(0x7FFF) << 16) | precision.map(|p| p as i32).unwrap_or(0xFFFF)
 }
 
 fn binop_name(op: &ast::BinaryOperator) -> Option<&'static str> {
@@ -584,13 +622,44 @@ impl<'a> Binder<'a> {
                     Expr::Literal(d, _) if !d.is_null() => crate::types::text::format_datum(d),
                     _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "INTERVAL requires a constant"),
                 };
-                let text = match &iv.leading_field {
-                    Some(f) if iv.last_field.is_none() && text.trim().parse::<f64>().is_ok() => {
-                        format!("{} {}", text.trim(), datetime_field_name(f))
-                    }
-                    _ => text,
+                // INTERVAL '...' DAY etc.: the fields restrict the value (and
+                // give unit-less numbers their unit), as interval_in does
+                use ast::DateTimeField as F;
+                let bit = |f: &F| -> Option<i32> {
+                    Some(match f {
+                        F::Year | F::Years => YEAR,
+                        F::Month | F::Months => MONTH,
+                        F::Day | F::Days => DAY,
+                        F::Hour | F::Hours => HOUR,
+                        F::Minute | F::Minutes => MINUTE,
+                        F::Second | F::Seconds => SECOND,
+                        _ => return None,
+                    })
                 };
-                Ok(Expr::Literal(parse_datum(&text, &SqlType::Interval, -1)?, SqlType::Interval))
+                let bad = || SqlError::syntax(format!("invalid interval qualifier in {e}"));
+                let range = match (&iv.leading_field, &iv.last_field) {
+                    (None, None) => None,
+                    (Some(l), None) => Some(interval_range(&[bit(l).ok_or_else(bad)?])),
+                    (Some(l), Some(t)) => {
+                        let (l, t) = (bit(l).ok_or_else(bad)?, bit(t).ok_or_else(bad)?);
+                        let span: &[i32] = match (l, t) {
+                            (YEAR, MONTH) => &[YEAR, MONTH],
+                            (DAY, HOUR) => &[DAY, HOUR],
+                            (DAY, MINUTE) => &[DAY, HOUR, MINUTE],
+                            (DAY, SECOND) => &[DAY, HOUR, MINUTE, SECOND],
+                            (HOUR, MINUTE) => &[HOUR, MINUTE],
+                            (HOUR, SECOND) => &[HOUR, MINUTE, SECOND],
+                            (MINUTE, SECOND) => &[MINUTE, SECOND],
+                            _ => return Err(bad()),
+                        };
+                        Some(interval_range(span))
+                    }
+                    (None, Some(_)) => return Err(bad()),
+                };
+                let seconds_only = range == Some(interval_range(&[SECOND]));
+                let precision = iv.fractional_seconds_precision.or(if seconds_only { iv.leading_precision } else { None });
+                let d = pgdatetime::parse_interval_raw_typmod(&text, interval_typmod(range, precision))?;
+                Ok(Expr::Literal(Datum::Interval(d), SqlType::Interval))
             }
             E::AtTimeZone { timestamp, time_zone } => {
                 let ts = self.bind_expr(timestamp, ctx)?;

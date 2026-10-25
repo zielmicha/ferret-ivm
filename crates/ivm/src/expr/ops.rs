@@ -73,7 +73,11 @@ fn int_xor(a: &Datum, b: &Datum) -> Result<Datum> {
 fn int_shift(a: &Datum, b: &Datum, left: bool) -> Result<Datum> {
     let s = b.as_i64().unwrap_or(0) as u32;
     Ok(match a {
-        Datum::Int2(x) => Datum::Int2(if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }),
+        // as in C, int2 is shifted as an int (masking the count to 5 bits)
+        Datum::Int2(x) => {
+            let x = *x as i32;
+            Datum::Int2((if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }) as i16)
+        }
         Datum::Int4(x) => Datum::Int4(if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }),
         Datum::Int8(x) => Datum::Int8(if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }),
         _ => return Err(internal("<<", a, b)),
