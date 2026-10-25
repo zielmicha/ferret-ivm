@@ -178,3 +178,47 @@ fn views_that_no_longer_plan_are_broken_not_fatal() {
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// After an upstream schema change, the indexes on the table move to its
+/// new version, following their columns by name (a dropped column moves
+/// the ones after it), and those whose columns are gone are dropped. They
+/// used to stay on the old table node (SHOW ARRANGEMENTS panicked with
+/// "dangling node", start-up panicked when an indexed column was gone).
+#[test]
+fn indexes_follow_upstream_schema_changes() {
+    use ivm::types::{Column, ColumnType, SqlType};
+    let dir = tmpdir("schema-indexes");
+    let e = Engine::start(&dir);
+    e.exec("CREATE TABLE t (id int PRIMARY KEY, a int, b text)");
+    e.exec("INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')");
+    e.exec("CREATE INDEX ta ON t (a)");
+    e.exec("CREATE INDEX tb ON t (b)");
+    e.exec("CREATE INDEX tbi ON t (b, id)");
+    e.exec("CHECKPOINT");
+    let oid: u64 = e.rows("SELECT oid FROM ivm.objects WHERE name = 't'")[0].parse().unwrap();
+    // as a source logs it: a was dropped upstream, b moved to position 1
+    let columns = vec![Column::new("id", ColumnType::new(SqlType::Int4).not_null()), Column::new("b", ColumnType::new(SqlType::Text))];
+    e.h.log(ivm::log::LogRecord::Schema { source: 0, table: oid - 16384, columns, pk: vec![0] }).unwrap();
+    assert_eq!(e.rows("SELECT * FROM t ORDER BY id"), ["1|x", "2|y"]);
+    let state = |e: &Engine| (e.rows("SHOW INDEXES"), e.rows("SHOW ARRANGEMENTS").into_iter().map(|r| r.split('|').skip(2).collect::<Vec<_>>().join("|")).collect::<Vec<_>>());
+    let expected = (
+        vec!["tb|t|[1]".to_string(), "tbi|t|[1, 0]".to_string()],
+        vec!["Table|#0|2|1".to_string(), "Table|#1|2|1".to_string(), "Table|#1, #0|2|1".to_string()],
+    );
+    assert_eq!(state(&e), expected);
+    e.exec("INSERT INTO t VALUES (3, 'z')");
+    e.shutdown();
+    // replayed from the log, then from a checkpoint
+    let e = Engine::start(&dir);
+    assert_eq!(e.rows("SELECT * FROM t ORDER BY id"), ["1|x", "2|y", "3|z"]);
+    let (indexes, arrangements) = state(&e);
+    assert_eq!(indexes, expected.0);
+    assert_eq!(arrangements.len(), 3, "{arrangements:?}");
+    e.exec("CHECKPOINT");
+    e.shutdown();
+    let e = Engine::start(&dir);
+    assert_eq!(state(&e).0, expected.0);
+    assert_eq!(e.rows("SELECT * FROM t WHERE b = 'z'"), ["3|z"]);
+    e.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

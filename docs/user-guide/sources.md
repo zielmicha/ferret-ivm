@@ -327,7 +327,9 @@ type at some position — the source:
    failing cast gives NULL); new columns are NULL. The table's version is
    incremented;
 3. dependent materialized views are re-planned against the new definition
-   and swapped at that GSN;
+   and swapped at that GSN; indexes on the table move to its new version,
+   following their columns by name, and an index whose column is gone is
+   dropped (logged);
 4. the source re-snapshots the table from the beginning, which fills the new
    columns of existing rows. Fresh reads wait for this snapshot only once its
    first chunk has been logged; until then they return the table at once,
@@ -361,13 +363,6 @@ Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
   change`). After the next checkpoint the engine **fails to start** because
   the view cannot be planned during recovery. Drop such views before making
   breaking upstream changes.
-- Indexes created on a replicated table (`CREATE INDEX`) are not rebuilt when
-  the table changes shape; they keep referring to the table's old dataflow
-  node. `SHOW ARRANGEMENTS` then crashes the engine thread (`dangling node`;
-  afterwards every statement fails with `engine is shutting down`), and if
-  the change dropped the indexed column, the engine panics during recovery
-  after the next checkpoint and the data directory cannot be started. Drop
-  indexes on replicated tables before changing their upstream schema.
 
 ### Tables added to or removed from the publication
 

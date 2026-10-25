@@ -635,7 +635,7 @@ impl Engine {
         };
         for o in self.catalog.objects.values() {
             match &o.kind {
-                ObjectKind::Index(i) if i.on == old.id && !new_cols.is_some_and(|c| index_fits(&i.columns, old_cols, c)) => {
+                ObjectKind::Index(i) if i.on == old.id && !new_cols.is_some_and(|c| remap_index(&i.columns, old_cols, c).is_some()) => {
                     return refuse(format!("index \"{}\" depends on its columns", o.name));
                 }
                 ObjectKind::Sink(s) if s.from == old.id && !new_cols.is_some_and(|c| same_columns(c, old_cols)) => {
@@ -753,33 +753,13 @@ impl Engine {
             }
             return Err(e);
         }
-        // indexes on the view move to the new version; one whose columns
-        // are gone is dropped (user replacements are checked beforehand)
+        // indexes on the view move to the new version (user replacements
+        // are checked beforehand)
         let old_cols = match old_cat.as_ref().map(|o| &o.kind) {
             Some(ObjectKind::MaterializedView(v)) => v.columns.clone(),
             _ => vec![],
         };
-        let indexes: Vec<(ObjectId, String, IndexDef)> = self
-            .catalog
-            .objects
-            .values()
-            .filter_map(|o| match &o.kind {
-                ObjectKind::Index(i) if i.on == id => Some((o.id, o.name.clone(), i.clone())),
-                _ => None,
-            })
-            .collect();
-        let mut old_index_arrs = Vec::new();
-        for (iid, iname, idef) in indexes {
-            if let Some(a) = self.rt.indexes.remove(&iid) {
-                old_index_arrs.push(a);
-            }
-            if index_fits(&idef.columns, &old_cols, &def.columns) {
-                self.create_index_rt(iid, &idef)?;
-            } else {
-                log::error!("index {iname} is dropped: its columns are gone from materialized view {name}");
-                self.catalog.remove(iid);
-            }
-        }
+        let old_index_arrs = self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
         self.graph.hydrate(&mut self.env, gsn)?;
         // the new root's error records (also when it is shared and was
         // hydrated long ago, or is the old version's own root)
@@ -843,24 +823,8 @@ impl Engine {
             Some(ObjectKind::MaterializedView(v)) => v.columns.clone(),
             _ => vec![],
         };
-        let indexes: Vec<(ObjectId, String, IndexDef)> = self
-            .catalog
-            .objects
-            .values()
-            .filter_map(|o| match &o.kind {
-                ObjectKind::Index(i) if i.on == id => Some((o.id, o.name.clone(), i.clone())),
-                _ => None,
-            })
-            .collect();
-        for (iid, iname, idef) in indexes {
-            self.rt.broken.remove(&iid);
-            if !index_fits(&idef.columns, &old_cols, &def.columns) {
-                log::error!("index {iname} is dropped: its columns are gone from materialized view {name}");
-                self.catalog.remove(iid);
-            } else if let Err(e) = self.create_index_rt(iid, &idef) {
-                self.rt.broken.insert(iid, e.message);
-            }
-        }
+        // (broken views have no index arrangements to release)
+        self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
         self.graph.hydrate(&mut self.env, gsn)?;
         let errs = self.graph.errors_of(self.rt.views[&id].node);
         merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
@@ -882,6 +846,38 @@ impl Engine {
             }
         }
         Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
+    }
+
+    /// Move the indexes on relation `on` to its new version, whose columns
+    /// are `new` (previously `old`): each follows its key columns by name,
+    /// and one whose columns are gone is dropped (logged). Returns the
+    /// arrangements of the old version, to release once nothing reads them.
+    fn move_indexes(&mut self, on: ObjectId, what: &str, old: &[Column], new: &[Column]) -> Vec<ArrId> {
+        let indexes: Vec<CatalogObject> =
+            self.catalog.objects.values().filter(|o| matches!(&o.kind, ObjectKind::Index(i) if i.on == on)).cloned().collect();
+        let mut old_arrs = Vec::new();
+        for o in indexes {
+            let ObjectKind::Index(idef) = &o.kind else { continue };
+            if let Some(a) = self.rt.indexes.remove(&o.id) {
+                old_arrs.push(a);
+            }
+            self.rt.broken.remove(&o.id);
+            match remap_index(&idef.columns, old, new) {
+                Some(columns) => {
+                    let idef = IndexDef { on, columns };
+                    if let Err(e) = self.create_index_rt(o.id, &idef) {
+                        log::error!("index {} is broken: {}", o.name, e.message);
+                        self.rt.broken.insert(o.id, e.message);
+                    }
+                    self.catalog.insert(CatalogObject { kind: ObjectKind::Index(idef), ..o });
+                }
+                None => {
+                    log::error!("index {} is dropped: its columns are gone from {what}", o.name);
+                    self.catalog.remove(o.id);
+                }
+            }
+        }
+        old_arrs
     }
 
     fn apply_create_index(&mut self, gsn: Gsn, sql: &str, ci: &ast::CreateIndex) -> Result<ExecResult> {
@@ -1070,26 +1066,9 @@ impl Engine {
         let tree = arr.tree;
         self.env.apply(tree, &mut ups, gsn)?;
         self.catalog.insert(CatalogObject { kind: ObjectKind::Table(def.clone()), ..obj.clone() });
-        // indexes on the table move to the new version (or go with their columns)
-        let indexes: Vec<(ObjectId, String, IndexDef)> = self
-            .catalog
-            .objects
-            .values()
-            .filter_map(|o| match &o.kind {
-                ObjectKind::Index(i) if i.on == table => Some((o.id, o.name.clone(), i.clone())),
-                _ => None,
-            })
-            .collect();
-        for (iid, iname, idef) in indexes {
-            if let Some(a) = self.rt.indexes.remove(&iid) {
-                self.graph.release_arr(&mut self.env, a)?;
-            }
-            if index_fits(&idef.columns, &old_columns, &columns) {
-                self.create_index_rt(iid, &idef)?;
-            } else {
-                log::error!("index {iname} is dropped: its columns are gone from table {}", obj.name);
-                self.catalog.remove(iid);
-            }
+        // indexes on the table move to the new version
+        for a in self.move_indexes(table, &format!("table {}", obj.name), &old_columns, &columns) {
+            self.graph.release_arr(&mut self.env, a)?;
         }
         self.graph.hydrate(&mut self.env, gsn)?;
         // subscribers to the table were promised the old columns
@@ -1148,10 +1127,10 @@ fn same_columns(a: &[Column], b: &[Column]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name && x.ty.ty == y.ty.ty && x.ty.typmod == y.ty.typmod)
 }
 
-/// Do index key columns (positions into `old`) denote the same columns in
-/// `new`?
-fn index_fits(key: &[usize], old: &[Column], new: &[Column]) -> bool {
-    key.iter().all(|&k| k < new.len() && old.get(k).is_some_and(|c| c.name == new[k].name))
+/// Index key columns (positions into `old`) at the positions of the same
+/// columns, by name, in `new`; None if one of them is gone.
+fn remap_index(key: &[usize], old: &[Column], new: &[Column]) -> Option<Vec<usize>> {
+    key.iter().map(|&k| old.get(k).and_then(|c| new.iter().position(|n| n.name == c.name))).collect()
 }
 
 fn object_type_name(t: ast::ObjectType) -> &'static str {
