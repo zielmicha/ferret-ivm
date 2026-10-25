@@ -282,7 +282,11 @@ impl Session {
                 FrontendMessage::CopyData(_) | FrontendMessage::CopyDone | FrontendMessage::CopyFail(_) => {}
                 FrontendMessage::Password(_) => {}
                 FrontendMessage::FunctionCall => {
+                    // like a simple query: the error, then ReadyForQuery
                     self.error(&SqlError::unsupported("function call protocol is not supported"));
+                    let st = self.txn_status();
+                    self.out.ready_for_query(st);
+                    self.flush()?;
                 }
             }
         }
