@@ -351,16 +351,25 @@ impl PgSource {
                 self.push_change(table, TableChange::Delete { key });
             }
             LogicalMessage::Truncate { relation_ids, .. } => {
+                let xid = self.txn.as_ref().map(|t| t.xid);
                 for r in relation_ids {
-                    if let Some(rm) = self.rels.get(&r) {
-                        let t = rm.table;
+                    let Some(t) = self.rels.get(&r).map(|rm| rm.table) else { continue };
+                    // a chunk read after the truncate already reflects it
+                    let in_chunk = self.chunk.as_ref().is_some_and(|ch| {
+                        ch.table == t
+                            && ch.phase == Phase::BeforeLow
+                            && matches!((&ch.snap, xid), (Some(snap), Some(x)) if xid_visible(snap, x))
+                    });
+                    if !self.tables[&t].pk.is_empty() || !self.multiset_visible(t) {
+                        // (a keyless table's chunk replaces its contents anyway)
                         self.push_change(t, TableChange::Truncate);
-                        if let Some(ch) = &mut self.chunk
-                            && ch.table == t
-                        {
-                            ch.rows.clear();
-                            ch.multiset.clear();
-                        }
+                    }
+                    if !in_chunk
+                        && let Some(ch) = &mut self.chunk
+                        && ch.table == t
+                    {
+                        ch.rows.clear();
+                        ch.multiset.clear();
                     }
                 }
             }
@@ -1036,6 +1045,125 @@ mod tests {
 
     fn insert(vals: &[i32]) -> LogicalMessage {
         LogicalMessage::Insert { relation_id: REL, new: vals.iter().map(|v| TupleValue::Text(v.to_string().into_bytes())).collect() }
+    }
+
+    fn message(tag: &str) -> LogicalMessage {
+        LogicalMessage::Message { transactional: true, lsn: Lsn(0), prefix: "ivm".into(), content: tag.as_bytes().to_vec() }
+    }
+
+    /// The contents of table 10 after applying the logged commits.
+    fn replay(log: &[LogRecord]) -> Vec<Row> {
+        let mut keyed: BTreeMap<i64, Row> = BTreeMap::new();
+        let mut multiset: Vec<Row> = Vec::new();
+        for r in log {
+            let LogRecord::Commit { changes, .. } = r else { continue };
+            for (t, ch) in changes {
+                assert_eq!(*t, 10);
+                match ch {
+                    TableChange::Upsert { row, .. } => {
+                        keyed.insert(row[0].as_i64().unwrap(), row.clone());
+                    }
+                    TableChange::Delete { key } => {
+                        keyed.remove(&key[0].as_i64().unwrap());
+                    }
+                    TableChange::Insert { row } => multiset.push(row.clone()),
+                    TableChange::Remove { row } => {
+                        let i = multiset.iter().position(|m| m == row).expect("removed row present");
+                        multiset.remove(i);
+                    }
+                    TableChange::Truncate => {
+                        keyed.clear();
+                        multiset.clear();
+                    }
+                }
+            }
+        }
+        multiset.sort_by_key(|r| r[0].as_i64());
+        keyed.into_values().chain(multiset).collect()
+    }
+
+    /// A chunk of table 10 between the stream's position and its low
+    /// watermark, read with a snapshot in which xids below 100 are visible.
+    fn chunk_before_low(rows: &[[i32; 2]], keyed: bool) -> Chunk {
+        let rows: Vec<Row> = rows.iter().map(|r| vec![Datum::Int4(r[0]), Datum::Int4(r[1])]).collect();
+        let mut ch = Chunk {
+            table: 10,
+            low: "L:1:10:1".into(),
+            high: "H:1:10:1".into(),
+            phase: Phase::BeforeLow,
+            rows: BTreeMap::new(),
+            multiset: Vec::new(),
+            snap: Some((100, 100, vec![])),
+            max_key: None,
+            max_key_text: None,
+            last: true,
+        };
+        if keyed {
+            for r in rows {
+                ch.max_key = Some(pk_bytes(&r, &[0]));
+                ch.rows.insert(pk_bytes(&r, &[0]), r);
+            }
+        } else {
+            ch.multiset = rows;
+        }
+        ch
+    }
+
+    /// A TRUNCATE (and rows inserted after it) that the chunk's snapshot
+    /// already saw: the chunk's rows are the table after the truncate. They
+    /// used to be thrown away with it, losing the rows inserted after it.
+    #[test]
+    fn truncate_seen_by_the_chunk_keeps_its_rows() {
+        for keyed in [true, false] {
+            let pk = if keyed { vec![0] } else { vec![] };
+            let (mut src, log) = source(vec![table(&["id", "a"], pk)], SourceState { slot_created: true, ..Default::default() });
+            src.handle_message(begin(80)).unwrap();
+            src.handle_message(relation(&["id", "a"], if keyed { 1 } else { 0 })).unwrap();
+            src.handle_message(commit(100)).unwrap();
+            src.chunk = Some(chunk_before_low(&[[5, 50]], keyed));
+            src.handle_message(begin(90)).unwrap();
+            src.handle_message(LogicalMessage::Truncate { options: 0, relation_ids: vec![REL] }).unwrap();
+            src.handle_message(commit(200)).unwrap();
+            src.handle_message(begin(91)).unwrap();
+            src.handle_message(insert(&[5, 50])).unwrap();
+            src.handle_message(commit(210)).unwrap();
+            for (xid, tag, end) in [(95, "L:1:10:1", 220), (96, "H:1:10:1", 230)] {
+                src.handle_message(begin(xid)).unwrap();
+                src.handle_message(message(tag)).unwrap();
+                src.handle_message(commit(end)).unwrap();
+            }
+            src.drain_acks(true).unwrap();
+            assert_eq!(replay(&log.lock()), vec![vec![Datum::Int4(5), Datum::Int4(50)]], "keyed: {keyed}");
+            assert!(src.state.tables[&10].done);
+        }
+    }
+
+    /// The same for a keyless table whose chunk was emitted at the low
+    /// watermark: a truncate its snapshot saw must not wipe it afterwards.
+    #[test]
+    fn truncate_seen_by_a_keyless_chunk_in_its_window() {
+        let (mut src, log) = source(vec![table(&["id", "a"], vec![])], SourceState { slot_created: true, ..Default::default() });
+        src.handle_message(begin(80)).unwrap();
+        src.handle_message(relation(&["id", "a"], 0)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.chunk = Some(chunk_before_low(&[[7, 70], [7, 70]], false));
+        src.handle_message(begin(95)).unwrap();
+        src.handle_message(message("L:1:10:1")).unwrap();
+        src.handle_message(commit(200)).unwrap();
+        // committed after the low watermark, but before the chunk's snapshot
+        src.handle_message(begin(90)).unwrap();
+        src.handle_message(LogicalMessage::Truncate { options: 0, relation_ids: vec![REL] }).unwrap();
+        src.handle_message(commit(210)).unwrap();
+        // ... and after it, a transaction the snapshot did not see
+        src.handle_message(begin(150)).unwrap();
+        src.handle_message(insert(&[8, 80])).unwrap();
+        src.handle_message(commit(220)).unwrap();
+        src.handle_message(begin(151)).unwrap();
+        src.handle_message(message("H:1:10:1")).unwrap();
+        src.handle_message(commit(230)).unwrap();
+        src.drain_acks(true).unwrap();
+        let row = |a: i32, b: i32| vec![Datum::Int4(a), Datum::Int4(b)];
+        assert_eq!(replay(&log.lock()), vec![row(7, 70), row(7, 70), row(8, 80)]);
     }
 
     /// A schema change resets the table's snapshot state and logs it at once:
