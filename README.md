@@ -19,9 +19,15 @@ PostgreSQL ───────────────────────
 
 ```sh
 cargo build --release
-./target/release/ivm --data-dir ./ivm-data --listen 127.0.0.1:6875
-psql -h 127.0.0.1 -p 6875 -U ivm
+./target/release/ivm --data-dir ./ivm-data --listen 127.0.0.1:6875 --http-listen 127.0.0.1:6876
+psql -h 127.0.0.1 -p 6875 -U ivm      # SQL
+# web UI for inspecting the server: http://127.0.0.1:6876/
 ```
+
+To see everything working at once, `examples/demo/start.sh` starts an
+upstream PostgreSQL with a small shop schema, an engine with the web UI,
+a dozen maintained views, a sink, streaming changes and live subscriptions
+([examples/demo](examples/demo/README.md)).
 
 The upstream needs `wal_level = logical`, a publication, and a primary key
 or `REPLICA IDENTITY FULL` on every published table
@@ -49,6 +55,7 @@ The [documentation](docs/README.md) covers:
 - the **SQL reference**: statements, queries, types, functions, and what
   maintained views accept;
 - the **internals**: architecture, dataflow, storage, planner, recovery;
+- the **web UI** for inspecting a running server;
 - the **on-disk format** and the **testing** guide.
 
 ## Repository layout

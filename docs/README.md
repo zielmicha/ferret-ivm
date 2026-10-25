@@ -24,6 +24,7 @@ relying on a feature.
 | [Temporal filters and errors](user-guide/temporal-filters-and-errors.md) | `now()` in maintained views and the logical clock; expression errors as data |
 | [Operations](user-guide/operations.md) | tuning, the data directory and `LOCK`, recovery, checkpoints, retention, durability, what is safe to delete, backups, replication-slot cleanup, monitoring |
 | [Troubleshooting and limitations](user-guide/troubleshooting.md) | common problems and their causes, limitations and differences from PostgreSQL, known problems with workarounds |
+| [Web UI](web-ui.md) | the inspection UI (`--http-listen`): enabling it, authentication, every screen, the JSON API |
 
 ## SQL reference
 
