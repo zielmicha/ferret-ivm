@@ -194,13 +194,20 @@ impl<'a> ExecCtx<'a> {
     }
 
     fn read_node(&mut self, node: NodeId) -> Result<Rows> {
-        match self.g.any_arrangement(node) {
+        match self.g.arrangement_at(node, self.at) {
             Some(a) => {
                 let mut rows = self.g.scan_arr(self.env, a, self.at)?;
                 rows.retain(|(_, w)| *w > 0);
                 Ok(rows)
             }
             None => {
+                if let (ReadAt::AsOf(t), Some(a)) = (self.at, self.g.any_arrangement(node)) {
+                    // (re)built later: its history before then is not kept
+                    return Err(SqlError::new(
+                        codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        format!("AS OF {t} is before the history of a relation it reads, which starts at {}", self.g.arr(a).since),
+                    ));
+                }
                 if self.at != ReadAt::Latest {
                     return Err(SqlError::unsupported("time travel requires an arranged relation"));
                 }
@@ -238,7 +245,8 @@ impl<'a> ExecCtx<'a> {
         let mut best: Option<(usize, Vec<Datum>)> = None;
         for &a in &self.g.node(node).arrangements {
             let arr = self.g.arr(a);
-            if !arr.hydrated {
+            // (an index built after the read's GSN lacks its history)
+            if !arr.covers(self.at) {
                 continue;
             }
             let mut vals = Vec::new();

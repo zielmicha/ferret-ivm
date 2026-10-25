@@ -216,6 +216,23 @@ pub fn run(
     let mut applied: Option<Gsn> = None;
     let mut backoff = Duration::from_millis(100);
     let mut last_flush = Instant::now();
+    // Wait out a backoff, still taking messages: changes are kept for later
+    // (they used to be read and dropped), a Stop ends the sink. False on Stop.
+    let wait = |backoff: Duration, applied: Option<Gsn>, pending: &mut Vec<(Gsn, Delta)>| -> bool {
+        let deadline = Instant::now() + backoff;
+        loop {
+            match rx.recv_deadline(deadline) {
+                Ok(SinkMsg::Data(g, d)) => {
+                    if g > applied.unwrap_or(snapshot_gsn) {
+                        pending.push((g, d));
+                    }
+                }
+                Ok(SinkMsg::Progress(_)) => {}
+                Ok(SinkMsg::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+                Err(RecvTimeoutError::Timeout) => return true,
+            }
+        }
+    };
     loop {
         if writer.is_none() {
             match Writer::connect(&name, &def, &columns) {
@@ -225,17 +242,10 @@ pub fn run(
                 }
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
-                    // keep the changes that arrived meanwhile: dropping one
-                    // loses it for good (only Stop ends the retries)
-                    while let Ok(m) = rx.try_recv() {
-                        match m {
-                            SinkMsg::Stop => return,
-                            SinkMsg::Data(g, d) if g > applied.unwrap_or(snapshot_gsn) => pending.push((g, d)),
-                            SinkMsg::Data(..) | SinkMsg::Progress(_) => {}
-                        }
+                    if !wait(backoff, applied, &mut pending) {
+                        return;
                     }
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
                     continue;
                 }
             }
@@ -259,7 +269,9 @@ pub fn run(
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
                     writer = None;
-                    std::thread::sleep(backoff);
+                    if !wait(backoff, applied, &mut pending) {
+                        return;
+                    }
                     continue;
                 }
             }

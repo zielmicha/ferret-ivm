@@ -1,6 +1,7 @@
 //! Random schemas, data changes and view queries for differential testing,
-//! shared by ivm-difftest (views against PostgreSQL) and the engine tests
-//! (views against the same queries run ad hoc, without PostgreSQL).
+//! shared by ivm-difftest (views against PostgreSQL) and the self-differential
+//! test, tests/selfdiff.rs (views against the same queries run ad hoc,
+//! without PostgreSQL).
 //!
 //! Queries are deterministic: every order that decides which rows a LIMIT,
 //! DISTINCT ON, window function or ordered aggregate sees is total (it ends

@@ -324,9 +324,10 @@ fn distinct_on_infinite_intervals() {
 /// created, the re-planned joins look up other indexes, the view's
 /// arrangements no longer match the checkpointed ones and are hydrated
 /// afresh: their history is gone, so reads AS OF a GSN before the restart
-/// return the hydrated state (nothing, here) instead of what the view held.
+/// fail ("before the history of a relation it reads"; they used to return
+/// the hydrated state) instead of returning what the view held.
 #[test]
-#[ignore = "bug: recovery re-plans joins from current table sizes; changed plans re-hydrate views and lose their AS OF history"]
+#[ignore = "bug: recovery re-plans joins from current table sizes; changed plans re-hydrate views, whose AS OF history then starts at the restart"]
 fn as_of_history_survives_restart_after_table_sizes_change() {
     let dir = tmpdir("replan-history");
     let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, retention_gsns: 100_000, ..Default::default() };

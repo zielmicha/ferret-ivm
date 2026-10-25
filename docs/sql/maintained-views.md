@@ -1,0 +1,128 @@
+# Maintained views
+
+Materialized views and `SUBSCRIBE (query)` are *maintained*: the engine
+builds a dataflow for the query and updates its result at every GSN that
+changes its inputs. This page explains which queries can be maintained, what
+is rejected and why, and how each construct is maintained — which determines
+what a change costs. The operators themselves are described in
+[Dataflow](../internals/dataflow.md).
+
+## Why maintained views must be deterministic
+
+The engine's central invariant is that the state of every index at GSN *g*
+is a pure function of the input log up to *g*. Several mechanisms rely on it:
+
+- **Recovery** loads a checkpoint and replays the log after it; replay must
+  produce exactly the state the engine had before the crash.
+- **Hydration**: a new view is computed from existing indexes at its creation
+  GSN and then maintained incrementally. Both paths must agree, now and after
+  any number of changes.
+- **Sharing**: a sub-plan identical to one of another view reuses that
+  view's operators and indexes; it must compute the same thing.
+- **Time travel and repeatable reads**: reading a view `AS OF g` must give
+  the same answer every time.
+
+A function whose result depends on something other than its arguments
+breaks all of these. Such functions are therefore rejected, and constructs
+whose result PostgreSQL leaves unspecified are pinned down.
+
+## What is rejected
+
+When a materialized view is created (and when a `SUBSCRIBE (query)` starts),
+every expression of the optimised plan — including expressions inside
+decorrelated subqueries — is checked (`check_deterministic` in
+`coord/ddl.rs`):
+
+1. **Non-immutable functions.** The registry marks functions as immutable,
+   stable or volatile. Everything that is not immutable is rejected:
+
+   | Function | Volatility |
+   |---|---|
+   | `random()`, `gen_random_uuid()`, `clock_timestamp()` | volatile |
+   | `now()`, `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date` | stable (the clock) |
+
+   ```
+   ERROR:  function random() is not allowed in a materialized view
+   DETAIL:  Maintained views must be deterministic: their state is a pure function of the input log.
+   ```
+
+2. **The clock outside temporal filters.** The `now()` family is allowed
+   only in conditions that the engine can maintain as time passes (a
+   *temporal filter*, see
+   [Temporal filters](../user-guide/temporal-filters-and-errors.md#accepted-forms)):
+   the logged clock ticks make it an input like any other. Anywhere else:
+
+   ```
+   ERROR:  now() is only supported in temporal filters of maintained views
+   HINT:  Use a top-level WHERE condition comparing a column expression with now() (optionally plus or minus a constant interval).
+   ```
+
+Virtual views and ad hoc queries are not checked; they may use any function.
+
+All other functions are immutable — including those that are only stable in
+PostgreSQL because they depend on the session time zone, which is fixed to
+UTC here (`to_char(timestamptz, ...)`, `date_trunc(text, timestamptz)`,
+`timestamp` ↔ `timestamptz` casts).
+
+## What is pinned down instead
+
+| PostgreSQL leaves unspecified | The engine does |
+|---|---|
+| input order of `string_agg`, `array_agg`, `json_agg`, `jsonb_agg`, `json(b)_object_agg` without `ORDER BY` | orders the input by the argument values |
+| rounding of floating-point `sum`/`avg`/`variance`/`stddev` (depends on summation order) | sums exactly and rounds once: the result depends only on the multiset of inputs |
+| which representation of equal values a group key, `DISTINCT`, `min`/`max` shows (`1.0` vs `1.00`, `-0` vs `0`, `'1 mon'` vs `'30 days'`) | the one that sorts first in the index (by its exact encoding); `numeric` sums use the largest display scale present |
+| which rows `LIMIT`, `DISTINCT ON` or `FETCH ... WITH TIES` keep among ties | the first in index order (by sort key, then by the encoding of the rest of the row) |
+| which of several errors a query reports | error records are kept per (SQLSTATE, message); reads report the smallest |
+
+These rules make an incrementally maintained result identical to a
+recomputation, whatever the order of past changes.
+
+## What can be maintained
+
+Every construct of the [query language](queries.md) can be used in a
+maintained view (subject to the rules above), with two exceptions found while
+checking this documentation: a `DISTINCT` aggregate with `FILTER` crashes the
+engine (see [Known problems](../user-guide/troubleshooting.md#known-problems)),
+and `agg(DISTINCT x ORDER BY y)` with `y` not among the arguments — which
+PostgreSQL rejects — is accepted, ordered by `x` in a materialized view but by
+`y` in an ad hoc query. How each construct is maintained:
+
+| Construct | Operator | Work per changed input row | State |
+|---|---|---|---|
+| `WHERE`, select-list expressions, projections | `Mfp` (fused map/filter/project) | constant | none |
+| inner joins (any number of inputs), `CROSS JOIN`, comma joins | `DeltaJoin` | one chain of index lookups into the other inputs, in an order chosen to keep intermediate results small | indexes of each input on its join keys; primary-key indexes are reused, identical indexes shared |
+| join with no equality condition between two inputs | `DeltaJoin` lookup with an empty key | a scan of the whole other input | an index of the input |
+| `LEFT` / `RIGHT` / `FULL` joins | inner join plus anti-joins, NULL-padded, in a `Union` | as the joins | as the joins |
+| `EXISTS`, `IN`, `= ANY`, semi-joins | presence join: lookup of the key's count in a count-summarised index (when correlated by equalities; other conditions become a join, `Distinct` and then a presence lookup) | one lookup | index of the subquery's key columns |
+| `NOT EXISTS`, `NOT IN`, anti-joins | input minus its semi-join | as semi-join | as semi-join |
+| correlated and scalar subqueries | decorrelated into joins and aggregations | as those | as those |
+| `GROUP BY` with `count`, `sum`, `avg`, `min`, `max`, `bool_and/or`, `every`, `stddev*`, `var*`, `any_value` | `Reduce` | per changed group, one range summary over the group in an index whose nodes carry partial aggregates — O(log n) regardless of group size; recently touched groups are cached in memory. If the query also has an ordered aggregate (next row), all its aggregates share one `Reduce` that rescans each changed group | input index keyed by the group key, with per-node summaries; output index keyed by the group key |
+| `string_agg`, `array_agg`, `json(b)_agg`, `json(b)_object_agg`, `mode`, `percentile_cont/disc` | `Reduce` | rescan of each changed group | as above (input index ordered by group key, then the aggregate's `ORDER BY`) |
+| `DISTINCT` aggregates (not with `FILTER`, see above) | aggregation over `DISTINCT (group, arguments)` | as `Distinct` + `Reduce` | as those |
+| several ordered aggregates with different orders, or several different `DISTINCT` argument sets | one `Reduce` per kind, joined on the group key | sum of the parts | sum of the parts |
+| `GROUPING SETS`, `ROLLUP`, `CUBE` | one aggregation per grouping set, unioned | per set | per set |
+| `SELECT DISTINCT`, `UNION` | `Distinct` | two key-prefix scans per changed value (before and after) | index of all columns |
+| `UNION ALL` | `Union` | constant | none |
+| `INTERSECT [ALL]`, `EXCEPT [ALL]` | `SetOp` | four key-prefix scans per changed value (each input, before and after) | index of all columns of each input |
+| `ORDER BY ... LIMIT/OFFSET`, `FETCH ... [WITH TIES]`, `DISTINCT ON` | `TopK` | per changed group, the first `offset + limit` rows before and after the change | input index keyed by (group, sort keys) |
+| window functions | `Window` | recomputation of each changed partition (before and after) | input index keyed by (partition, order) |
+| set-returning functions | `FlatMap` | the function's output | none |
+| `WITH RECURSIVE` | `Recursive` | recomputation of the whole fixpoint from the current inputs, diffed against the previous result | index of the result (and of the inputs) |
+| conditions over `now()` | `TemporalFilter` | bisection of the row's validity interval; due events at each tick | index of pending (time, row) events |
+| `VALUES` | `Constant` | — | none |
+
+Output of every operator is *consolidated* per GSN: a row inserted and
+deleted in the same GSN never appears, and an update is one retraction and
+one insertion.
+
+Operators and indexes are hash-consed by their structure: two views that
+share a sub-plan (same tables, same joins, same filters) share its operators
+and indexes, and so does a view with the indexes created by
+`CREATE INDEX`. `EXPLAIN DATAFLOW` shows `shared xN` on shared nodes.
+
+## Errors
+
+Expression errors inside a maintained view do not fail the statement that
+caused them; they become error records that make reads of the view fail
+until the offending rows are gone
+([Errors as data](../user-guide/temporal-filters-and-errors.md#errors-as-data)).

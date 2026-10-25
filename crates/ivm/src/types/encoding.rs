@@ -391,3 +391,60 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     }
     None
 }
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use crate::types::text::parse_datum;
+    use std::cmp::Ordering;
+
+    fn enc(d: &Datum, spec: SortSpec) -> Vec<u8> {
+        let mut v = Vec::new();
+        encode_key(d, spec, &mut v);
+        v
+    }
+
+    /// For every pair: memcmp of the encodings orders like sql_cmp (reversed
+    /// for DESC), equal values encode identically, and decoding plus the
+    /// fidelity suffix restores the exact value.
+    fn check(ty: &SqlType, texts: &[&str]) {
+        let vals: Vec<Datum> = texts.iter().map(|t| parse_datum(t, ty, -1).unwrap_or_else(|e| panic!("{t}: {e}"))).collect();
+        for spec in [SortSpec::ASC, SortSpec::DESC] {
+            for (i, a) in vals.iter().enumerate() {
+                let ea = enc(a, spec);
+                for (j, b) in vals.iter().enumerate() {
+                    let eb = enc(b, spec);
+                    let want = if spec.desc { b.sql_cmp(a) } else { a.sql_cmp(b) };
+                    assert_eq!(ea.cmp(&eb), want, "{ty:?} {spec:?}: {} vs {}", texts[i], texts[j]);
+                }
+                let (mut d, n) = decode_key(&ea, ty, spec).unwrap();
+                assert_eq!(n, ea.len(), "{}: length", texts[i]);
+                let mut fid = Vec::new();
+                if !a.is_null() && has_fidelity(ty) {
+                    encode_fidelity(a, &mut fid);
+                    let used = apply_fidelity(&mut d, &fid).unwrap();
+                    assert_eq!(used, fid.len());
+                }
+                assert_eq!(crate::types::datum::exact_cmp(&d, a), Ordering::Equal, "{ty:?}: {} round trip gave {d:?}", texts[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn key_order_matches_sql_order() {
+        check(&SqlType::Numeric, &["-Infinity", "-1e100", "-12.5", "-12.50", "-1", "-0.001", "0", "0.000", "0.001", "1", "1.0", "9.99", "10", "100", "1e100", "Infinity", "NaN"]);
+        check(&SqlType::Float8, &["-Infinity", "-1e308", "-1", "-0", "0", "5e-324", "1", "1.5", "1e308", "Infinity", "NaN"]);
+        check(&SqlType::Float4, &["-Infinity", "-1", "-0", "0", "1e-45", "1", "3.4e38", "Infinity", "NaN"]);
+        check(&SqlType::Interval, &["-infinity", "-1 year", "-1 day", "0", "1 microsecond", "1 day", "24 hours", "1 mon", "30 days", "1 year", "infinity"]);
+        check(&SqlType::Date, &["-infinity", "4713-01-01 BC", "2000-01-01", "2026-10-25", "294276-12-31", "infinity"]);
+        check(&SqlType::TimestampTz, &["-infinity", "1999-12-31 23:59:59.999999+00", "2000-01-01 00:00:00+00", "2026-10-25 12:00:00+00", "infinity"]);
+        check(&SqlType::Text, &["", "A", "Z", "a", "a ", "aa", "b", "é", "€", "\u{10FFFF}"]);
+        check(&SqlType::Bytea, &["\\x", "\\x00", "\\x0000", "\\x0001", "\\x01", "\\xff", "\\xff00"]);
+        check(&SqlType::Uuid, &["00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", "ffffffff-ffff-ffff-ffff-ffffffffffff"]);
+        check(&SqlType::Bool, &["false", "true"]);
+        check(&SqlType::Array(Box::new(SqlType::Int4)), &["{}", "{1}", "{1,2}", "{1,2,3}", "{1,NULL}", "{2}", "{NULL}", "{{1,2},{3,4}}", "[0:1]={1,2}", "{1,2,3,4}"]);
+        check(&SqlType::Array(Box::new(SqlType::Numeric)), &["{}", "{1.0}", "{1.00,2}", "{NaN}", "{-1}"]);
+        check(&SqlType::Array(Box::new(SqlType::Text)), &["{}", "{\"\"}", "{a}", "{a,b}", "{ab}", "{b}", "{NULL}"]);
+        check(&SqlType::Jsonb, &["null", "\"\"", "\"a\"", "\"b\"", "1", "1.0", "2", "false", "true", "[]", "[1]", "[1,2]", "[2]", "{}", "{\"a\": 1}", "{\"b\": 1}", "{\"a\": 1, \"b\": 2}", "{\"aa\": 1}"]);
+    }
+}

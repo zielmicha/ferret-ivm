@@ -982,3 +982,223 @@ fn retracted_entries_are_consolidated_behind_the_frontier() {
     env.apply(t, &mut vec![(b"c".to_vec(), 1)], 3).unwrap();
     assert!(env.get(t, b"a").unwrap().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// the storage review's full-history model test (01e3f1b), kept for its
+// final check that GC keeps the store within a small factor of its live data
+
+/// Entries `ggg:uuuuu:<numeric text or NULL>`; summaries over the numeric.
+struct TextNumSummarizer {
+    spec: Vec<AggKind>,
+}
+
+fn text_num_of(key: &[u8]) -> Datum {
+    let s = std::str::from_utf8(key).unwrap();
+    let text = s.splitn(3, ':').nth(2).unwrap();
+    if text == "NULL" { Datum::Null } else { Datum::numeric(pgnumeric::Numeric::parse(text).unwrap()) }
+}
+
+impl Summarizer for TextNumSummarizer {
+    fn spec(&self) -> &[AggKind] {
+        &self.spec
+    }
+    fn add_entry(&self, acc: &mut Summary, key: &[u8], weight: i64) -> Result<()> {
+        acc.count += weight;
+        let v = text_num_of(key);
+        for (i, k) in self.spec.iter().enumerate() {
+            k.add(&mut acc.aggs[i], &v, weight)?;
+        }
+        Ok(())
+    }
+    fn update_entry(&self, acc: &mut Summary, key: &[u8], before: i64, after: i64) -> Result<bool> {
+        acc.count += after - before;
+        let v = text_num_of(key);
+        for (i, k) in self.spec.iter().enumerate() {
+            if !k.update(&mut acc.aggs[i], &v, before, after)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// After a checkpoint (nothing dirty): the live bytes recorded per segment
+/// equal the bytes of the nodes reachable from the trees, and every segment
+/// holding a reachable node exists.
+fn check_live_accounting(env: &mut Env) {
+    fn walk(env: &mut Env, ptr: NodePtr, live: &mut BTreeMap<u32, u64>) {
+        let (loc, children) = match ptr {
+            NodePtr::Disk(loc) => {
+                let node = Node::decode(&env.segs.read(loc).unwrap()).unwrap();
+                let ch = match node {
+                    Node::Internal(ch) => ch.iter().map(|c| c.ptr).collect(),
+                    Node::Leaf(_) => vec![],
+                };
+                (loc, ch)
+            }
+            NodePtr::Mem(id) => {
+                let slot = env.slot(id);
+                assert!(!slot.dirty, "dirty node after a checkpoint");
+                let ch = match slot.node.as_ref().unwrap() {
+                    Node::Internal(ch) => ch.iter().map(|c| c.ptr).collect(),
+                    Node::Leaf(_) => vec![],
+                };
+                (slot.disk.unwrap(), ch)
+            }
+        };
+        *live.entry(loc.seg).or_default() += loc.len as u64;
+        for c in children {
+            walk(env, c, live);
+        }
+    }
+    let mut live: BTreeMap<u32, u64> = BTreeMap::new();
+    let roots: Vec<NodePtr> = env.trees.values().filter_map(|t| t.root).collect();
+    for r in roots {
+        walk(env, r, &mut live);
+    }
+    let recorded: BTreeMap<u32, u64> = env.seg_live.iter().filter(|(_, (_, l))| *l > 0).map(|(id, (_, l))| (*id, *l)).collect();
+    assert_eq!(live, recorded, "live bytes per segment");
+    let files = env.segs.list().unwrap();
+    for seg in live.keys() {
+        assert!(files.contains(seg), "segment {seg} holds live nodes but is gone");
+    }
+}
+
+/// Full-history model of one tree.
+#[derive(Clone, Default)]
+struct HistModel(BTreeMap<Vec<u8>, Vec<(Gsn, i64)>>);
+
+impl HistModel {
+    fn weight_at(&self, k: &[u8], t: Gsn) -> i64 {
+        self.0.get(k).map(|h| h.iter().filter(|(g, _)| *g <= t).map(|(_, w)| w).sum()).unwrap_or(0)
+    }
+    fn total(&self, k: &[u8]) -> i64 {
+        self.weight_at(k, Gsn::MAX)
+    }
+    fn truncate_after(&mut self, g: Gsn) {
+        for h in self.0.values_mut() {
+            h.retain(|(x, _)| *x <= g);
+        }
+        self.0.retain(|_, h| !h.is_empty());
+    }
+}
+
+/// Random updates with a moving retention frontier, AS OF reads at every
+/// retained time, checkpoints, crashes (reopen without a checkpoint), GC
+/// and a cache small enough to evict constantly: reads must equal the
+/// model, summaries their recomputation.
+#[test]
+fn time_travel_crashes_and_gc_against_model() {
+    for seed in [0x9E3779B97F4A7C15u64, 0xD1B54A32D192ED03, 0x2545F4914F6CDD1D] {
+        let tmp = TempDir::new(&format!("storage-tt-{seed:x}"));
+        let dir = tmp.path().to_path_buf();
+        let opts = EnvOptions { cache_bytes: 16 << 10, leaf_bytes: 400, internal_bytes: 300, segment_bytes: 16 << 10 };
+        let spec = vec![AggKind::SumNumeric, AggKind::Min, AggKind::Max, AggKind::CountNonNull];
+        let summ: Arc<dyn Summarizer> = Arc::new(TextNumSummarizer { spec: spec.clone() });
+        let (mut env, _) = Env::open(&dir, opts.clone()).unwrap();
+        let tree = env.create_tree(summ.clone());
+        let retention = 7;
+        let mut rng = Rng::new(seed);
+        let mut model = HistModel::default();
+        let mut ckpt: Option<(Gsn, HistModel)> = None;
+        let mut gsn: Gsn = 0;
+        let values = ["1", "1.0", "2.50", "-3", "0", "7.25", "NULL", "10"];
+        for step in 0..1500 {
+            gsn += 1;
+            env.set_frontier(gsn.saturating_sub(retention));
+            let n = 1 + rng.below(if step % 100 == 0 { 300 } else { 10 });
+            let mut ups = Vec::new();
+            for _ in 0..n {
+                let k = format!("{:03}:{:05}:{}", rng.below(5), rng.below(300), values[rng.below(8) as usize]).into_bytes();
+                let cur = model.total(&k);
+                let w = if cur > 0 && rng.below(2) == 0 { -cur } else { 1 + rng.below(2) as i64 };
+                ups.push((k.clone(), w));
+                let h = model.0.entry(k).or_default();
+                match h.last_mut() {
+                    Some((g, lw)) if *g == gsn => *lw += w,
+                    _ => h.push((gsn, w)),
+                }
+            }
+            env.apply(tree, &mut ups, gsn).unwrap();
+            let frontier = env.frontier();
+            // point reads at random retained times
+            for _ in 0..5 {
+                let t = frontier + rng.below(gsn - frontier + 1);
+                let k = format!("{:03}:{:05}:{}", rng.below(5), rng.below(300), values[rng.below(8) as usize]).into_bytes();
+                let got = env.get(tree, &k).unwrap().map(|h| h.weight(ReadAt::AsOf(t))).unwrap_or(0);
+                assert_eq!(got, model.weight_at(&k, t), "seed {seed:x} step {step}: {k:?} as of {t}");
+            }
+            if step % 25 == 0 {
+                // full scan as of a retained time
+                let t = frontier + rng.below(gsn - frontier + 1);
+                let got: Vec<(Vec<u8>, i64)> = env
+                    .scan(tree, Bound::Unbounded, Bound::Unbounded)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, h)| (k.to_vec(), h.weight(ReadAt::AsOf(t))))
+                    .filter(|(_, w)| *w != 0)
+                    .collect();
+                let want: Vec<(Vec<u8>, i64)> =
+                    model.0.keys().map(|k| (k.clone(), model.weight_at(k, t))).filter(|(_, w)| *w != 0).collect();
+                assert_eq!(got, want, "seed {seed:x} step {step}: scan as of {t}");
+                env.check_summaries(tree).unwrap();
+                let mut s = Summary::empty(&spec);
+                for k in model.0.keys() {
+                    summ.add_entry(&mut s, k, model.total(k)).unwrap();
+                }
+                assert!(env.tree_summary(tree).exact_eq(&s), "seed {seed:x} step {step}: tree summary");
+            }
+            match rng.below(40) {
+                0..=2 => {
+                    env.checkpoint(gsn, format!("{gsn}").as_bytes()).unwrap();
+                    check_live_accounting(&mut env);
+                    ckpt = Some((gsn, model.clone()));
+                }
+                3 => {
+                    env.gc(1 + rng.below(40) as usize).unwrap();
+                }
+                4 => {
+                    // crash: everything after the last checkpoint is lost
+                    drop(env);
+                    let (e, rec) = Env::open(&dir, opts.clone()).unwrap();
+                    env = e;
+                    match &ckpt {
+                        Some((g, m)) => {
+                            let rec = rec.expect("recovered checkpoint");
+                            assert_eq!(rec.gsn, *g);
+                            assert_eq!(rec.app, format!("{g}").into_bytes());
+                            env.attach_tree(tree, summ.clone()).unwrap();
+                            gsn = *g;
+                            model = m.clone();
+                        }
+                        None => {
+                            assert!(rec.is_none());
+                            let t = env.create_tree(summ.clone());
+                            assert_eq!(t, tree);
+                            gsn = 0;
+                            model = HistModel::default();
+                        }
+                    }
+                    env.set_frontier(gsn.saturating_sub(retention));
+                    model.truncate_after(gsn);
+                }
+                _ => {}
+            }
+        }
+        // garbage collection keeps the store bounded
+        // garbage collection (one sparse segment per round; relocation
+        // rewrites paths to the root, so it never quite settles) keeps the
+        // store within a small factor of its live data
+        for _ in 0..300 {
+            env.gc(10_000).unwrap();
+            gsn += 1;
+            env.checkpoint(gsn, b"").unwrap();
+            check_live_accounting(&mut env);
+        }
+        let st = env.stats();
+        let live: u64 = st.segments.iter().map(|s| s.2).sum();
+        let total: u64 = st.segments.iter().map(|s| s.1).sum();
+        assert!(total <= 4 * live + 4 * opts.segment_bytes, "{st:?}");
+    }
+}
+

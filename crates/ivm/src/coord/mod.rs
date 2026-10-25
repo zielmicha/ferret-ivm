@@ -119,6 +119,9 @@ pub(crate) struct AppState {
     /// Error records of arranged dataflow nodes (absent in older checkpoints).
     #[serde(default)]
     pub errors: crate::dataflow::ErrorState,
+    /// GSN from which each tree's history is complete (by fingerprint).
+    #[serde(default)]
+    pub arr_since: Vec<(Vec<u8>, Gsn)>,
 }
 
 pub struct Engine {
@@ -262,9 +265,19 @@ impl Running {
 /// Open (recovering if needed) and start the engine threads.
 pub fn start(cfg: Config) -> Result<Running> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    // one engine per data directory: held until the process exits
+    // one engine per data directory: held until the process exits. Retried
+    // briefly: a process forked concurrently (e.g. a test spawning
+    // PostgreSQL) holds a copy of a just-released lock until it execs
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(cfg.data_dir.join("LOCK"))?;
-    if lock.try_lock().is_err() {
+    let mut locked = lock.try_lock().is_ok();
+    for _ in 0..40 {
+        if locked {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        locked = lock.try_lock().is_ok();
+    }
+    if !locked {
         return Err(SqlError::new(
             codes::OBJECT_IN_USE,
             format!("data directory {} is in use by another ivm process", cfg.data_dir.display()),
@@ -273,9 +286,7 @@ pub fn start(cfg: Config) -> Result<Running> {
     let shared = Arc::new(Shared::default());
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
-    let writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
-    let last_logged = writer.last_gsn();
-    shared.durable_gsn.store(last_logged, Ordering::Release);
+    let mut writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
     let (env, recovered) = Env::open(
         &cfg.data_dir.join("store"),
         EnvOptions { cache_bytes: cfg.cache_bytes, ..Default::default() },
@@ -321,6 +332,14 @@ pub fn start(cfg: Config) -> Result<Running> {
     for (gsn, rec) in records {
         engine.apply_record(gsn, rec)?;
     }
+    // The checkpoint can be ahead of the log if the log lost records it
+    // covers (an unsynced tail with --no-sync): GSNs must continue after
+    // it, or new records would be taken for already applied ones.
+    if writer.last_gsn() < engine.processed {
+        log::warn!("the input log ends at gsn {} before the checkpoint at {}; continuing after the checkpoint", writer.last_gsn(), engine.processed);
+        writer.skip_to(engine.processed);
+    }
+    shared.durable_gsn.store(writer.last_gsn(), Ordering::Release);
     engine.replaying = false;
     engine.shared.processed_gsn.store(engine.processed, Ordering::Release);
     let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
@@ -354,6 +373,7 @@ impl Engine {
         self.next_req = app.next_req;
         self.processed = rec.gsn;
         self.graph.recovery = app.trees.into_iter().collect();
+        self.graph.recovery_since = app.arr_since.into_iter().collect();
         self.clock = app.clock;
         self.graph.now = app.clock;
         self.ticks.push_back((rec.gsn, app.clock));
@@ -361,8 +381,14 @@ impl Engine {
         self.source_lsns = app.source_lsns.into_iter().collect();
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
         for obj in &objects {
+            if let ObjectKind::Table(t) = &obj.kind {
+                self.table_rt(obj.id, t, true)?;
+            }
+        }
+        // views and indexes after the views they read (id order is not a
+        // dependency order: CREATE OR REPLACE keeps a view's id)
+        for (obj, _) in self.dependency_order(&objects) {
             match &obj.kind {
-                ObjectKind::Table(t) => self.table_rt(obj.id, t, true)?,
                 ObjectKind::MaterializedView(v) => self.create_view_rt(obj.id, &v.sql)?,
                 ObjectKind::Index(i) => self.create_index_rt(obj.id, i)?,
                 _ => {}
@@ -381,8 +407,69 @@ impl Engine {
             self.env.drop_tree(t)?;
         }
         self.graph.recovery.clear();
+        self.graph.recovery_since.clear();
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns));
         Ok(())
+    }
+
+    /// Materialized views and indexes of `objects`, each after the
+    /// materialized views and indexes it depends on, with those
+    /// dependencies (the relations a view's query reads, including the
+    /// views it mentions; an index's target; an error for a view that does
+    /// not plan).
+    pub(crate) fn dependency_order<'a>(
+        &self,
+        objects: &'a [crate::catalog::CatalogObject],
+    ) -> Vec<(&'a crate::catalog::CatalogObject, Result<Vec<ObjectId>>)> {
+        fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
+            if let crate::sql::Rel::Get { id, .. } = r {
+                out.push(*id);
+            }
+            for i in r.inputs() {
+                gets(i, out);
+            }
+        }
+        let mut pending: Vec<(&crate::catalog::CatalogObject, Result<Vec<ObjectId>>)> = Vec::new();
+        for o in objects {
+            let deps = match &o.kind {
+                ObjectKind::Index(i) => Ok(vec![i.on]),
+                ObjectKind::MaterializedView(v) => crate::sql::parser::parse_single_query(&v.sql)
+                    .and_then(|q| crate::sql::plan_query(&self.catalog, &q, vec![]))
+                    .map(|bq| {
+                        let mut ids = self.catalog.mentioned_views(&v.sql);
+                        gets(&bq.rel, &mut ids);
+                        ids
+                    }),
+                _ => continue,
+            };
+            pending.push((o, deps));
+        }
+        let ordered: std::collections::HashSet<ObjectId> = pending.iter().map(|(o, _)| o.id).collect();
+        let mut done = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            let before = out.len();
+            let mut rest = Vec::new();
+            for (o, deps) in pending {
+                // a view that does not plan has no known dependencies
+                let ready = match &deps {
+                    Ok(d) => d.iter().all(|x| *x == o.id || done.contains(x) || !ordered.contains(x)),
+                    Err(_) => true,
+                };
+                if ready {
+                    done.insert(o.id);
+                    out.push((o, deps));
+                } else {
+                    rest.push((o, deps));
+                }
+            }
+            pending = rest;
+            if out.len() == before {
+                // no progress (cannot happen for a valid catalog)
+                out.append(&mut pending);
+            }
+        }
+        out
     }
 
     fn run(mut self, rx: Receiver<EngineMsg>, handle: EngineHandle) -> Result<()> {
@@ -507,6 +594,9 @@ impl Engine {
         }
         match rec {
             LogRecord::Commit { source, lsn, changes } => {
+                // local DML is planned when it arrives, but DDL logged before
+                // it (a DROP of its table) applies first: then it applies nothing
+                let dropped = source == 0 && changes.iter().any(|(t, _)| !self.rt.tables.contains_key(t));
                 let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
                 for (table, ch) in changes {
                     if let Some(n) = self.rt.tables.get(&table) {
@@ -519,7 +609,12 @@ impl Engine {
                 if source == 0 {
                     // local DML: lsn carries the request id
                     let n = self.dml_counts.remove(&lsn).unwrap_or_default();
-                    self.reply_pending(lsn, Ok(ExecResult::Command { tag: n }));
+                    let res = if dropped {
+                        Err(SqlError::new(codes::UNDEFINED_TABLE, "the table of this statement was dropped before it could be applied"))
+                    } else {
+                        Ok(ExecResult::Command { tag: n })
+                    };
+                    self.reply_pending(lsn, res);
                     self.drain_dml_queue();
                 } else {
                     let e = self.source_lsns.entry(source).or_insert(0);
@@ -554,8 +649,9 @@ impl Engine {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
                 self.processed = gsn;
                 // The source snapshots the table again to fill in the new
-                // columns; until it logs progress, its last logged state has
-                // the snapshot done, and a restart would never redo it.
+                // columns, and logs its reset state right after this record;
+                // a restart in between would take the snapshot as done and
+                // never redo it, so the record resets the state as well.
                 if let Some(state) = self.source_states.get_mut(&source) {
                     *state = crate::source::postgres::snapshot_again(state, table);
                 }
@@ -665,6 +761,7 @@ impl Engine {
             next_req: self.next_req,
             clock: self.clock,
             errors: self.graph.error_state(),
+            arr_since: self.graph.arrangement_since().into_iter().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;
