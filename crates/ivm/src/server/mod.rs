@@ -4,6 +4,7 @@
 use crate::coord::api::{ExecResult, Interrupts, ResultColumn, SessionVars, SubEvent};
 use crate::coord::{EngineHandle, EngineMsg};
 use crate::error::{codes, Result, SqlError};
+use crate::listen::{Listener, Stream};
 use crate::sql::parser::{parse_statement, split_statements, AsOf, ShowKind, Statement, SubscribeTarget};
 use crate::sql::ParamSlot;
 use crate::types::text::{format_datum, parse_datum, recv_datum, send_datum};
@@ -12,14 +13,12 @@ use parking_lot::Mutex;
 use pgproto::server::{read_frontend_message, read_startup_packet, BackendWriter, FieldDescription, FrontendMessage, StartupPacket};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone, Default)]
 pub struct ServerConfig {
-    pub listen: String,
     /// If set, clients must authenticate with this password (cleartext).
     pub password: Option<String>,
 }
@@ -31,39 +30,53 @@ type CancelMap = Arc<Mutex<HashMap<u32, (u32, Arc<Interrupts>)>>>;
 /// Reserved, not committed, memory.
 const SESSION_STACK: usize = 16 << 20;
 
-/// Accept connections forever.
-pub fn serve(cfg: ServerConfig, engine: EngineHandle) -> Result<()> {
-    let listener = TcpListener::bind(&cfg.listen)?;
-    log::info!("listening on {}", cfg.listen);
-    serve_listener(listener, cfg, engine)
+/// Accept connections on `listener` (TCP or Unix-domain) forever.
+pub fn serve_listener(listener: impl Into<Listener>, cfg: ServerConfig, engine: EngineHandle) -> Result<()> {
+    Server::new(cfg, engine).serve(listener)
 }
 
-pub fn serve_listener(listener: TcpListener, cfg: ServerConfig, engine: EngineHandle) -> Result<()> {
-    let cancels: CancelMap = Arc::new(Mutex::new(HashMap::new()));
-    let next_pid = Arc::new(AtomicU32::new(1));
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
-        if engine.shared.shutdown.load(Ordering::Acquire) {
-            break;
-        }
-        let engine = engine.clone();
-        let cfg = cfg.clone();
-        let cancels = cancels.clone();
-        let pid = next_pid.fetch_add(1, Ordering::Relaxed);
-        std::thread::Builder::new()
-            .name(format!("ivm-session-{pid}"))
-            // statements (and their syntax trees) may nest deeply
-            .stack_size(SESSION_STACK)
-            .spawn(move || {
-                let _ = stream.set_nodelay(true);
-                if let Err(e) = Session::run(stream, cfg, engine, cancels.clone(), pid) {
-                    log::debug!("session {pid} ended: {e}");
-                }
-                cancels.lock().remove(&pid);
-            })
-            .ok();
+/// The sessions of any number of listeners: they share process IDs and
+/// cancel keys (a CancelRequest may come through another listener).
+#[derive(Clone)]
+pub struct Server {
+    cfg: ServerConfig,
+    engine: EngineHandle,
+    cancels: CancelMap,
+    next_pid: Arc<AtomicU32>,
+}
+
+impl Server {
+    pub fn new(cfg: ServerConfig, engine: EngineHandle) -> Server {
+        Server { cfg, engine, cancels: Arc::new(Mutex::new(HashMap::new())), next_pid: Arc::new(AtomicU32::new(1)) }
     }
-    Ok(())
+
+    /// Accept connections on `listener` forever (on the calling thread).
+    pub fn serve(&self, listener: impl Into<Listener>) -> Result<()> {
+        let listener = listener.into();
+        loop {
+            let Ok(stream) = listener.accept() else { continue };
+            if self.engine.shared.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let engine = self.engine.clone();
+            let cfg = self.cfg.clone();
+            let cancels = self.cancels.clone();
+            let pid = self.next_pid.fetch_add(1, Ordering::Relaxed);
+            std::thread::Builder::new()
+                .name(format!("ivm-session-{pid}"))
+                // statements (and their syntax trees) may nest deeply
+                .stack_size(SESSION_STACK)
+                .spawn(move || {
+                    let _ = stream.set_nodelay(true);
+                    if let Err(e) = Session::run(stream, cfg, engine, cancels.clone(), pid) {
+                        log::debug!("session {pid} ended: {e}");
+                    }
+                    cancels.lock().remove(&pid);
+                })
+                .ok();
+        }
+        Ok(())
+    }
 }
 
 /// Prepared statements and portals keep the statement's text and parse it
@@ -86,8 +99,8 @@ struct Portal {
 
 struct Session {
     engine: EngineHandle,
-    reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    reader: BufReader<Stream>,
+    writer: BufWriter<Stream>,
     out: BackendWriter,
     vars: SessionVars,
     prepared: HashMap<String, Prepared>,
@@ -137,12 +150,11 @@ fn encode_value(d: &Datum, ty: &SqlType, binary: bool) -> Option<Vec<u8>> {
 
 /// Has the client closed the connection (or did it reset)? Peeks without
 /// blocking; pending messages (a pipelining client) mean it is there.
-fn client_gone(stream: &TcpStream) -> bool {
+fn client_gone(stream: &Stream) -> bool {
     if stream.set_nonblocking(true).is_err() {
         return false;
     }
-    let mut b = [0u8; 1];
-    let gone = match stream.peek(&mut b) {
+    let gone = match stream.peek_byte() {
         Ok(n) => n == 0,
         Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted),
     };
@@ -165,7 +177,7 @@ fn copy_escape(s: &str) -> String {
 }
 
 impl Session {
-    fn run(stream: TcpStream, cfg: ServerConfig, engine: EngineHandle, cancels: CancelMap, pid: u32) -> Result<()> {
+    fn run(stream: Stream, cfg: ServerConfig, engine: EngineHandle, cancels: CancelMap, pid: u32) -> Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = BufWriter::new(stream.try_clone()?);
         let mut out = BackendWriter::new();

@@ -59,7 +59,7 @@ access to the upstream PostgreSQL.
 ivm --data-dir ./ivm-data --listen 127.0.0.1:6875
 ```
 
-On start the server binds the listen address, opens (or creates) the data
+On start the server binds the listen addresses, opens (or creates) the data
 directory, recovers the last checkpoint, restarts the sinks, replays the
 input log written after the checkpoint, restarts the sources, and then
 accepts connections (a client that connects during recovery waits until
@@ -69,19 +69,19 @@ then). Log output goes to standard error. See
 ### Command-line flags
 
 Every flag is parsed in `crates/ivm/src/main.rs`; defaults come from
-`coord::Config::default()` and `ServerConfig`.
+`coord::Config::default()` and `main.rs` (the listen address).
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--data-dir DIR` | `ivm-data` (relative to the working directory) | Data directory: input log, storage segments, manifest, lock file. Created if missing. See [Operations](operations.md#the-data-directory). |
-| `--listen ADDR` | `127.0.0.1:6875` | TCP address of the PostgreSQL-protocol server (`host:port`, passed to `TcpListener::bind`). There is no Unix-socket listener. |
+| `--listen ADDR` | `127.0.0.1:6875` | Address of the PostgreSQL-protocol server: `host:port` (TCP, passed to `TcpListener::bind`) or, if `ADDR` contains a `/`, the path of a [Unix-domain socket](#unix-domain-sockets). Can be given several times to listen on several addresses; the default applies only when none is given. |
 | `--password PW` | none | If given, every client must send this password (cleartext password authentication; the user name is not checked). Without it, any user name and password are accepted. |
 | `--cache-mb N` | `1024` | Target size of the node cache (buffer pool) in MiB. Clean tree nodes are evicted above it; a checkpoint is also forced when dirty nodes exceed half of it. See [Configuration and tuning](operations.md#configuration-and-tuning). |
 | `--checkpoint-secs N` | `10` | Seconds between checkpoints (a checkpoint is only taken if records were applied since the last one). |
 | `--retention-gsns N` | `1000` | Number of GSNs of history kept for `AS OF` reads. Older versions are consolidated, and older input-log segments may be deleted. |
 | `--tick-ms N` | `1000` | Interval of logged wall-clock ticks, which define `now()`. `0` disables ticks; `now()` then stays at the last logged tick (2000-01-01 00:00:00 UTC on a data directory that never had one). |
 | `--no-sync` | off (fsync on) | Do not `fsync` the input log after each commit batch. Faster, but an operating-system crash or power loss can lose changes that were already acknowledged to sources and clients; see [Operations](operations.md#durability-and---no-sync). |
-| `--http-listen ADDR` | off | Serve the [web UI](../web-ui.md) and its JSON API on `ADDR` (`host:port`, e.g. `127.0.0.1:6876`). With `--password`, every HTTP request needs Basic authentication with that password (any user name). |
+| `--http-listen ADDR` | off | Serve the [web UI](../web-ui.md) and its JSON API on `ADDR`: `host:port` (e.g. `127.0.0.1:6876`) or the path of a Unix-domain socket, as for `--listen`. Can be given several times. With `--password`, every HTTP request needs Basic authentication with that password (any user name). |
 | `-h`, `--help` | | Print usage and exit with status 2. |
 
 Any unknown flag, a missing value or an unparsable number also prints the
@@ -92,9 +92,9 @@ Exit statuses and start-up failures:
 | Situation | Message on standard error | Status |
 |---|---|---|
 | bad command-line arguments, `--help` | the usage text | 2 |
-| the listen address cannot be bound (it is bound before recovery) | `ivm: cannot listen on <addr>: <reason>` (for example `Address already in use`) | 1 |
+| a listen address cannot be bound (they are bound before recovery) | `ivm: cannot listen on <addr>: <reason>` (for example `Address already in use`, also for a Unix-domain socket another process listens on) | 1 |
 | the engine cannot start (the data directory is locked, recovery fails, ...) | `ivm: failed to start: <reason>` | 1 |
-| the web UI cannot start | `ivm: cannot start the web UI: <reason>` | 1 |
+| the web UI cannot start | `ivm: cannot start the web UI: <reason>` (`<addr>: <reason>` for an address that cannot be bound) | 1 |
 | the engine stops by itself after an error, or the listener fails | `ivm: the engine stopped` (the cause is logged before), `ivm: server error: <reason>` | 1 |
 | a requested shutdown (below) whose final checkpoint succeeded | | 0 |
 | a requested shutdown during which a thread failed or the final checkpoint failed | | 1 |
@@ -137,6 +137,9 @@ The server speaks the PostgreSQL frontend/backend protocol version 3, so
 psql -h 127.0.0.1 -p 6875 -U ivm
 ```
 
+or, through a [Unix-domain socket](#unix-domain-sockets),
+`psql -h /run/ivm -p 6875 -U ivm`.
+
 - **User and database names** are not checked; any values work. The session
   reports itself as user `ivm` in database `ivm` (`current_user`,
   `current_database()`).
@@ -151,6 +154,34 @@ psql -h 127.0.0.1 -p 6875 -U ivm
   `postgres`, `TimeZone` `UTC`, `integer_datetimes` `on`,
   `standard_conforming_strings` `on`, `is_superuser` `on`,
   `session_authorization` `ivm`, and echoes `application_name`.
+
+### Unix-domain sockets
+
+A `--listen` address that contains a `/` is the path of a Unix-domain
+socket, which the server creates when it starts. PostgreSQL clients name a
+socket by its directory and a port: libpq (and so `psql`) and most drivers
+connect to `DIR/.s.PGSQL.PORT` for `host=DIR port=PORT` (a host that starts
+with `/`). Name the socket that way, next to TCP or instead of it:
+
+```sh
+ivm --data-dir ./ivm-data --listen 127.0.0.1:6875 --listen /run/ivm/.s.PGSQL.6875
+psql -h /run/ivm -p 6875 -U ivm
+```
+
+- **Access** is controlled by the file system: the socket file gets the
+  permissions the umask leaves, and connecting to it needs write
+  permission on it (on Linux) and search permission on its directory,
+  which must exist. `--password` applies to socket connections as well.
+- **The file** is removed when the server exits, also when it fails to
+  start. One left behind by a server that did not exit cleanly (`SIGKILL`,
+  a crash, a second signal) is replaced at the next start, since nothing
+  accepts connections on it. A socket another process listens on fails the
+  start (`Address already in use`); a file that is not a socket is never
+  removed.
+- **Paths** are relative to the server's working directory (a relative
+  one still needs a `/`: `./ivm.sock`) and are limited to 107 bytes on
+  Linux.
+- A `CancelRequest` may come through any of the server's listeners.
 
 ### Drivers
 

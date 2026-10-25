@@ -1,16 +1,18 @@
 //! The web UI's HTTP server and JSON API, against a real engine (no
-//! PostgreSQL needed). Requests go over raw TCP so malformed ones can be
-//! sent too.
+//! PostgreSQL needed). Requests go over raw TCP (or a Unix-domain socket)
+//! so malformed ones can be sent too.
 
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
 use ivm::http::{HttpConfig, HttpServer};
+use ivm::listen::LocalAddr;
 use ivm::types::text::format_datum;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn tmpdir(name: &str) -> PathBuf {
@@ -34,9 +36,9 @@ impl Fixture {
         let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
         let running = coord::start(cfg).expect("engine starts");
         let h = running.handle.clone();
-        let server = ivm::http::start(HttpConfig { listen: "127.0.0.1:0".into(), password: password.map(String::from) }, h.clone())
+        let server = ivm::http::start(HttpConfig { listen: vec!["127.0.0.1:0".into()], password: password.map(String::from) }, h.clone())
             .expect("http server starts");
-        let addr = server.local_addr;
+        let LocalAddr::Tcp(addr) = server.local_addrs[0] else { unreachable!() };
         Fixture { running: Some(running), server: Some(server), h, addr, dir }
     }
 
@@ -97,6 +99,15 @@ impl Response {
 /// Send raw bytes and read the response until the server closes.
 fn raw(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let _ = s.write_all(bytes);
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+fn raw_unix(path: &Path, bytes: &[u8]) -> Vec<u8> {
+    let mut s = UnixStream::connect(path).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
     let _ = s.write_all(bytes);
     let mut out = Vec::new();
@@ -559,4 +570,30 @@ fn metrics_and_event_stream() {
         }
         assert!(Instant::now() < deadline, "no topology event: {text}");
     }
+}
+
+/// The UI on a Unix-domain socket, next to a TCP listener; the socket file
+/// is removed at shutdown.
+#[test]
+fn unix_domain_sockets() {
+    let dir = tmpdir("unix");
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    let running = coord::start(cfg).expect("engine starts");
+    let path = dir.join("ui.sock");
+    let listen = vec![path.to_str().unwrap().to_string(), "127.0.0.1:0".into()];
+    let server = ivm::http::start(HttpConfig { listen, password: None }, running.handle.clone()).expect("http server starts");
+    assert_eq!(server.local_addrs[0], LocalAddr::Unix(path.clone()));
+    let LocalAddr::Tcp(addr) = server.local_addrs[1] else { panic!("{:?}", server.local_addrs) };
+    let get = |host: &str| parse(&raw_unix(&path, format!("GET /api/overview HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()));
+    let r = get("localhost");
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["counts"]["tables"], 0, "{}", r.text());
+    // the DNS-rebinding guard holds here too (a reverse proxy on a loopback
+    // port may forward to the socket)
+    assert_eq!(get("evil.example").status, 403);
+    assert_eq!(request(addr, "GET", "/api/overview", &[], b"").status, 200);
+    server.shutdown();
+    assert!(!path.exists(), "the socket file is removed");
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }

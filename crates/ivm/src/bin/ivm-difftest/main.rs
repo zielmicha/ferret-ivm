@@ -130,7 +130,7 @@ impl Engine {
             let port = listener.local_addr().unwrap().port();
             let h = running.handle.clone();
             std::thread::spawn(move || {
-                let _ = server::serve_listener(listener, ServerConfig { listen: String::new(), password: None }, h);
+                let _ = server::serve_listener(listener, ServerConfig::default(), h);
             });
             let client = connect(&format!("host=127.0.0.1 port={port} user=ivm dbname=ivm"));
             (Engine::InProcess { running: Some(running), data: data.to_path_buf() }, client)

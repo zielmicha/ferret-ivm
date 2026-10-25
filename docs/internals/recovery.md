@@ -23,7 +23,7 @@ implementation checkpoints everything together).
 
 ## The recovery protocol
 
-The server binary binds its listen address before recovery (a failure exits
+The server binary binds its listen addresses before recovery (a failure exits
 with status 1 at once) and accepts connections only once recovery is done.
 `coord::start`:
 

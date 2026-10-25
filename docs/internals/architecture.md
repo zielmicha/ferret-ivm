@@ -51,8 +51,8 @@ Where the implementation differs from the design:
 
 | Thread | Owns | Does |
 |---|---|---|
-| main | | parses flags, starts the signal and stop-file threads, binds the listening socket, runs recovery (`coord::start`), starts the web UI (with `--http-listen`) and the listener, then waits for a shutdown request (or for the engine to stop by itself) and shuts down after a final checkpoint (`main.rs`; exit status 0, or 1 when a thread or the final checkpoint failed) |
-| `ivm-listener` | the listening socket | accepts connections (`server::serve_listener`) and starts a session thread for each |
+| main | | parses flags, starts the signal and stop-file threads, binds the listening sockets (TCP or Unix-domain, `listen.rs`), runs recovery (`coord::start`), starts the web UI (with `--http-listen`) and the listeners, then waits for a shutdown request (or for the engine to stop by itself) and shuts down after a final checkpoint, removing the files of Unix-domain sockets (`main.rs`; exit status 0, or 1 when a thread or the final checkpoint failed) |
+| `ivm-listener` (one per `--listen` address) | a listening socket | accepts connections (`server::Server::serve`) and starts a session thread for each; the listeners share process IDs and cancel keys |
 | `ivm-signals` | | turns the first `SIGINT`/`SIGTERM` into a shutdown request; a second one exits the process at once (status 1) |
 | `ivm-sequencer` | the input-log writer | assigns GSNs, appends and `fsync`s records in batches, generates clock ticks, acknowledges submitters, forwards durable records to the engine |
 | `ivm-engine` (64 MiB stack) | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, takes checkpoints, builds the web UI's snapshots |
@@ -60,7 +60,7 @@ Where the implementation differs from the design:
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
 | `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, removes it and requests a shutdown |
-| `ivm-http` (with `--http-listen`: a driver thread and the two worker threads of its own tokio runtime) | the HTTP listener | the web UI's server, its once-a-second metrics sampler and the SQL console ([Web UI](../web-ui.md)); engine snapshots are requested with a callback, so no async thread blocks on the engine |
+| `ivm-http` (with `--http-listen`: a driver thread and the two worker threads of its own tokio runtime) | the HTTP listeners | the web UI's server, its once-a-second metrics sampler and the SQL console ([Web UI](../web-ui.md)); engine snapshots are requested with a callback, so no async thread blocks on the engine |
 | `ivm-slot-drop-<slot>` | | drop the replication slot of a dropped source, retrying with a delay doubling from 250 ms to 10 s (also while the stopping source's session still holds it) until it is dropped or gone; pending drops are saved in checkpoints and started again after recovery |
 
 There is exactly one engine thread: all dataflow maintenance, all index

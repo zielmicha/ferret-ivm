@@ -1,9 +1,11 @@
 //! Wire-protocol tests against an in-process server, with raw messages.
 
 use ivm::coord;
+use ivm::listen::Stream;
 use ivm::server::{self, ServerConfig};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -36,13 +38,13 @@ fn start(name: &str) -> (Running, u16) {
     let port = listener.local_addr().unwrap().port();
     let h = engine.handle.clone();
     std::thread::spawn(move || {
-        let _ = server::serve_listener(listener, ServerConfig { listen: String::new(), password: None }, h);
+        let _ = server::serve_listener(listener, ServerConfig::default(), h);
     });
     (Running { engine, dir }, port)
 }
 
 struct Conn {
-    s: TcpStream,
+    s: Stream,
 }
 
 /// A backend message: (tag, body).
@@ -52,7 +54,7 @@ impl Conn {
     fn connect(port: u16) -> Conn {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        let mut c = Conn { s };
+        let mut c = Conn { s: Stream::Tcp(s) };
         let mut body = Vec::new();
         body.extend_from_slice(&196608u32.to_be_bytes());
         for (k, v) in [("user", "ivm"), ("database", "ivm")] {
@@ -382,6 +384,11 @@ fn comment_only_statements_are_empty() {
 fn connect_with_key(port: u16) -> (Conn, u32, u32) {
     let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    start_with_key(Stream::Tcp(s))
+}
+
+/// Start a session on `s`: its BackendKeyData (pid, secret), and the connection.
+fn start_with_key(s: Stream) -> (Conn, u32, u32) {
     let mut c = Conn { s };
     let mut body = 196608u32.to_be_bytes().to_vec();
     body.extend_from_slice(b"user\0ivm\0\0");
@@ -712,4 +719,47 @@ fn waiting_reads_are_cancelled_and_dropped() {
     drop(c2);
     until_parked(&running, 0);
     running.shutdown();
+}
+
+/// Sessions on a Unix-domain socket: a client library finds it from a
+/// directory and a port; reads are cancelled (also through another
+/// listener of the same server) and dropped when the client goes away.
+#[test]
+fn unix_domain_sockets() {
+    let dir = tmpdir("unix");
+    let sockets = tmpdir("unix-sockets");
+    std::fs::create_dir_all(&sockets).unwrap();
+    let path = sockets.join(".s.PGSQL.6875");
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    let engine = coord::start(cfg).expect("engine starts");
+    let (unix, file) = ivm::listen::bind(path.to_str().unwrap()).unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = tcp.local_addr().unwrap().port();
+    let srv = server::Server::new(ServerConfig::default(), engine.handle.clone());
+    for l in [unix, tcp.into()] {
+        let srv = srv.clone();
+        std::thread::spawn(move || srv.serve(l));
+    }
+    let running = Running { engine, dir };
+    let cfg = pgproto::Config::parse(&format!("host={} port=6875 user=ivm", sockets.display())).unwrap();
+    let mut client = pgproto::Client::connect(&cfg).unwrap();
+    client.simple_query("CREATE TABLE t (id int PRIMARY KEY)").unwrap();
+    client.simple_query("INSERT INTO t VALUES (1), (2)").unwrap();
+    assert_eq!(client.query("SELECT count(*) FROM t").unwrap().rows, [[Some("2".to_string())]]);
+    let s = UnixStream::connect(&path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let (mut c, pid, secret) = start_with_key(Stream::Unix(s));
+    c.send(b'Q', b"SELECT 1 AS OF 1000000\0");
+    until_parked(&running, 1);
+    cancel(port, pid, secret);
+    assert_eq!(error_code(&c.until_ready()).as_deref(), Some("57014"));
+    c.send(b'Q', b"SELECT 1 AS OF 1000000\0");
+    until_parked(&running, 1);
+    drop(c);
+    until_parked(&running, 0);
+    drop(client);
+    running.shutdown();
+    drop(file);
+    assert!(!path.exists(), "the socket file is removed");
+    let _ = std::fs::remove_dir_all(&sockets);
 }

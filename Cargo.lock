@@ -698,6 +698,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "smallvec",
+ "socket2",
  "sqlparser",
  "tokio",
  "tower",
