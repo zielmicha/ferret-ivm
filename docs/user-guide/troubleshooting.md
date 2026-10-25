@@ -319,7 +319,6 @@ test, with workarounds.
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| An OID cast to `regclass`, `regtype` or `regnamespace` is a `text` value (the name) | `c.oid::regclass = 'orders'::regclass` fails with `operator does not exist: text = oid` | compare OIDs: `c.oid = 'orders'::regclass` |
 | Session settings: `RESET` (also `RESET ALL`) does not undo a `SET`; `set_config()` changes nothing; `current_setting()` reports the server's fixed settings | after `SET read_mode = latest; RESET read_mode` the session still reads `latest`; `current_setting()` ignores values changed with `SET` (and fails for `read_mode`), and its `application_name` is always empty | `SET` the value wanted; use `SHOW` |
 
 ### Time travel

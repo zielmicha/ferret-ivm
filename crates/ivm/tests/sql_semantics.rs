@@ -528,6 +528,39 @@ fn reg_types_accept_names() {
     running.shutdown();
 }
 
+/// reg* values compare as the OIDs they are, also an OID cast to a reg*
+/// type (which otherwise is its name, as text, so that it prints as one),
+/// as in PostgreSQL. `oid::regclass = 't1'::regclass` used to fail with
+/// "operator does not exist: text = oid".
+#[test]
+fn reg_values_compare_as_oids() {
+    let running = start("regcompare");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    let classes = rows(&h, "SELECT count(*) FROM pg_class").remove(0);
+    for (sql, want) in [
+        ("SELECT c.relname FROM pg_class c WHERE c.oid::regclass = 't1'::regclass", vec!["t1"]),
+        ("SELECT c.relname FROM pg_class c WHERE 't1'::regclass = (c.oid)::regclass", vec!["t1"]),
+        ("SELECT c.relname FROM pg_class c WHERE CAST(c.oid AS regclass) IN ('t1', 't2'::regclass) ORDER BY 1", vec!["t1", "t2"]),
+        ("SELECT c.relname FROM pg_class c WHERE c.oid::regclass IN ('t1', 't2') ORDER BY 1", vec!["t1", "t2"]),
+        ("SELECT c.relname FROM pg_class c WHERE c.oid::regclass IS NOT DISTINCT FROM 't2'::regclass", vec!["t2"]),
+        ("SELECT count(*) FROM pg_class c WHERE c.oid::regclass <> 't1'::regclass AND relname IN ('t1', 't2')", vec!["1"]),
+        ("SELECT count(*) FROM pg_class c WHERE c.oid::regclass = c.oid", vec![classes.as_str()]),
+        ("SELECT a.attname FROM pg_attribute a WHERE a.attrelid::regclass = 't2'::regclass AND a.attnum = 2", vec!["x"]),
+        ("SELECT t.typname FROM pg_type t WHERE t.oid::regtype = 'integer'::regtype", vec!["int4"]),
+        ("SELECT n.nspname FROM pg_namespace n WHERE n.oid::regnamespace = 'public'::regnamespace", vec!["public"]),
+        // they still print as names
+        ("SELECT c.oid::regclass, c.oid::regclass::text, 'x' || c.oid::regclass FROM pg_class c WHERE relname = 't1'", vec!["t1|t1|xt1"]),
+    ] {
+        assert_eq!(rows(&h, sql), want, "{sql}");
+    }
+    // as in PostgreSQL, the other side of = is an oid: an untyped literal is
+    // read as one (in IN, with only reg* values and literals, as a name)
+    let err = try_rows(&h, "SELECT c.relname FROM pg_class c WHERE c.oid::regclass = 't1'").unwrap_err();
+    assert!(err.contains("invalid input syntax for type oid"), "{err}");
+    running.shutdown();
+}
+
 #[test]
 fn current_setting_reports_server_settings() {
     let running = start("current-setting");

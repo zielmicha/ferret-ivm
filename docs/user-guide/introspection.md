@@ -230,8 +230,8 @@ unknown names (`relation "x" does not exist`, `type "x" does not exist`,
 OID columns (`WHERE attrelid = 'orders'::regclass`); as a select-list item
 it prints the name, in a column named after the type (`regclass`). OIDs cast
 to these types print names (or the number, for an OID that names nothing),
-as `text`: compare OIDs, not reg* values (`c.oid::regclass =
-'orders'::regclass` fails with `operator does not exist: text = oid`).
+as `text`, and compare as OIDs, as in PostgreSQL (`c.oid::regclass =
+'orders'::regclass`; see [reg* casts](../sql/types.md)).
 `regproc`, `regrole`, `regprocedure` and `regoper` are plain aliases of
 `oid`: OIDs print as numbers and names are not accepted.
 
