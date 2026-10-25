@@ -1856,6 +1856,10 @@ impl<'a> Binder<'a> {
             fp.push(s.desc as u8);
             fp.push(s.nulls_first as u8);
         }
+        fp.push(0xFC);
+        if let Some(f) = fraction {
+            fp.extend_from_slice(&f64::to_bits(f).to_le_bytes());
+        }
         let mut c = collector.borrow_mut();
         if let Some(k) = c.aggs.iter().position(|a| a.fp == fp) {
             return Ok(Expr::AggRef(k, c.aggs[k].ret.ty.clone()));

@@ -354,6 +354,27 @@ fn as_of_history_survives_restart_after_table_sizes_change() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Identical aggregate calls in a query are computed once, but percentiles
+/// differing only in their fraction counted as identical: every one
+/// returned the first one's percentile (ad hoc and in views).
+#[test]
+fn percentiles_with_different_fractions() {
+    let dir = tmpdir("percentiles");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+    exec(&h, "INSERT INTO t SELECT i, i % 2, i * 10 FROM generate_series(1, 11) i");
+    let q = "SELECT g, percentile_cont(0) WITHIN GROUP (ORDER BY v), percentile_cont(0.25) WITHIN GROUP (ORDER BY v), \
+             percentile_disc(0.5) WITHIN GROUP (ORDER BY v), percentile_disc(1) WITHIN GROUP (ORDER BY v) FROM t GROUP BY g";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    assert_eq!(rows(&h, &format!("{q} ORDER BY g")), ["0|20|40|60|100", "1|10|35|50|110"]);
+    exec(&h, "DELETE FROM t WHERE id IN (1, 2)");
+    assert_eq!(rows(&h, &format!("{q} ORDER BY g")), ["0|40|55|60|100", "1|30|50|70|110"]);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY g"), rows(&h, &format!("{q} ORDER BY g")));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Ad hoc execution deduplicated a group's rows for a DISTINCT ordered
 /// aggregate in place, so ordered aggregates after it saw only the distinct
 /// rows (here mode() saw x = 17 alone). Expected values are PostgreSQL's.
