@@ -258,9 +258,7 @@ pub fn start(cfg: Config) -> Result<Running> {
     let shared = Arc::new(Shared::default());
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
-    let writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
-    let last_logged = writer.last_gsn();
-    shared.durable_gsn.store(last_logged, Ordering::Release);
+    let mut writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
     let (env, recovered) = Env::open(
         &cfg.data_dir.join("store"),
         EnvOptions { cache_bytes: cfg.cache_bytes, ..Default::default() },
@@ -306,6 +304,14 @@ pub fn start(cfg: Config) -> Result<Running> {
     for (gsn, rec) in records {
         engine.apply_record(gsn, rec)?;
     }
+    // The checkpoint can be ahead of the log if the log lost records it
+    // covers (an unsynced tail with --no-sync): GSNs must continue after
+    // it, or new records would be taken for already applied ones.
+    if writer.last_gsn() < engine.processed {
+        log::warn!("the input log ends at gsn {} before the checkpoint at {}; continuing after the checkpoint", writer.last_gsn(), engine.processed);
+        writer.skip_to(engine.processed);
+    }
+    shared.durable_gsn.store(writer.last_gsn(), Ordering::Release);
     engine.replaying = false;
     engine.shared.processed_gsn.store(engine.processed, Ordering::Release);
     let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };

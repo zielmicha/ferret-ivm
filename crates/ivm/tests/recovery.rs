@@ -173,3 +173,41 @@ fn int8_variance_does_not_overflow() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The log can lose records a checkpoint covers (its unsynced tail, with
+/// --no-sync). New records must not reuse those GSNs: they used to be taken
+/// for already applied ones and skipped (their DML never answered), and
+/// fresh reads went back to the state at the end of the log.
+#[test]
+fn log_tail_lost_behind_a_checkpoint() {
+    let dir = tmpdir("lost-tail");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    for i in 0..5 {
+        exec(&h, &format!("INSERT INTO t VALUES ({i})"));
+    }
+    exec(&h, "CHECKPOINT");
+    running.shutdown();
+    let seg = std::fs::read_dir(dir.join("log")).unwrap().next().unwrap().unwrap().path();
+    let len = std::fs::metadata(&seg).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&seg).unwrap().set_len(len / 3).unwrap();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT count(*) FROM t"), ["5"]);
+    let h2 = h.clone();
+    let insert = std::thread::spawn(move || try_exec(&h2, "INSERT INTO t VALUES (100)"));
+    let t0 = std::time::Instant::now();
+    while !insert.is_finished() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "INSERT never answered");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    insert.join().unwrap().unwrap();
+    assert_eq!(rows(&h, "SELECT count(*) FROM t"), ["6"]);
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT count(*) FROM t"), ["6"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -262,6 +262,12 @@ impl LogWriter {
         self.last_gsn
     }
 
+    /// Continue numbering after `gsn` (a checkpoint taken after records the
+    /// log has since lost, e.g. an unsynced tail).
+    pub fn skip_to(&mut self, gsn: Gsn) {
+        self.last_gsn = self.last_gsn.max(gsn);
+    }
+
     /// Buffer a record. GSNs must be strictly increasing.
     pub fn append(&mut self, gsn: Gsn, rec: &LogRecord) -> Result<()> {
         if self.cur_len >= SEGMENT_BYTES && self.buf.is_empty() {
