@@ -119,6 +119,9 @@ pub(crate) struct AppState {
     /// GSN from which each tree's history is complete (by fingerprint).
     #[serde(default)]
     pub arr_since: Vec<(Vec<u8>, Gsn)>,
+    /// Replication slots of dropped sources still to be dropped.
+    #[serde(default)]
+    pub slot_drops: Vec<crate::source::SlotDrop>,
 }
 
 pub struct Engine {
@@ -334,6 +337,8 @@ pub fn start(cfg: Config) -> Result<Running> {
     let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
     engine.handle = Some(handle.clone());
     engine.start_sources_and_sinks(&handle)?;
+    // slot drops left from before the restart (or replayed DROP SOURCEs)
+    crate::source::resume_slot_drops(&shared);
     let seq = Sequencer { writer, rx: srx, engine: etx.clone(), shared: shared.clone(), tick: cfg.tick };
     let t1 = std::thread::Builder::new().name("ivm-sequencer".into()).spawn(move || {
         if let Err(e) = seq.run() {
@@ -368,6 +373,7 @@ impl Engine {
         self.ticks.push_back((rec.gsn, app.clock));
         self.source_states = app.source_states.into_iter().collect();
         self.source_lsns = app.source_lsns.into_iter().collect();
+        self.shared.slot_drops.lock().extend(app.slot_drops);
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
         for obj in &objects {
             if let ObjectKind::Table(t) = &obj.kind {
@@ -741,6 +747,7 @@ impl Engine {
             clock: self.clock,
             errors: self.graph.error_state(),
             arr_since: self.graph.arrangement_since().into_iter().collect(),
+            slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;

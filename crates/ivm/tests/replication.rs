@@ -491,6 +491,46 @@ fn chunks_see_transactions_decoded_before_them() {
     assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
 }
 
+fn slot_exists(up: &mut Upstream, slot: &str) -> bool {
+    up.rows(&format!("SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'")) == ["1"]
+}
+
+/// The slot of a dropped source is dropped even if the upstream is down
+/// for longer than a few seconds: it used to be given up after about 5 s,
+/// leaving a slot that retains WAL for good.
+#[test]
+fn slots_of_dropped_sources_are_dropped_after_an_outage() {
+    let (mut up, mut ivm, _dir) = setup("slot-drop-outage", &["CREATE TABLE t (id int PRIMARY KEY)"]);
+    let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t");
+    let slot = slot_name(&mut ivm);
+    up._pg.stop();
+    ivm.exec("DROP SOURCE s");
+    std::thread::sleep(Duration::from_secs(6));
+    up._pg.restart().unwrap();
+    up.client = connect(&up.conninfo);
+    assert!(slot_exists(&mut up, &slot));
+    eventually("the slot to be dropped", || !slot_exists(&mut up, &slot));
+}
+
+/// A slot drop that has not succeeded yet when the engine stops is retried
+/// after the next start; it used to be forgotten.
+#[test]
+fn slot_drops_survive_a_restart() {
+    let (mut up, mut ivm, dir) = setup("slot-drop-restart", &["CREATE TABLE t (id int PRIMARY KEY)"]);
+    let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t");
+    let slot = slot_name(&mut ivm);
+    up._pg.stop();
+    ivm.exec("DROP SOURCE s");
+    ivm.shutdown();
+    // (longer than the drop used to be retried)
+    std::thread::sleep(Duration::from_secs(6));
+    up._pg.restart().unwrap();
+    up.client = connect(&up.conninfo);
+    assert!(slot_exists(&mut up, &slot));
+    let _ivm = Ivm::start(&dir);
+    eventually("the slot to be dropped", || !slot_exists(&mut up, &slot));
+}
+
 /// The replication slot of the (only) source.
 fn slot_name(ivm: &mut Ivm) -> String {
     ivm.rows("SHOW SOURCES")[0].split('|').nth(2).unwrap().to_string()

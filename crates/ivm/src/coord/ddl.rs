@@ -233,6 +233,8 @@ impl Engine {
                 self.check_source_tables(&name, &discovered)?;
                 let id = self.catalog.alloc_id();
                 let slot = slot.unwrap_or_else(|| default_slot_name(&name, id));
+                // a dropped source's slot by the same name is this source's now
+                crate::source::cancel_slot_drop(&self.shared, &slot);
                 let def = SourceDef { conninfo, publication, slot, tables };
                 self.catalog.insert(CatalogObject {
                     id,
@@ -833,9 +835,9 @@ impl Engine {
                 if let Some(h) = self.source_handles.remove(&id) {
                     h.stop();
                 }
-                if !self.replaying {
-                    crate::source::drop_slot_async(def.conninfo.clone(), def.slot.clone());
-                }
+                // recorded also when replaying: the drop may not have
+                // succeeded before the restart (it is retried after it)
+                crate::source::drop_slot_async(&self.shared, def.conninfo.clone(), def.slot.clone(), !self.replaying);
                 self.source_states.remove(&id);
                 // a dropped source no longer holds back reads waiting for an LSN
                 self.source_lsns.remove(&id);

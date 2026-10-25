@@ -437,11 +437,14 @@ that depends on them — views, materialized views, indexes and sinks,
 transitively — are dropped with it. `CASCADE` is accepted and has no effect.
 
 The source thread is stopped and the replication slot is dropped in the
-background (`DROP_REPLICATION_SLOT`, up to 20 attempts 250 ms apart; a slot
-that no longer exists counts as dropped). If the upstream is unreachable
-during those five seconds, or the engine stops before the drop succeeds, the
-slot remains and must be dropped by hand (see below). Replaying a
-`DROP SOURCE` from the log does not try to drop the slot again.
+background (`DROP_REPLICATION_SLOT`; a slot that no longer exists counts as
+dropped). Failed attempts — the upstream is unreachable, the slot still in
+use — are retried with a delay doubling from 250 ms up to 10 s, with a
+warning in the log at attempts 1, 2, 4, 8, ..., until the drop succeeds.
+Pending drops are saved in checkpoints (and re-derived from a `DROP SOURCE`
+replayed from the log), so a drop that has not succeeded when the engine
+stops is retried after the next start. Creating a source whose slot has the
+name of a slot still to be dropped (an explicit `SLOT`) cancels that drop.
 
 ## Monitoring
 
@@ -462,9 +465,10 @@ server log (`RUST_LOG=ivm::source=debug` for more).
 
 ## Cleaning up upstream slots
 
-An engine that is stopped for good, a deleted data directory, or a failed
-background drop leave a slot behind that retains WAL. List and drop them in
-PostgreSQL:
+An engine that is stopped for good, or a deleted data directory, leave
+slots behind that retain WAL (as does, until it succeeds, the background
+drop of a dropped source's slot whose upstream is unreachable). List and
+drop them in PostgreSQL:
 
 ```sql
 SELECT slot_name, active, restart_lsn, confirmed_flush_lsn
