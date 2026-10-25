@@ -73,6 +73,80 @@ pub enum Statement {
     Empty,
 }
 
+/// If a string literal, quoted identifier, comment or dollar-quoted string
+/// starts at byte `i`, the index of its last byte (clamped to the input).
+fn skip_lexical(b: &[u8], i: usize) -> Option<usize> {
+    let ident_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    match b[i] {
+        q @ (b'\'' | b'"') => {
+            // E'...' strings also take backslash escapes
+            let escapes = q == b'\''
+                && i > 0
+                && matches!(b[i - 1], b'e' | b'E')
+                && !(i > 1 && (ident_byte(b[i - 2]) || b[i - 2] == b'$'));
+            let mut j = i + 1;
+            while j < b.len() {
+                if escapes && b[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if b[j] == q {
+                    if j + 1 < b.len() && b[j + 1] == q {
+                        j += 2;
+                        continue;
+                    }
+                    return Some(j);
+                }
+                j += 1;
+            }
+            Some(b.len() - 1)
+        }
+        b'-' if b.get(i + 1) == Some(&b'-') => {
+            let mut j = i;
+            while j + 1 < b.len() && b[j + 1] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if b.get(i + 1) == Some(&b'*') => {
+            // block comments nest
+            let (mut j, mut depth) = (i + 2, 1);
+            while j < b.len() {
+                if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                    depth += 1;
+                    j += 2;
+                } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        return Some(j - 1);
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            Some(b.len() - 1)
+        }
+        // dollar quoting: $tag$ ... $tag$ (not $1 parameters, not inside identifiers)
+        b'$' if !(i > 0 && ident_byte(b[i - 1])) => {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] >= 0x80) {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'$' && !(j > i + 1 && b[i + 1].is_ascii_digit()) {
+                let tag = &b[i..=j];
+                let end = b[j + 1..].windows(tag.len()).position(|w| w == tag);
+                return Some(match end {
+                    Some(p) => j + p + tag.len(),
+                    None => b.len() - 1,
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Split a query string into statements at top-level semicolons.
 pub fn split_statements(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
@@ -81,48 +155,11 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     let mut i = 0;
     let mut depth = 0i32;
     while i < b.len() {
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
         match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == q {
-                        if i + 1 < b.len() && b[i + 1] == q {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'$' => {
-                // dollar quoting: $tag$ ... $tag$
-                let mut j = i + 1;
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-                    j += 1;
-                }
-                if j < b.len() && b[j] == b'$' && !(j > i + 1 && b[i + 1].is_ascii_digit()) {
-                    let tag = &sql[i..=j];
-                    if let Some(end) = sql[j + 1..].find(tag) {
-                        i = j + 1 + end + tag.len() - 1;
-                    } else {
-                        i = b.len();
-                    }
-                }
-            }
             b'(' => depth += 1,
             b')' => depth -= 1,
             b';' if depth <= 0 => {
@@ -287,9 +324,10 @@ impl Toks {
 
 /// Strip a trailing `AS OF ...` clause from a SELECT.
 fn strip_as_of(sql: &str) -> Result<(String, AsOf)> {
-    let lower = sql.to_lowercase();
-    let Some(idx) = find_top_level(&lower, " as of ") else { return Ok((sql.to_string(), AsOf::Default)) };
-    let rest = sql[idx + 7..].trim();
+    // ASCII lowercasing keeps byte offsets valid for `sql`
+    let lower = sql.to_ascii_lowercase();
+    let Some((idx, rest_at)) = find_as_of(&lower) else { return Ok((sql.to_string(), AsOf::Default)) };
+    let rest = sql[rest_at..].trim();
     let mut t = Toks::new(rest);
     let as_of = if t.eat("at") {
         t.expect("least")?;
@@ -309,31 +347,35 @@ fn strip_as_of(sql: &str) -> Result<(String, AsOf)> {
     Ok((sql[..idx].to_string(), as_of))
 }
 
-/// Last occurrence of `pat` outside quotes/parentheses.
-fn find_top_level(s: &str, pat: &str) -> Option<usize> {
+/// The last `AS OF` (words separated by whitespace, followed by more text)
+/// outside parentheses, quotes and comments of a lowercased statement:
+/// (offset of the whitespace before AS, offset just after OF).
+fn find_as_of(s: &str) -> Option<(usize, usize)> {
     let b = s.as_bytes();
+    let ws = |c: u8| c.is_ascii_whitespace();
     let mut depth = 0;
-    let mut in_q: Option<u8> = None;
     let mut found = None;
     let mut i = 0;
     while i < b.len() {
-        let c = b[i];
-        match in_q {
-            Some(q) => {
-                if c == q {
-                    in_q = None;
-                }
-            }
-            None => match c {
-                b'\'' | b'"' => in_q = Some(c),
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {
-                    if depth == 0 && s[i..].starts_with(pat) {
-                        found = Some(i);
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            c if depth == 0 && ws(c) && b[i + 1..].starts_with(b"as") => {
+                let mut j = i + 3;
+                if j < b.len() && ws(b[j]) {
+                    while j < b.len() && ws(b[j]) {
+                        j += 1;
+                    }
+                    if b[j..].starts_with(b"of") && b.get(j + 2).is_some_and(|c| ws(*c)) {
+                        found = Some((i, j + 2));
                     }
                 }
-            },
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -396,8 +438,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
             return parse_subscribe(sql, &mut t, false);
         }
         "copy" => {
-            // COPY (SUBSCRIBE ...) TO STDOUT
-            let lower = sql.to_lowercase();
+            // COPY (SUBSCRIBE ...) TO STDOUT (ASCII lowercasing keeps
+            // byte offsets valid for `sql`)
+            let lower = sql.to_ascii_lowercase();
             if let Some(p) = lower.find("subscribe")
                 && lower[..p].trim_end().ends_with('(')
             {
@@ -707,6 +750,36 @@ mod tests {
     fn split() {
         let v = split_statements("select 1; select ';' ; -- c;\nselect $$a;b$$; select (1;2)");
         assert_eq!(v.len(), 4, "{v:?}");
+        // escaped quotes in E'' strings, nested comments, tagged dollar quotes
+        let v = split_statements(r"select E'a\';b'; select /* x /* y; */ z; */ 2; select $f$;$$;$f$; select 'ü;'");
+        assert_eq!(v, vec![r"select E'a\';b'", "select /* x /* y; */ z; */ 2", "select $f$;$$;$f$", "select 'ü;'"]);
+    }
+
+    fn as_of(sql: &str) -> AsOf {
+        match parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+            Statement::Select { as_of, .. } => as_of,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn as_of_clause() {
+        // non-ASCII text outside quotes used to panic (byte slicing inside a character)
+        assert_eq!(as_of("select 1 as ü"), AsOf::Default);
+        assert_eq!(as_of("select 'İİ' as x, ü from t as of 7"), AsOf::Gsn(7));
+        // AS OF inside comments, strings and dollar quotes is not a clause
+        assert_eq!(as_of("select a from t -- as of 1"), AsOf::Default);
+        assert_eq!(as_of("select a from t /* as of 1 */"), AsOf::Default);
+        assert_eq!(as_of("select $$ as of 1 $$"), AsOf::Default);
+        assert_eq!(as_of("select ' as of 1'"), AsOf::Default);
+        // any whitespace separates the words
+        assert_eq!(as_of("select a from t\nAS\tOF 12"), AsOf::Gsn(12));
+        assert_eq!(as_of("select a from t as of latest"), AsOf::Latest);
+        match parse_statement("select a from t as of 3").unwrap() {
+            Statement::Select { text, .. } => assert_eq!(text, "select a from t"),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_statement("COPY (SUBSCRIBE (select 'İ' from t)) TO STDOUT").is_ok());
     }
 
     #[test]
