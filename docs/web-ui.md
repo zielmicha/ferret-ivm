@@ -29,7 +29,10 @@ ivm --data-dir ./ivm-data --listen 127.0.0.1:6875 --http-listen 127.0.0.1:6876
 
 Then open <http://127.0.0.1:6876/>. The flag takes any `host:port`;
 `127.0.0.1:0` picks a free port (the log line `web UI on http://…` shows
-which). The server shares the process with the engine and stops with it.
+which). The server shares the process with the engine: it starts once
+recovery has finished (an address that cannot be bound ends the process
+with status 1, `ivm: cannot start the web UI: …`) and stops first at
+shutdown.
 
 To reach a server on another machine without exposing the port, prefer an
 SSH tunnel (`ssh -L 6876:127.0.0.1:6876 host`) over listening on a public
@@ -42,7 +45,8 @@ in front of it if it must be reachable over a network.
   (pages, assets and API alike) requires HTTP Basic authentication with that
   password; the user name is ignored. Browsers prompt once and then send the
   credentials with every request, including the event stream. Wrong or
-  missing credentials get `401` with `WWW-Authenticate: Basic realm="ivm"`.
+  missing credentials get `401` with
+  `WWW-Authenticate: Basic realm="ivm", charset="UTF-8"`.
   The comparison is constant-time. Basic auth sends the password in clear
   text, so use it over loopback, an SSH tunnel or TLS.
 - **Without a password,** the server only answers requests whose `Host`
@@ -52,27 +56,36 @@ in front of it if it must be reachable over a network.
   API. Other host names get `403`; start ivm with `--password` to use them.
 - **Read-only.** The API cannot change anything. The SQL console accepts
   exactly one `SELECT`, `SHOW` or `EXPLAIN` statement; everything else is
-  refused with `403`. It only accepts `application/json` bodies, which a
-  page on another origin cannot send without a CORS preflight that this
-  server never grants.
-- **Secrets.** Connection strings of sources are shown with passwords
-  masked (`password=***`, `postgres://user:***@host`).
+  refused with `403`. It only accepts `application/json` bodies (`415`
+  otherwise), which a page on another origin cannot send without a CORS
+  preflight that this server never grants.
+- **Secrets.** The `conninfo` of a source (the Sources screen,
+  `/api/sources`) is shown with passwords masked (`password=***`,
+  `postgres://user:***@host`). The stored `CREATE SOURCE` and `CREATE SINK`
+  statements are not: the catalog (`sql`), the history and the console
+  (`ivm.objects`, `ivm.catalog_history`, `SHOW CREATE VIEW`) show their
+  connection strings, passwords included, as a pgwire client sees them.
+  Protect the UI like the SQL port.
 - **Headers.** Responses carry a strict `Content-Security-Policy` (scripts
   only from the server itself, no inline scripts, no framing),
   `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
   `Referrer-Policy: no-referrer`. API responses are `Cache-Control: no-store`.
 - **Limits.** At most 256 concurrent connections (more are closed at once),
-  request heads up to 64 KiB (`431` beyond), bodies up to 64 KiB (`413`),
-  10 s to send the request head, 10 s for a body, 60 s per request, 64
-  concurrent event streams and 4 concurrent console queries. At most 16
+  request heads limited by a 64 KiB read buffer (`431` for a head that does
+  not fit; the check is made per read, so heads somewhat above it can get
+  through), bodies up to 64 KiB (`413`), 10 s to send the request head,
+  10 s for a body, 60 s per request (`504`), 64 concurrent event streams
+  and 4 concurrent console queries (`503` and `429` beyond). At most 16
   snapshot requests are queued at the engine at any time, however many
-  clients poll. Malformed requests get `400`; they never take the server down.
+  clients poll; a request waits at most 15 s for a place in that queue
+  (`503`) and 15 s for the engine's answer (`504`). Malformed requests get
+  `400`; they never take the server down.
 
 ## Screens
 
 The navigation on the left (a menu button on phones) leads to nine screens.
 A dot in the header shows the state of the live connection (green: live,
-yellow: the engine has not answered the last status request, red:
+yellow: the engine has not answered the last status request for 2 s, red:
 reconnecting) next to the latest processed GSN. The moon button switches
 between light and dark mode; the choice is remembered, otherwise the
 operating system's preference applies. Every view keeps its state in the URL
@@ -108,15 +121,18 @@ replication message, commits and row changes logged since start, the current
 ingest rate with a two-minute sparkline, and the masked connection string.
 
 The initial snapshot section shows how many tables are loaded and, per
-table, its upstream name, primary key, row count, state (`done`, `loading`,
+table, its upstream name, key (the primary key, or the replica identity
+index; none for a multiset table), row count, state (`done`, `loading`,
 `pending`, or `cannot read; retrying` with the error as tooltip) and the
-snapshot boundary (the primary key of the last row
-loaded; the next chunk starts after it). Tables load one at a time in
-primary-key-ordered chunks; the upstream row count is not known, so the
-table being loaded shows an animated bar and its growing row count. While
-a snapshot is loading, the frontier LSN does not advance (a read waiting for
-an LSN must not see a partially loaded table), so the lag grows until the
-snapshot completes.
+snapshot boundary (the key of the last row loaded; the next chunk starts
+after it). Tables load one at a time in key-ordered chunks (a table without
+a key in one piece); the upstream row count is not known, so the table
+being loaded shows an animated bar and its growing row count. A table that
+has to be copied again (after an upstream schema or key change, or a lost
+replication slot) is `pending` or `loading` again until it is complete.
+While a snapshot is loading, the frontier LSN does not advance (a read
+waiting for an LSN must not see a partially loaded table), so the lag grows
+until the snapshot completes.
 
 ### Catalog
 
@@ -140,20 +156,23 @@ object opens:
 - **Errors:** the view's error records with SQLSTATE, message and the number
   of rows producing each.
 
-Dependencies follow the catalog's own rule, the one `DROP` uses: a view
-depends on every object its SQL mentions by name.
+Dependencies here are found textually: a view is shown as depending on
+every object whose name occurs as a word in its lowercased SQL. That is not
+the rule `DROP` uses (the relations the view actually reads), so the graphs
+can show an edge that does not exist (a column or alias named like another
+object) and miss one that does (a quoted name with capital letters).
 
 ### Dataflow
 
 The operators of the running dataflow as a layered graph, laid out left to
-right or top down (by default whichever fits the view better). Each operator shows its kind and id, the table or view it
-is the root of, its parameters (filter, group key, join paths, limit, …), the
-records held in its arrangements and, while it is processing changes, its
-output rate. Colors follow the operator family (source, map/filter, join,
-aggregate, order/limit, set operations, time/recursion; the legend is in the
-corner). Edges of operators that produced output in the last interval are
-animated, and busy operators glow. Operators not yet hydrated have a dashed
-outline.
+right or top down (by default whichever fits the view better). Each operator
+shows its kind and id, the table or view it is the root of, its parameters
+(filter, group key, join paths, limit, …), the records held in its
+arrangements and, while it is processing changes, its output rate. Colors
+follow the operator family (source, map/filter, join, aggregate,
+order/limit, set operations, time/recursion; the legend is in the corner).
+Edges of operators that produced output in the last interval are animated,
+and busy operators glow. Operators not yet hydrated have a dashed outline.
 
 Choose an object (table, materialized view, index, sink or subscription) in
 the selector to highlight the operators it depends on; the rest are dimmed.
@@ -191,46 +210,56 @@ owning operator in the dataflow graph.
 
 ### Activity
 
-`SUBSCRIBE` sessions (the operator they follow, the table or view or an ad
-hoc query, whether progress messages are on), reads waiting for a GSN, an
-LSN (`AS OF AT LEAST LSN`) or an initial snapshot, with their statements,
-requests waiting for their log record, the DML queue, and sinks with status,
-committed GSN and how far behind the engine they are.
+`SUBSCRIBE` sessions (the operator they follow, the table or materialized
+view subscribed to, or an ad hoc query, which includes a subscription to a
+virtual view; whether progress messages are on), reads waiting for a GSN, an
+LSN (`AS OF AT LEAST LSN`) or a table's snapshot (initial, or a table copied
+again), with their statements, requests waiting for their log record, the
+DML queue, and sinks with status, committed GSN and how far behind the
+engine they are.
 
 ### Errors
 
 Error records held by materialized views (errors are data: an expression
 error becomes an error record, and reads of the view fail until the
-offending rows are gone), sources or sinks in an error state, and broken
-materialized views and indexes (not maintained since a start at which their
-definition could no longer be planned; see
-[Operations](user-guide/operations.md#recovery)). The number of view error
-records also appears as a badge in the navigation.
+offending rows are gone), sources or sinks in an error state (including a
+sink that cannot start, `error: broken: …`), and broken materialized views
+and indexes (not maintained: they could not be built at a start, typically
+because their definition no longer plans, or an index could not be rebuilt
+after its relation changed shape; see
+[Operations](user-guide/operations.md#recovery)). The number of rows
+producing view errors (the sum of the error records' counts) also appears
+as a badge in the navigation.
 
 ### History
 
-Every DDL statement with the GSN it took effect at (the most recent 10,000),
-newest first, filterable by text and by kind (create, drop, alter). The same
-history is queryable as `ivm.catalog_history`.
+Every DDL statement with the GSN it took effect at, newest first,
+filterable by text and by kind (create, drop, alter). The screen shows the
+latest 1,000 of the statements the catalog keeps (the most recent 10,000 to
+11,000); the whole history is queryable as `ivm.catalog_history`.
 
 ### SQL console
 
 Runs one read-only statement (`SELECT`, `SHOW`, `EXPLAIN`) through the same
 path as a pgwire session, so results equal what psql would show. Choose the
-read mode (`fresh` waits for the ingestion frontier and initial snapshots,
-`latest` reads what is processed now) and a row cap (100, 1,000 or 10,000
-rows; the result says how many rows the statement produced). `Ctrl+Enter`
-runs the statement. Recent statements are kept in the browser.
+read mode (`fresh` waits for the ingestion frontier and for tables still
+being copied, `latest` reads what is processed now) and a row cap (100,
+1,000 or 10,000 rows; the result says how many rows the statement
+produced). `Ctrl+Enter` runs the statement. Recent statements are kept in
+the browser. A statement without a result after 30 s is given up, and a
+read still waiting in the engine (for freshness or a snapshot) is dropped
+there.
 
 ## API reference
 
 All endpoints are `GET` unless noted and return JSON (errors as
-`{"error": "...", "code": "SQLSTATE"}` with a 4xx/5xx status). Paths are
-relative to the server root. Every engine snapshot is taken on the engine
-thread between two log records, so it is consistent at one GSN, reported as
-`gsn`. Sizes are capped: samples hold at most 500 rows and examine at most
-20,000 entries, SQL texts are cut at 64 KiB, the dataflow lists at most
-20,000 operators.
+`{"error": "..."}` with a 4xx/5xx status, plus `"code": "SQLSTATE"` when
+the error comes from SQL). Paths are relative to the server root. Every
+engine snapshot is taken on the engine thread between two log records, so
+it is consistent at one GSN, reported as `gsn`. Sizes are capped: samples
+hold at most 500 rows and examine at most 20,000 entries, sample cells are
+cut at 2 KiB and SQL texts at 64 KiB, the dataflow lists at most 20,000
+operators and arrangements.
 
 | Endpoint | Returns |
 |---|---|
@@ -244,7 +273,7 @@ thread between two log records, so it is consistent at one GSN, reported as
 | `/api/dataflow/node/ID?sample=N` | One operator in full, with samples of its arrangements (default 20 rows) |
 | `/api/objects/NAME?sample=N` | One catalog object with plans, errors and a row sample (default 50 rows) |
 | `/api/sessions` | Subscriptions, waiting reads, request queues, sinks |
-| `/api/errors` | View error records, failing sources and sinks |
+| `/api/errors` | View error records, failing sources and sinks, broken views and indexes |
 | `POST /api/query` | Read-only SQL console |
 
 Static files are served from `/` (`index.html`, `js/…`, `css/…`,
@@ -281,10 +310,13 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
 ```
 
 `stats.steps` sums the per-operator counters since start (monotonic);
-`catalog_version` counts applied DDL statements; `last_checkpoint_ms` is the
-engine start until the first checkpoint. `process` comes from `/proc` and is
-null on systems without it (`cpu_percent` assumes 100 clock ticks per
-second, the Linux norm).
+`catalog_version` is the length of the catalog history, so it changes with
+every applied DDL statement (the history is trimmed back to 10,000 entries
+once it exceeds 11,000); `last_checkpoint_ms` is the engine start until the
+first checkpoint; `clock_ms` is null before the first clock tick and
+`config.tick_ms` null with `--tick-ms 0`. The `process` fields come from
+`/proc` and are null where it is not available (`cpu_percent` assumes 100
+clock ticks per second, the Linux norm).
 
 ### `GET /api/metrics?since=MS` and `GET /api/events`
 
@@ -331,7 +363,7 @@ fill the gap.
     "last_message_ms": 1792932981612.1, "server_time_ms": 1792932981610.8,
     "commits": 26, "changes": 245800, "slot_created": true,
     "tables": [{"id": 1001, "name": "customers", "upstream": "public.customers", "pk": ["id"],
-                "snapshot": "done", "boundary": ["5000"], "rows": 5000}],
+                "snapshot": "done", "error": null, "boundary": ["5000"], "rows": 5000}],
     "tables_done": 4
   }]
 }
@@ -341,9 +373,12 @@ fill the gap.
 keepalives and with commits), i.e. how far it has decoded, so `lag_bytes`
 measures what was decoded upstream but is not yet durable here. `commits`
 and `changes` count what the source handed to the input log since the
-process started (snapshot rows included). `snapshot` is `done`, `loading`
-(the table the chunk in flight belongs to), `error` (its chunk query failed;
-`error` holds the message, and the source retries it) or `pending`.
+process started (snapshot rows included). `pk` lists the table's key
+columns (the replica identity index's, else the primary key's; empty for a
+multiset table). `snapshot` is `done`, `loading` (the first table not done
+whose chunks can be read, which the source copies next), `error` (its chunk
+query failed; `error` holds the message, and the source retries it) or
+`pending`; `boundary` is the key of the last row copied.
 
 ### `GET /api/catalog` and `GET /api/catalog/history`
 
@@ -363,9 +398,11 @@ process started (snapshot rows included). `snapshot` is `done`, `loading`
 `kind` is `table`, `materialized view`, `view`, `index`, `source` or `sink`.
 `rows` is the record count of the backing arrangement (tables, materialized
 views, indexes), `errors` the number of distinct error records (materialized
-views), `status` the state of sources and sinks, `detail` a one-line
-description (replication origin of a table, key of an index, target of a
-sink, publication and slot of a source).
+views), `status` the state of sources and sinks, and `error: broken:
+<reason>` for a broken materialized view or index (null otherwise),
+`detail` a one-line description (replication origin of a table, key of an
+index, target of a sink, publication and slot of a source). `depends_on` and
+`dependents` are found textually, as described under [Catalog](#catalog).
 
 `/api/catalog/history?limit=N` returns `{"gsn", "total", "entries": [{"gsn",
 "action", "sql"}]}`, newest first; `action` is the statement's leading
@@ -447,8 +484,10 @@ how many entries were examined. Unknown ids get `404`, malformed ones `400`.
 `errors` its error records (`code`, `message`, `count`); `sample` the first
 rows of a table or materialized view (`columns`, `rows`, `truncated`,
 `scanned`); `source` the entry from `/api/sources` for a source; `nodes` the
-dataflow operators the object depends on; `problems` parts that could not be
-produced. Fields that do not apply are `null`.
+dataflow operators the object depends on; `problems` the reason a broken
+object is broken (`broken: <reason>`) and parts that could not be produced.
+`plan`, `dataflow`, `maintenance`, `sample` and `source` are `null` where
+they do not apply. Unknown names get `404`.
 
 ### `GET /api/sessions` and `GET /api/errors`
 
@@ -463,13 +502,17 @@ produced. Fields that do not apply are `null`.
 }
 ```
 
-`target` is null for a subscription to an ad hoc query; `wait` is `gsn`,
-`lsn` or `snapshot`. `/api/errors` returns `{"gsn", "views": [{"id", "name",
-"code", "message", "count"}], "sources": [{"id", "name", "status"}],
-"sinks": [...], "broken": [...]}`, listing sources and sinks whose status
-starts with `error`, and broken materialized views and indexes (status
-`error: broken: <reason>`, also the `status` of such objects in
-`/api/catalog`).
+`target` names the table or materialized view whose dataflow node the
+subscription follows (one of them when identical views share the node), and
+is null for a subscription to an ad hoc query or to a virtual view (which is
+subscribed as its query); `wait` is `gsn`, `lsn` or `snapshot`.
+
+`/api/errors` returns `{"gsn", "views": [{"id", "name", "code", "message",
+"count"}], "sources": [{"id", "name", "status"}], "sinks": [...], "broken":
+[...]}`, listing sources and sinks whose status starts with `error` (a sink
+that cannot start has the status `error: broken: <reason>`), and broken
+materialized views and indexes (status `error: broken: <reason>`, also the
+`status` of such objects in `/api/catalog`).
 
 ### `POST /api/query`
 
@@ -479,8 +522,8 @@ Request (`Content-Type: application/json`):
 {"sql": "SELECT region, revenue FROM revenue_by_region", "mode": "fresh", "limit": 1000}
 ```
 
-`mode` is `fresh` (default) or `latest`; `limit` defaults to 1,000 and is
-capped at 10,000. Response:
+`mode` is `fresh` (default) or `latest` (anything else gets `400`);
+`limit` defaults to 1,000 and is capped at 10,000. Response:
 
 ```json
 {"columns": [{"name": "region", "type": "text"}, {"name": "revenue", "type": "numeric"}],
@@ -489,10 +532,14 @@ capped at 10,000. Response:
 ```
 
 Values are PostgreSQL's text representations (NULL is `null`; cells longer
-than 64 KiB are cut). A statement that is not `SELECT`, `SHOW` or `EXPLAIN`
-gets `403`, several statements `400`, a failing statement `400` with its
-SQLSTATE in `code`, no result within 30 s `504` (a fresh read waits for
-initial snapshots; try `latest`), too many concurrent queries `429`.
+than 64 KiB are cut, and rows stop after about 8 MiB of cell text, with
+`truncated` set). A body that is not `application/json` gets `415`, a
+statement that is not `SELECT`, `SHOW` or `EXPLAIN` `403`, several
+statements `400`, a failing statement `400` with its SQLSTATE in `code`
+(`503` while the engine shuts down, `500` for internal errors), no result
+within 30 s `504` (a fresh read waits for tables still being copied; try
+`latest`; the waiting read is dropped in the engine), too many concurrent
+queries `429`.
 
 ## What the engine measures
 
@@ -507,7 +554,8 @@ frontiers, buffer-pool bookkeeping) plus three cheap counters added for it:
 - **Per source:** the upstream WAL position and server time from the
   replication stream, the arrival time of the last message, and commits and
   row changes handed to the input log, as relaxed atomic stores in the
-  source thread.
+  source thread; and the tables whose snapshot chunk cannot be read, with
+  the error.
 - **Per tree:** bytes and nodes resident in the buffer pool, computed on
   demand in one pass over the pool.
 
@@ -523,15 +571,16 @@ sampled time series.
   handling, router, auth), `api.rs` (JSON endpoints), `metrics.rs` (sampler,
   ring buffer, event stream, `/proc` statistics), `console.rs` (SQL console)
   and `assets.rs` (embedded files). It runs on a tokio runtime with two
-  worker threads of its own; requests reach the engine through a callback
-  that completes a oneshot channel, so no async thread blocks on the engine.
-- `crates/ivm/web/` holds the UI: `index.html`, `css/app.css`, and ES modules
-  under `js/` (`main.js` router and shell, `live.js` samples and event
-  stream, `api.js`, `dom.js`, `format.js`, `charts.js` (uPlot wrapper),
-  `graph.js` (dagre layout, SVG rendering, pan and zoom) and one module per
-  screen in `js/views/`). There is no build step: edit the files and
-  rebuild the binary. A new file must be listed in `http/assets.rs`; a unit
-  test fails otherwise.
+  worker threads of its own (`ivm-http`); requests reach the engine through
+  a callback that completes a oneshot channel, so no async thread blocks on
+  the engine.
+- `crates/ivm/web/` holds the UI: `index.html`, `favicon.svg`,
+  `css/app.css`, and ES modules under `js/` (`main.js` router and shell,
+  `live.js` samples and event stream, `api.js`, `dom.js`, `format.js`,
+  `charts.js` (uPlot wrapper), `graph.js` (dagre layout, SVG rendering, pan
+  and zoom) and one module per screen in `js/views/`). There is no build
+  step: edit the files and rebuild the binary. A new file must be listed in
+  `http/assets.rs`; a unit test fails otherwise.
 - `crates/ivm/tests/http.rs` tests the server against a real engine:
   snapshot consistency with `SHOW ARRANGEMENTS` and `EXPLAIN DATAFLOW`,
   record counts, counters, error records, authentication, static files,
