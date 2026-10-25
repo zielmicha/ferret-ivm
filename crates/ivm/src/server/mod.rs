@@ -397,9 +397,30 @@ impl Session {
                     return Err(SqlError::unsupported(format!("client_encoding \"{value}\" is not supported; use UTF8")));
                 }
             }
+            // the remaining checks reject values that would be accepted but
+            // not honored: output is always ISO / postgres / hex, input dates
+            // are read month first and backslashes are not escapes
             "datestyle" => {
-                if !value.to_uppercase().contains("ISO") {
-                    return Err(SqlError::unsupported("only DateStyle ISO is supported"));
+                let ok = value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|t| !t.is_empty())
+                    .all(|t| matches!(t.to_uppercase().as_str(), "ISO" | "MDY" | "US" | "NONEURO" | "NONEUROPEAN" | "DEFAULT"));
+                if !ok {
+                    return Err(SqlError::unsupported(format!("DateStyle \"{value}\" is not supported; only ISO, MDY is")));
+                }
+            }
+            "intervalstyle" | "bytea_output" => {
+                let fixed = if name == "intervalstyle" { "postgres" } else { "hex" };
+                let v = value.to_lowercase();
+                if v != fixed && v != "default" {
+                    return Err(SqlError::unsupported(format!("{name} \"{value}\" is not supported; only {fixed} is")));
+                }
+            }
+            "standard_conforming_strings" => {
+                let v = value.to_lowercase();
+                let on = matches!(v.as_str(), "on" | "1" | "default") || (!v.is_empty() && ("true".starts_with(&v) || "yes".starts_with(&v)));
+                if !on {
+                    return Err(SqlError::unsupported("standard_conforming_strings = off is not supported"));
                 }
             }
             _ => {}

@@ -442,3 +442,37 @@ fn show_read_mode_before_set() {
     assert_eq!(first_values(&c.query("SHOW read_mode")), vec!["latest"]);
     running.shutdown();
 }
+
+#[test]
+fn set_rejects_settings_the_server_cannot_honor() {
+    let (running, port) = start("setvalues");
+    let mut c = Conn::connect(port);
+    // these were accepted and then silently ignored: '01/02/2024'::date
+    // stayed January 2nd under DMY, bytea kept the hex format, ...
+    for sql in [
+        "SET DateStyle = 'ISO, DMY'",
+        "SET datestyle TO ymd",
+        "SET DateStyle = 'European'",
+        "SET IntervalStyle = 'iso_8601'",
+        "SET bytea_output = 'escape'",
+        "SET standard_conforming_strings = off",
+    ] {
+        let msgs = c.query(sql);
+        assert!(error_message(&msgs).is_some_and(|m| m.contains("not supported")), "{sql}: {msgs:?}");
+    }
+    // the values in effect, and other settings, are still accepted
+    for sql in [
+        "SET DateStyle = 'ISO, MDY'",
+        "SET DateStyle = ISO",
+        "SET datestyle TO mdy",
+        "SET IntervalStyle = postgres",
+        "SET bytea_output = hex",
+        "SET standard_conforming_strings = on",
+        "SET extra_float_digits = 3",
+        "SET search_path = public",
+    ] {
+        assert_eq!(error_message(&c.query(sql)), None, "{sql}");
+    }
+    assert_eq!(first_values(&c.query("SELECT '01/02/2024'::date")), vec!["2024-01-02"]);
+    running.shutdown();
+}
