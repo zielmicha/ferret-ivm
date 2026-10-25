@@ -905,3 +905,29 @@ fn parameters_must_be_supplied() {
     assert!(try_rows(&h, "SELECT count(*) FROM pm").is_err());
     running.shutdown();
 }
+
+#[test]
+fn array_type_modifiers_apply_to_elements() {
+    let running = start("array-typmod");
+    let h = running.handle.clone();
+    // the modifier of varchar(n)[], numeric(p,s)[], char(n)[] was ignored
+    assert_eq!(
+        rows(&h, "SELECT '{abc}'::varchar(2)[], '{ab   }'::char(3)[], ARRAY['abc']::varchar(2)[], '{1.005}'::numeric(5,2)[]"),
+        vec![r#"{ab}|{"ab "}|{ab}|{1.01}"#]
+    );
+    exec(&h, "CREATE TABLE ta (id int PRIMARY KEY, x varchar(2)[], n numeric(5,2)[], c char(3)[])");
+    exec(&h, "INSERT INTO ta VALUES (1, '{ab,NULL}', '{1.005,NULL}', '{a,\"b  \"}'), (5, ARRAY['ab', 'cd'], ARRAY[1.5], ARRAY['xy'])");
+    for (q, msg) in [
+        ("INSERT INTO ta VALUES (2, '{abc}', '{1}', '{a}')", "value too long for type character varying(2)"),
+        ("INSERT INTO ta VALUES (3, '{ab}', '{12345.678}', '{a}')", "numeric field overflow"),
+        ("INSERT INTO ta VALUES (4, '{\"ab  \"}', '{{1.5,2},{3,4.444}}', '{abcd}')", "value too long for type character(3)"),
+    ] {
+        let err = try_exec(&h, q).unwrap_err();
+        assert!(err.contains(msg), "{q}: {err}");
+    }
+    assert_eq!(
+        rows(&h, "SELECT id, x, n, c, c = '{a,b}'::char(3)[] FROM ta ORDER BY id"),
+        vec![r#"1|{ab,NULL}|{1.01,NULL}|{"a  ","b  "}|t"#, r#"5|{ab,cd}|{1.50}|{"xy "}|f"#]
+    );
+    running.shutdown();
+}

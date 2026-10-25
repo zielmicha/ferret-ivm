@@ -88,8 +88,9 @@ pub fn sql_type_of(dt: &ast::DataType) -> Result<(SqlType, i32)> {
                 | ast::ArrayElemTypeDef::Qualified(t, _) => t,
                 ast::ArrayElemTypeDef::None => sql_bail!(codes::SYNTAX_ERROR, "array element type required"),
             };
-            let (t, _) = sql_type_of(inner)?;
-            (t.array_of(), -1)
+            // an array type's modifier is its elements' (varchar(2)[])
+            let (t, tm) = sql_type_of(inner)?;
+            (t.array_of(), tm)
         }
         D::Custom(name, args) => {
             let (_, n) = object_name(name)?;
