@@ -1015,8 +1015,9 @@ impl Engine {
                 self.shared.source_lsn.lock().remove(&id);
             }
             ObjectKind::Sink(_) => {
+                // (the engine thread does not wait for the sink thread)
                 if let Some(h) = self.sink_handles.remove(&id) {
-                    h.stop();
+                    let _ = h.stop();
                 }
             }
             ObjectKind::View(_) => {}
@@ -1097,7 +1098,7 @@ impl Engine {
         let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == node).map(|(id, _)| *id).collect();
         for id in sinks {
             if let Some(h) = self.sink_handles.remove(&id) {
-                h.stop();
+                let _ = h.stop();
             }
             if let (Some(o), Some(handle)) = (self.catalog.get(id).cloned(), self.handle.clone())
                 && let ObjectKind::Sink(sd) = &o.kind

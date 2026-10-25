@@ -162,3 +162,39 @@ fn subscription_lifecycle() {
     assert_eq!(events_until(&subs[0], |ev| ev.starts_with("error")), ["error: table \"a\" was dropped"]);
     e.shutdown();
 }
+
+/// A server that accepts connections and never answers: a sink or source
+/// connecting to it waits in its connection attempt (no connect_timeout).
+fn silent_server() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut open = Vec::new();
+        for c in listener.incoming().flatten() {
+            open.push(c);
+        }
+    });
+    port
+}
+
+/// DROP SINK returns while the sink thread is stuck connecting (the engine
+/// thread used to wait for it, and froze), and so does a shutdown.
+#[test]
+fn stuck_sinks_and_sources_do_not_block_the_engine() {
+    let port = silent_server();
+    let e = Engine::start("stuck-threads");
+    e.exec("CREATE TABLE t (id int PRIMARY KEY)");
+    e.exec(&format!("CREATE SINK s FROM t INTO POSTGRES CONNECTION 'host=127.0.0.1 port={port}' TABLE 'target'"));
+    std::thread::sleep(Duration::from_millis(300));
+    e.within("DROP SINK s", 5).unwrap();
+    e.within("INSERT INTO t VALUES (1)", 5).unwrap();
+    // one left running at shutdown
+    e.exec(&format!("CREATE SINK s2 FROM t INTO POSTGRES CONNECTION 'host=127.0.0.1 port={port}' TABLE 'target'"));
+    std::thread::sleep(Duration::from_millis(300));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        e.shutdown();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(20)).expect("the engine stops");
+}

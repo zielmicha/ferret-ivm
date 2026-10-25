@@ -562,11 +562,20 @@ impl Engine {
         for (_, s) in self.source_handles.drain() {
             s.stop();
         }
-        for (_, s) in self.sink_handles.drain() {
-            s.stop();
-        }
+        let threads: Vec<JoinHandle<()>> = self.sink_handles.drain().filter_map(|(_, s)| s.stop()).collect();
         let _ = self.seq.send(SeqMsg::Shutdown);
         self.checkpoint()?;
+        // give sinks a moment to finish; one stuck in a connection attempt
+        // is left behind
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for t in threads {
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
         Ok(())
     }
 
