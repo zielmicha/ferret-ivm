@@ -562,6 +562,9 @@ impl Engine {
         }
         match rec {
             LogRecord::Commit { source, lsn, changes } => {
+                // local DML is planned when it arrives, but DDL logged before
+                // it (a DROP of its table) applies first: then it applies nothing
+                let dropped = source == 0 && changes.iter().any(|(t, _)| !self.rt.tables.contains_key(t));
                 let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
                 for (table, ch) in changes {
                     if let Some(n) = self.rt.tables.get(&table) {
@@ -574,7 +577,12 @@ impl Engine {
                 if source == 0 {
                     // local DML: lsn carries the request id
                     let n = self.dml_counts.remove(&lsn).unwrap_or_default();
-                    self.reply_pending(lsn, Ok(ExecResult::Command { tag: n }));
+                    let res = if dropped {
+                        Err(SqlError::new(codes::UNDEFINED_TABLE, "the table of this statement was dropped before it could be applied"))
+                    } else {
+                        Ok(ExecResult::Command { tag: n })
+                    };
+                    self.reply_pending(lsn, res);
                     self.drain_dml_queue();
                 } else {
                     let e = self.source_lsns.entry(source).or_insert(0);

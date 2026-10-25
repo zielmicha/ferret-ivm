@@ -294,3 +294,33 @@ fn dependencies_are_the_relations_read() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// DML planned before a concurrent DROP of its table (logged just before
+/// it) applies nothing; it used to report success.
+#[test]
+fn dml_racing_a_drop_of_its_table_fails() {
+    use ivm::coord::api::Request;
+    use ivm::coord::EngineMsg;
+    let dir = tmpdir("dml-drop");
+    // fsync: the DROP's group commit takes long enough for the INSERT to be planned before it applies
+    let running = coord::start(coord::Config { data_dir: dir.clone(), sync: true, tick: None, ..Default::default() }).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    let send = |sql: &str| {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let stmt = ivm::sql::parse_statement(sql).unwrap();
+        h.tx.send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params: vec![], vars: SessionVars::default(), extra: String::new(), reply: tx }))
+            .unwrap();
+        rx
+    };
+    let drop = send("DROP TABLE t");
+    let ins = send("INSERT INTO t VALUES (1)");
+    drop.recv().unwrap().unwrap();
+    assert!(ins.recv().unwrap().is_err(), "the INSERT applied nothing");
+    // later DML is not held up
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    exec(&h, "INSERT INTO t VALUES (2)");
+    assert_eq!(rows(&h, "SELECT * FROM t"), ["2"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
