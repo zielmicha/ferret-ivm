@@ -253,3 +253,32 @@ fn correlated_scalar_aggregates_keep_casts_of_outer_columns() {
     assert_eq!(rows(&h, "SELECT * FROM cnt ORDER BY id"), vec!["1|1|1|3", "2|1|2|4", "3|2|0|", "4|0|2|3", "5|1|1|"]);
     running.shutdown();
 }
+
+#[test]
+fn decorrelated_subqueries_see_outer_values_exactly() {
+    let running = start("decorrelate-fidelity");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    exec(&h, "CREATE TABLE iv (id int PRIMARY KEY, v interval)");
+    exec(&h, "INSERT INTO iv VALUES (1, '1 day'), (2, '24 hours'), (3, '1 mon'), (4, '30 days')");
+    // subqueries are evaluated once per distinct outer value: 1.0 and 1.00
+    // (or 1 day and 24 hours) are equal, but must not share a result
+    let lateral = "SELECT t1.id, s.cc FROM t1, LATERAL (SELECT t1.c AS cc FROM t2 WHERE t2.id = 1) s ORDER BY 1";
+    assert_eq!(rows(&h, lateral), vec!["1|1.0", "2|1.00", "3|2.5", "4|", "5|3"]);
+    let scalar = "SELECT id, (SELECT t1.c * 2 FROM t2 WHERE t2.id = 1), (SELECT t1.c::text FROM t2 LIMIT 1) FROM t1 ORDER BY id";
+    assert_eq!(rows(&h, scalar), vec!["1|2.0|1.0", "2|2.00|1.00", "3|5.0|2.5", "4||", "5|6|3"]);
+    let marks = "SELECT id, c IN (SELECT t2.c FROM t2 WHERE t2.c::text <> t1.c::text), \
+                 c = ANY (SELECT t2.c * 1.0 FROM t2 WHERE t2.c::text = t1.c::text) FROM t1 ORDER BY id";
+    assert_eq!(rows(&h, marks), vec!["1|t|f", "2|t|f", "3|f|t", "4|f|f", "5|t|f"]);
+    let intervals = "SELECT id, (SELECT extract(hour FROM iv.v) + count(*) FROM t2) FROM iv ORDER BY id";
+    assert_eq!(rows(&h, intervals), vec!["1|5", "2|29", "3|5", "4|5"]);
+    // maintained incrementally too
+    exec(&h, &format!("CREATE MATERIALIZED VIEW sc AS {}", scalar.replace(" ORDER BY id", "")));
+    exec(&h, "INSERT INTO t1 VALUES (6, 7, 70, 1.000, 'q', NULL, NULL)");
+    exec(&h, "UPDATE t1 SET c = 2.50 WHERE id = 5");
+    assert_eq!(
+        rows(&h, "SELECT * FROM sc ORDER BY id"),
+        vec!["1|2.0|1.0", "2|2.00|1.00", "3|5.0|2.5", "4||", "5|5.00|2.50", "6|2.000|1.000"]
+    );
+    running.shutdown();
+}

@@ -307,21 +307,30 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
     let mut cols = BTreeMap::new();
     outer_cols(&right, 1, &mut cols);
     let ccols: Vec<usize> = cols.keys().copied().collect();
-    let k = ccols.len();
     let dpos: BTreeMap<usize, usize> = ccols.iter().enumerate().map(|(i, c)| (*c, i)).collect();
-    let d = Rel::Distinct { input: Box::new(left.clone().project(ccols.clone())) };
+    let left_types = left.schema();
+    // D's key over left columns: the correlated columns, plus the exact text
+    // of those whose equal values can differ in representation (1.0 and
+    // 1.00): the subquery must see each outer value as it is
+    let mut dkeys: Vec<Expr> = ccols.iter().map(|c| Expr::Column(*c)).collect();
+    for c in &ccols {
+        if left_types[*c].ty.needs_fidelity() {
+            dkeys.push(Expr::Cast(Box::new(Expr::Column(*c)), SqlType::Text, -1, false));
+        }
+    }
+    let k = dkeys.len();
+    let d = Rel::Distinct { input: Box::new(left.clone().map(dkeys.clone()).project((nl..nl + k).collect())) };
     let mut r2 = push_dep(right, &d, k, &dpos)?;
     shift_outer_depth(&mut r2, 1);
     let nr = r2.arity() - k;
-    let left_types = left.schema();
     let d_cond = |offset: usize| -> Vec<Expr> {
-        ccols.iter().enumerate().map(|(i, c)| nd_eq(Expr::Column(*c), Expr::Column(offset + i))).collect()
+        dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(offset + i))).collect()
     };
     match kind {
         ApplyKind::Semi { lhs, negated, null_aware } => {
             if null_aware {
                 // NOT IN: keep rows whose IN-mark is false
-                let marked = mark_join(left, r2, k, &ccols, SubqueryKind::In(lhs))?;
+                let marked = mark_join(left, r2, k, &dkeys, SubqueryKind::In(lhs))?;
                 let m = marked.arity() - 1;
                 return Ok(marked.filter(vec![Expr::Not(Box::new(Expr::Column(m)))]).project((0..nl).collect()));
             }
@@ -333,7 +342,7 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
             }
             Ok(Rel::Join { left: Box::new(left), right: Box::new(r2), kind: if negated { JoinKind::Anti } else { JoinKind::Semi }, on })
         }
-        ApplyKind::Mark { kind: sk } => mark_join(left, r2, k, &ccols, sk),
+        ApplyKind::Mark { kind: sk } => mark_join(left, r2, k, &dkeys, sk),
         ApplyKind::Scalar => {
             // at most one row per D value
             let rtypes = r2.schema();
@@ -378,13 +387,14 @@ fn unique_on_prefix(rel: &Rel, k: usize) -> bool {
     }
 }
 
-/// Mark join: append a boolean column computed per left row.
-fn mark_join(left: Rel, r2: Rel, k: usize, ccols: &[usize], sk: SubqueryKind) -> Result<Rel> {
+/// Mark join: append a boolean column computed per left row. `r2` starts
+/// with the k columns of D, whose key over left columns is `dkeys`.
+fn mark_join(left: Rel, r2: Rel, k: usize, dkeys: &[Expr], sk: SubqueryKind) -> Result<Rel> {
     let nl = left.arity();
     let left_types = left.schema();
     let i8 = ColumnType::new(SqlType::Int8).not_null();
     let d_on = |offset: usize| -> Vec<Expr> {
-        ccols.iter().enumerate().map(|(i, c)| nd_eq(Expr::Column(*c), Expr::Column(offset + i))).collect()
+        dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(offset + i))).collect()
     };
     match sk {
         SubqueryKind::Exists => {
@@ -402,7 +412,7 @@ fn mark_join(left: Rel, r2: Rel, k: usize, ccols: &[usize], sk: SubqueryKind) ->
             // (x, y) IN (...) is = ANY over rows: fields compare as a conjunction
             let lt: Vec<SqlType> = lhs.iter().map(|e| e.ty(&left_types)).collect();
             let rt: Vec<SqlType> = r2.schema()[k..].iter().map(|c| c.ty.clone()).collect();
-            quantified_join(left, r2, k, ccols, lhs, false, &|l, r| {
+            quantified_join(left, r2, k, dkeys, lhs, false, &|l, r| {
                 let mut parts = Vec::with_capacity(l.len());
                 for i in 0..l.len() {
                     parts.push(sql_eq(l[i].clone(), &lt[i], r[i].clone(), &rt[i])?);
@@ -468,7 +478,7 @@ fn mark_join(left: Rel, r2: Rel, k: usize, ccols: &[usize], sk: SubqueryKind) ->
             proj.push(a - 1);
             Ok(m.project(proj))
         }
-        SubqueryKind::AnyAll { lhs, func, all } => quantified_join(left, r2, k, ccols, vec![*lhs], all, &|l, r| {
+        SubqueryKind::AnyAll { lhs, func, all } => quantified_join(left, r2, k, dkeys, vec![*lhs], all, &|l, r| {
             Ok(Expr::Call(Box::new(crate::expr::Call { func, args: vec![l[0].clone(), r[0].clone()], ret: SqlType::Bool })))
         }),
         SubqueryKind::Scalar => unreachable!(),
@@ -482,7 +492,7 @@ fn quantified_join(
     left: Rel,
     r2: Rel,
     k: usize,
-    ccols: &[usize],
+    dkeys: &[Expr],
     lhs: Vec<Expr>,
     all: bool,
     pred: &dyn Fn(&[Expr], &[Expr]) -> Result<Expr>,
@@ -495,7 +505,7 @@ fn quantified_join(
     let lm = left.clone().map(lhs);
     let rm = r2.map(vec![Expr::bool(true)]);
     let n1 = nl + m;
-    let on: Vec<Expr> = ccols.iter().enumerate().map(|(i, c)| nd_eq(Expr::Column(*c), Expr::Column(n1 + i))).collect();
+    let on: Vec<Expr> = dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(n1 + i))).collect();
     let j = Rel::Join { left: Box::new(lm), right: Box::new(rm), kind: JoinKind::Left, on };
     let lcols: Vec<Expr> = (nl..nl + m).map(Expr::Column).collect();
     let rcols: Vec<Expr> = (n1 + k..n1 + k + w).map(Expr::Column).collect();
