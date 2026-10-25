@@ -840,9 +840,12 @@ impl Gen<'_> {
         format!("{q} {op} {b}")
     }
 
-    /// DISTINCT ON over one table: ivm matches DISTINCT ON expressions only
-    /// with unqualified, unaliased columns of the select list, and wants the
-    /// ORDER BY columns selected (PostgreSQL needs neither).
+    /// DISTINCT ON over one table, ordered by its keys and then by id so that
+    /// the row each group keeps is determined (PostgreSQL wants the ORDER BY
+    /// to start with the DISTINCT ON expressions). The keys are plain
+    /// columns, which are also selected; ivm also accepts other expressions
+    /// and ORDER BY columns that are not selected, which this generator
+    /// does not produce.
     fn distinct_on(&mut self) -> String {
         let t = self.rng.below(self.tables.len() as u64) as usize;
         let srcs = [Src { alias: "a0".into(), table: t }];
