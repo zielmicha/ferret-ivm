@@ -388,9 +388,61 @@ impl<'a> Lowerer<'a> {
             }
             residual.push(c);
         }
+        let sizes: Vec<i64> = inputs
+            .iter()
+            .map(|s| {
+                self.g.node(s.node).arrangements.first().map(|a| self.env.tree_count(self.g.arr(*a).tree)).unwrap_or(1_000_000)
+            })
+            .collect();
+        // Arrangement keys are evaluated on every row of the arranged node.
+        // A key that is not a plain column of an input's node (computed by
+        // its MFP or by the join condition) would be evaluated on rows the
+        // MFP filters out too, and a key that fails would abort the whole
+        // step. Such inputs are materialized with their computed keys as
+        // extra columns: their arrangements are then keyed by columns, and
+        // expression errors become error records of the materialized node.
+        let mut inputs = inputs;
+        let mut extra_keys: Vec<Vec<Expr>> = vec![Vec::new(); n];
+        for j in 0..n {
+            if inputs[j].presence.is_some() {
+                continue;
+            }
+            let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
+            let mut computed = false;
+            let mut extra: Vec<Expr> = Vec::new();
+            for e in &edges {
+                for (side, ex) in [(e.a, &e.ea), (e.b, &e.eb)] {
+                    if side != j {
+                        continue;
+                    }
+                    let local = ex.remapped(&|c| c - offsets[j]);
+                    if local.substitute(&defs).as_column().is_some() {
+                        continue;
+                    }
+                    computed = true;
+                    if local.as_column().is_none() && !extra.iter().any(|x| same_expr(x, &local)) {
+                        extra.push(local);
+                    }
+                }
+            }
+            if !computed {
+                continue;
+            }
+            let s = &inputs[j];
+            let (width, schema) = (s.width, s.schema.clone());
+            let mut l = Lowered { node: s.node, mfp: s.mfp.clone(), schema: s.schema.clone() };
+            for e in &extra {
+                l.mfp.add_map(e.clone());
+                l.schema.push(e.column_type(&schema));
+            }
+            let node = self.materialize(l);
+            let mut mfp = Mfp::identity(width + extra.len());
+            mfp.project(&(0..width).collect::<Vec<_>>());
+            inputs[j] = JoinInputSpec { node, mfp, width, schema, presence: None, exact: false };
+            extra_keys[j] = extra;
+        }
         let mut join_inputs = Vec::with_capacity(n);
         let mut nodes = Vec::with_capacity(n);
-        let mut sizes = Vec::with_capacity(n);
         for (i, s) in inputs.iter().enumerate() {
             join_inputs.push(JoinInput {
                 node: s.node,
@@ -401,14 +453,6 @@ impl<'a> Lowerer<'a> {
                 exact: s.exact,
             });
             nodes.push(s.node);
-            let size = self
-                .g
-                .node(s.node)
-                .arrangements
-                .first()
-                .map(|a| self.env.tree_count(self.g.arr(*a).tree))
-                .unwrap_or(1_000_000);
-            sizes.push(size);
         }
         // the joined row schema
         let mut schema = Vec::with_capacity(width);
@@ -477,6 +521,8 @@ impl<'a> Lowerer<'a> {
                     let local = je.remapped(&|c| c - offsets[j]);
                     let raw = if inputs[j].presence.is_some() {
                         local
+                    } else if let Some(k) = extra_keys[j].iter().position(|x| same_expr(x, &local)) {
+                        Expr::Column(inputs[j].width + k)
                     } else {
                         let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
                         local.substitute(&defs)
@@ -918,6 +964,14 @@ impl From<Lowered> for JoinInputSpec {
     fn from(l: Lowered) -> Self {
         JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None, exact: false }
     }
+}
+
+/// Structural equality of expressions.
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    a.fingerprint(&mut x);
+    b.fingerprint(&mut y);
+    x == y
 }
 
 /// Equality of two expressions of the same (already aligned) type.

@@ -381,3 +381,46 @@ fn recursive_query_errors_are_data() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Join keys computed by an input's filtered map (or by the condition
+/// itself) are not evaluated on rows the filter excludes, and a key that
+/// fails is an error record of the view: arranging the raw input by the
+/// expression failed hydration and, for later rows, the whole step (whose
+/// DML then never completed).
+#[test]
+fn computed_join_keys() {
+    let dir = tmpdir("computed-keys");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE a (id int PRIMARY KEY, v int, code text)");
+    exec(&h, "CREATE TABLE b (id int PRIMARY KEY, x int)");
+    exec(&h, "INSERT INTO a VALUES (1, 50, '1'), (2, 100, 'x'), (3, 25, '3')");
+    exec(&h, "INSERT INTO b VALUES (1, 2), (2, 0), (3, 1)");
+    let filtered = "SELECT a.id AS aid, b2.id AS bid FROM a JOIN (SELECT id, 100 / x AS q FROM b WHERE x <> 0) b2 ON a.v = b2.q";
+    let cast = "SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.code::int = b.id WHERE a.code ~ '^[0-9]+$'";
+    let failing = "SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.v = 100 / b.x";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW filtered AS {filtered}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW cast_ AS {cast}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW failing AS {failing}"));
+    let check = |h: &EngineHandle| {
+        for (v, q) in [("filtered", filtered), ("cast_", cast)] {
+            assert_eq!(rows(h, &format!("SELECT * FROM {v} ORDER BY 1, 2")), rows(h, &format!("{q} ORDER BY 1, 2")), "{v}");
+        }
+    };
+    assert_eq!(rows(&h, "SELECT * FROM filtered ORDER BY 1, 2"), ["1|1", "2|3"]);
+    assert_eq!(rows(&h, "SELECT * FROM cast_ ORDER BY 1, 2"), ["1|1", "3|3"]);
+    let div0 = Some("22012 division by zero".to_string());
+    assert_eq!(read_error(&h, "SELECT * FROM failing"), div0);
+    exec_within(&h, "INSERT INTO b VALUES (4, 0), (5, 4)", 20);
+    exec_within(&h, "INSERT INTO a VALUES (4, 25, 'y'), (5, 100, '5')", 20);
+    check(&h);
+    assert_eq!(rows(&h, "SELECT * FROM filtered ORDER BY 1, 2"), ["1|1", "2|3", "3|5", "4|5", "5|3"]);
+    exec_within(&h, "DELETE FROM b WHERE x = 0", 20);
+    check(&h);
+    assert_eq!(rows(&h, "SELECT * FROM failing ORDER BY 1, 2"), rows(&h, &format!("{failing} ORDER BY 1, 2")));
+    exec_within(&h, "UPDATE b SET x = 0 WHERE id = 3", 20);
+    assert_eq!(read_error(&h, "SELECT * FROM failing"), div0);
+    check(&h);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
