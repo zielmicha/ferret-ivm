@@ -1036,17 +1036,13 @@ impl<'a> Binder<'a> {
     fn functional_dependencies(&self, rel: &Rel, scope: &Scope, group: &[Expr]) -> Vec<usize> {
         let grouped: Vec<usize> = group.iter().filter_map(|g| g.as_column()).collect();
         let mut out = Vec::new();
-        // find Get leaves and their column offsets within the FROM scope
-        let mut leaves = Vec::new();
-        collect_get_offsets(rel, 0, &mut leaves);
-        for (offset, arity, keys) in leaves {
+        // base tables of the FROM clause and where their columns are in it
+        let mut tables = Vec::new();
+        collect_tables(rel, &mut tables);
+        for (positions, keys) in tables {
             for key in keys {
-                if !key.is_empty() && key.iter().all(|k| grouped.contains(&(offset + k))) {
-                    for c in 0..arity {
-                        if offset + c < scope.len() {
-                            out.push(offset + c);
-                        }
-                    }
+                if !key.is_empty() && key.iter().all(|k| positions[*k].iter().any(|p| grouped.contains(p))) {
+                    out.extend(positions.iter().flatten().copied().filter(|p| *p < scope.len()));
                 }
             }
         }
@@ -1388,13 +1384,44 @@ fn same_exprs(exprs: &[Expr], idx: &[usize]) -> bool {
     idx[1..].iter().all(|i| fp(&exprs[*i]) == first)
 }
 
-fn collect_get_offsets(rel: &Rel, offset: usize, out: &mut Vec<(usize, usize, Vec<Vec<usize>>)>) {
+/// Base tables a FROM relation reads directly: for each, the output
+/// positions of each of its columns (several when a USING join merges it,
+/// none when projected away) and its keys.
+fn collect_tables(rel: &Rel, out: &mut Vec<(Vec<Vec<usize>>, Vec<Vec<usize>>)>) {
     match rel {
-        Rel::Get { columns, keys, .. } => out.push((offset, columns.len(), keys.clone())),
-        Rel::Filter { input, .. } => collect_get_offsets(input, offset, out),
+        Rel::Get { columns, keys, .. } => out.push(((0..columns.len()).map(|c| vec![c]).collect(), keys.clone())),
+        Rel::Filter { input, .. } => collect_tables(input, out),
         Rel::Join { left, right, kind, .. } if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right | JoinKind::Full) => {
-            collect_get_offsets(left, offset, out);
-            collect_get_offsets(right, offset + left.arity(), out);
+            collect_tables(left, out);
+            let mut r = Vec::new();
+            collect_tables(right, &mut r);
+            let nl = left.arity();
+            for (positions, keys) in r {
+                out.push((positions.into_iter().map(|ps| ps.into_iter().map(|p| p + nl).collect()).collect(), keys));
+            }
+        }
+        // a LATERAL subquery's columns are not base table columns
+        Rel::Apply { left, kind: ApplyKind::Lateral { .. }, .. } => collect_tables(left, out),
+        Rel::Map { input, exprs } => {
+            let n = input.arity();
+            let start = out.len();
+            collect_tables(input, out);
+            for (positions, _) in out[start..].iter_mut() {
+                for ps in positions.iter_mut() {
+                    let copies: Vec<usize> =
+                        exprs.iter().enumerate().filter(|(_, e)| matches!(e, Expr::Column(c) if ps.contains(c))).map(|(j, _)| n + j).collect();
+                    ps.extend(copies);
+                }
+            }
+        }
+        Rel::Project { input, cols } => {
+            let start = out.len();
+            collect_tables(input, out);
+            for (positions, _) in out[start..].iter_mut() {
+                for ps in positions.iter_mut() {
+                    *ps = cols.iter().enumerate().filter(|(_, c)| ps.contains(c)).map(|(i, _)| i).collect();
+                }
+            }
         }
         _ => {}
     }

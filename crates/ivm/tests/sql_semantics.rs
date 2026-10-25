@@ -456,3 +456,30 @@ fn distinct_on_with_expressions_outside_the_select_list() {
     assert!(try_rows(&h, "SELECT DISTINCT a FROM t1 ORDER BY b").is_err());
     running.shutdown();
 }
+
+#[test]
+fn group_by_primary_key_through_using_and_lateral() {
+    let running = start("fd");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // other columns of a table whose primary key is grouped may be used; this
+    // failed through USING joins and LATERAL
+    for q in [
+        "SELECT t1.id, t1.a, count(*) FROM t1 JOIN t2 USING (id) GROUP BY t1.id ORDER BY 1 LIMIT 2",
+        "SELECT id, a, count(*) FROM t1 JOIN t2 USING (id) GROUP BY id ORDER BY 1 LIMIT 2",
+        "SELECT id, a, count(*) FROM t1 LEFT JOIN t2 USING (id) GROUP BY id ORDER BY 1 LIMIT 2",
+    ] {
+        assert_eq!(rows(&h, q), vec!["1|1|1", "2|2|1"], "{q}");
+    }
+    assert_eq!(
+        rows(&h, "SELECT t1.id, t1.a, l.n FROM t1, LATERAL (SELECT count(*) n FROM t2 WHERE t2.x = t1.a) l GROUP BY t1.id, l.n ORDER BY 1 LIMIT 2"),
+        vec!["1|1|1", "2|2|2"]
+    );
+    // but not through a FULL JOIN's merged column (a COALESCE)
+    assert!(try_rows(&h, "SELECT id, a FROM t1 FULL JOIN t2 USING (id) GROUP BY id").is_err());
+    // (PostgreSQL also rejects derived tables; plain column copies of a base
+    // table keep the dependency, so ivm accepts them)
+    assert_eq!(rows(&h, "SELECT s.id, s.a FROM (SELECT * FROM t1 WHERE id < 3) s GROUP BY s.id ORDER BY 1"), vec!["1|1", "2|2"]);
+    assert!(try_rows(&h, "SELECT s.id, s.a FROM (SELECT DISTINCT * FROM t1) s GROUP BY s.id").is_err());
+    running.shutdown();
+}
