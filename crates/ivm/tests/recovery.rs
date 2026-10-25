@@ -324,3 +324,22 @@ fn dml_racing_a_drop_of_its_table_fails() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Replacing a view so that a materialized view reading it would become
+/// non-deterministic is rejected (it used to pass, and the dependent view
+/// was then dropped while being re-planned).
+#[test]
+fn replacements_keep_dependents_deterministic() {
+    let dir = tmpdir("replace-nondet");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    exec(&h, "INSERT INTO t VALUES (1)");
+    exec(&h, "CREATE VIEW pv AS SELECT id, id * 1.0 AS r FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW m AS SELECT count(*) AS n, sum(r) AS s FROM pv");
+    assert!(try_exec(&h, "CREATE OR REPLACE VIEW pv AS SELECT id, random() AS r FROM t").is_err());
+    exec(&h, "INSERT INTO t VALUES (2)");
+    assert_eq!(rows(&h, "SELECT * FROM m"), ["2|3.0"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

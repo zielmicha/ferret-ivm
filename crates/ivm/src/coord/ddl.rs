@@ -580,7 +580,8 @@ impl Engine {
                 && o.id != old.id
             {
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
-                if let Err(e) = crate::sql::plan_query(&cat, &q, vec![]) {
+                // (it inlines the views it reads: they must keep it deterministic)
+                if let Err(e) = crate::sql::plan_query(&cat, &q, vec![]).and_then(|bq| check_deterministic(&bq.rel)) {
                     return refuse(format!("materialized view \"{}\" would no longer be valid: {}", o.name, e.message));
                 }
             }
