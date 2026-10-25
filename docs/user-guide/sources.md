@@ -19,6 +19,11 @@ protocol and replication client).
   `messages` (PostgreSQL 14+) and calls `pg_current_snapshot()`
   (PostgreSQL 13+). Development and all tests use PostgreSQL 17.
 - **`wal_level = logical`**, which needs a server restart.
+- **A database encoding other than `SQL_ASCII`.** Values are replicated as
+  UTF-8 text; a `SQL_ASCII` database does not validate text and could hold
+  bytes that are not UTF-8, so `CREATE SOURCE` (and every connection of the
+  source) fails with `the upstream database's encoding is SQL_ASCII ...`.
+  Other server encodings are converted to UTF-8 by PostgreSQL.
 - **`max_replication_slots`** and **`max_wal_senders`**: each source uses one
   logical slot and one walsender connection while running.
 - Each source additionally opens ordinary connections: one while
@@ -95,7 +100,7 @@ be single-quoted, with `\'` and `\\` escapes) or a `postgres://` /
   `$USER`, else `$LOGNAME`, else `postgres`), `password`, `dbname`
   (default: the user name), `application_name`,
   `fallback_application_name`, `connect_timeout`, `options`,
-  `client_encoding`.
+  `client_encoding` (sources require `UTF8`, the default).
 - Authentication: trust, cleartext password, MD5, SCRAM-SHA-256 (without
   channel binding).
 - No TLS: `sslmode=require`/`verify-*`, `ssl=true` and

@@ -306,6 +306,29 @@ fn keyless_tables_resnapshot_without_duplicates() {
     assert_eq!(up.rows(q), ["1|x|5", "1|x|5", "3|z|6"]);
 }
 
+/// Text in a SQL_ASCII database is not checked for any encoding, so values
+/// that are not UTF-8 could reach the source (where they used to become '',
+/// or U+FFFD in snapshots). Such upstreams are rejected.
+#[test]
+fn sql_ascii_upstreams_are_rejected() {
+    let mut up = Upstream::start();
+    up.exec("CREATE DATABASE legacy TEMPLATE template0 ENCODING 'SQL_ASCII' LOCALE_PROVIDER libc LOCALE 'C'");
+    let conninfo = up.conninfo.replace("dbname=postgres", "dbname=legacy");
+    let mut db = connect(&conninfo);
+    db.simple_query("CREATE TABLE t (id int PRIMARY KEY, s text); INSERT INTO t VALUES (1, E'caf\\xe9'); CREATE PUBLICATION p FOR ALL TABLES")
+        .unwrap();
+    let dir = tmpdir("sql-ascii");
+    let mut ivm = Ivm::start(&dir);
+    let err = ivm.client.simple_query(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{conninfo}' PUBLICATION 'p'")).unwrap_err();
+    assert!(err.message.contains("SQL_ASCII"), "{}", err.message);
+    // values must arrive as UTF-8, not in another client encoding
+    up.exec("CREATE TABLE u (id int PRIMARY KEY, s text); CREATE PUBLICATION p FOR ALL TABLES");
+    let latin1 = format!("{} client_encoding=LATIN1", up.conninfo);
+    let err = ivm.client.simple_query(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{latin1}' PUBLICATION 'p'")).unwrap_err();
+    assert!(err.message.contains("client_encoding UTF8"), "{}", err.message);
+    assert!(ivm.rows("SHOW SOURCES").is_empty());
+}
+
 /// Wait until `f` returns true (or fail after a timeout).
 fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     let t0 = Instant::now();

@@ -66,7 +66,30 @@ fn connect(conninfo: &str, replication: bool) -> Result<Client> {
         cfg.application_name = Some("ivm".into());
     }
     let c = if replication { Client::connect_replication(&cfg)? } else { Client::connect(&cfg)? };
+    check_encoding(&c)?;
     Ok(c)
+}
+
+/// Values must arrive as UTF-8. A SQL_ASCII database stores bytes without
+/// checking any encoding, and its text is sent unconverted, so it can hold
+/// values that are not UTF-8; another client encoding (set in the
+/// connection string) would make the server convert into it.
+fn check_encoding(c: &Client) -> Result<()> {
+    if c.parameter("server_encoding").is_some_and(|e| e.eq_ignore_ascii_case("SQL_ASCII")) {
+        return Err(SqlError::new(
+            codes::FEATURE_NOT_SUPPORTED,
+            "the upstream database's encoding is SQL_ASCII, which does not validate text: values may not be valid UTF-8",
+        )
+        .with_hint("Replicate from a database with a real encoding, such as UTF8."));
+    }
+    match c.parameter("client_encoding") {
+        Some(e) if !e.eq_ignore_ascii_case("UTF8") => Err(SqlError::new(
+            codes::FEATURE_NOT_SUPPORTED,
+            format!("source connections must use client_encoding UTF8, not {e}"),
+        )
+        .with_hint("Remove client_encoding from the connection string.")),
+        _ => Ok(()),
+    }
 }
 
 /// Discover the tables of a publication (columns, primary keys, replica identity).
@@ -248,8 +271,14 @@ impl PgSource {
                 TupleValue::Null => {}
                 TupleValue::UnchangedToast => unchanged.push(*c),
                 TupleValue::Text(_) | TupleValue::Binary(_) => {
-                    let s = v.as_str().unwrap_or("");
                     let col = &t.columns[*c];
+                    // (values are requested in text format, as UTF-8)
+                    let Some(s) = v.as_str() else {
+                        return Err(SqlError::new(
+                            codes::CHARACTER_NOT_IN_REPERTOIRE,
+                            format!("value of column \"{}\" of {}.{} is not valid UTF-8", col.name, t.upstream.0, t.upstream.1),
+                        ));
+                    };
                     row[*c] = parse_datum(s, &col.ty.ty, -1)?;
                 }
             }
@@ -1329,6 +1358,28 @@ mod tests {
         src.drain_acks(true).unwrap();
         assert!(src.chunk.as_ref().is_some_and(|c| c.phase == Phase::BeforeLow), "the old run's watermarks were taken for the chunk's");
         assert!(replay(&log.lock()).is_empty());
+    }
+
+    /// A text value that is not UTF-8 fails the change; it used to become ''.
+    #[test]
+    fn values_that_are_not_utf8_fail() {
+        let mut t = table(&["id", "s"], vec![0]);
+        t.columns[1] = Column::new("s", ColumnType::new(SqlType::Text));
+        let (mut src, _) = source(vec![t], done_state(10));
+        src.handle_message(begin(5)).unwrap();
+        let LogicalMessage::Relation(mut rel) = relation(&["id", "s"], 1) else { unreachable!() };
+        rel.columns[1].type_oid = 25;
+        src.handle_message(LogicalMessage::Relation(rel)).unwrap();
+        let text = |id: &str, s: &[u8]| LogicalMessage::Insert {
+            relation_id: REL,
+            new: vec![TupleValue::Text(id.as_bytes().to_vec()), TupleValue::Text(s.to_vec())],
+        };
+        src.handle_message(text("1", "café".as_bytes())).unwrap();
+        // Latin-1 é
+        let bad = text("2", &[b'c', b'a', b'f', 0xe9]);
+        let err = src.handle_message(bad).unwrap_err();
+        assert_eq!(err.code, codes::CHARACTER_NOT_IN_REPERTOIRE);
+        assert!(err.message.contains("column \"s\" of public.t"), "{}", err.message);
     }
 
     #[test]
