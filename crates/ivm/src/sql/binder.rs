@@ -1400,10 +1400,14 @@ fn same_exprs(exprs: &[Expr], idx: &[usize]) -> bool {
     idx[1..].iter().all(|i| fp(&exprs[*i]) == first)
 }
 
+/// A base table seen through a FROM relation: the output positions of each
+/// of its columns, and its keys.
+type BaseTable = (Vec<Vec<usize>>, Vec<Vec<usize>>);
+
 /// Base tables a FROM relation reads directly: for each, the output
 /// positions of each of its columns (several when a USING join merges it,
 /// none when projected away) and its keys.
-fn collect_tables(rel: &Rel, out: &mut Vec<(Vec<Vec<usize>>, Vec<Vec<usize>>)>) {
+fn collect_tables(rel: &Rel, out: &mut Vec<BaseTable>) {
     match rel {
         Rel::Get { columns, keys, .. } => out.push(((0..columns.len()).map(|c| vec![c]).collect(), keys.clone())),
         Rel::Filter { input, .. } => collect_tables(input, out),

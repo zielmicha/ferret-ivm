@@ -248,6 +248,10 @@ pub fn is_aggregate_name(n: &str) -> bool {
     AGGREGATES.contains(&n)
 }
 
+/// A table function with its coerced arguments, output columns and their
+/// default names.
+type ResolvedTableFunc = (TableFunc, Vec<Expr>, Vec<ColumnType>, Vec<String>);
+
 /// Deepest expression nesting accepted (see Binder::bind_expr).
 pub const MAX_EXPR_DEPTH: usize = 1000;
 
@@ -2049,7 +2053,7 @@ impl<'a> Binder<'a> {
         name: &str,
         mut bound: Vec<Expr>,
         types: Vec<SqlType>,
-    ) -> Result<(TableFunc, Vec<Expr>, Vec<ColumnType>, Vec<String>)> {
+    ) -> Result<ResolvedTableFunc> {
         let (func, out, names): (TableFunc, Vec<ColumnType>, Vec<String>) = match (name, bound.len()) {
             ("generate_series", 2 | 3) => {
                 // the step's type follows from the bounds' (interval for
@@ -2300,7 +2304,7 @@ impl<'a> Binder<'a> {
         let lateral = pushed && bound.iter().any(|b| b.has_outer());
         let types: Vec<SqlType> = bound.iter().map(|b| b.ty(&[])).collect();
         // unnest(a, b, ...): one unnest per array, zipped (as ROWS FROM)
-        let calls: Vec<(TableFunc, Vec<Expr>, Vec<ColumnType>, Vec<String>)> = if name == "unnest" && bound.len() > 1 {
+        let calls: Vec<ResolvedTableFunc> = if name == "unnest" && bound.len() > 1 {
             bound.into_iter().zip(types).map(|(b, t)| self.resolve_table_function(name, vec![b], vec![t])).collect::<Result<_>>()?
         } else {
             vec![self.resolve_table_function(name, bound, types)?]
