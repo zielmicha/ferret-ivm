@@ -99,7 +99,7 @@ pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache
     }
     if let Some(a) = g.any_arrangement(id) {
         let data = g.scan_arr(env, a, ReadAt::Latest)?;
-        return Ok(Arc::new(Output { data, errs: vec![] }));
+        return Ok(Arc::new(Output { data, errs: g.errors_of(id) }));
     }
     let node = g.node(id);
     let mut out = Output::default();
@@ -179,7 +179,11 @@ pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache
             window::snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Recursive(p) => {
-            recursive_eval(g, env, node, p, &mut out)?;
+            for i in &node.inputs {
+                let s = snapshot_errs(g, env, *i, cache)?;
+                out.errs.extend(s);
+            }
+            recursive_snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Temporal(p) => {
             let input = owned(snapshot_node(g, env, node.inputs[0], cache)?);
@@ -195,11 +199,11 @@ pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache
     Ok(out)
 }
 
-/// Errors present in a node's snapshot (only nodes without arrangements
-/// recompute; arranged nodes have no stored errors).
+/// Errors present in a node's snapshot (arranged nodes keep theirs in the
+/// graph; the others recompute).
 fn snapshot_errs(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache) -> Result<ErrDelta> {
     if g.any_arrangement(id).is_some() {
-        return Ok(vec![]);
+        return Ok(g.errors_of(id));
     }
     Ok(snapshot_node(g, env, id, cache)?.errs.clone())
 }
@@ -624,6 +628,10 @@ pub struct RecursivePlan {
     /// Catalog object -> node for the Gets inside base/step.
     pub sources: Vec<(u64, NodeId)>,
     pub out_arr: ArrId,
+    /// The query's error while it has no valid result (under the empty
+    /// key), so that it retracts when the query recovers; checkpointed with
+    /// the graph's error state.
+    pub errors: OpErrors,
 }
 
 impl RecursivePlan {
@@ -638,20 +646,49 @@ impl RecursivePlan {
     }
 }
 
-fn recursive_eval(g: &Graph, env: &mut Env, node: &Node, p: &RecursivePlan, out: &mut Output) -> Result<()> {
-    let _ = node;
-    let rows = crate::exec::eval_recursive(g, env, p)?;
-    out.data = rows;
+/// Contents of a recursive query (hydration: rebuilds its error state).
+fn recursive_snapshot(g: &Graph, env: &mut Env, p: &RecursivePlan, out: &mut Output) -> Result<()> {
+    let mut errors = p.errors.lock();
+    errors.clear();
+    match crate::exec::eval_recursive(g, env, p) {
+        Ok(rows) => out.data = rows,
+        Err(e) if super::reduce::is_data_error(&e) => {
+            let rec = err_record(&e);
+            errors.insert(Vec::new(), rec.clone());
+            out.errs.push((rec, 1));
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
 fn recursive_step(g: &Graph, env: &mut Env, node: &Node, p: &RecursivePlan, gsn: Gsn, out: &mut Output) -> Result<()> {
-    let _ = gsn;
-    let mut new = Output::default();
-    recursive_eval(g, env, node, p, &mut new)?;
+    let _ = (node, gsn);
     let old = g.scan_arr(env, p.out_arr, ReadAt::Latest)?;
-    out.data.extend(new.data);
     out.data.extend(old.into_iter().map(|(r, w)| (r, -w)));
+    let mut errors = p.errors.lock();
+    match crate::exec::eval_recursive(g, env, p) {
+        Ok(rows) => {
+            out.data.extend(rows);
+            if let Some(prev) = errors.remove(&Vec::new()) {
+                out.errs.push((prev, -1));
+            }
+        }
+        // an expression error: the query has no valid result, so its rows
+        // retract and the error is reported (never a failed step)
+        Err(e) if super::reduce::is_data_error(&e) => {
+            let rec = err_record(&e);
+            match errors.insert(Vec::new(), rec.clone()) {
+                Some(prev) if prev == rec => {}
+                Some(prev) => {
+                    out.errs.push((prev, -1));
+                    out.errs.push((rec, 1));
+                }
+                None => out.errs.push((rec, 1)),
+            }
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 

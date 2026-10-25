@@ -112,6 +112,9 @@ pub(crate) struct AppState {
     /// Logical clock (timestamptz microseconds) at the checkpoint.
     #[serde(default)]
     pub clock: i64,
+    /// Error records of arranged dataflow nodes (absent in older checkpoints).
+    #[serde(default)]
+    pub errors: crate::dataflow::ErrorState,
 }
 
 pub struct Engine {
@@ -355,6 +358,7 @@ impl Engine {
                 v.errors = errs.into_iter().collect();
             }
         }
+        self.graph.restore_error_state(app.errors);
         // anything that could not be matched to a recovered tree is rebuilt
         // from the recovered state
         self.graph.hydrate(&mut self.env, self.processed)?;
@@ -635,6 +639,7 @@ impl Engine {
             source_lsns: self.source_lsns.iter().map(|(k, v)| (*k, *v)).collect(),
             next_req: self.next_req,
             clock: self.clock,
+            errors: self.graph.error_state(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;
