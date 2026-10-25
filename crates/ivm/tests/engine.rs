@@ -380,7 +380,7 @@ fn indexed_reads_match_scans() {
         "CREATE MATERIALIZED VIEW per_a AS SELECT a.id, a.region, count(t.id) AS n, sum(t.amount) AS total \
          FROM a LEFT JOIN t ON t.a_id = a.id GROUP BY a.id, a.region",
     );
-    exec(&h, "CREATE INDEX ON t (kind)");
+    exec(&h, "CREATE INDEX t_kind ON t (kind)");
     let sorted = |q: &str| {
         let mut r = rows(&h, q);
         r.sort();
@@ -441,5 +441,29 @@ fn indexed_reads_match_scans() {
     );
     assert_eq!(old, 21);
     check("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25", "SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25");
+    // arrangements built after the GSN lack the history before it: AS OF
+    // reads use neither their key ranges nor their lookups
+    exec(&h, "DROP INDEX t_kind");
+    exec(&h, "CREATE INDEX t_kind_a ON t (kind, a_id)");
+    let mut m = 0;
+    for k in [1, 2] {
+        m += check(
+            &format!("SELECT id FROM t WHERE kind = 'k{k}' AS OF {gsn}"),
+            &format!("SELECT id FROM t WHERE kind || '' = 'k{k}' AS OF {gsn}"),
+        );
+        m += check(
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind || '' = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
+        );
+    }
+    assert!(m > 100, "the AS OF queries return rows ({m})");
+    // a relation rebuilt after the GSN has no history before it
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW per_a AS SELECT a.id, a.region FROM a");
+    for q in [format!("SELECT region FROM per_a WHERE id = 5 AS OF {gsn}"), format!("SELECT id FROM per_a AS OF {gsn}")] {
+        let stmt = ivm::sql::parse_statement(&q).unwrap();
+        let err = h.execute(stmt, vec![], SessionVars::default(), String::new()).err().map(|e| e.message);
+        assert!(err.as_deref().is_some_and(|e| e.contains("before the history")), "{q}: {err:?}");
+    }
     running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
