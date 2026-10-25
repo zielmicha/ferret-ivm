@@ -168,3 +168,18 @@ fn at_time_zone_and_generate_series_resolve_like_postgresql() {
     assert_eq!(column_types(&h, "SELECT * FROM generate_series(1, 3, 2::bigint)"), vec!["bigint"]);
     running.shutdown();
 }
+
+#[test]
+fn same_named_output_columns_are_ambiguous_only_if_different() {
+    let running = start("orderby-names");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // used to fail with 'ORDER BY "a" is ambiguous'
+    assert_eq!(rows(&h, "SELECT a, a FROM t1 WHERE id < 3 ORDER BY a"), vec!["1|1", "2|2"]);
+    assert_eq!(rows(&h, "SELECT *, id FROM t2 WHERE id = 1 ORDER BY id"), vec!["1|1|100|1.000|a|1"]);
+    assert_eq!(rows(&h, "SELECT a + 1 AS x, a + 1 AS x FROM t1 GROUP BY x ORDER BY x"), vec!["2|2", "3|3", "4|4", "|"]);
+    assert_eq!(rows(&h, "SELECT DISTINCT ON (a) a, a FROM t1 ORDER BY a"), vec!["1|1", "2|2", "3|3", "|"]);
+    let err = try_rows(&h, "SELECT a AS x, b AS x FROM t1 ORDER BY x").unwrap_err();
+    assert!(err.contains("ambiguous"), "{err}");
+    running.shutdown();
+}

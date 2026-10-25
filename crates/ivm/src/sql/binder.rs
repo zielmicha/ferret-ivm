@@ -372,7 +372,7 @@ impl<'a> Binder<'a> {
                 let mut extra = Vec::new();
                 for ob in order_by {
                     let spec = sort_spec(&ob.options);
-                    let col = match self.order_by_output_ref(&ob.expr, &names, visible)? {
+                    let col = match self.order_by_output_ref(&ob.expr, &names, visible, None)? {
                         Some(c) => c,
                         None => {
                             let e = self.bind_expr(&ob.expr, &Ctx::plain(&scope, "ORDER BY"))?;
@@ -392,8 +392,10 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// ORDER BY item naming an output column (alias or ordinal).
-    fn order_by_output_ref(&self, e: &ast::Expr, names: &[String], visible: usize) -> Result<Option<usize>> {
+    /// ORDER BY item naming an output column (alias or ordinal). Several
+    /// output columns of that name are ambiguous unless they are the same
+    /// expression (`exprs`, when known).
+    fn order_by_output_ref(&self, e: &ast::Expr, names: &[String], visible: usize, exprs: Option<&[Expr]>) -> Result<Option<usize>> {
         match e {
             ast::Expr::Value(v) => {
                 if let ast::Value::Number(n, _) = &v.value {
@@ -411,6 +413,7 @@ impl<'a> Binder<'a> {
                 match hits.len() {
                     0 => Ok(None),
                     1 => Ok(Some(hits[0])),
+                    _ if exprs.is_some_and(|x| same_exprs(x, &hits)) => Ok(Some(hits[0])),
                     _ => sql_bail!(codes::AMBIGUOUS_COLUMN, "ORDER BY \"{name}\" is ambiguous"),
                 }
             }
@@ -703,7 +706,7 @@ impl<'a> Binder<'a> {
         let mut order_items: Vec<(OrderTarget, SortSpec)> = Vec::new();
         for ob in order_by {
             let spec = sort_spec(&ob.options);
-            if let Some(c) = self.order_by_output_ref(&ob.expr, &names, names.len())? {
+            if let Some(c) = self.order_by_output_ref(&ob.expr, &names, names.len(), Some(&sel_exprs))? {
                 // an alias that is also an input column name prefers the output column (PG)
                 order_items.push((OrderTarget::Output(c), spec));
                 continue;
@@ -935,6 +938,7 @@ impl<'a> Binder<'a> {
             };
             order.push(SortKey { col, spec });
         }
+        let out_exprs = proj_exprs.clone();
         let mut all_out = proj_exprs;
         all_out.extend(extra);
         let base = rel.arity();
@@ -963,7 +967,7 @@ impl<'a> Binder<'a> {
                 let mut group = Vec::new();
                 let mut extra = Vec::new();
                 for e in exprs {
-                    let c = match self.order_by_output_ref(e, &names_all, visible)? {
+                    let c = match self.order_by_output_ref(e, &names_all, visible, Some(&out_exprs))? {
                         Some(c) => c,
                         None => {
                             // expression over input columns: must match a select expression
@@ -1010,7 +1014,7 @@ impl<'a> Binder<'a> {
                 let name = ident(id);
                 if scope.resolve(None, &name)?.is_none() && self.lookup_outer(None, &name)?.is_none() {
                     let hits: Vec<usize> = (0..names.len()).filter(|i| names[*i] == name).collect();
-                    if hits.len() == 1 {
+                    if !hits.is_empty() && same_exprs(sel, &hits) {
                         return Ok(sel[hits[0]].clone());
                     }
                 }
@@ -1361,6 +1365,17 @@ impl<'a> Binder<'a> {
 enum OrderTarget {
     Output(usize),
     Expr(Expr),
+}
+
+/// Whether the expressions at `idx` are all the same.
+fn same_exprs(exprs: &[Expr], idx: &[usize]) -> bool {
+    let fp = |e: &Expr| {
+        let mut v = Vec::new();
+        e.fingerprint(&mut v);
+        v
+    };
+    let first = fp(&exprs[idx[0]]);
+    idx[1..].iter().all(|i| fp(&exprs[*i]) == first)
 }
 
 fn collect_get_offsets(rel: &Rel, offset: usize, out: &mut Vec<(usize, usize, Vec<Vec<usize>>)>) {
