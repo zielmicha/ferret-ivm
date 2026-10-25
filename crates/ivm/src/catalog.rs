@@ -92,11 +92,16 @@ pub struct Catalog {
     pub next_id: ObjectId,
     /// DDL history: (gsn, statement) — "what was the catalog at g" is a query.
     pub history: Vec<(Gsn, String)>,
+    /// Random id of this data directory, part of default replication slot
+    /// names (so that engines with similar catalogs do not share slots);
+    /// chosen at the first CREATE SOURCE and logged with each.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 impl Catalog {
     pub fn new() -> Catalog {
-        Catalog { objects: BTreeMap::new(), next_id: 1000, history: Vec::new() }
+        Catalog { objects: BTreeMap::new(), next_id: 1000, history: Vec::new(), instance_id: None }
     }
 
     pub fn alloc_id(&mut self) -> ObjectId {

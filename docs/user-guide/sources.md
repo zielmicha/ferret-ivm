@@ -209,13 +209,19 @@ functions (which follow PostgreSQL 17). Nullability comes from `attnotnull`.
 
 Each source owns one logical replication slot using `pgoutput`:
 
-- The default name is `ivm_<name>_<id>`: the source name lowercased, every
-  character other than `a-z0-9` replaced by `_`, truncated so that the whole
-  name fits PostgreSQL's 63-byte limit, and suffixed with the source's
-  catalog object id. For example source `pg` with id 1000 gets
-  `ivm_pg_1000`; source `"Second-Src"` gets `ivm_second_src_1011`. Because
-  the id is unique, a re-created source never reuses a slot that is still
-  being dropped.
+- The default name is `ivm_<name>_<instance>_<id>`: the source name
+  lowercased, every character other than `a-z0-9` replaced by `_`, truncated
+  so that the whole name fits PostgreSQL's 63-byte limit, then the data
+  directory's instance id (8 hex digits, chosen randomly at its first
+  `CREATE SOURCE`, stored in the catalog and logged with every
+  `CREATE SOURCE`) and the source's catalog object id. For example source
+  `pg` with id 1000 gets `ivm_pg_3f9a1c2e_1000`; source `"Second-Src"` gets
+  `ivm_second_src_3f9a1c2e_1011`. Because the object id is unique, a
+  re-created source never reuses a slot that is still being dropped; because
+  of the instance id, engines whose catalogs are alike (same source names and
+  ids) do not share slots when they replicate the same database. Sources
+  created by versions without the instance id keep their names
+  (`ivm_<name>_<id>`).
 - `SLOT 'name'` chooses the name explicitly.
 - The slot is created when the source first starts streaming
   (`CREATE_REPLICATION_SLOT ... LOGICAL pgoutput NOEXPORT_SNAPSHOT`). If a
@@ -474,7 +480,7 @@ drop them in PostgreSQL:
 SELECT slot_name, active, restart_lsn, confirmed_flush_lsn
 FROM pg_replication_slots WHERE slot_name LIKE 'ivm\_%';
 
-SELECT pg_drop_replication_slot('ivm_pg_1000');
+SELECT pg_drop_replication_slot('ivm_pg_3f9a1c2e_1000');
 ```
 
 A slot can only be dropped while no walsender uses it (`active = false`);

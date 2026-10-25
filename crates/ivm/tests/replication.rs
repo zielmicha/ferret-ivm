@@ -491,6 +491,38 @@ fn chunks_see_transactions_decoded_before_them() {
     assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
 }
 
+/// Default slot names contain an id unique to the data directory: two
+/// engines with similar catalogs replicating one database used to get the
+/// same slot name, and fought over the slot. The name is logged with the
+/// source, so replaying the log (here: from the start, without the
+/// checkpoint) gives the same one.
+#[test]
+fn default_slot_names_differ_between_engines() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE t (id int PRIMARY KEY)");
+    up.exec("INSERT INTO t VALUES (1)");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let (dir1, dir2) = (tmpdir("slot-names-1"), tmpdir("slot-names-2"));
+    let (mut a, mut b) = (Ivm::start(&dir1), Ivm::start(&dir2));
+    for ivm in [&mut a, &mut b] {
+        ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    }
+    let (sa, sb) = (slot_name(&mut a), slot_name(&mut b));
+    assert_ne!(sa, sb);
+    assert!(sa.starts_with("ivm_s_") && sa.ends_with("_1000") && sa.len() > "ivm_s_1000".len(), "{sa}");
+    up.exec("INSERT INTO t VALUES (2)");
+    for ivm in [&mut a, &mut b] {
+        assert_eq!(caught_up(ivm, &mut up, "SELECT count(*) FROM t"), ["2"]);
+    }
+    a.shutdown();
+    std::fs::remove_dir_all(dir1.join("store")).unwrap();
+    let mut a = Ivm::start(&dir1);
+    assert_eq!(slot_name(&mut a), sa);
+    up.exec("INSERT INTO t VALUES (3)");
+    assert_eq!(caught_up(&mut a, &mut up, "SELECT count(*) FROM t"), ["3"]);
+    assert_eq!(up.rows("SELECT count(*) FROM pg_replication_slots"), ["2"]);
+}
+
 fn slot_exists(up: &mut Upstream, slot: &str) -> bool {
     up.rows(&format!("SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'")) == ["1"]
 }

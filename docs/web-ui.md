@@ -319,7 +319,7 @@ fill the gap.
 {
   "gsn": 65,
   "sources": [{
-    "id": 1000, "name": "shop", "publication": "shop_pub", "slot": "ivm_shop_1000",
+    "id": 1000, "name": "shop", "publication": "shop_pub", "slot": "ivm_shop_3f9a1c2e_1000",
     "conninfo": "host=127.0.0.1 port=5432 user=postgres dbname=shop password=***",
     "status": "streaming", "created_gsn": 3,
     "frontier_lsn": 67095592, "frontier": "0/3FFCC28",
