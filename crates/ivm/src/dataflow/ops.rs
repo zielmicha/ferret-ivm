@@ -239,13 +239,10 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
                 TableChange::Remove { row } => out.data.push((row, -1)),
                 TableChange::Delete { key } => out.data.push((key, -1)),
                 TableChange::Truncate => {
+                    // retract the stored contents; the changes so far in this
+                    // tick are dropped (retracting them as well would leave
+                    // them negative)
                     let mut cur = g.scan_arr(env, *primary, ReadAt::Latest)?;
-                    consolidate(&mut out.data);
-                    // retract current contents plus anything added in this tick
-                    let pending = std::mem::take(&mut out.data);
-                    for (r, w) in pending {
-                        cur.push((r, w));
-                    }
                     consolidate(&mut cur);
                     out.data = cur.into_iter().map(|(r, w)| (r, -w)).collect();
                 }
@@ -273,7 +270,12 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
         index.insert(key, touched.len() - 1);
         Ok(touched.len() - 1)
     };
+    // The row the previous change deleted. A primary key change arrives as a
+    // delete of the old key directly followed by an upsert of the new row,
+    // whose unchanged (TOASTed) values are those of the old key's row.
+    let mut deleted: Option<Row> = None;
     for ch in changes {
+        let just_deleted = std::mem::take(&mut deleted);
         match ch {
             TableChange::Upsert { mut row, unchanged } => {
                 let i = touch(env, &mut index, &mut touched, layout.encode_prefix_of(&row, pk))?;
@@ -284,7 +286,7 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
                         After::Row(r) => Some(r),
                         After::Absent => None,
                     };
-                    if let Some(o) = old {
+                    if let Some(o) = old.or(just_deleted.as_ref()) {
                         for c in &unchanged {
                             row[*c] = o[*c].clone();
                         }
@@ -299,6 +301,12 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
             }
             TableChange::Delete { key: kv } => {
                 let i = touch(env, &mut index, &mut touched, layout.encode_prefix(&kv))?;
+                let (stored, after) = &touched[i];
+                deleted = match after {
+                    After::Stored => stored.clone(),
+                    After::Row(r) => Some(r.clone()),
+                    After::Absent => None,
+                };
                 touched[i].1 = After::Absent;
             }
             TableChange::Insert { row } => {

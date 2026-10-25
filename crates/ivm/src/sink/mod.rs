@@ -28,7 +28,9 @@ pub struct SinkHandle {
 
 impl SinkHandle {
     pub fn send(&self, gsn: Gsn, rows: &Delta) {
-        if !rows.is_empty() {
+        if rows.is_empty() {
+            self.progress(gsn);
+        } else {
             let _ = self.tx.send(SinkMsg::Data(gsn, rows.clone()));
         }
     }

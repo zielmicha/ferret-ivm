@@ -83,7 +83,32 @@ fn push(rel: Rel, preds: Vec<Expr>) -> Result<Rel> {
         }
         Rel::Map { input, exprs } => {
             let n = input.arity();
-            let (down, up): (Vec<Expr>, Vec<Expr>) = preds.into_iter().partition(|p| all_below(p, n));
+            // A predicate over computed columns moves below the map with
+            // their expressions substituted, as PostgreSQL pushes quals into
+            // subqueries: the other columns are then computed only for the
+            // rows that pass, and raise errors only where PostgreSQL does.
+            // (Not through expressions whose value may change from one
+            // evaluation to the next.)
+            let mut all: Vec<Expr> = (0..n).map(Expr::Column).collect();
+            for e in &exprs {
+                let expanded = e.substitute(&all);
+                all.push(expanded);
+            }
+            let inlinable = |p: &Expr| {
+                cols_of(p).iter().all(|&c| {
+                    c < n || (all[c].is_deterministic() && !all[c].contains_now() && !all[c].has_subquery() && !all[c].has_outer())
+                })
+            };
+            let (mut down, mut up) = (Vec::new(), Vec::new());
+            for p in preds {
+                if all_below(&p, n) {
+                    down.push(p);
+                } else if inlinable(&p) {
+                    down.push(p.substitute(&all));
+                } else {
+                    up.push(p);
+                }
+            }
             let input = push(*input, down)?;
             Ok(finish(Rel::Map { input: Box::new(input), exprs }, up))
         }

@@ -20,11 +20,29 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// While nothing is pending, the progress row is advanced to the last GSN
+/// delivered at most this often (and when the sink stops): after a restart,
+/// a target that is that far needs no resynchronization.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
 fn lit(d: &Datum, c: &Column) -> String {
     if d.is_null() {
         return "NULL".into();
     }
     format!("'{}'::{}", format_datum(d).replace('\'', "''"), format_type(&c.ty.ty, c.ty.typmod))
+}
+
+/// Columns a retraction must match by text: types PostgreSQL has no
+/// equality for (json, jsonpath), and types whose equal values differ in
+/// representation (numeric scales, -0, jsonb numbers), where equality could
+/// delete a row holding another representation than the retracted one.
+fn compare_as_text(ty: &crate::types::SqlType) -> bool {
+    use crate::types::SqlType;
+    match ty {
+        SqlType::Json | SqlType::JsonPath | SqlType::Jsonb | SqlType::Numeric | SqlType::Float4 | SqlType::Float8 => true,
+        SqlType::Array(e) => compare_as_text(e),
+        _ => false,
+    }
 }
 
 fn qident(s: &str) -> String {
@@ -132,9 +150,9 @@ impl Writer {
                     .iter()
                     .zip(r)
                     .map(|(c, d)| {
-                        if c.ty.ty == crate::types::SqlType::Json {
-                            // json has no equality operator; its text is kept as written
-                            format!("{}::text IS NOT DISTINCT FROM {}::text", qident(&c.name), lit(d, c))
+                        if compare_as_text(&c.ty.ty) {
+                            // the text identifies the value exactly
+                            format!("{}::text IS NOT DISTINCT FROM ({})::text", qident(&c.name), lit(d, c))
                         } else {
                             format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c))
                         }
@@ -160,7 +178,15 @@ impl Writer {
         Ok(())
     }
 
-    fn apply(&mut self, batch: &[(Gsn, Delta)]) -> Result<()> {
+    /// Record that the target is as of `gsn` (nothing pending).
+    fn save_progress(&mut self, gsn: Gsn) -> Result<()> {
+        self.client.simple_query(&self.progress_sql(gsn))?;
+        Ok(())
+    }
+
+    /// Apply a batch and record that the target is as of `progress` (at
+    /// least the batch's last GSN).
+    fn apply(&mut self, batch: &[(Gsn, Delta)], progress: Gsn) -> Result<()> {
         let mut sql = String::from("BEGIN;");
         for (_, delta) in batch {
             // retractions first, then insertions (an update is -old +new)
@@ -176,7 +202,7 @@ impl Writer {
                 sql.push(';');
             }
         }
-        sql.push_str(&self.progress_sql(batch.last().unwrap().0));
+        sql.push_str(&self.progress_sql(progress));
         sql.push_str("; COMMIT;");
         if let Err(e) = self.client.simple_query(&sql) {
             let _ = self.client.simple_query("ROLLBACK");
@@ -201,20 +227,28 @@ pub fn run(
     let mut writer: Option<Writer> = None;
     // GSNs at or below this are already in the target
     let mut applied: Option<Gsn> = None;
+    // The last GSN the engine delivered (a change, or a GSN without one): once
+    // `pending` is written, the target is the relation as of this GSN, which
+    // is what the progress row records. Recording only the GSNs of changes
+    // made every restart rewrite the target: the restarted engine's snapshot
+    // is always later (clock ticks, other tables).
+    let mut seen: Gsn = snapshot_gsn;
     let mut backoff = Duration::from_millis(100);
     let mut last_flush = Instant::now();
+    let mut last_progress = Instant::now();
     // Wait out a backoff, still taking messages: changes are kept for later
     // (they used to be read and dropped), a Stop ends the sink. False on Stop.
-    let wait = |backoff: Duration, applied: Option<Gsn>, pending: &mut Vec<(Gsn, Delta)>| -> bool {
+    let wait = |backoff: Duration, applied: Option<Gsn>, pending: &mut Vec<(Gsn, Delta)>, seen: &mut Gsn| -> bool {
         let deadline = Instant::now() + backoff;
         loop {
             match rx.recv_deadline(deadline) {
                 Ok(SinkMsg::Data(g, d)) => {
+                    *seen = (*seen).max(g);
                     if g > applied.unwrap_or(snapshot_gsn) {
                         pending.push((g, d));
                     }
                 }
-                Ok(SinkMsg::Progress(_)) => {}
+                Ok(SinkMsg::Progress(g)) => *seen = (*seen).max(g),
                 Ok(SinkMsg::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
                 Err(RecvTimeoutError::Timeout) => return true,
             }
@@ -229,7 +263,7 @@ pub fn run(
                 }
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
-                    if !wait(backoff, applied, &mut pending) {
+                    if !wait(backoff, applied, &mut pending, &mut seen) {
                         return;
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -256,34 +290,38 @@ pub fn run(
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
                     writer = None;
-                    if !wait(backoff, applied, &mut pending) {
+                    if !wait(backoff, applied, &mut pending, &mut seen) {
                         return;
                     }
                     continue;
                 }
             }
         }
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        let stop = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(SinkMsg::Data(g, d)) => {
+                seen = seen.max(g);
                 if g > applied.unwrap_or(snapshot_gsn) {
                     pending.push((g, d));
                 }
+                false
             }
-            Ok(SinkMsg::Progress(_)) => {}
-            Ok(SinkMsg::Stop) => return,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
-        }
+            Ok(SinkMsg::Progress(g)) => {
+                seen = seen.max(g);
+                false
+            }
+            Ok(SinkMsg::Stop) | Err(RecvTimeoutError::Disconnected) => true,
+            Err(RecvTimeoutError::Timeout) => false,
+        };
+        let w = writer.as_mut().unwrap();
         let rows: usize = pending.iter().map(|(_, d)| d.len()).sum();
-        if !pending.is_empty() && (rows > 1000 || last_flush.elapsed() > Duration::from_millis(100)) {
-            let w = writer.as_mut().unwrap();
-            match w.apply(&pending) {
+        if !pending.is_empty() && (stop || rows > 1000 || last_flush.elapsed() > Duration::from_millis(100)) {
+            match w.apply(&pending, seen) {
                 Ok(()) => {
-                    let last = pending.last().unwrap().0;
-                    *status.lock() = format!("running (gsn {last})");
-                    applied = Some(last);
+                    *status.lock() = format!("running (gsn {seen})");
+                    applied = Some(seen);
                     pending.clear();
                     last_flush = Instant::now();
+                    last_progress = Instant::now();
                 }
                 Err(e) => {
                     *status.lock() = format!("error: {e}");
@@ -292,6 +330,22 @@ pub fn run(
                     // committed progress tells whether it already landed
                 }
             }
+        } else if pending.is_empty() && applied.is_some_and(|a| a < seen) && (stop || last_progress.elapsed() >= PROGRESS_INTERVAL) {
+            // nothing changed since: the target is current as of `seen`
+            match w.save_progress(seen) {
+                Ok(()) => {
+                    *status.lock() = format!("running (gsn {seen})");
+                    applied = Some(seen);
+                }
+                Err(e) => {
+                    *status.lock() = format!("error: {e}");
+                    writer = None;
+                }
+            }
+            last_progress = Instant::now();
+        }
+        if stop {
+            return;
         }
     }
 }

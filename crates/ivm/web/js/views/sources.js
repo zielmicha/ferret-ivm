@@ -11,6 +11,9 @@ function snapshotCell(t) {
   if (t.snapshot === 'done') {
     return h('div.row', h('div.progress.done', h('span', { style: { width: '100%' } })), badge('done', 'good'));
   }
+  if (t.snapshot === 'error') {
+    return h('div.row', { title: t.error || '' }, h('div.progress', h('span', { style: { width: '0%' } })), badge('cannot read; retrying', 'crit'));
+  }
   if (t.snapshot === 'loading') {
     return h('div.row', h('div.progress.indeterminate', { title: 'Loading in primary key order; the upstream row count is not known' }, h('span')), badge('loading', 'info'));
   }
@@ -37,7 +40,7 @@ function sourceCard(src) {
     { key: 'upstream', label: 'Upstream', cls: 'nowrap' },
     { key: 'pk', label: 'Key', render: (t) => (t.pk.length ? t.pk.join(', ') : h('span.muted', 'none (multiset)')), sortable: false },
     { key: 'rows', label: 'Rows', num: true, render: (t) => fmt.int(t.rows) },
-    { key: 'snapshot', label: 'Snapshot', render: snapshotCell, sort: (t) => ({ done: 2, loading: 1, pending: 0 })[t.snapshot] },
+    { key: 'snapshot', label: 'Snapshot', render: snapshotCell, sort: (t) => ({ done: 3, loading: 2, pending: 1, error: 0 })[t.snapshot] },
     {
       key: 'boundary', label: 'Snapshot boundary', sortable: false,
       render: (t) => (t.snapshot === 'done' ? h('span.muted', '—') : t.boundary ? h('span.mono', t.boundary.join(', ')) : h('span.muted', 'start')),

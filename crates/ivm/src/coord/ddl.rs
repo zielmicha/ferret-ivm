@@ -68,9 +68,15 @@ pub fn statement_sql(stmt: &Statement) -> String {
 }
 
 /// A valid replication slot name unique to this source object, so that a
-/// re-created source never shares a slot that is still being dropped.
-fn default_slot_name(source: &str, id: ObjectId) -> String {
-    let suffix = format!("_{id}");
+/// re-created source never shares a slot that is still being dropped, and
+/// to the data directory (`instance`), so that engines with similar catalogs
+/// replicating the same database do not share one either. (Sources logged
+/// by versions without the instance id keep names without it.)
+fn default_slot_name(source: &str, id: ObjectId, instance: Option<&str>) -> String {
+    let suffix = match instance {
+        Some(i) => format!("_{i}_{id}"),
+        None => format!("_{id}"),
+    };
     let mut base: String = source
         .chars()
         .map(|c| c.to_ascii_lowercase())
@@ -82,6 +88,22 @@ fn default_slot_name(source: &str, id: ObjectId) -> String {
 
 fn parse_discovered(extra: &str) -> Result<Vec<DiscoveredTable>> {
     serde_json::from_str(extra).map_err(|e| SqlError::internal(format!("bad source discovery record: {e}")))
+}
+
+/// What a CREATE SOURCE record logs besides its statement: the discovered
+/// tables and the data directory's id for the default slot name. (Older
+/// records hold just the tables.)
+#[derive(Serialize, Deserialize)]
+struct SourceExtra {
+    tables: Vec<DiscoveredTable>,
+    instance: Option<String>,
+}
+
+fn parse_source_extra(extra: &str) -> Result<SourceExtra> {
+    match serde_json::from_str::<SourceExtra>(extra) {
+        Ok(x) => Ok(x),
+        Err(_) => Ok(SourceExtra { tables: parse_discovered(extra)?, instance: None }),
+    }
 }
 
 fn quote(s: &str) -> String {
@@ -112,7 +134,7 @@ impl Engine {
     }
 
     /// Validate a DDL statement against the current catalog and log it.
-    pub(crate) fn submit_ddl(&mut self, stmt: &Statement, extra: String, reply: Sender<Result<ExecResult>>) -> Result<Option<ExecResult>> {
+    pub(crate) fn submit_ddl(&mut self, stmt: &Statement, mut extra: String, reply: Sender<Result<ExecResult>>) -> Result<Option<ExecResult>> {
         // dry run: plan views to report errors before logging
         if let Statement::Sql(s) = stmt {
             match &**s {
@@ -145,7 +167,12 @@ impl Engine {
                 if self.catalog.by_name(name).is_some() {
                     sql_bail!(codes::DUPLICATE_OBJECT, "source \"{name}\" already exists");
                 }
-                self.check_source_tables(name, &parse_discovered(&extra)?)?;
+                let tables = parse_discovered(&extra)?;
+                self.check_source_tables(name, &tables)?;
+                // the data directory's id goes into the record, so that
+                // replay names the slot the same way
+                let instance = self.catalog.instance_id.get_or_insert_with(|| format!("{:08x}", crate::source::random_u64() as u32)).clone();
+                extra = serde_json::to_string(&SourceExtra { tables, instance: Some(instance) }).map_err(|e| SqlError::internal(e.to_string()))?;
             }
             Statement::AlterSourceRefresh { name } => {
                 let Some(src) = self.catalog.by_name(name) else {
@@ -247,10 +274,15 @@ impl Engine {
                     sql_bail!(codes::DUPLICATE_OBJECT, "source \"{name}\" already exists");
                 }
                 // validate everything before touching the catalog
-                let discovered = parse_discovered(extra)?;
+                let SourceExtra { tables: discovered, instance } = parse_source_extra(extra)?;
                 self.check_source_tables(&name, &discovered)?;
+                if self.catalog.instance_id.is_none() {
+                    self.catalog.instance_id = instance.clone();
+                }
                 let id = self.catalog.alloc_id();
-                let slot = slot.unwrap_or_else(|| default_slot_name(&name, id));
+                let slot = slot.unwrap_or_else(|| default_slot_name(&name, id, instance.as_deref()));
+                // a dropped source's slot by the same name is this source's now
+                crate::source::cancel_slot_drop(&self.shared, &slot);
                 let def = SourceDef { conninfo, publication, slot, tables };
                 self.catalog.insert(CatalogObject {
                     id,
@@ -312,9 +344,8 @@ impl Engine {
                     created_gsn: gsn,
                     create_sql: sql.to_string(),
                 });
-                if !self.replaying
-                    && let Some(h) = self.handle.clone()
-                {
+                // (also while replaying: sinks receive replayed records)
+                if let Some(h) = self.handle.clone() {
                     // the sink is durable now; a failure to start it is not a DDL error
                     self.start_sink_or_mark_broken(id, &name, &def, &h);
                 }
@@ -772,24 +803,43 @@ impl Engine {
         let mut diff: Vec<(crate::types::Row, i64)> = new_rows;
         diff.extend(old_rows.into_iter().map(|(r, w)| (r, -w)));
         crate::dataflow::consolidate(&mut diff);
+        // (by view: other views and ad hoc subscriptions may share the old node)
+        let same = same_columns(&def.columns, &old_cols);
         for s in self.subs.iter_mut() {
-            if s.node == old.node {
+            if s.view != Some(id) {
+                continue;
+            }
+            if same {
                 s.node = new_node;
                 if !diff.is_empty() {
                     let _ = s.tx.send(SubEvent::Data { gsn, rows: diff.clone() });
                 }
+            } else {
+                // they were promised the old columns
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                    codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{name}\" changed its columns"),
+                )));
+                s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        if same_columns(&def.columns, &old_cols) {
-            for sink in self.sink_handles.values_mut() {
-                if sink.node == old.node {
+        // the view's sinks (not those of other views sharing the old node)
+        let sinks: Vec<ObjectId> = self
+            .sink_handles
+            .keys()
+            .copied()
+            .filter(|sid| matches!(self.catalog.get(*sid).map(|o| &o.kind), Some(ObjectKind::Sink(sd)) if sd.from == id))
+            .collect();
+        if same {
+            for sid in &sinks {
+                if let Some(sink) = self.sink_handles.get_mut(sid) {
                     sink.node = new_node;
                     sink.send(gsn, &diff);
                 }
             }
         } else {
             // (re-planned after an upstream change) new rows, new columns
-            self.restart_sinks_on(old.node)?;
+            self.restart_sinks(sinks)?;
         }
         for a in old_index_arrs {
             self.graph.release_arr(&mut self.env, a)?;
@@ -828,10 +878,8 @@ impl Engine {
         self.graph.hydrate(&mut self.env, gsn)?;
         let errs = self.graph.errors_of(self.rt.views[&id].node);
         merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
-        // (on replay, sinks start once the log is replayed)
-        if let Some(handle) = self.handle.clone()
-            && !self.replaying
-        {
+        // (also while replaying: sinks receive replayed records)
+        if let Some(handle) = self.handle.clone() {
             let sinks: Vec<(ObjectId, String, SinkDef)> = self
                 .catalog
                 .objects
@@ -1003,11 +1051,14 @@ impl Engine {
                 }
             }
             ObjectKind::Source(def) => {
-                // (the engine thread does not wait for the source thread)
-                let thread = self.source_handles.remove(&id).and_then(|h| h.stop());
-                if !self.replaying {
-                    crate::source::drop_slot_async(def.conninfo.clone(), def.slot.clone(), thread);
+                // (the engine thread does not wait for the source thread;
+                // dropping the slot retries until its session let go of it)
+                if let Some(h) = self.source_handles.remove(&id) {
+                    let _ = h.stop();
                 }
+                // recorded also when replaying: the drop may not have
+                // succeeded before the restart (it is retried after it)
+                crate::source::drop_slot_async(&self.shared, def.conninfo.clone(), def.slot.clone(), !self.replaying);
                 self.source_states.remove(&id);
                 // a dropped source no longer holds back reads waiting for an LSN
                 self.source_lsns.remove(&id);
@@ -1095,6 +1146,11 @@ impl Engine {
     /// rebuilt with other columns) from their relation's current version.
     fn restart_sinks_on(&mut self, node: NodeId) -> Result<()> {
         let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == node).map(|(id, _)| *id).collect();
+        self.restart_sinks(sinks)
+    }
+
+    /// Restart sinks from their relation's current version.
+    fn restart_sinks(&mut self, sinks: Vec<ObjectId>) -> Result<()> {
         for id in sinks {
             if let Some(h) = self.sink_handles.remove(&id) {
                 let _ = h.stop();
@@ -1248,4 +1304,33 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
         }
     }
     Ok(TableDef { columns, pk, source: None, upstream: None, version: 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_slot_names() {
+        assert_eq!(default_slot_name("pg", 1000, Some("3f9a1c2e")), "ivm_pg_3f9a1c2e_1000");
+        // sources logged by older versions keep their names
+        assert_eq!(default_slot_name("Second-Src", 1011, None), "ivm_second_src_1011");
+        let long = default_slot_name(&"x".repeat(100), 1000, Some("3f9a1c2e"));
+        assert_eq!(long.len(), 63);
+        assert!(long.ends_with("_3f9a1c2e_1000"), "{long}");
+    }
+
+    /// CREATE SOURCE records carry the data directory's id; older ones are
+    /// just the discovered tables.
+    #[test]
+    fn source_extra_formats() {
+        let t = DiscoveredTable { schema: "public".into(), name: "t".into(), columns: vec![], pk: vec![], replica_identity_full: true };
+        let old = serde_json::to_string(&vec![t.clone()]).unwrap();
+        let x = parse_source_extra(&old).unwrap();
+        assert_eq!((x.tables.len(), x.instance), (1, None));
+        let new = serde_json::to_string(&SourceExtra { tables: vec![t], instance: Some("ab".into()) }).unwrap();
+        let x = parse_source_extra(&new).unwrap();
+        assert_eq!((x.tables.len(), x.instance.as_deref()), (1, Some("ab")));
+        assert!(parse_source_extra("{").is_err());
+    }
 }

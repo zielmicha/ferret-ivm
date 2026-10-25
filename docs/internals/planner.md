@@ -264,5 +264,6 @@ arrangements at a given `ReadAt`:
 
 Because the executor and the dataflow share the aggregate, window and
 expression code, a maintained view and the same query run ad hoc compute
-the same values; the engine tests compare the two, and the differential
-tester compares maintained views with PostgreSQL ([Testing](../testing.md)).
+the same values; the self-differential test compares the two, and the
+differential tester compares maintained views with PostgreSQL
+([Testing](../testing.md)).

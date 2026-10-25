@@ -57,16 +57,21 @@ implementation checkpoints everything together).
    the checkpoint GSN (`Graph::hydrate`), then **drop** recovered trees that
    nothing attached (arrangements that no longer exist) and set the retention
    frontier.
-7. **Replay** every log record after the checkpoint GSN through
+7. **Start the sinks** from the recovered state (each takes a snapshot at
+   the checkpoint GSN; a target at least that far resumes, one behind it is
+   resynchronised, see
+   [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)).
+8. **Replay** every log record after the checkpoint GSN through
    `apply_record`, with `replaying = true`: DDL is re-applied from its logged
-   text and `extra`, no source or sink is started, no slot is dropped, and
-   nobody is waiting for replies. A DDL record that fails is only logged, but
+   text and `extra`, no source is started, and nobody is waiting for
+   replies; the sinks receive the replayed changes (a sink created by a
+   replayed `CREATE SINK` starts then), and slot drops of replayed
+   `DROP SOURCE`s are recorded. A DDL record that fails is only logged, but
    any other record that fails to apply stops the start-up with its error.
-8. **Start** the sources (with their logged state and resume LSN), the sinks
-   (each takes a snapshot and resynchronises, see
-   [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)), the
-   sequencer (whose next GSN is the log's last GSN + 1), and the engine
-   thread; then the server starts accepting connections.
+9. **Start** the sources (with their logged state and resume LSN), the
+   pending slot drops, the sequencer (whose next GSN is the log's last
+   GSN + 1), and the engine thread; then the server starts accepting
+   connections.
 
 A data directory without a checkpoint replays the whole log from GSN 1 (the
 log is only truncated after checkpoints).
@@ -149,24 +154,36 @@ into the WAL around them.
 `PgSource::maybe_start_chunk` runs whenever no upstream transaction is open
 in the stream and no chunk is in flight:
 
-1. Pick the table with the lowest id whose snapshot is not done.
+1. Pick the table with the lowest id whose snapshot is not done (skipping
+   tables whose chunk query failed recently: they are retried after a
+   delay growing from 1 s to 60 s, while the other tables proceed).
 2. On a normal connection, emit the **low watermark**:
-   `SELECT pg_logical_emit_message(true, 'ivm', 'L:<source>:<table>:<seq>')`
+   `SELECT pg_logical_emit_message(true, 'ivm', 'L:<source>:<table>:<run>:<seq>')`
    (a transactional message: it appears in the stream at its commit).
-3. Read the chunk in one transaction:
+   `<run>` is a random id chosen each time the source thread starts and
+   `<seq>` counts its chunks, so the tag is unique: after a restart the
+   stream resumes before watermarks of the previous run, and logical
+   messages reach every slot of the database, including those of other
+   engines.
+3. Read the chunk in one transaction, in two round trips:
    ```sql
    BEGIN ISOLATION LEVEL REPEATABLE READ;
    SELECT pg_current_snapshot()::text;
+   -- checked: does it see every transaction decoded so far? (below)
    SELECT <columns> FROM <schema>.<table>
      [WHERE (<pk>) > (<boundary>)] ORDER BY <pk> LIMIT 10000;
    COMMIT
    ```
+   If the snapshot does not contain every transaction the stream has
+   decoded while tables are being copied (see
+   [Filtering stream changes](#filtering-stream-changes)), the transaction is
+   rolled back and the chunk retried 100 ms later.
    String key columns use `COLLATE "C"`, so the upstream order matches the
    engine's key order. The rows are kept in memory keyed by their encoded
    primary key; the chunk records its last key (`max_key`), whether it is the
    last chunk (fewer than 10,000 rows), and the snapshot's
    `(xmin, xmax, xip)`.
-4. Emit the **high watermark** `'H:<source>:<table>:<seq>'`.
+4. Emit the **high watermark** `'H:<source>:<table>:<run>:<seq>'`.
 
 The chunk starts in phase *before-low*. While the stream is processed:
 
@@ -189,7 +206,7 @@ For every streamed change of key `k` in table `T` (`snapshot_filter`):
 | same, phase *before-low*, the transaction is **not** visible in the chunk's snapshot | apply, and remove `k` from the chunk |
 | same, phase *before-low*, the transaction **is** visible in the chunk's snapshot | skip (the chunk already contains its effect) |
 | otherwise (`k` beyond everything copied so far) | skip: a later chunk will read the row's current value |
-| `TRUNCATE` | apply always, and clear the chunk's rows of that table |
+| `TRUNCATE` | apply always, and clear the chunk's rows of that table (unless the chunk is in phase *before-low* and its snapshot saw the truncation) |
 
 Why this yields a consistent copy (with one exception, below): the chunk's snapshot is taken after the
 low watermark committed, so every transaction that commits after the high
@@ -205,12 +222,21 @@ rows and the boundary move are logged in the same commit, so the engine's
 copy is always a prefix of the key space that agrees with the upstream as of
 the GSN.
 
-The exception, found by reading the code (not reproduced): a `TRUNCATE` that
-committed before the low watermark but is processed while the chunk is in
-flight clears the chunk's rows, although the chunk's snapshot already
-reflects the truncation. Rows inserted after the `TRUNCATE` and visible in
-the snapshot are then skipped by the stream (phase *before-low*, visible)
-and missing from the chunk, so they are never copied.
+"A later chunk reads the row's current value" holds only if that chunk's
+snapshot contains the skipped transaction, and the same race applies: a
+transaction is decoded once its commit record is flushed but becomes visible
+only when it ends, which a synchronous standby can delay for as long as it
+takes to confirm the commit. So the source keeps the ids of the transactions
+it decodes while some table is being copied (`PgSource::unseen`; when a
+table starts to be copied again, also the last 1,024 decoded before, whose
+changes were applied to rows the re-snapshot overwrites), and reads a chunk
+only once its snapshot sees all of them; transactions a snapshot sees are
+forgotten, as later snapshots see them too. If many accumulate without a
+chunk being read (a table that cannot be read), they are checked against a
+fresh `pg_current_snapshot()` at most once a second. Without this check, a
+chunk read while such a transaction was invisible kept the row's old value
+for good (reproduced with an unreachable synchronous standby,
+`chunks_see_transactions_decoded_before_them`).
 
 The 32-bit transaction ids of the stream are compared with the 64-bit
 snapshot by choosing the epoch closest to the snapshot (`xid_visible`).
@@ -235,6 +261,11 @@ in the snapshot is not caught.
   boundary.
 - `ALTER SOURCE ... REFRESH` adds tables that are snapshotted the same way.
 - After an upstream schema change the table's state is reset and the whole
-  table is copied again; because a re-snapshot only upserts, rows deleted
-  upstream while their key is beyond the boundary are not removed (see
+  table is copied again. A re-snapshot only upserts the rows it reads, so
+  stream deletes of keys beyond the boundary are applied rather than
+  skipped (the row may still be stored). When the stored rows cannot be
+  trusted — after a key change, whose deletes by the old key were lost —
+  the state also says `truncate`: before the first chunk's low watermark,
+  between upstream transactions, the source logs a commit truncating the
+  table, which then fills exactly as in an initial snapshot (see
   [Sources](../user-guide/sources.md#upstream-schema-changes)).

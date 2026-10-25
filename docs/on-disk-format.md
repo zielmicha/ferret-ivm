@@ -181,18 +181,24 @@ table 1000, `Delete`, key row with one value, int4 4.
 - `extra`: empty, or for `CREATE SOURCE` and `ALTER SOURCE ... REFRESH` the
   discovered upstream tables as a JSON array of
   `{"schema": str, "name": str, "columns": [Column], "pk": [column index, ...], "replica_identity_full": bool}`
-  (`coord::ddl::DiscoveredTable`; `Column` as in [AppState](#checkpoint-application-state-appstate)).
-  For `REFRESH` the array lists all discovered tables; the engine adds the new
-  ones.
+  (`coord::ddl::DiscoveredTable`; `Column` as in [AppState](#checkpoint-application-state-appstate);
+  `pk` is the key: the replica identity index's columns, else the primary
+  key's). For `REFRESH` the array lists all discovered tables; the engine
+  adds the new ones. `CREATE SOURCE` records now log an object instead,
+  `{"tables": [...], "instance": str}`, with the data directory's instance id
+  for the default slot name (`ivm_<name>_<instance>_<id>`); a plain array
+  (older records) means a default name without it.
 
 **Progress** — a source's bookkeeping without data.
 
 - `lsn`: the end LSN of the commit after which it was logged (informational;
   not used on replay).
 - `state`: JSON `SourceState`:
-  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...]}}}`
+  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...], "truncate": bool}}}`
   where `boundary` holds the text values of the last primary key copied by the
-  initial snapshot.
+  initial snapshot, and `truncate` (absent: `false`) says that the table's
+  next snapshot chunk starts by truncating it (after a key change or a lost
+  replication slot).
 
 **Schema** — an upstream table changed shape: the source `ObjectId`, the table
 `ObjectId`, the new columns as a JSON array of `Column`, and the new primary
@@ -433,14 +439,16 @@ with `serde_json`):
       }
     },
     "next_id": 1009,
-    "history": [[47, "CREATE TABLE orders (...)"], ...]
+    "history": [[47, "CREATE TABLE orders (...)"], ...],
+    "instance_id": "3f9a1c2e"
   },
   "trees": [[[24, 205, 206, 130, 207, 117, 128, 118, 215, 229, 14, 19, 128, 103, 100, 230], 9], ...],
   "view_errors": [[1008, [[["22003", "value out of range: overflow"], 1]]], [1003, []]],
   "source_states": [[1000, "{\"slot_created\":true,\"tables\":{...}}"]],
   "source_lsns": [[1000, 32216824]],
   "next_req": 24,
-  "clock": 846243883442476
+  "clock": 846243883442476,
+  "slot_drops": [{"conninfo": "host=db dbname=app user=repl", "slot": "ivm_old_3f9a1c2e_1004"}]
 }
 ```
 
@@ -449,6 +457,7 @@ with `serde_json`):
 | `catalog.objects` | map from object id (as a JSON string key) to `CatalogObject` |
 | `catalog.next_id` | next object id |
 | `catalog.history` | `[gsn, statement]` of the successfully applied DDL statements (`ivm.catalog_history`): the most recent 10,000 (trimmed back to 10,000 when it reaches 11,000) |
+| `catalog.instance_id` | the data directory's random id in default slot names, set by the first `CREATE SOURCE`; `null` if absent |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view: its error records `[[sqlstate, message], count]` |
 | `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records) |
@@ -456,6 +465,7 @@ with `serde_json`):
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
 | `ticks` | `[gsn, clock]` of the clock ticks in the retention window (at most the last 100,000), for `now()` in reads as of earlier GSNs; `[]` if absent (then `[[checkpoint gsn, clock]]`) |
+| `slot_drops` | replication slots of dropped sources not dropped upstream yet (`conninfo`, `slot`), retried after the start; `[]` if absent |
 
 `CatalogObject`: `id`, `name`, `kind`, `created_gsn`, `create_sql` (the
 logged statement; for replicated tables the text
@@ -832,7 +842,7 @@ Consequences of code changes for an existing data directory:
 | Change | Consequence |
 |---|---|
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible |
-| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock` and `ticks` were added with `#[serde(default)]`.) |
+| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState`, were added with `#[serde(default)]`.) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/primary-key text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
 | inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again |

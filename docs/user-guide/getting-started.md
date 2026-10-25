@@ -189,7 +189,7 @@ CREATE SOURCE pg FROM POSTGRES
   CONNECTION 'host=db.example.com port=5432 dbname=app user=replicator password=...'
   PUBLICATION 'app_pub';
 
-SHOW SOURCES;   -- slot ivm_pg_<id>, status "snapshotting public.orders", then "streaming"
+SHOW SOURCES;   -- slot ivm_pg_<instance>_<id>, status "snapshotting public.orders", then "streaming"
 SHOW TABLES;    -- orders, customers (source pg)
 
 -- a maintained view

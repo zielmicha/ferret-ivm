@@ -88,6 +88,9 @@ pub(crate) struct Subscription {
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
     pub progress: bool,
+    /// The materialized view subscribed to by name (its node may be shared
+    /// with other views, so dropping it is matched by view, not by node).
+    pub view: Option<ObjectId>,
     /// The relations it reads, also through views: it ends when one of
     /// them is dropped.
     pub reads: Vec<ObjectId>,
@@ -133,6 +136,9 @@ pub(crate) struct AppState {
     /// (absent in older checkpoints).
     #[serde(default)]
     pub ticks: Vec<(Gsn, i64)>,
+    /// Replication slots of dropped sources still to be dropped.
+    #[serde(default)]
+    pub slot_drops: Vec<crate::source::SlotDrop>,
 }
 
 /// DDL statements kept in the catalog history (`ivm.catalog_history`), the
@@ -315,6 +321,14 @@ impl Running {
     pub fn alive(&self) -> bool {
         self.threads.iter().all(|t| !t.is_finished())
     }
+
+    /// Stop without the final checkpoint, as if the process had died right
+    /// after its last log write: the next start recovers the last
+    /// checkpoint and replays the log after it (for tests).
+    pub fn crash(self) {
+        self.handle.shared.crash.store(true, Ordering::Release);
+        self.shutdown();
+    }
 }
 
 /// Open (recovering if needed) and start the engine threads.
@@ -378,6 +392,12 @@ pub fn start(cfg: Config) -> Result<Running> {
         ticks: VecDeque::new(),
     };
     engine.recover(recovered)?;
+    // Sinks start from the checkpoint's state and receive the replayed
+    // records like live ones: a target that is as far as the checkpoint
+    // (it is after a clean shutdown) resumes without being rewritten.
+    let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
+    engine.handle = Some(handle.clone());
+    engine.start_sinks(&handle)?;
     // replay the log after the checkpoint
     let records = crate::log::read_from(&cfg.data_dir.join("log"), engine.processed)?;
     if !records.is_empty() {
@@ -396,9 +416,9 @@ pub fn start(cfg: Config) -> Result<Running> {
     shared.durable_gsn.store(writer.last_gsn(), Ordering::Release);
     engine.replaying = false;
     engine.shared.processed_gsn.store(engine.processed, Ordering::Release);
-    let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
-    engine.handle = Some(handle.clone());
-    engine.start_sources_and_sinks(&handle)?;
+    engine.start_sources(&handle)?;
+    // slot drops left from before the restart (or replayed DROP SOURCEs)
+    crate::source::resume_slot_drops(&shared);
     let seq = Sequencer { writer, rx: srx, engine: etx.clone(), shared: shared.clone(), tick: cfg.tick };
     let seq_shared = shared.clone();
     let t1 = std::thread::Builder::new().name("ivm-sequencer".into()).spawn(move || {
@@ -441,6 +461,7 @@ impl Engine {
         }
         self.source_states = app.source_states.into_iter().collect();
         self.source_lsns = app.source_lsns.into_iter().collect();
+        self.shared.slot_drops.lock().extend(app.slot_drops);
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
         for obj in &objects {
             if let ObjectKind::Table(t) = &obj.kind {
@@ -591,10 +612,19 @@ impl Engine {
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
+        // ask sources and sinks to stop, without waiting for them here
         let mut threads: Vec<JoinHandle<()>> = self.source_handles.drain().filter_map(|(_, s)| s.stop()).collect();
-        threads.extend(self.sink_handles.drain().filter_map(|(_, s)| s.stop()));
+        for (_, s) in self.sink_handles.drain() {
+            // everything applied is delivered: the sink records it as its
+            // progress, matching the final checkpoint, so that the next
+            // start does not resynchronize it
+            s.progress(self.processed);
+            threads.extend(s.stop());
+        }
         let _ = self.seq.send(SeqMsg::Shutdown);
-        self.checkpoint()?;
+        if !self.shared.crash.load(Ordering::Acquire) {
+            self.checkpoint()?;
+        }
         // give sources and sinks a moment to finish; one stuck in a
         // connection attempt is left behind
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -741,9 +771,17 @@ impl Engine {
                 }
                 self.snap_epoch += 1;
             }
-            LogRecord::Schema { source: _, table, columns, pk } => {
+            LogRecord::Schema { source, table, columns, pk } => {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
                 self.processed = gsn;
+                // The source snapshots the table again to fill in the new
+                // columns, and logs its reset state right after this record;
+                // a restart in between would take the snapshot as done and
+                // never redo it, so the record resets the state as well.
+                if let Some(state) = self.source_states.get_mut(&source) {
+                    *state = crate::source::postgres::snapshot_again(state, table);
+                }
+                self.snap_epoch += 1;
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }
@@ -856,6 +894,7 @@ impl Engine {
             errors: self.graph.error_state(),
             arr_since: self.graph.arrangement_since().into_iter().collect(),
             ticks: self.ticks.iter().skip(self.ticks.len().saturating_sub(MAX_SAVED_TICKS)).copied().collect(),
+            slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;
@@ -867,19 +906,28 @@ impl Engine {
         Ok(())
     }
 
-    fn start_sources_and_sinks(&mut self, handle: &EngineHandle) -> Result<()> {
+    fn start_sources(&mut self, handle: &EngineHandle) -> Result<()> {
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
         for obj in objects {
-            match &obj.kind {
-                ObjectKind::Source(def) => {
-                    let state = self.source_states.get(&obj.id).cloned().unwrap_or_default();
-                    let tables = self.source_tables(obj.id);
-                    let resume = self.source_lsns.get(&obj.id).copied().unwrap_or(0);
-                    let h = crate::source::start(obj.id, obj.name.clone(), def.clone(), tables, state, resume, handle.clone())?;
-                    self.source_handles.insert(obj.id, h);
-                }
-                ObjectKind::Sink(def) => self.start_sink_or_mark_broken(obj.id, &obj.name, def, handle),
-                _ => {}
+            if let ObjectKind::Source(def) = &obj.kind {
+                let state = self.source_states.get(&obj.id).cloned().unwrap_or_default();
+                let tables = self.source_tables(obj.id);
+                let resume = self.source_lsns.get(&obj.id).copied().unwrap_or(0);
+                let h = crate::source::start(obj.id, obj.name.clone(), def.clone(), tables, state, resume, handle.clone())?;
+                self.source_handles.insert(obj.id, h);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the sinks of the catalog (before the log is replayed; sinks
+    /// created by replayed records start when those are applied).
+    fn start_sinks(&mut self, handle: &EngineHandle) -> Result<()> {
+        let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
+        for obj in objects {
+            if let ObjectKind::Sink(def) = &obj.kind {
+                // (one that cannot start, e.g. over a broken view, is marked broken)
+                self.start_sink_or_mark_broken(obj.id, &obj.name, def, handle);
             }
         }
         Ok(())

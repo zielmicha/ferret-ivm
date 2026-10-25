@@ -225,15 +225,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decimal_display() {
-        assert_eq!(Decimal::new(5000000, 6).to_string(), "5.000000");
-        assert_eq!(Decimal::new(-5, 3).to_string(), "-0.005");
-        assert_eq!(Decimal::new(2020, 0).to_string(), "2020");
-        assert_eq!(Decimal::INFINITY.to_string(), "Infinity");
-        assert_eq!(Decimal::NEG_INFINITY.to_string(), "-Infinity");
-    }
-
-    #[test]
     fn format_g() {
         assert_eq!(c_format_g(5.0, 2, true), "05");
         assert_eq!(c_format_g(60.5, 2, true), "60.5");

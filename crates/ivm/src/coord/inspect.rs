@@ -192,8 +192,11 @@ pub struct SourceTableInfo {
     pub name: String,
     pub upstream: String,
     pub pk: Vec<String>,
-    /// "done", "loading" (the chunk in flight is from this table) or "pending".
+    /// "done", "loading" (the chunk in flight is from this table), "error"
+    /// (its chunk cannot be read; retried) or "pending".
     pub snapshot: &'static str,
+    /// Why the table cannot be copied (snapshot "error").
+    pub error: Option<String>,
     /// Primary key of the last snapshotted row (text values).
     pub boundary: Option<Vec<String>>,
     pub rows: i64,
@@ -818,25 +821,35 @@ impl Engine {
             ),
             None => (0, 0, 0, 0, 0),
         };
+        let table_errors = gauges.as_ref().map(|g| g.table_errors.lock().clone()).unwrap_or_default();
         let mut tables: Vec<SourceTableInfo> = self
             .source_tables(id)
             .into_iter()
             .map(|t| {
                 let st = state.tables.get(&t.id).cloned().unwrap_or_default();
+                let error = if st.done { None } else { table_errors.get(&t.id).cloned() };
                 SourceTableInfo {
                     id: t.id,
                     name: self.catalog.get(t.id).map(|o| o.name.clone()).unwrap_or_default(),
                     upstream: format!("{}.{}", t.upstream.0, t.upstream.1),
                     pk: t.pk.iter().filter_map(|c| t.columns.get(*c)).map(|c| c.name.clone()).collect(),
-                    snapshot: if st.done { "done" } else { "pending" },
+                    snapshot: if st.done {
+                        "done"
+                    } else if error.is_some() {
+                        "error"
+                    } else {
+                        "pending"
+                    },
+                    error,
                     boundary: st.boundary.clone(),
                     rows: self.object_rows(t.id).unwrap_or(0),
                 }
             })
             .collect();
         tables.sort_by_key(|t| t.id);
-        // the source snapshots its unfinished tables in id order, one chunk at a time
-        if let Some(t) = tables.iter_mut().find(|t| t.snapshot != "done") {
+        // the source snapshots its unfinished tables in id order, one chunk
+        // at a time (skipping those that cannot be read)
+        if let Some(t) = tables.iter_mut().find(|t| t.snapshot == "pending") {
             t.snapshot = "loading";
         }
         let tables_done = tables.iter().filter(|t| t.snapshot == "done").count();

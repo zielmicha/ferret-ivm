@@ -102,9 +102,11 @@ Every start is a recovery:
    or a catalog that drifted) does not stop the start: it is logged and
    kept in the catalog as **broken**, together with the indexes on it, the
    views reading it and the sinks reading it (which are not started).
-5. Replay the input-log records after the checkpoint's GSN.
-6. Restart sources (from their logged progress) and sinks (which
-   resynchronise), start the sequencer and engine threads, and listen.
+5. Restart sinks from the checkpoint's state (a target that is up to date
+   resumes; one that is behind is resynchronised), then replay the
+   input-log records after the checkpoint's GSN, which also reach the sinks.
+6. Restart sources (from their logged progress), start the sequencer and
+   engine threads, and listen.
 
 Recovery time is dominated by log replay (bounded by the checkpoint
 interval) and by rebuilding indexes that could not be matched. Sources only

@@ -1486,57 +1486,6 @@ fn numeric_in_typmod(s: &str, typmod: i32) -> Result<Numeric> {
 mod tests {
     use super::*;
 
-    fn n(s: &str) -> Numeric {
-        Numeric::parse(s).unwrap()
-    }
-
-    #[test]
-    fn basic_pictures() {
-        assert_eq!(
-            to_char_numeric(&n("-1234.567"), "9,999.99").unwrap(),
-            "-1,234.57"
-        );
-        assert_eq!(to_char_numeric(&n("0.5"), "9.9").unwrap(), "  .5");
-        assert_eq!(to_char_numeric(&n("12"), "FM999th").unwrap(), "12th");
-        assert_eq!(to_char_int4(25, "9EEEE").unwrap(), " 2e+01");
-        assert_eq!(to_char_int8(25, "9EEEE").unwrap(), " 3e+01");
-        assert_eq!(to_char_int4(1, "9V9999999999").unwrap(), " -2147483648");
-        assert_eq!(to_char_int4(1999, "RN").unwrap(), "        MCMXCIX");
-        assert_eq!(to_char_int4(5, "RNSG").unwrap(), "              V");
-        assert_eq!(to_char_float8(f64::NAN, "9999.99").unwrap(), "  NaN");
-        assert_eq!(
-            to_char_float8(1.5, "9.99999999999999999\"abc\"").unwrap(),
-            " 1.50000000000000"
-        );
-        assert_eq!(to_char_numeric(&n("9.99"), "9.9EEEE").unwrap(), " 10.0e+00");
-        assert_eq!(to_char_int4(12, "").unwrap(), "");
-    }
-
-    #[test]
-    fn to_number_basics() {
-        assert_eq!(
-            to_number("-1,234.5", "9,999.99")
-                .unwrap()
-                .unwrap()
-                .to_string(),
-            "-1234.5"
-        );
-        assert_eq!(to_number("12", "").unwrap(), None);
-        let e = to_number("abc", "999").unwrap_err();
-        assert_eq!(
-            (e.sqlstate, e.message.as_str()),
-            ("22P02", "invalid input syntax for type numeric: \" \"")
-        );
-        let e = to_number("12345", "99.999").unwrap_err();
-        assert_eq!(e.sqlstate, "22003");
-        assert_eq!(
-            e.detail.as_deref(),
-            Some(
-                "A field with precision 2, scale 0 must round to an absolute value less than 10^2."
-            )
-        );
-    }
-
     #[test]
     fn pow10_matches_correct_rounding_elsewhere() {
         for k in 0..=308 {

@@ -24,7 +24,7 @@ disconnects.
 | Error | Fix |
 |---|---|
 | `publication "x" does not exist` | create the publication, or fix the name (it is case-sensitive) |
-| `table "s.t" has no primary key and REPLICA IDENTITY is not FULL` | add a primary key, `ALTER TABLE s.t REPLICA IDENTITY FULL`, or exclude the table with `FOR TABLES (...)` |
+| `table "s.t" has no primary key and REPLICA IDENTITY is not FULL` | add a primary key, `ALTER TABLE s.t REPLICA IDENTITY USING INDEX <unique index>` or `... REPLICA IDENTITY FULL`, or exclude the table with `FOR TABLES (...)` |
 | `relation "t" already exists` | another object (possibly a table of another source) has the same name; rename it or use separate publications |
 | `upstream table "s.t" has the same name as source "t"` | choose another source name |
 | connection errors, `sslmode=require is not supported` | the engine connects without TLS ([connection strings](sources.md#connection-strings)) |
@@ -40,19 +40,23 @@ the source keeps retrying.
 The source reconnects with backoff (up to 10 s) by itself. Persistent
 errors:
 
-- `replication slot "ivm_..." does not exist`: the slot was dropped
-  upstream. The source never re-creates a slot it created before; drop and
-  re-create the source (which takes a new initial snapshot).
+- `replication slot "ivm_..." does not exist (dropped upstream); re-creating
+  it ...` or `... was invalidated upstream ...`: the slot was dropped, or
+  invalidated by `max_slot_wal_keep_size`. The source re-creates it and
+  copies all its tables again by itself
+  ([Slots](sources.md#slots)).
 - authentication or permission errors: fix the role; the source picks the
   change up on its next attempt.
-- `relation "s.t" does not exist` or `permission denied for table t` while a
-  table still has to be copied: the source cannot continue at all until the
-  table is readable again; if it was removed from the publication or
-  dropped, drop and re-create the source
+- `cannot copy table s.t: relation "s.t" does not exist` or
+  `... permission denied for table t`: the table still has to be copied but
+  cannot be read. The source retries it (up to every 60 s) and streams the
+  other tables meanwhile; fix the privilege, or, if the table was dropped,
+  drop and re-create the source
   ([Sources](sources.md#tables-added-to-or-removed-from-the-publication)).
 
-The reconnect delay doubles up to 10 s and is never reset, so a source that
-has failed a few times retries only every 10 s.
+The reconnect delay doubles up to 10 s while sessions keep failing, and is
+reset to 200 ms by a session that replicated an upstream transaction or
+stayed connected for 10 s.
 
 ### Reads of a view fail with an error
 
@@ -98,9 +102,10 @@ schema and tables, and that an existing target table matches the relation's
 columns ([requirements](sinks.md#requirements-on-the-target)). After an
 outage, compare the target with the view: changes that arrived while the sink
 was reconnecting may be missing ([known problems](sinks.md#known-problems)).
-To force a resynchronisation, restart the engine or `DROP SINK` and
-`CREATE SINK` again: a new sink's snapshot is newer than any committed
-progress, so it rewrites the target from the snapshot.
+To force a resynchronisation, `DROP SINK` and `CREATE SINK` again: a new
+sink's snapshot is newer than any committed progress, so it rewrites the
+target from the snapshot. (A restart no longer does: a target that is up to
+date resumes.)
 
 ### Maintenance is slow
 
@@ -167,9 +172,10 @@ that are gone ([cleanup](sources.md#cleaning-up-upstream-slots)).
   `C.UTF-8` collation); `COLLATE` only accepts `C`, `default`, `ucs_basic`,
   `pg_c_utf8` and `C.UTF-8`.
 - `AS OF` reads use the current catalog.
-- Upstream: PostgreSQL 14+, tables need a primary key or
-  `REPLICA IDENTITY FULL`; publication row filters and column lists are not
-  supported; unknown types replicate as text.
+- Upstream: PostgreSQL 14+, not `SQL_ASCII`; tables need a primary key,
+  `REPLICA IDENTITY USING INDEX` or `REPLICA IDENTITY FULL`; publication row
+  filters and column lists are not supported; unknown types replicate as
+  text.
 
 ### DDL and DML
 
@@ -235,10 +241,7 @@ Problems found while writing and checking this documentation (at commit
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| `REPLICA IDENTITY USING INDEX` (an index other than the primary key) is accepted | upstream deletes and primary-key changes are silently lost | use `DEFAULT` or `FULL` |
-| Upstream primary-key or replica-identity changes are not detected | afterwards upstream deletes are silently lost | re-create the source |
-| Deletes during a re-snapshot after a schema change are skipped | rows deleted upstream right after a schema change stay in the replica | re-create the source after the change if it matters |
-| The decision to re-snapshot after a schema change is not logged until the first chunk completes | until then fresh reads do not wait and show NULL in new columns; a restart in that window forgets the re-snapshot for good | check new columns after such changes; re-create the source |
+| Primary-key changes of a `REPLICA IDENTITY FULL` or `NOTHING` table are not detected | the table stays keyed by the old key; if those columns stop being unique, rows with the same old key are merged | re-create the source after such a change |
 | A sink drops queued changes while reconnecting | the target misses changes after an outage, or after concurrent `CREATE SINK`s race on creating `ivm_sink_progress` | create `ivm_sink_progress` in advance; create sinks one at a time; resynchronise after outages |
 | Time-travel reads use indexes built after the read GSN | `AS OF` reads of a replaced (or re-indexed) materialized view, and point lookups through a newer index, return too few rows or none | read without the `WHERE column = constant` condition, or within the index's lifetime |
 | Error records: not retracted after a restart (aggregate groups) or when they existed at creation (aggregates without `GROUP BY`); errors below an index or of shared operators not counted at creation; not versioned for `AS OF`; errors in join conditions treated as no match | views fail although the data is fixed, or succeed although PostgreSQL would fail ([details](temporal-filters-and-errors.md#errors-as-data)) | drop and re-create the view |
@@ -251,8 +254,6 @@ Problems found while writing and checking this documentation (at commit
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
-| A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
-| The source reconnect delay is never reset | after a few failures every reconnect waits 10 s | none |
+| A table that cannot be read while its snapshot is incomplete (dropped, no `SELECT`) | it stays incomplete and is retried; the source's frontier does not advance, so `AS OF AT LEAST LSN` reads wait | grant `SELECT`, or re-create the source |
 | `SHOW read_mode` before `SET read_mode` | `unrecognized configuration parameter` | `SET read_mode = fresh` first |
 | `current_user`, `session_user`, `user`, `current_catalog` | `function ...() does not exist` | use a literal |

@@ -111,10 +111,15 @@ pub struct Shared {
     pub lsn_waiters: AtomicBool,
     /// Upstream position and ingest counters per source (web UI).
     pub source_gauges: Mutex<HashMap<u64, Arc<crate::source::SourceGauges>>>,
+    /// Replication slots of dropped sources still to be dropped (saved in
+    /// checkpoints).
+    pub slot_drops: Mutex<std::collections::BTreeSet<crate::source::SlotDrop>>,
     pub shutdown: AtomicBool,
     /// The engine or the sequencer thread stopped with an error (including
     /// a failed final checkpoint).
     pub failed: AtomicBool,
+    /// Stop without the final checkpoint (simulated crash, for tests).
+    pub crash: AtomicBool,
 }
 
 impl Shared {

@@ -109,7 +109,8 @@ ingest rate with a two-minute sparkline, and the masked connection string.
 
 The initial snapshot section shows how many tables are loaded and, per
 table, its upstream name, primary key, row count, state (`done`, `loading`,
-`pending`) and the snapshot boundary (the primary key of the last row
+`pending`, or `cannot read; retrying` with the error as tooltip) and the
+snapshot boundary (the primary key of the last row
 loaded; the next chunk starts after it). Tables load one at a time in
 primary-key-ordered chunks; the upstream row count is not known, so the
 table being loaded shows an animated bar and its growing row count. While
@@ -321,7 +322,7 @@ fill the gap.
 {
   "gsn": 65,
   "sources": [{
-    "id": 1000, "name": "shop", "publication": "shop_pub", "slot": "ivm_shop_1000",
+    "id": 1000, "name": "shop", "publication": "shop_pub", "slot": "ivm_shop_3f9a1c2e_1000",
     "conninfo": "host=127.0.0.1 port=5432 user=postgres dbname=shop password=***",
     "status": "streaming", "created_gsn": 3,
     "frontier_lsn": 67095592, "frontier": "0/3FFCC28",
@@ -341,7 +342,8 @@ keepalives and with commits), i.e. how far it has decoded, so `lag_bytes`
 measures what was decoded upstream but is not yet durable here. `commits`
 and `changes` count what the source handed to the input log since the
 process started (snapshot rows included). `snapshot` is `done`, `loading`
-(the table the chunk in flight belongs to) or `pending`.
+(the table the chunk in flight belongs to), `error` (its chunk query failed;
+`error` holds the message, and the source retries it) or `pending`.
 
 ### `GET /api/catalog` and `GET /api/catalog/history`
 

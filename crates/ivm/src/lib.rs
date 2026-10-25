@@ -18,6 +18,8 @@ pub mod source;
 pub mod sql;
 pub mod storage;
 pub mod sysrel;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub mod types;
 
 pub use error::{Result, SqlError};
