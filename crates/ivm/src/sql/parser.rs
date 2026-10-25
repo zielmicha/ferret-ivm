@@ -244,7 +244,26 @@ fn check_operator_chains(sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// Split a query string into statements at top-level semicolons.
+/// Whether `sql` holds nothing but whitespace and comments.
+fn is_blank(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let comment = b[i..].starts_with(b"--") || b[i..].starts_with(b"/*");
+        match skip_lexical(b, i) {
+            Some(end) if comment => i = end + 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Split a query string into statements at top-level semicolons (dropping
+/// statements that are only comments, as PostgreSQL does).
 pub fn split_statements(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
@@ -261,7 +280,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             b')' => depth -= 1,
             b';' if depth <= 0 => {
                 let s = sql[start..i].trim();
-                if !s.is_empty() {
+                if !is_blank(s) {
                     out.push(s.to_string());
                 }
                 start = i + 1;
@@ -271,7 +290,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         i += 1;
     }
     let s = sql[start..].trim();
-    if !s.is_empty() {
+    if !is_blank(s) {
         out.push(s.to_string());
     }
     out
@@ -491,7 +510,7 @@ fn parse_std(sql: &str) -> Result<ast::Statement> {
 /// Parse one statement.
 pub fn parse_statement(sql: &str) -> Result<Statement> {
     let sql = sql.trim().trim_end_matches(';').trim();
-    if sql.is_empty() {
+    if is_blank(sql) {
         return Ok(Statement::Empty);
     }
     check_operator_chains(sql)?;
@@ -850,6 +869,10 @@ mod tests {
         assert_eq!(v.len(), 4, "{v:?}");
         // escaped quotes in E'' strings, nested comments, tagged dollar quotes
         let v = split_statements(r"select E'a\';b'; select /* x /* y; */ z; */ 2; select $f$;$$;$f$; select 'ü;'");
+        // comment-only statements are no statements
+        assert_eq!(split_statements("select 1; -- done\n /* end */"), vec!["select 1"]);
+        assert!(split_statements("-- nothing").is_empty());
+        assert!(matches!(parse_statement("/* nothing */"), Ok(Statement::Empty)));
         assert_eq!(v, vec![r"select E'a\';b'", "select /* x /* y; */ z; */ 2", "select $f$;$$;$f$", "select 'ü;'"]);
     }
 

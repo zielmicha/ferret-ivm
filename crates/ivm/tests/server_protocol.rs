@@ -352,3 +352,14 @@ fn deep_prepared_statements_do_not_crash_sessions() {
     assert_eq!(first_values(&c.query("SELECT 2")), vec!["2"]);
     running.shutdown();
 }
+
+#[test]
+fn comment_only_statements_are_empty() {
+    let (running, port) = start("comments");
+    let mut c = Conn::connect(port);
+    // used to end with ERROR: empty statement
+    assert_eq!(tags(&c.query("SELECT 1; -- done")), "TDCZ");
+    assert_eq!(tags(&c.query("-- nothing")), "IZ");
+    assert_eq!(tags(&c.query("/* nothing */ ;")), "IZ");
+    running.shutdown();
+}
