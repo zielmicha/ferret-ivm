@@ -1039,6 +1039,53 @@ fn rejected_sink_batches_back_off_and_keep_the_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sink thread can outlive its sink: here its batch waits for a lock in
+/// the target while the sink is dropped and created again under the same
+/// name, and the new sink resynchronises the target. The old batch used to
+/// land afterwards anyway, leaving a row the relation no longer has, and to
+/// move the progress row back to its older GSN. Writers of a sink now take
+/// turns on the progress row, and one whose progress is outdated cannot
+/// write.
+#[test]
+fn a_sink_thread_outliving_its_sink_cannot_undo_the_new_one() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int)");
+    let dir = tmpdir("sink-zombie");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    let create = format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo);
+    ivm.exec(&create);
+    ivm.exec("INSERT INTO t VALUES (1, 1)");
+    eventually("the first row", || up.rows("SELECT id, v FROM target") == ["1|1"]);
+    // the sink's next batch waits for a transaction inserting the same key
+    let mut blocker = connect(&up.conninfo);
+    blocker.simple_query("BEGIN; INSERT INTO target VALUES (2, 999)").unwrap();
+    ivm.exec("INSERT INTO t VALUES (2, 2)");
+    eventually("the batch to wait", || {
+        up.rows("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND application_name <> 'psql'") == ["1"]
+    });
+    // meanwhile the sink is replaced by a new one with the same name, after
+    // the row is gone from the relation
+    ivm.exec("DROP SINK sk");
+    ivm.exec("DELETE FROM t WHERE id = 2");
+    ivm.exec("INSERT INTO t VALUES (3, 3)");
+    let gsn: i64 = ivm.rows("SHOW GSN")[0].parse().unwrap();
+    ivm.exec(&create);
+    std::thread::sleep(Duration::from_millis(500));
+    blocker.simple_query("ROLLBACK").unwrap();
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    eventually("the new sink to run", || status(&mut ivm).starts_with("running"));
+    // give the old thread's batch every chance to land
+    std::thread::sleep(Duration::from_millis(500));
+    ivm.exec("INSERT INTO t VALUES (4, 4)");
+    eventually("the next row", || up.rows("SELECT count(*) FROM target WHERE id = 4") == ["1"]);
+    assert_eq!(up.rows("SELECT id, v FROM target ORDER BY id"), ["1|1", "3|3", "4|4"]);
+    let progress: i64 = up.rows("SELECT gsn FROM ivm_sink_progress WHERE sink = 'sk'")[0].parse().unwrap();
+    assert!(progress > gsn, "progress {progress} is behind the new sink's snapshot (after GSN {gsn})");
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Tests driving the engine through its API (`EngineHandle::execute`)
 /// rather than the wire protocol.
 mod api {

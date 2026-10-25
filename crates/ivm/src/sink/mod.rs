@@ -43,8 +43,9 @@ impl SinkHandle {
     /// Ask the sink thread to stop, without waiting for it: it may be in a
     /// connection attempt or a long write, which the engine thread must not
     /// wait for. Returns the thread, to join where waiting is fine. (A thread
-    /// that outlives its sink cannot undo a newer sink of the same name: it
-    /// resumes from the progress row, which only moves forward.)
+    /// that outlives its sink cannot undo a newer sink of the same name:
+    /// writers take turns on the progress row, which only moves forward, and
+    /// one whose progress is outdated cannot write; see `postgres::Writer`.)
     pub fn stop(mut self) -> Option<std::thread::JoinHandle<()>> {
         let _ = self.tx.send(SinkMsg::Stop);
         self.thread.take()

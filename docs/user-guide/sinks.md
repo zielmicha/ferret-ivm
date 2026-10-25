@@ -96,13 +96,25 @@ transaction:
 
 ```sql
 BEGIN;
+SELECT gsn FROM ivm_sink_progress WHERE sink = '<name>' FOR UPDATE;
+-- (checked by the sink before it goes on, see below)
 -- for each GSN in order:
 --   one DELETE per removed row instance, then
 --   INSERTs of the added rows (500 rows per statement)
 INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('<name>', <last gsn delivered>)
-  ON CONFLICT (sink) DO UPDATE SET gsn = EXCLUDED.gsn;
+  ON CONFLICT (sink) DO UPDATE SET gsn = GREATEST(ivm_sink_progress.gsn, EXCLUDED.gsn);
 COMMIT;
 ```
+
+Every write — a flush, a progress update, a resynchronisation — first locks
+the sink's progress row, so that the writers of one sink take turns, and
+checks it: a flush or progress update goes on only if the row still holds
+the progress this thread last committed (or read), a resynchronisation only
+if the row is not after its snapshot GSN. Otherwise another writer has
+moved it — a newer sink of the same name, while this thread was stopping
+(see [DROP SINK](#monitoring-and-drop-sink)) — and the transaction is rolled
+back (`error: sink progress moved to gsn <n> by another writer`). The
+progress row itself never moves backwards.
 
 With `KEY`:
 
@@ -228,10 +240,12 @@ drops the sink.
 
 The engine does not wait for the sink thread: the thread stops by itself as
 soon as it sees the request (a sink retrying its connection, or stuck in a
-connection attempt, can take a while). A sink thread that outlives its sink
-cannot undo the work of a new sink of the same name: it resumes from the
-progress row, which only moves forward. At shutdown the engine waits up to
-5 s for its sinks to stop.
+connection attempt or a long write, can take a while). A sink thread that
+outlives its sink cannot undo the work of a new sink of the same name: a
+write it has in progress holds the progress row's lock, so the new sink's
+resynchronisation waits for it and then rewrites the target, and a write it
+starts after the new sink wrote fails the progress check. At shutdown the
+engine waits up to 5 s for its sinks to stop.
 
 ## Known problems
 

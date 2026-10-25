@@ -59,6 +59,16 @@ fn qtable(t: &str) -> String {
     t.split('.').map(qident).collect::<Vec<_>>().join(".")
 }
 
+/// What a write transaction requires of the committed progress (see
+/// `Writer::begin`).
+#[derive(Clone, Copy)]
+enum Check {
+    /// This writer's progress: it applies changes on top of it.
+    Is(Gsn),
+    /// At most this writer's snapshot GSN: it rewrites the target.
+    NotAfter(Gsn),
+}
+
 struct Writer {
     client: pgproto::Client,
     sink: String,
@@ -105,11 +115,56 @@ impl Writer {
         Ok(r.rows.first().and_then(|row| row[0].as_ref()).and_then(|s| s.parse().ok()))
     }
 
+    /// The progress upsert; the row only moves forward.
     fn progress_sql(&self, gsn: Gsn) -> String {
         format!(
-            "INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('{}', {gsn}) ON CONFLICT (sink) DO UPDATE SET gsn = EXCLUDED.gsn",
+            "INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('{}', {gsn}) \
+             ON CONFLICT (sink) DO UPDATE SET gsn = GREATEST(ivm_sink_progress.gsn, EXCLUDED.gsn)",
             self.sink.replace('\'', "''")
         )
+    }
+
+    /// Open a write transaction holding the lock of the sink's progress row,
+    /// so that the writers of a sink take turns: a sink thread can outlive
+    /// its sink (it is not waited for, and may be in a long write) while a
+    /// new sink of the same name starts. The row must pass `check` (or be
+    /// missing): otherwise another writer moved it, and this writer's
+    /// changes, made for another state of the target, must not land.
+    fn begin(&mut self, check: Check) -> Result<()> {
+        let r = self.client.simple_query(&format!(
+            "BEGIN; SELECT gsn FROM ivm_sink_progress WHERE sink = '{}' FOR UPDATE",
+            self.sink.replace('\'', "''")
+        ));
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.client.simple_query("ROLLBACK");
+                return Err(e.into());
+            }
+        };
+        let current: Option<Gsn> = r.iter().find_map(|q| q.rows.first()).and_then(|row| row[0].as_deref()).and_then(|s| s.parse().ok());
+        let moved = match (current, check) {
+            (None, _) => None,
+            (Some(c), Check::Is(g)) => (c != g).then(|| format!("sink progress moved to gsn {c} by another writer (this one is at {g})")),
+            (Some(c), Check::NotAfter(g)) => {
+                (c > g).then(|| format!("sink progress is at gsn {c}, after this writer's snapshot at {g}: another writer is newer"))
+            }
+        };
+        if let Some(m) = moved {
+            let _ = self.client.simple_query("ROLLBACK");
+            return Err(crate::error::SqlError::new(crate::error::codes::OBJECT_NOT_IN_PREREQUISITE_STATE, m));
+        }
+        Ok(())
+    }
+
+    /// Run the rest of a transaction `begin` opened, ending with COMMIT.
+    fn commit(&mut self, mut sql: String) -> Result<()> {
+        sql.push_str("; COMMIT;");
+        if let Err(e) = self.client.simple_query(&sql) {
+            let _ = self.client.simple_query("ROLLBACK");
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     fn insert_sql(&self, rows: &[&Row]) -> String {
@@ -172,28 +227,31 @@ impl Writer {
 
     /// Replace the target contents with a snapshot.
     fn resync(&mut self, rows: &Delta, gsn: Gsn) -> Result<()> {
-        let mut sql = format!("BEGIN; DELETE FROM {};", self.table);
+        // (after a write of another writer still in progress: its rows go too)
+        self.begin(Check::NotAfter(gsn))?;
+        let mut sql = format!("DELETE FROM {};", self.table);
         let expanded: Vec<&Row> = rows.iter().flat_map(|(r, w)| std::iter::repeat_n(r, (*w).max(0) as usize)).collect();
         for chunk in expanded.chunks(500) {
             sql.push_str(&self.insert_sql(chunk));
             sql.push(';');
         }
         sql.push_str(&self.progress_sql(gsn));
-        sql.push_str("; COMMIT;");
-        self.client.simple_query(&sql)?;
-        Ok(())
+        self.commit(sql)
     }
 
-    /// Record that the target is as of `gsn` (nothing pending).
-    fn save_progress(&mut self, gsn: Gsn) -> Result<()> {
-        self.client.simple_query(&self.progress_sql(gsn))?;
-        Ok(())
+    /// Record that the target is as of `gsn` (nothing pending; the
+    /// committed progress is `applied`).
+    fn save_progress(&mut self, gsn: Gsn, applied: Gsn) -> Result<()> {
+        self.begin(Check::Is(applied))?;
+        let sql = self.progress_sql(gsn);
+        self.commit(sql)
     }
 
     /// Apply a batch and record that the target is as of `progress` (at
-    /// least the batch's last GSN).
-    fn apply(&mut self, batch: &[(Gsn, Delta)], progress: Gsn) -> Result<()> {
-        let mut sql = String::from("BEGIN;");
+    /// least the batch's last GSN; the committed progress is `applied`).
+    fn apply(&mut self, batch: &[(Gsn, Delta)], progress: Gsn, applied: Gsn) -> Result<()> {
+        self.begin(Check::Is(applied))?;
+        let mut sql = String::new();
         for (_, delta) in batch {
             // retractions first, then insertions (an update is -old +new)
             for (r, w) in delta.iter().filter(|(_, w)| *w < 0) {
@@ -209,12 +267,7 @@ impl Writer {
             }
         }
         sql.push_str(&self.progress_sql(progress));
-        sql.push_str("; COMMIT;");
-        if let Err(e) = self.client.simple_query(&sql) {
-            let _ = self.client.simple_query("ROLLBACK");
-            return Err(e.into());
-        }
-        Ok(())
+        self.commit(sql)
     }
 }
 
@@ -336,7 +389,7 @@ pub fn run(
         let w = writer.as_mut().unwrap();
         let rows: usize = pending.iter().map(|(_, d)| d.len()).sum();
         let written = if !pending.is_empty() && (stop || rows > 1000 || last_flush.elapsed() > Duration::from_millis(100)) {
-            let r = w.apply(&pending, seen);
+            let r = w.apply(&pending, seen, applied.unwrap_or(snapshot_gsn));
             if r.is_ok() {
                 applied = Some(seen);
                 pending.clear();
@@ -347,7 +400,7 @@ pub fn run(
         } else if pending.is_empty() && applied.is_some_and(|a| a < seen) && (stop || last_progress.elapsed() >= PROGRESS_INTERVAL) {
             // nothing changed since: the target is current as of `seen`
             last_progress = Instant::now();
-            let r = w.save_progress(seen);
+            let r = w.save_progress(seen, applied.unwrap_or(snapshot_gsn));
             if r.is_ok() {
                 applied = Some(seen);
             }
