@@ -334,3 +334,50 @@ fn aggregate_errors_retract_after_recovery() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Run a statement, failing (instead of hanging) if no reply comes: a DML
+/// whose dataflow step fails is never acknowledged.
+fn exec_within(h: &EngineHandle, sql: &str, secs: u64) {
+    let (h2, sql2) = (h.clone(), sql.to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(try_exec(&h2, &sql2).map(|_| ()));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(r) => r.unwrap_or_else(|e| panic!("{sql}: {e}")),
+        Err(_) => panic!("{sql}: no reply within {secs}s (its dataflow step failed)"),
+    }
+}
+
+/// An expression error while evaluating a recursive query is an error
+/// record of the view (its rows retract until the query recovers), not a
+/// failed step: the failed step was never acknowledged and left the
+/// dataflow half-updated.
+#[test]
+fn recursive_query_errors_are_data() {
+    let dir = tmpdir("recursive-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, x int)");
+    exec(&h, "INSERT INTO t VALUES (1, 4)");
+    let q = "WITH RECURSIVE r(n) AS (SELECT x FROM t UNION SELECT 100 / n FROM r WHERE n <> 1) SELECT n FROM r";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW r1 AS {q}"));
+    assert_eq!(rows(&h, "SELECT * FROM r1 ORDER BY n"), ["4", "25"]);
+    exec_within(&h, "INSERT INTO t VALUES (2, 0)", 20);
+    let div0 = Some("22012 division by zero".to_string());
+    assert_eq!(read_error(&h, "SELECT * FROM r1"), div0);
+    exec(&h, &format!("CREATE MATERIALIZED VIEW r2 AS {q}")); // failing when created
+    assert_eq!(read_error(&h, "SELECT * FROM r2"), div0);
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(read_error(&h, "SELECT * FROM r1"), div0);
+    exec_within(&h, "DELETE FROM t WHERE id = 2", 20);
+    exec_within(&h, "INSERT INTO t VALUES (3, 5)", 20);
+    for v in ["r1", "r2"] {
+        assert_eq!(rows(&h, &format!("SELECT * FROM {v} ORDER BY n")), ["4", "5", "20", "25"], "{v}");
+    }
+    assert_eq!(rows(&h, "SELECT * FROM t ORDER BY id"), ["1|4", "3|5"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -174,6 +174,7 @@ pub type OpErrors = Arc<parking_lot::Mutex<BTreeMap<Vec<u8>, (String, String)>>>
 fn operator_errors(kind: &NodeKind) -> Option<&OpErrors> {
     match kind {
         NodeKind::Reduce(p) => Some(&p.errors),
+        NodeKind::Recursive(p) => Some(&p.errors),
         _ => None,
     }
 }

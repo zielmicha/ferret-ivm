@@ -276,6 +276,7 @@ impl<'a> Lowerer<'a> {
                     distinct: *distinct,
                     sources,
                     out_arr: usize::MAX,
+                    errors: Default::default(),
                 };
                 let full = Layout::full(columns);
                 let node = self.g.add_node_with_output_arr(
