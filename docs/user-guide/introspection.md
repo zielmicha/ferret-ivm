@@ -134,7 +134,7 @@ All results are text columns, except `SHOW GSN`.
 |---|---|
 | `SHOW SOURCES` | `name`, `publication`, `slot`, `tables`, `lsn`, `status` ([Sources](sources.md#monitoring)) |
 | `SHOW TABLES` | `name`, `source` (source name or `(local)`), `rows` (sum of multiplicities in the primary index) |
-| `SHOW VIEWS` | `name`, `kind` (`materialized` or `virtual`), `rows` (materialized views: rows in the view's index), `errors` (number of distinct error records currently present) |
+| `SHOW VIEWS` | `name`, `kind` (`materialized` or `virtual`), `rows` (materialized views: rows in the view's index), `errors` (number of distinct error records currently present), `status` (materialized views: `ok`, or `broken: <reason>` for a view that is not maintained, see [Operations](operations.md#recovery)) |
 | `SHOW MATERIALIZED VIEWS` | same as `SHOW VIEWS`, materialized views only |
 | `SHOW INDEXES` | `name`, `on` (relation), `columns` (0-based column positions, e.g. `[2]`) |
 | `SHOW SINKS` | `name`, `from`, `table`, `status` ([Sinks](sinks.md#monitoring-and-drop-sink)) |
@@ -162,7 +162,7 @@ SELECT * FROM ivm.objects;
 
 | Relation | Columns | Contents |
 |---|---|---|
-| `ivm.catalog_history` | `gsn bigint`, `statement text` | every DDL statement that was applied successfully, with its GSN, in order — including statements of objects that have since been dropped. "What did the catalog look like at GSN g?" is a query over it, with two gaps: upstream schema changes rewrite table definitions without an entry, and a multi-object `DROP` that failed part-way (after dropping some objects) is missing. |
+| `ivm.catalog_history` | `gsn bigint`, `statement text` | every DDL statement that was applied successfully, with its GSN, in order — including statements of objects that have since been dropped; the most recent 10,000 (up to 11,000) are kept. "What did the catalog look like at GSN g?" is a query over it, with one gap: upstream schema changes rewrite table definitions without an entry. |
 | `ivm.objects` | `oid oid`, `name text`, `kind text`, `created_gsn bigint`, `definition text` | the current catalog objects: OID (`16384 + id`), name, kind (`table`, `view`, `materialized view`, `index`, `source`, `sink`), the GSN of the statement that created (or last replaced) the object, and its stored statement |
 
 Both are computed from the catalog when a query is planned; they are not

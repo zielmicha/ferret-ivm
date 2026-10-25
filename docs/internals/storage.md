@@ -225,7 +225,9 @@ id once it reaches 256 MiB. A checkpoint (`Env::checkpoint(gsn, app)`):
 
 On open, the last valid manifest record defines the state: the active
 segment is truncated to the recorded length, and segment files the record
-does not mention are deleted.
+does not mention are deleted. Without a valid record, a store that may have
+had a checkpoint — a non-empty manifest, or no manifest but segment files
+with data — is refused instead, and nothing is modified.
 
 ## Garbage collection
 

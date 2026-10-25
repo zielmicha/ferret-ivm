@@ -394,7 +394,10 @@ a7 00 00 00  78 16 b4 e1     len 167, crc
   that is incomplete or fails its CRC, and the file is truncated to the end of
   the last valid frame (without `fsync`). The last valid record is the
   recovered checkpoint; a record that passes its CRC but does not decode
-  aborts start-up.
+  aborts start-up. A non-empty manifest without any valid record, and a
+  missing manifest while segment files hold data, also abort start-up,
+  modifying nothing (opening would otherwise delete the segments). A new
+  manifest is created empty and the directory `fsync`ed.
 - **Append** (the checkpoint's commit point): the frame is written at the end
   of the file with a positioned write and the file is `fdatasync`ed. Before
   that, all nodes the record refers to have been written and `fsync`ed.
@@ -413,6 +416,10 @@ a7 00 00 00  78 16 b4 e1     len 167, crc
    `fsync`ed.
 3. The checkpoint record is appended to the manifest.
 4. Sealed segments whose `live_bytes` is 0 are deleted.
+
+Creating a segment file (the first one, and each new active segment) is
+followed by an `fsync` of the store directory, so that a checkpoint never
+refers to a file whose directory entry a crash could lose.
 
 ## Checkpoint application state (AppState)
 
@@ -449,7 +456,7 @@ with `serde_json`):
 |---|---|
 | `catalog.objects` | map from object id (as a JSON string key) to `CatalogObject` |
 | `catalog.next_id` | next object id |
-| `catalog.history` | `[gsn, statement]` of every successfully applied DDL statement (`ivm.catalog_history`) |
+| `catalog.history` | `[gsn, statement]` of the successfully applied DDL statements (`ivm.catalog_history`): the most recent 10,000 (trimmed back to 10,000 when it reaches 11,000) |
 | `catalog.instance_id` | the data directory's random id in default slot names, set by the first `CREATE SOURCE`; `null` if absent |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view: its error records `[[sqlstate, message], count]` |
@@ -457,6 +464,7 @@ with `serde_json`):
 | `source_lsns` | per source: the end LSN of its last logged commit (resume point); `[]` if absent |
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
+| `ticks` | `[gsn, clock]` of the clock ticks in the retention window (at most the last 100,000), for `now()` in reads as of earlier GSNs; `[]` if absent (then `[[checkpoint gsn, clock]]`) |
 | `slot_drops` | replication slots of dropped sources not dropped upstream yet (`conninfo`, `slot`), retried after the start; `[]` if absent |
 
 `CatalogObject`: `id`, `name`, `kind`, `created_gsn`, `create_sql` (the
@@ -834,13 +842,13 @@ Consequences of code changes for an existing data directory:
 | Change | Consequence |
 |---|---|
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible |
-| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState`, were added with `#[serde(default)]`.) |
+| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState`, were added with `#[serde(default)]`.) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/primary-key text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
 | inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again |
 | semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
 | planner or lowering changes that produce different plans for the same SQL | as for fingerprint changes: the views are rebuilt |
-| catalog SQL that no longer binds (removed syntax or functions) | the engine fails to start while re-planning the view |
+| catalog SQL that no longer binds (removed syntax or functions) | the view (and what reads it) is marked broken at start-up: not maintained, reads of it fail with the reason; drop it or repair it with `CREATE OR REPLACE` ([Operations](user-guide/operations.md#recovery)) |
 
 An upgrade that changes any of the "incompatible" rows requires starting
 from an empty data directory (and re-creating sources, which re-snapshot the

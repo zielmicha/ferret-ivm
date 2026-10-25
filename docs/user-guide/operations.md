@@ -37,9 +37,11 @@ Things to keep in mind when sizing:
   thread, so the engine uses about one core for its work (plus the
   sequencer, one thread per source, sink and client session).
 - **Memory outside the cache**: hydration of a new view holds snapshots of
-  intermediate results; aggregation group caches; subscription queues are
-  unbounded; the in-memory LSN→GSN map keeps the last 100,000 upstream
-  commits.
+  intermediate results; aggregation group caches; subscription and sink
+  queues are unbounded. The queue of logged records the engine has yet to
+  apply is bounded: when the engine is 10,000 records behind, the log stops
+  taking new records until it catches up (sources then pause reading the
+  replication stream, and the upstream keeps the WAL).
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
 
@@ -89,12 +91,17 @@ Every start is a recovery:
 3. Open the store: read the manifest, take its last valid record as the
    checkpoint, truncate the active segment to the length recorded in it, and
    delete segment files the checkpoint does not reference (written after
-   it).
+   it). A store whose manifest is missing (while segment files hold data)
+   or has no valid record stops the start, untouched.
 4. Restore the catalog and engine state from the checkpoint, rebuild the
    dataflow from the catalog, and attach every index whose structure matches
    one in the checkpoint. A table whose primary index is not in the
    checkpoint stops the start (its rows exist nowhere else). Indexes that do
-   not match are rebuilt from the recovered ones.
+   not match are rebuilt from the recovered ones. A materialized view whose
+   stored definition can no longer be planned (code that became stricter,
+   or a catalog that drifted) does not stop the start: it is logged and
+   kept in the catalog as **broken**, together with the indexes on it, the
+   views reading it and the sinks reading it (which are not started).
 5. Restart sinks from the checkpoint's state (a target that is up to date
    resumes; one that is behind is resynchronised), then replay the
    input-log records after the checkpoint's GSN, which also reach the sinks.
@@ -113,9 +120,17 @@ Startup failures and what they mean:
 | `cannot decode checkpoint state: ...` | the checkpoint was written by an incompatible version ([Compatibility](../on-disk-format.md#compatibility)) |
 | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | the table's primary index cannot be found by its structural fingerprint — usually an incompatible version |
 | `node checksum mismatch at ...`, `cannot open segment ...` | damaged or missing store files |
-| any planning error (`relation "x" does not exist`, `column "b" does not exist`) | a materialized view in the catalog can no longer be planned; see [Troubleshooting](troubleshooting.md#the-engine-does-not-start) |
-| `index target without dataflow`, `sink source without dataflow` | a materialized view with an index or a sink was replaced by a virtual view ([Known problems](troubleshooting.md#known-problems)) |
+| `.../MANIFEST has no valid checkpoint record ...`, `.../MANIFEST is missing but segment files hold data ...` | the manifest is damaged or was deleted; nothing was modified. Restore it (or the data directory) from a backup. If the engine crashed during its very first checkpoint, removing `store/` is safe: the store is rebuilt from the log (start-up refuses if the log no longer starts at GSN 1) |
 | a panic (`thread 'main' panicked at ...`, `has overflowed its stack`) | a bug triggered by the catalog or the log, for example an index whose columns no longer exist after an upstream schema change or a `CREATE OR REPLACE`, or a `DISTINCT` aggregate with `FILTER` ([Known problems](troubleshooting.md#known-problems)) |
+
+A broken object is not maintained. Reading it, or anything reading it,
+fails with SQLSTATE `55000` and the reason (`materialized view "v" is broken:
+column "b" does not exist`); `SHOW VIEWS` (`status`), `SHOW SINKS` and the
+web UI (catalog and errors pages) show it. `DROP` removes it (with `CASCADE`,
+what depends on it), and `CREATE OR REPLACE MATERIALIZED VIEW` with a
+definition that plans repairs it: the view is built and hydrated again, the
+views reading it with it, its indexes are rebuilt and its sinks start. Every
+start tries to build broken views again.
 
 ## Checkpoints and garbage collection
 
@@ -174,10 +189,12 @@ GSN, see an older state until the log has caught up with the checkpoint. Use
 
 ## Stopping and restarting
 
-See [Stopping the server](getting-started.md#stopping-the-server). Because
-recovery replays the log, any way of stopping — stop file, `SIGTERM`,
-`SIGKILL`, a crash — loses no acknowledged change. Upstream WAL is retained
-in the slots while the engine is down.
+See [Stopping the server](getting-started.md#stopping-the-server): `SIGINT`,
+`SIGTERM` and the stop file take a final checkpoint, so the next start has
+no log to replay. Because recovery replays the log, any other way of
+stopping — a second signal, `SIGKILL`, a crash — loses no acknowledged
+change either. Upstream WAL is retained in the slots while the engine is
+down.
 
 ## What is safe to delete
 

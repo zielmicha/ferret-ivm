@@ -37,10 +37,8 @@ Where the implementation differs from the design:
   threads, but the dataflow is not partitioned across cores.
 - **Atomic checkpoints** of all indexes at one GSN instead of per-arrangement
   durable frontiers ([Recovery](recovery.md)).
-- **No persisted LSN→GSN mapping.** Each commit record carries its LSN, and
-  `AS OF AT LEAST LSN` waits for the per-source LSN frontiers; the engine
-  keeps an in-memory list of recent (source, LSN, GSN) triples
-  (`Engine::lsn_map`) that nothing reads.
+- **No LSN→GSN mapping.** Each commit record carries its LSN, and
+  `AS OF AT LEAST LSN` waits for the per-source LSN frontiers.
 - **Recursion by recomputation.** `WITH RECURSIVE` recomputes the fixpoint
   instead of using nested time ([Dataflow](dataflow.md#recursive)).
 - **Planning.** Join orders use equality edges, unique keys and exact index
@@ -53,14 +51,16 @@ Where the implementation differs from the design:
 
 | Thread | Owns | Does |
 |---|---|---|
-| main | the listening socket | parses flags, runs recovery (`coord::start`), then accepts connections forever (`server::serve`) |
+| main | | parses flags, binds the listening socket, runs recovery (`coord::start`), starts the listener, then waits for a shutdown request (or for the engine to stop by itself) and shuts down after a final checkpoint |
+| `ivm-listener` | the listening socket | accepts connections (`server::serve_listener`) |
+| `ivm-signals` | | turns the first `SIGINT`/`SIGTERM` into a shutdown request; a second one exits the process at once |
 | `ivm-sequencer` | the input-log writer | assigns GSNs, appends and `fsync`s records in batches, generates clock ticks, acknowledges submitters, forwards durable records to the engine |
 | `ivm-engine` | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, takes checkpoints |
 | `ivm-session-<n>` (one per client) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
-| stop-file watcher | | polls for `.ivm-stop` every 500 ms; when it appears, requests a shutdown and exits the process at once, without waiting for the final checkpoint |
-| slot-drop helpers | | short-lived; drop a replication slot after `DROP SOURCE` |
+| `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, requests a shutdown |
+| slot-drop helpers | | drop a replication slot after `DROP SOURCE`, retrying (also while the stopping source's session still holds it) until it is dropped |
 
 There is exactly one engine thread: all dataflow maintenance, all index
 reads and writes, and all query execution happen on it. Everything that
@@ -172,6 +172,14 @@ record. `--no-sync` skips the `fsync` but keeps the order.
 `SeqMsg::Truncate(gsn)` (sent after each checkpoint) deletes old log
 segments; `SeqMsg::Shutdown` stops the sequencer after the current batch.
 
+Backpressure: before each batch the sequencer waits while the engine has
+`MAX_ENGINE_LAG` (10,000) or more durable records still to apply
+(`durable_gsn - processed_gsn`; not while shutting down). Acknowledgements
+then stop, sources block once 10,000 of their commits are unacknowledged,
+and the engine's queue of durable batches stays bounded. The engine never
+waits for the sequencer (its appends are not acknowledged synchronously),
+so it always catches up.
+
 ## The engine loop
 
 The engine thread waits for an `EngineMsg` with a 200 ms timeout and
@@ -179,12 +187,12 @@ handles:
 
 | Message | Action |
 |---|---|
-| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread, any other error leaves the record half-applied without advancing `processed` or replying to the client |
+| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread; any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
-| `Wake` | a source frontier moved: re-check reads waiting for an LSN |
-| `Shutdown` | stop sources and sinks, stop the sequencer, take a final checkpoint, exit (the stop-file path exits the process before this completes) |
+| `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
+| `Shutdown` | ask sources and sinks to stop, stop the sequencer, take a final checkpoint, wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
 takes a checkpoint if one is due, and removes cancelled subscriptions.
@@ -224,9 +232,7 @@ Frontiers derived from it:
 
 Upstream LSNs are mapped to the GSN clock through the log: every source
 `Commit` record carries the upstream transaction's end LSN. The engine keeps
-the last logged LSN per source (checkpointed as the source's resume point)
-and an in-memory list of the last 100,000 (source, LSN, GSN) triples, which
-nothing reads at present.
+the last logged LSN per source (checkpointed as the source's resume point).
 
 Reads choose a GSN from these frontiers
 ([Reads](../user-guide/reads.md#read-points)): a fresh read takes the
@@ -249,11 +255,20 @@ While an LSN read waits, `want_keepalive` makes the sources request a
 keepalive from the upstream, so that the frontier advances to the server's
 current WAL position even without traffic.
 
+Each request carries its session's `Interrupts` (in `SessionVars`): a
+`CancelRequest` sets `cancel` (and sends `Wake`), and the session sets
+`gone` when its client disconnects while it waits (`execute_while` checks
+the socket every 200 ms). `wake_parked` answers a parked read of a
+cancelled statement with `57014` and drops one whose client is gone; queued
+DML (`dml_queue`) is cancelled the same way, but still runs when only its
+client is gone.
+
 ## The logical clock
 
 The engine's logical clock (`Engine::clock`, PostgreSQL epoch microseconds)
 is the maximum of the tick times applied so far. A deque of recent
 (GSN, clock) pairs lets a read at GSN *g* evaluate `now()` as the clock at
-*g* (`clock_at`); pairs older than the retention frontier are dropped, and
-after a restart the deque starts at the checkpoint's clock. The dataflow sees
+*g* (`clock_at`); pairs older than the retention frontier are dropped.
+Checkpoints save the deque (at most its last 100,000 pairs; `AppState::ticks`),
+so reads as of earlier GSNs see the same clock after a restart. The dataflow sees
 the clock as `Graph::now`; temporal-filter operators run whenever it moves.

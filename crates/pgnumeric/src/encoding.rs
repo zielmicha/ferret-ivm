@@ -325,6 +325,16 @@ pub(crate) fn encode_binary(n: &Numeric, out: &mut Vec<u8>) {
 }
 
 pub(crate) fn decode_binary(buf: &[u8]) -> Result<(Numeric, usize)> {
+    decode_binary_checked(buf, true)
+}
+
+/// `decode_binary`, also accepting finite values beyond the storage format's
+/// range (results of unbounded arithmetic, see `Numeric::add_unbounded`).
+pub(crate) fn decode_binary_unbounded(buf: &[u8]) -> Result<(Numeric, usize)> {
+    decode_binary_checked(buf, false)
+}
+
+fn decode_binary_checked(buf: &[u8], check_range: bool) -> Result<(Numeric, usize)> {
     let h = *buf.first().ok_or_else(|| bin_error("empty input"))?;
     match h {
         BIN_NAN => return Ok((Numeric::nan(), 1)),
@@ -372,7 +382,13 @@ pub(crate) fn decode_binary(buf: &[u8]) -> Result<(Numeric, usize)> {
         dscale: dscale as i32,
         digits,
     };
-    let v = make_result(v).map_err(|_| bin_error("value out of range"))?;
+    let v = if check_range {
+        make_result(v).map_err(|_| bin_error("value out of range"))?
+    } else {
+        let mut v = v;
+        strip_var(&mut v);
+        v
+    };
     if !v.digits.is_empty() && min_scale_of(&v) > v.dscale {
         return Err(bin_error("scale hides digits"));
     }

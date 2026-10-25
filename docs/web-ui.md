@@ -201,14 +201,17 @@ committed GSN and how far behind the engine they are.
 
 Error records held by materialized views (errors are data: an expression
 error becomes an error record, and reads of the view fail until the
-offending rows are gone), and sources or sinks in an error state. The
-number of view error records also appears as a badge in the navigation.
+offending rows are gone), sources or sinks in an error state, and broken
+materialized views and indexes (not maintained since a start at which their
+definition could no longer be planned; see
+[Operations](user-guide/operations.md#recovery)). The number of view error
+records also appears as a badge in the navigation.
 
 ### History
 
-Every DDL statement with the GSN it took effect at, newest first, filterable
-by text and by kind (create, drop, alter). The same history is queryable as
-`ivm.catalog_history`.
+Every DDL statement with the GSN it took effect at (the most recent 10,000),
+newest first, filterable by text and by kind (create, drop, alter). The same
+history is queryable as `ivm.catalog_history`.
 
 ### SQL console
 
@@ -463,8 +466,10 @@ produced. Fields that do not apply are `null`.
 `target` is null for a subscription to an ad hoc query; `wait` is `gsn`,
 `lsn` or `snapshot`. `/api/errors` returns `{"gsn", "views": [{"id", "name",
 "code", "message", "count"}], "sources": [{"id", "name", "status"}],
-"sinks": [...]}`, listing sources and sinks whose status starts with
-`error`.
+"sinks": [...], "broken": [...]}`, listing sources and sinks whose status
+starts with `error`, and broken materialized views and indexes (status
+`error: broken: <reason>`, also the `status` of such objects in
+`/api/catalog`).
 
 ### `POST /api/query`
 

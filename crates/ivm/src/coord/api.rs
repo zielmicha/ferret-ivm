@@ -50,6 +50,31 @@ impl std::fmt::Debug for ExecResult {
 pub struct SessionVars {
     /// "fresh" (default) or "latest".
     pub read_mode: String,
+    /// Interrupts of the session's statements (None: never interrupted).
+    pub interrupts: Option<Arc<Interrupts>>,
+}
+
+/// Interrupts of a session's statement, set by the session thread and
+/// checked by the engine while the statement waits (a parked read, DML
+/// queued behind another statement).
+#[derive(Debug, Default)]
+pub struct Interrupts {
+    /// A CancelRequest for the running statement (reset when the next
+    /// statement starts).
+    pub cancel: AtomicBool,
+    /// Nobody waits for the result any more: the client disconnected, or
+    /// gave up waiting.
+    pub gone: AtomicBool,
+}
+
+impl Interrupts {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
+    pub fn gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
 }
 
 pub enum Request {
@@ -90,6 +115,9 @@ pub struct Shared {
     /// checkpoints).
     pub slot_drops: Mutex<std::collections::BTreeSet<crate::source::SlotDrop>>,
     pub shutdown: AtomicBool,
+    /// The engine or the sequencer thread stopped with an error (including
+    /// a failed final checkpoint).
+    pub failed: AtomicBool,
     /// Stop without the final checkpoint (simulated crash, for tests).
     pub crash: AtomicBool,
 }

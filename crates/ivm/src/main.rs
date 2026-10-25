@@ -1,4 +1,10 @@
 //! ivm server binary.
+//!
+//! Exit status: 0 after a requested shutdown (SIGINT, SIGTERM or the stop
+//! file) whose final checkpoint succeeded; 1 when the server cannot start
+//! (the listen address, the data directory, recovery, the web UI), when it
+//! stops because of an error, or on a second shutdown signal; 2 for bad
+//! command-line arguments.
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -19,9 +25,20 @@ fn usage() -> ! {
          \n\
          --http-listen ADDR  serve the web UI and JSON API on ADDR (e.g. 127.0.0.1:6876);\n\
          \x20                   off by default. With --password, it requires HTTP Basic\n\
-         \x20                   auth with that password (any user name)."
+         \x20                   auth with that password (any user name).\n\
+         \n\
+         SIGINT, SIGTERM or a file named .ivm-stop in the working directory stop the\n\
+         server after a final checkpoint; a second signal exits at once."
     );
     std::process::exit(2)
+}
+
+/// Why the server stops.
+enum Stop {
+    /// A shutdown was requested (signal or stop file).
+    Requested(&'static str),
+    /// The server failed.
+    Failed(String),
 }
 
 fn main() {
@@ -49,6 +66,21 @@ fn main() {
             _ => usage(),
         }
     }
+    // shutdown requests, from now on (also during recovery)
+    let (stop_tx, stop_rx) = crossbeam_channel::unbounded::<Stop>();
+    if let Err(e) = handle_signals(stop_tx.clone()) {
+        eprintln!("ivm: cannot install signal handlers: {e}");
+        std::process::exit(1);
+    }
+    watch_stop_file(stop_tx.clone());
+    // the listen address before recovery, which may take long
+    let listener = match std::net::TcpListener::bind(&scfg.listen) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ivm: cannot listen on {}: {e}", scfg.listen);
+            std::process::exit(1);
+        }
+    };
     let running = match coord::start(cfg) {
         Ok(r) => r,
         Err(e) => {
@@ -68,25 +100,76 @@ fn main() {
         },
         None => None,
     };
-    let h2 = handle.clone();
-    ctrlc_like(move || h2.shutdown());
-    if let Err(e) = server::serve(scfg, handle) {
-        eprintln!("ivm: server error: {e}");
+    log::info!("listening on {}", scfg.listen);
+    let h = handle.clone();
+    let spawned = std::thread::Builder::new().name("ivm-listener".into()).spawn(move || {
+        let r = server::serve_listener(listener, scfg, h);
+        let _ = stop_tx.send(Stop::Failed(match r {
+            Ok(()) => "the listener stopped".into(),
+            Err(e) => format!("server error: {e}"),
+        }));
+    });
+    if let Err(e) = spawned {
+        eprintln!("ivm: cannot start the listener: {e}");
+        running.shutdown();
+        std::process::exit(1);
     }
+    // (an engine that stops by itself, after an error, ends the process)
+    let stop = loop {
+        match stop_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(s) => break s,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if running.alive() => {}
+            Err(_) => break Stop::Failed("the engine stopped".into()),
+        }
+    };
+    let mut status = match stop {
+        Stop::Requested(why) => {
+            log::info!("{why}: shutting down (final checkpoint)");
+            0
+        }
+        Stop::Failed(e) => {
+            eprintln!("ivm: {e}");
+            1
+        }
+    };
     drop(http);
     running.shutdown();
+    if handle.shared.failed.load(std::sync::atomic::Ordering::Acquire) {
+        // (logged by the failing thread, e.g. the final checkpoint)
+        status = 1;
+    }
+    std::process::exit(status);
 }
 
-/// Shut down cleanly on SIGINT/SIGTERM without extra dependencies.
-fn ctrlc_like(f: impl Fn() + Send + 'static) {
-    std::thread::spawn(move || {
-        // poll for a stop file as a portable fallback
+/// SIGINT and SIGTERM request a shutdown; a second one exits at once (the
+/// input log makes that safe: the next start replays it).
+fn handle_signals(stop: crossbeam_channel::Sender<Stop>) -> std::io::Result<()> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
+    std::thread::Builder::new().name("ivm-signals".into()).spawn(move || {
+        let mut requested = false;
+        for sig in signals.forever() {
+            if requested {
+                eprintln!("ivm: second signal, exiting without a final checkpoint");
+                std::process::exit(1);
+            }
+            requested = true;
+            let _ = stop.send(Stop::Requested(if sig == SIGINT { "SIGINT" } else { "SIGTERM" }));
+        }
+    })?;
+    Ok(())
+}
+
+/// A file named `.ivm-stop` in the working directory requests a shutdown
+/// (polled every 500 ms; the file is removed).
+fn watch_stop_file(stop: crossbeam_channel::Sender<Stop>) {
+    let _ = std::thread::Builder::new().name("ivm-stop-file".into()).spawn(move || {
         loop {
             std::thread::sleep(Duration::from_millis(500));
             if std::path::Path::new(".ivm-stop").exists() {
                 let _ = std::fs::remove_file(".ivm-stop");
-                f();
-                std::process::exit(0);
+                let _ = stop.send(Stop::Requested("stop file"));
+                return;
             }
         }
     });

@@ -24,6 +24,8 @@ num-bigint = "0.5.1"
 num-traits = "0.2.19"
 num-integer = "0.1.47"
 mimalloc = { version = "0.1.52", default-features = false }
+# graceful shutdown of the server binary on SIGINT / SIGTERM
+signal-hook = "0.3"
 # web UI (--http-listen): HTTP/1.1 server on its own tokio runtime
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }

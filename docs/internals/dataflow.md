@@ -407,7 +407,12 @@ reads fail while any count is positive
 Counts can become negative (a retraction of an error that was never counted)
 and then mask later errors.
 
-Errors raised inside `WITH RECURSIVE` evaluation, and errors computing an
-arrangement's key expression (`Layout` key expressions such as `a.x + 1`),
-do not become error records: they abort `Graph::step`, and the record is left
-half-applied.
+Errors raised inside `WITH RECURSIVE` evaluation are an error record of the
+query. Arrangement keys are plain columns (a join key computed by an input's
+MFP, such as `a.x + 1`, is materialized as a column of that input, whose MFP
+turns its errors into records), and summaries cannot fail: numeric sums are
+kept exactly beyond numeric's range (`NumSum`), and only the aggregate value
+read from them is checked (an error record of its group). An error that
+still escapes `Graph::step` would be a bug: the engine logs it, does not
+apply the record again (it may be half-applied), and fails the statement
+that wrote it.

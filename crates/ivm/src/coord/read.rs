@@ -25,6 +25,18 @@ fn text_rows(columns: &[&str], rows: Vec<Vec<String>>) -> ExecResult {
     }
 }
 
+/// The error ending a waiting request whose statement was interrupted: by a
+/// cancel, or (for a read, which has no effects) because nobody waits for
+/// its result any more. Queued DML of a client that is gone still runs.
+fn interruption(req: &Request, read: bool) -> Option<SqlError> {
+    let Request::Execute { vars, .. } = req else { return None };
+    let i = vars.interrupts.as_ref()?;
+    if i.cancelled() {
+        return Some(SqlError::new(codes::QUERY_CANCELED, "canceling statement due to user request"));
+    }
+    (read && i.gone()).then(|| SqlError::new(codes::QUERY_CANCELED, "canceling statement: the client is gone"))
+}
+
 pub fn parse_lsn(s: &str) -> Result<u64> {
     let (hi, lo) = s.split_once('/').ok_or_else(|| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
     let hi = u64::from_str_radix(hi.trim(), 16).map_err(|_| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
@@ -165,7 +177,7 @@ impl Engine {
                 }
                 Some(ObjectKind::View(v)) | Some(ObjectKind::MaterializedView(v)) => {
                     if let Ok(q) = crate::sql::parser::parse_single_query(&v.sql)
-                        && let Ok(bq) = crate::sql::plan_query(&self.catalog, &q, vec![])
+                        && let Ok(bq) = crate::sql::plan_stored_query(&self.catalog, &q)
                     {
                         gets(&bq.rel, &mut ids);
                     }
@@ -213,8 +225,7 @@ impl Engine {
             AsOf::Default | AsOf::Fresh => self.shared.durable(),
             AsOf::AtLeastLsn(l) => {
                 let lsn = parse_lsn(l)?;
-                let frontiers = self.shared.source_lsn.lock().clone();
-                if frontiers.is_empty() || frontiers.values().any(|f| *f < lsn) {
+                if !self.lsn_reached(l, lsn)? {
                     self.shared.lsn_waiters.store(true, Ordering::Release);
                     self.shared.want_keepalive.store(true, Ordering::Release);
                     self.parked.push(Parked {
@@ -258,6 +269,7 @@ impl Engine {
             ReadAt::AsOf(target)
         };
         let mut bq = crate::sql::plan_query(&self.catalog, &query, params)?;
+        self.check_broken(&bq.rel)?;
         self.check_view_errors(&bq.rel)?;
         // now() is the logical clock as of the read, so reads are repeatable
         bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
@@ -301,24 +313,63 @@ impl Engine {
         Ok(Some(ExecResult::Query { columns, rows: out }))
     }
 
-    /// Re-run parked reads whose GSN (or LSN) condition is now satisfied.
+    /// Has every source's LSN frontier reached `lsn` (written `text`)? A
+    /// source that has not reported a frontier yet (it is snapshotting or
+    /// has not connected) has not. An error without any source: the LSN is
+    /// a position in a source's upstream WAL, so nothing could ever reach
+    /// it, and reading at once could not show the commit the client waits
+    /// for (read-your-writes).
+    pub(crate) fn lsn_reached(&self, text: &str, lsn: u64) -> Result<bool> {
+        let sources: Vec<ObjectId> =
+            self.catalog.objects.values().filter(|o| matches!(o.kind, ObjectKind::Source(_))).map(|o| o.id).collect();
+        if sources.is_empty() {
+            return Err(SqlError::new(
+                codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                format!("AS OF AT LEAST LSN '{text}' cannot be satisfied: there is no source"),
+            )
+            .with_hint("The LSN is a position in the WAL of a source's upstream server; create the source first."));
+        }
+        let frontiers = self.shared.source_lsn.lock();
+        Ok(sources.iter().all(|s| frontiers.get(s).is_some_and(|f| *f >= lsn)))
+    }
+
+    /// Re-run parked reads whose GSN (or LSN) condition is now satisfied;
+    /// end those (and queued DML) whose statement was interrupted.
     pub(crate) fn wake_parked(&mut self, _handle: &EngineHandle) {
+        if !self.dml_queue.is_empty() {
+            for req in std::mem::take(&mut self.dml_queue) {
+                match interruption(&req, false) {
+                    Some(e) => {
+                        if let Request::Execute { reply, .. } = &req {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                    None => self.dml_queue.push_back(req),
+                }
+            }
+        }
         if self.parked.is_empty() {
             return;
         }
-        let frontiers = self.shared.source_lsn.lock().clone();
         // snapshot progress or catalog changes since reads were parked
         let snapshots_changed = self.snap_epoch != self.snap_epoch_seen;
         self.snap_epoch_seen = self.snap_epoch;
         let mut still = Vec::new();
         for p in std::mem::take(&mut self.parked) {
+            if let Some(e) = interruption(&p.req, true) {
+                if let Request::Execute { reply, .. } = &p.req {
+                    let _ = reply.send(Err(e));
+                }
+                continue;
+            }
             let ready = match p.wait {
+                // (re-run on an error: it fails then, e.g. when the last
+                // source was dropped)
                 Wait::Lsn => match &p.req {
                     Request::Execute { stmt, .. } => match &**stmt {
-                        Statement::Select { as_of: AsOf::AtLeastLsn(l), .. } => match parse_lsn(l) {
-                            Ok(lsn) => !frontiers.is_empty() && frontiers.values().all(|f| *f >= lsn),
-                            Err(_) => true,
-                        },
+                        Statement::Select { as_of: AsOf::AtLeastLsn(l), .. } => {
+                            parse_lsn(l).and_then(|lsn| self.lsn_reached(l, lsn)).unwrap_or(true)
+                        }
                         _ => true,
                     },
                     _ => true,
@@ -344,25 +395,33 @@ impl Engine {
 
     fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
         let mut view = None;
-        let (node, pinned, columns): (NodeId, Option<NodeId>, Vec<ResultColumn>) = match target {
+        let (node, pinned, columns, reads): (NodeId, Option<NodeId>, Vec<ResultColumn>, Vec<ObjectId>) = match target {
             SubscribeTarget::Name(name) => {
                 let Some(obj) = self.catalog.by_name(&name).cloned() else {
                     sql_bail!(codes::UNDEFINED_TABLE, "relation \"{name}\" does not exist");
                 };
+                if let Some(e) = self.broken_error(obj.id) {
+                    return Err(e);
+                }
                 match &obj.kind {
                     ObjectKind::MaterializedView(v) => {
                         view = Some(obj.id);
                         let rt = &self.rt.views[&obj.id];
-                        (rt.node, None, v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect())
+                        let cols = v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect();
+                        (rt.node, None, cols, vec![obj.id])
                     }
                     ObjectKind::Table(t) => (
                         self.rt.tables[&obj.id],
                         None,
                         t.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect(),
+                        vec![obj.id],
                     ),
-                    ObjectKind::View(v) => {
-                        let q = crate::sql::parser::parse_single_query(&v.sql)?;
-                        return self.subscribe(SubscribeTarget::Query(Box::new(q), v.sql.clone()), snapshot, progress, params);
+                    ObjectKind::View(_) => {
+                        // through the view (not its query): its column list
+                        // names the columns, as in reads of it
+                        let text = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+                        let q = crate::sql::parser::parse_single_query(&text)?;
+                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params);
                     }
                     _ => sql_bail!(codes::WRONG_OBJECT_TYPE, "cannot subscribe to {} \"{name}\"", obj.kind.name()),
                 }
@@ -370,6 +429,21 @@ impl Engine {
             SubscribeTarget::Query(q, _) => {
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
+                self.check_broken(&bq.rel)?;
+                // what it reads: the relations of the plan, and the views
+                // (inlined in it) it reads them through
+                fn gets(r: &Rel, out: &mut Vec<ObjectId>) {
+                    if let Rel::Get { id, .. } = r {
+                        out.push(*id);
+                    }
+                    for i in r.inputs() {
+                        gets(i, out);
+                    }
+                }
+                let mut reads = self.catalog.references(&q.to_string()).unwrap_or_default();
+                gets(&bq.rel, &mut reads);
+                reads.sort_unstable();
+                reads.dedup();
                 let names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
                 let types: Vec<ColumnType> = bq.column_types();
                 let rel = bq.into_rel();
@@ -386,7 +460,7 @@ impl Engine {
                 self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
                 self.graph.hydrate(&mut self.env, self.processed)?;
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
-                (node, Some(node), cols)
+                (node, Some(node), cols, reads)
             }
         };
         let (tx, rx) = unbounded();
@@ -398,7 +472,7 @@ impl Engine {
             }
         }
         let _ = tx.send(SubEvent::Progress { gsn: self.processed });
-        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view });
+        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
         Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
     }
 
@@ -497,19 +571,24 @@ impl Engine {
                 let mut rows = Vec::new();
                 for o in self.catalog.objects.values() {
                     match &o.kind {
-                        ObjectKind::MaterializedView(_) => {
-                            let v = &self.rt.views[&o.id];
-                            let n = self.env.tree_count(self.graph.arr(v.arr).tree);
-                            let errs = v.errors.values().filter(|w| **w > 0).count();
-                            rows.push(vec![o.name.clone(), "materialized".into(), n.to_string(), errs.to_string()]);
-                        }
+                        ObjectKind::MaterializedView(_) => match self.rt.views.get(&o.id) {
+                            Some(v) => {
+                                let n = self.env.tree_count(self.graph.arr(v.arr).tree);
+                                let errs = v.errors.values().filter(|w| **w > 0).count();
+                                rows.push(vec![o.name.clone(), "materialized".into(), n.to_string(), errs.to_string(), "ok".into()]);
+                            }
+                            None => {
+                                let reason = self.rt.broken.get(&o.id).cloned().unwrap_or_default();
+                                rows.push(vec![o.name.clone(), "materialized".into(), String::new(), String::new(), format!("broken: {reason}")]);
+                            }
+                        },
                         ObjectKind::View(_) if matches!(k, ShowKind::Views) => {
-                            rows.push(vec![o.name.clone(), "virtual".into(), String::new(), String::new()]);
+                            rows.push(vec![o.name.clone(), "virtual".into(), String::new(), String::new(), String::new()]);
                         }
                         _ => {}
                     }
                 }
-                text_rows(&["name", "kind", "rows", "errors"], rows)
+                text_rows(&["name", "kind", "rows", "errors", "status"], rows)
             }
             ShowKind::Indexes => {
                 let mut rows = Vec::new();
@@ -526,8 +605,7 @@ impl Engine {
                 for o in self.catalog.objects.values() {
                     if let ObjectKind::Sink(s) = &o.kind {
                         let from = self.catalog.get(s.from).map(|x| x.name.clone()).unwrap_or_default();
-                        let status = self.sink_handles.get(&o.id).map(|h| h.status()).unwrap_or_else(|| "stopped".into());
-                        rows.push(vec![o.name.clone(), from, s.table.clone(), status]);
+                        rows.push(vec![o.name.clone(), from, s.table.clone(), self.sink_status(o.id)]);
                     }
                 }
                 text_rows(&["name", "from", "table", "status"], rows)
@@ -556,8 +634,9 @@ impl Engine {
                     vec!["segments".into(), st.segments.len().to_string()],
                 ];
                 for (src, lsn) in self.shared.source_lsn.lock().iter() {
-                    let name = self.catalog.get(*src).map(|o| o.name.clone()).unwrap_or_default();
-                    rows.push(vec![format!("source {name} lsn"), format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)]);
+                    // (a dropped source's thread may report once more)
+                    let Some(o) = self.catalog.get(*src) else { continue };
+                    rows.push(vec![format!("source {} lsn", o.name), format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)]);
                 }
                 text_rows(&["frontier", "value"], rows)
             }
@@ -646,12 +725,17 @@ impl Engine {
                     sql_bail!(codes::WRONG_OBJECT_TYPE, "\"{name}\" is not a view");
                 };
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
-                self.explain(ExplainKind::Plan, ExplainTarget::Query(Box::new(q)), params)
+                // a stored definition (as recovery plans it)
+                let bq = crate::sql::plan_stored_query(&self.catalog, &q)?;
+                Ok(text_rows(&["QUERY PLAN"], bq.rel.explain().lines().map(|l| vec![l.to_string()]).collect()))
             }
             (k, ExplainTarget::Name(name)) => {
                 let Some(o) = self.catalog.by_name(&name).cloned() else {
                     sql_bail!(codes::UNDEFINED_TABLE, "relation \"{name}\" does not exist");
                 };
+                if let Some(e) = self.broken_error(o.id) {
+                    return Err(e);
+                }
                 let Some(v) = self.rt.views.get(&o.id) else {
                     sql_bail!(codes::WRONG_OBJECT_TYPE, "\"{name}\" is not a materialized view");
                 };

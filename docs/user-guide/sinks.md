@@ -183,13 +183,12 @@ place. A sink is a dependent object of its relation: `DROP TABLE` /
 which drops the sink too, and `DROP SOURCE` of a replicated table's source
 drops the sink.
 
-The engine thread waits for the sink thread to stop. A sink that is
-retrying its connection handles one queued message per retry (up to 10 s
-each) and reaches the stop request only after every change queued before it,
-so dropping such a sink — directly, with `CASCADE` or through `DROP SOURCE` —
-can freeze the whole engine for a long time. If that happens, stop the
-engine with the stop file and start it again; the logged `DROP` is replayed
-without waiting.
+The engine does not wait for the sink thread: the thread stops by itself as
+soon as it sees the request (a sink retrying its connection, or stuck in a
+connection attempt, can take a while). A sink thread that outlives its sink
+cannot undo the work of a new sink of the same name: it resumes from the
+progress row, which only moves forward. At shutdown the engine waits up to
+5 s for its sinks to stop.
 
 ## Known problems
 

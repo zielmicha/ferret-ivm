@@ -73,6 +73,12 @@ pub struct Runtime {
     pub tables: HashMap<ObjectId, NodeId>,
     pub views: HashMap<ObjectId, ViewRt>,
     pub indexes: HashMap<ObjectId, ArrId>,
+    /// Catalog objects without a runtime, with the reason: materialized
+    /// views whose stored definition no longer plans at recovery (newer,
+    /// stricter code or catalog drift), indexes on them or whose columns
+    /// are gone, sinks reading them. They stay in the catalog: reads fail
+    /// with the reason, DROP removes them, CREATE OR REPLACE repairs a view.
+    pub broken: BTreeMap<ObjectId, String>,
 }
 
 pub(crate) struct Subscription {
@@ -85,6 +91,9 @@ pub(crate) struct Subscription {
     /// The materialized view subscribed to by name (its node may be shared
     /// with other views, so dropping it is matched by view, not by node).
     pub view: Option<ObjectId>,
+    /// The relations it reads, also through views: it ends when one of
+    /// them is dropped.
+    pub reads: Vec<ObjectId>,
 }
 
 /// A read waiting for the engine to reach a GSN.
@@ -122,10 +131,24 @@ pub(crate) struct AppState {
     /// GSN from which each tree's history is complete (by fingerprint).
     #[serde(default)]
     pub arr_since: Vec<(Vec<u8>, Gsn)>,
+    /// Recent (gsn, clock) ticks (`Engine::ticks`, the last MAX_SAVED_TICKS
+    /// of the retention window), for now() in reads as of earlier GSNs
+    /// (absent in older checkpoints).
+    #[serde(default)]
+    pub ticks: Vec<(Gsn, i64)>,
     /// Replication slots of dropped sources still to be dropped.
     #[serde(default)]
     pub slot_drops: Vec<crate::source::SlotDrop>,
 }
+
+/// DDL statements kept in the catalog history (`ivm.catalog_history`), the
+/// most recent ones: the history is part of every checkpoint.
+pub const MAX_HISTORY: usize = 10_000;
+
+/// Most clock ticks kept in a checkpoint: a day of ticks at the default
+/// interval. now() in a read as of an older GSN (within a larger retention
+/// window) after a restart is the oldest kept tick's clock.
+const MAX_SAVED_TICKS: usize = 100_000;
 
 pub struct Engine {
     pub cfg: Config,
@@ -162,8 +185,6 @@ pub struct Engine {
     pub(crate) handle: Option<EngineHandle>,
     pub(crate) source_handles: HashMap<ObjectId, crate::source::SourceHandle>,
     pub(crate) sink_handles: HashMap<ObjectId, crate::sink::SinkHandle>,
-    /// Recent (source, lsn, gsn) commits for "at least LSN" reads.
-    pub lsn_map: VecDeque<(ObjectId, u64, Gsn)>,
     /// Logical clock: the latest logged tick (timestamptz microseconds).
     pub clock: i64,
     /// Recent (gsn, clock) ticks, for now() in reads as of a past GSN.
@@ -198,6 +219,41 @@ impl EngineHandle {
             .send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params, vars, extra, reply: tx }))
             .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
         rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?
+    }
+
+    /// `execute`, giving up when `alive` returns false (polled every 200 ms
+    /// while the statement runs or waits): the request is then marked
+    /// `gone` in its session's interrupts, so that the engine drops it if
+    /// it is still waiting (a parked read), and the call fails with
+    /// IO_ERROR.
+    pub fn execute_while(
+        &self,
+        stmt: crate::sql::parser::Statement,
+        params: Vec<crate::sql::ParamSlot>,
+        vars: SessionVars,
+        extra: String,
+        mut alive: impl FnMut() -> bool,
+    ) -> Result<ExecResult> {
+        let interrupts = vars.interrupts.clone();
+        let (tx, rx) = bounded(1);
+        self.tx
+            .send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params, vars, extra, reply: tx }))
+            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(r) => return r,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !alive() {
+                        if let Some(i) = &interrupts {
+                            i.gone.store(true, Ordering::Release);
+                            let _ = self.tx.send(EngineMsg::Wake);
+                        }
+                        return Err(SqlError::new(codes::IO_ERROR, "client disconnected"));
+                    }
+                }
+                Err(_) => return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down")),
+            }
+        }
     }
 
     pub fn describe(
@@ -249,11 +305,21 @@ pub struct Running {
 }
 
 impl Running {
+    /// Stop the engine after a final checkpoint and wait for its threads.
+    /// A failure (also a panic) is recorded in `Shared::failed`.
     pub fn shutdown(self) {
         self.handle.shutdown();
         for t in self.threads {
-            let _ = t.join();
+            if t.join().is_err() {
+                self.handle.shared.failed.store(true, Ordering::Release);
+            }
         }
+    }
+
+    /// Are the engine's threads still running (they stop on a shutdown
+    /// request, an error or a panic)?
+    pub fn alive(&self) -> bool {
+        self.threads.iter().all(|t| !t.is_finished())
     }
 
     /// Stop without the final checkpoint, as if the process had died right
@@ -322,7 +388,6 @@ pub fn start(cfg: Config) -> Result<Running> {
         handle: None,
         source_handles: HashMap::new(),
         sink_handles: HashMap::new(),
-        lsn_map: VecDeque::new(),
         clock: 0,
         ticks: VecDeque::new(),
     };
@@ -355,9 +420,11 @@ pub fn start(cfg: Config) -> Result<Running> {
     // slot drops left from before the restart (or replayed DROP SOURCEs)
     crate::source::resume_slot_drops(&shared);
     let seq = Sequencer { writer, rx: srx, engine: etx.clone(), shared: shared.clone(), tick: cfg.tick };
+    let seq_shared = shared.clone();
     let t1 = std::thread::Builder::new().name("ivm-sequencer".into()).spawn(move || {
         if let Err(e) = seq.run() {
             log::error!("sequencer failed: {e}");
+            seq_shared.failed.store(true, Ordering::Release);
         }
     })?;
     let h2 = handle.clone();
@@ -365,8 +432,10 @@ pub fn start(cfg: Config) -> Result<Running> {
     // to sql::parser::MAX_OPERATOR_CHAIN deep, bound expressions up to
     // sql::binder_expr::MAX_EXPR_DEPTH); reserved, not committed, memory
     let t2 = std::thread::Builder::new().name("ivm-engine".into()).stack_size(64 << 20).spawn(move || {
+        let shared = h2.shared.clone();
         if let Err(e) = engine.run(erx, h2) {
             log::error!("engine failed: {e}");
+            shared.failed.store(true, Ordering::Release);
         }
     })?;
     Ok(Running { handle, threads: vec![t1, t2], _lock: lock })
@@ -385,7 +454,11 @@ impl Engine {
         self.graph.recovery_since = app.arr_since.into_iter().collect();
         self.clock = app.clock;
         self.graph.now = app.clock;
-        self.ticks.push_back((rec.gsn, app.clock));
+        if app.ticks.is_empty() {
+            self.ticks.push_back((rec.gsn, app.clock));
+        } else {
+            self.ticks = app.ticks.into_iter().collect();
+        }
         self.source_states = app.source_states.into_iter().collect();
         self.source_lsns = app.source_lsns.into_iter().collect();
         self.shared.slot_drops.lock().extend(app.slot_drops);
@@ -396,12 +469,21 @@ impl Engine {
             }
         }
         // views and indexes after the views they read (id order is not a
-        // dependency order: CREATE OR REPLACE keeps a view's id)
+        // dependency order: CREATE OR REPLACE keeps a view's id). One that
+        // cannot be built (its stored definition no longer plans) is kept,
+        // marked broken, instead of keeping the engine from starting.
         for (obj, _) in self.dependency_order(&objects) {
-            match &obj.kind {
-                ObjectKind::MaterializedView(v) => self.create_view_rt(obj.id, &v.sql)?,
-                ObjectKind::Index(i) => self.create_index_rt(obj.id, i)?,
-                _ => {}
+            let r = match &obj.kind {
+                ObjectKind::MaterializedView(v) => self.create_view_rt(obj.id, &v.sql),
+                ObjectKind::Index(i) => self.create_index_rt(obj.id, i),
+                _ => continue,
+            };
+            if let Err(e) = r {
+                if e.code.starts_with("58") {
+                    return Err(e);
+                }
+                log::error!("{} {} is broken and not maintained: {}", obj.kind.name(), obj.name, e.message);
+                self.rt.broken.insert(obj.id, e.message);
             }
         }
         for (id, errs) in app.view_errors {
@@ -444,7 +526,7 @@ impl Engine {
             let deps = match &o.kind {
                 ObjectKind::Index(i) => Ok(vec![i.on]),
                 ObjectKind::MaterializedView(v) => crate::sql::parser::parse_single_query(&v.sql)
-                    .and_then(|q| crate::sql::plan_query(&self.catalog, &q, vec![]))
+                    .and_then(|q| crate::sql::plan_stored_query(&self.catalog, &q))
                     .map(|bq| {
                         let mut ids = self.catalog.mentioned_views(&v.sql);
                         gets(&bq.rel, &mut ids);
@@ -492,10 +574,25 @@ impl Engine {
             match msg {
                 Some(EngineMsg::Durable(batch)) => {
                     for (gsn, rec) in batch {
+                        let dml = match &rec {
+                            LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
+                            _ => None,
+                        };
                         if let Err(e) = self.apply_record(gsn, rec) {
                             log::error!("failed to apply gsn {gsn}: {e}");
                             if e.code.starts_with("XX") || e.code.starts_with("58") {
                                 return Err(e);
+                            }
+                            // (data errors are error records, so this is a
+                            // bug) The record is not applied again: its
+                            // statement fails instead of leaving the client,
+                            // the DML queued behind it and fresh reads
+                            // waiting forever.
+                            self.processed = self.processed.max(gsn);
+                            if let Some(req) = dml {
+                                self.dml_counts.remove(&req);
+                                self.reply_pending(req, Err(e));
+                                self.drain_dml_queue();
                             }
                         }
                     }
@@ -515,19 +612,29 @@ impl Engine {
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
-        for (_, s) in self.source_handles.drain() {
-            s.stop();
-        }
+        // ask sources and sinks to stop, without waiting for them here
+        let mut threads: Vec<JoinHandle<()>> = self.source_handles.drain().filter_map(|(_, s)| s.stop()).collect();
         for (_, s) in self.sink_handles.drain() {
             // everything applied is delivered: the sink records it as its
             // progress, matching the final checkpoint, so that the next
             // start does not resynchronize it
             s.progress(self.processed);
-            s.stop();
+            threads.extend(s.stop());
         }
         let _ = self.seq.send(SeqMsg::Shutdown);
         if !self.shared.crash.load(Ordering::Acquire) {
             self.checkpoint()?;
+        }
+        // give sources and sinks a moment to finish; one stuck in a
+        // connection attempt is left behind
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for t in threads {
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
         Ok(())
     }
@@ -630,13 +737,11 @@ impl Engine {
                     };
                     self.reply_pending(lsn, res);
                     self.drain_dml_queue();
-                } else {
+                } else if self.catalog.get(source).is_some() {
+                    // (a dropped source's thread may still log a record
+                    // before it notices that it was stopped)
                     let e = self.source_lsns.entry(source).or_insert(0);
                     *e = (*e).max(lsn);
-                    self.lsn_map.push_back((source, lsn, gsn));
-                    while self.lsn_map.len() > 100_000 {
-                        self.lsn_map.pop_front();
-                    }
                 }
             }
             LogRecord::Ddl { req, sql, extra } => {
@@ -645,6 +750,11 @@ impl Engine {
                 self.snap_epoch += 1;
                 if res.is_ok() {
                     self.catalog.history.push((gsn, sql.clone()));
+                    // (every checkpoint saves it; trimmed in steps)
+                    if self.catalog.history.len() > MAX_HISTORY + MAX_HISTORY / 10 {
+                        let excess = self.catalog.history.len() - MAX_HISTORY;
+                        self.catalog.history.drain(..excess);
+                    }
                 }
                 if let Err(e) = &res
                     && self.replaying
@@ -656,7 +766,9 @@ impl Engine {
             }
             LogRecord::Progress { source, lsn: _, state } => {
                 self.processed = gsn;
-                self.source_states.insert(source, state);
+                if self.catalog.get(source).is_some() {
+                    self.source_states.insert(source, state);
+                }
                 self.snap_epoch += 1;
             }
             LogRecord::Schema { source, table, columns, pk } => {
@@ -719,9 +831,14 @@ impl Engine {
         }
         for s in self.subs.iter() {
             if let Some(o) = outputs.get(&s.node) {
+                // a new error record ends the subscription, as it fails
+                // reads (a retracted one does not)
                 if !o.errs.is_empty() {
-                    let (code, msg) = o.errs[0].0.clone();
-                    let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+                    let mut errs = o.errs.clone();
+                    crate::dataflow::consolidate_errs(&mut errs);
+                    if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
+                        let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+                    }
                 }
                 if !o.data.is_empty() {
                     let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
@@ -776,6 +893,7 @@ impl Engine {
             clock: self.clock,
             errors: self.graph.error_state(),
             arr_since: self.graph.arrangement_since().into_iter().collect(),
+            ticks: self.ticks.iter().skip(self.ticks.len().saturating_sub(MAX_SAVED_TICKS)).copied().collect(),
             slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
@@ -808,10 +926,52 @@ impl Engine {
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
         for obj in objects {
             if let ObjectKind::Sink(def) = &obj.kind {
-                self.start_sink(obj.id, &obj.name, def, handle)?;
+                // (one that cannot start, e.g. over a broken view, is marked broken)
+                self.start_sink_or_mark_broken(obj.id, &obj.name, def, handle);
             }
         }
         Ok(())
+    }
+
+    /// Start a sink of the catalog; one that cannot start (it reads a
+    /// broken view) is marked broken instead.
+    pub(crate) fn start_sink_or_mark_broken(&mut self, id: ObjectId, name: &str, def: &crate::catalog::SinkDef, handle: &EngineHandle) {
+        self.rt.broken.remove(&id);
+        if let Err(e) = self.start_sink(id, name, def, handle) {
+            log::error!("sink {name} is broken and not started: {}", e.message);
+            self.rt.broken.insert(id, e.message);
+        }
+    }
+
+    /// The error of using broken object `id`, if it is broken.
+    pub(crate) fn broken_error(&self, id: ObjectId) -> Option<SqlError> {
+        let reason = self.rt.broken.get(&id)?;
+        let what = self.catalog.get(id).map(|o| format!("{} \"{}\"", o.kind.name(), o.name)).unwrap_or_else(|| format!("object {id}"));
+        Some(
+            SqlError::new(codes::OBJECT_NOT_IN_PREREQUISITE_STATE, format!("{what} is broken: {reason}"))
+                .with_hint("Drop it, or replace a broken view with CREATE OR REPLACE MATERIALIZED VIEW."),
+        )
+    }
+
+    /// Fail if the plan reads a broken relation.
+    pub(crate) fn check_broken(&self, rel: &crate::sql::Rel) -> Result<()> {
+        if self.rt.broken.is_empty() {
+            return Ok(());
+        }
+        fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
+            if let crate::sql::Rel::Get { id, .. } = r {
+                out.push(*id);
+            }
+            for i in r.inputs() {
+                gets(i, out);
+            }
+        }
+        let mut ids = Vec::new();
+        gets(rel, &mut ids);
+        match ids.into_iter().find_map(|id| self.broken_error(id)) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Tables belonging to a source: (table id, upstream schema, name, columns, pk).

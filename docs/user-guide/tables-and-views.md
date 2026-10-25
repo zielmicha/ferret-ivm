@@ -253,13 +253,14 @@ DROP SINK [ IF EXISTS ] name                 -- see Sinks
   (`"x" is not a table`).
 - Replicated tables cannot be dropped (`drop the source instead`).
 - Dependent objects — views and materialized views whose query mentions the
-  object's name, indexes on it, sinks from it — make the drop fail with
-  SQLSTATE `2BP01` unless `CASCADE` is given, which drops them (recursively)
-  first.
-- A statement naming several objects is not atomic: they are dropped one
-  after another, and an error (for example `table "nosuch" does not exist`)
-  leaves the earlier ones dropped. Such a statement is also missing from
-  `ivm.catalog_history`.
+  object's name, sinks from it — make the drop fail with SQLSTATE `2BP01`
+  unless `CASCADE` is given, which drops them (recursively) first. Indexes
+  on a dropped table or materialized view are dropped with it, as in
+  PostgreSQL.
+- A statement naming several objects is atomic: every name is checked
+  first, and an error (for example `table "nosuch" does not exist`) drops
+  nothing. Objects named in the same statement do not hold each other back
+  (`DROP VIEW v, view_over_v` needs no `CASCADE`).
 - Subscriptions to a dropped materialized view end with
   `materialized view "x" was dropped`.
 - Dropping releases the object's dataflow nodes and indexes unless other

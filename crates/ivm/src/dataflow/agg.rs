@@ -327,7 +327,8 @@ fn finalize_sum(st: &AggState, arg: &SqlType) -> Result<Datum> {
             Datum::Int8(i64::try_from(*v).map_err(|_| SqlError::new(codes::NUMERIC_VALUE_OUT_OF_RANGE, "bigint out of range"))?)
         }
         (AggState::SumInt(v), _) => Datum::numeric(Numeric::from_i128(*v)),
-        (AggState::SumNumeric(n), _) => Datum::numeric(n.value()),
+        // (the exact sum may be beyond numeric's range)
+        (AggState::SumNumeric(n), _) => Datum::numeric(n.value().checked()?),
         (AggState::SumFloat(f), SqlType::Float4) => {
             // as with float4pl, a finite sum beyond real's range overflows
             let v = float_sum_value(f)?;

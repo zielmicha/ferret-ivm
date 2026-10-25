@@ -34,18 +34,25 @@ implementation checkpoints everything together).
    whose CRC is valid, and truncate a torn tail. Re-open the active segment
    truncated to the recorded length, delete segment files the record does
    not list, and register every tree root as *recovered but not attached*.
+   A manifest that has contents but no valid record, or a missing manifest
+   while segment files hold data, stops the start before anything is
+   modified: the checkpoint may have existed, and the log may already be
+   truncated after it.
 4. **Restore the engine state** (`Engine::recover`) from the record's
    application state (JSON `AppState`): catalog, the map from arrangement
    fingerprint to tree id, view error counts, source states and resume LSNs,
    the request counter and the logical clock.
-5. **Rebuild the dataflow** from the catalog, object by object in id order:
-   tables (`table_rt`), materialized views (planned and lowered again from
-   their SQL text), indexes. Every arrangement the planner asks for looks up
-   its fingerprint in the recovered map (see below); found trees are attached
-   and count as hydrated. Because `CREATE OR REPLACE` keeps the object's id,
-   a view replaced to read a relation created after it is rebuilt before
-   that relation exists, and recovery fails (`relation "b" has no dataflow`;
-   a known problem).
+5. **Rebuild the dataflow** from the catalog: tables (`table_rt`), then
+   materialized views (planned and lowered again from their SQL text) and
+   indexes, each after the views it reads (`dependency_order`: ids are not
+   a dependency order, as `CREATE OR REPLACE` keeps the object's id). Every
+   arrangement the planner asks for looks up its fingerprint in the
+   recovered map (see below); found trees are attached and count as
+   hydrated. A view or index that cannot be built (its definition no longer
+   plans, or it reads a view that cannot be built) is logged and recorded
+   in `Runtime::broken` instead of stopping the start; it stays in the
+   catalog without a dataflow, and its recovered trees are dropped with the
+   other unattached ones.
 6. **Hydrate** everything that was not matched, from the recovered state at
    the checkpoint GSN (`Graph::hydrate`), then **drop** recovered trees that
    nothing attached (arrangements that no longer exist) and set the retention

@@ -67,8 +67,8 @@ the retention) fail with SQLSTATE `55000`:
 ERROR:  AS OF 2 is before the retention frontier 3
 ```
 
-A GSN in the future makes the read wait until the engine reaches it (such a
-wait cannot be cancelled).
+A GSN in the future makes the read wait until the engine reaches it (the
+wait can be cancelled, see below).
 `SHOW GSN` returns the last applied GSN, and `SHOW FRONTIERS`
 the retention frontier. Note that every clock tick (by default one per
 second) consumes a GSN, so 1000 GSNs are at most about 17 minutes on an idle
@@ -115,11 +115,21 @@ advances even when no data flows. Because all sources are compared, this
 form is meant for sources that replicate from the same PostgreSQL cluster.
 
 A source's frontier does not advance while any of its tables is loading an
-initial snapshot, nor while the source is stuck in an error. If the engine
-has **no sources at all**, such a read waits until a source exists and
-reaches the LSN; a dropped source no longer holds reads back. Waiting reads
-cannot be cancelled (only `SUBSCRIBE` can); a client that disconnects is
-freed, but the read stays parked in the engine until its condition holds.
+initial snapshot, nor while the source is stuck in an error; a source that
+has not reported a frontier yet holds reads back too. A dropped source no
+longer holds reads back. If the engine has **no sources at all**, the read
+fails at once with SQLSTATE `55000` (`AS OF AT LEAST LSN '...' cannot be
+satisfied: there is no source`), also a waiting read when the last source
+is dropped: the LSN is a position in an upstream's WAL, so a read without
+sources could not show the commit it waits for.
+
+A read that waits — for freshness, an LSN, a future GSN or an initial
+snapshot — ends with SQLSTATE `57014` (`canceling statement due to user
+request`) when the client cancels it (a `CancelRequest`, Ctrl-C in psql);
+DML queued behind another statement is cancelled the same way. The engine
+also drops a waiting read when its client disconnects (the session checks
+the connection every 200 ms while it waits), and the web UI console drops
+its read when it stops waiting (after 30 s).
 
 ### now() in reads
 
@@ -276,17 +286,15 @@ A subscription runs until
 
 - the client cancels the query (for example Ctrl-C in psql), which ends it
   with `canceling statement due to user request` (SQLSTATE `57014`);
-- the client disconnects — noticed when the server next sends something
-  (a change, or a progress row with `PROGRESS`); until then the
-  subscription, and the private dataflow of a query subscription, stay
-  alive;
-- the subscribed materialized view is dropped
-  (`materialized view "x" was dropped`); a subscription to a dropped *table*
-  does not end, and keeps sending progress rows;
-- the subscribed relation's error records change: the subscription ends with
-  the error — also when an error record is *retracted*, that is when the
-  relation has just become readable again (a known problem). The initial
-  snapshot of a subscription leaves rows that fail out instead of failing;
+- the client disconnects (the session checks the connection every 200 ms);
+- a relation it reads — the subscribed table, view or materialized view,
+  a relation a subscribed view or query reads, directly or through views —
+  is dropped (`table "x" was dropped`, `view "x" was dropped`,
+  `materialized view "x" was dropped`, SQLSTATE `42P01`);
+- the subscribed relation gets an error record: the subscription ends with
+  the error (the retraction of an error record does not end it). The
+  initial snapshot of a subscription leaves rows that fail out instead of
+  failing;
 - the engine shuts down.
 
 If the subscribed materialized view is replaced with `CREATE OR REPLACE` by

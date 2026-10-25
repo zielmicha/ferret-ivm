@@ -147,7 +147,10 @@ impl Catalog {
         }
         let q = crate::sql::parser::parse_single_query(sql).ok()?;
         let rec = Recording { cat: self, seen: Default::default() };
-        crate::sql::Binder::new(&rec).bind_query(&q).ok()?;
+        let mut b = crate::sql::Binder::new(&rec);
+        // a stored definition: tolerate what earlier versions accepted
+        b.stored_definition = true;
+        b.bind_query(&q).ok()?;
         Some(rec.seen.into_inner())
     }
 
@@ -204,9 +207,6 @@ pub(crate) fn sql_mentions(sql: &str, name: &str) -> bool {
     let lower = sql.to_lowercase();
     lower.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).any(|w| w.trim_matches('"') == name)
 }
-
-/// System relations exposed to SQL (read-only).
-pub const SYSTEM_RELATIONS: &[&str] = &["ivm_catalog", "ivm_lsn_gsn", "ivm_frontiers"];
 
 impl BindCatalog for Catalog {
     fn definitions(&self, kind: &str) -> Vec<(u32, String)> {

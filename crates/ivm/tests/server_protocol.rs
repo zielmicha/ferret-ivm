@@ -511,3 +511,64 @@ fn show_reports_fixed_settings() {
     assert_eq!(first_values(&c.query("SHOW search_path")), vec!["public"]);
     running.shutdown();
 }
+
+/// The SQLSTATE of the ErrorResponse in `msgs`.
+fn error_code(msgs: &[Msg]) -> Option<String> {
+    let (_, b) = msgs.iter().find(|m| m.0 == b'E')?;
+    b.split(|c| *c == 0).find(|f| f.first() == Some(&b'C')).map(|f| String::from_utf8_lossy(&f[1..]).into_owned())
+}
+
+/// Reads waiting in the engine.
+fn parked_reads(running: &Running) -> usize {
+    match running.engine.handle.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
+        ivm::coord::inspect::InspectReply::Stats(s) => s.parked_reads,
+        other => panic!("unexpected reply {other:?}"),
+    }
+}
+
+/// Wait until `n` reads wait in the engine.
+fn until_parked(running: &Running, n: usize) {
+    let t0 = std::time::Instant::now();
+    while parked_reads(running) != n {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{n} reads do not wait in the engine");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A read waiting in the engine (here for a GSN that never comes) ends
+/// with 57014 on a CancelRequest, and is dropped when its client
+/// disconnects; it used to wait forever (only SUBSCRIBE was cancellable).
+#[test]
+fn waiting_reads_are_cancelled_and_dropped() {
+    let (running, port) = start("cancel-parked");
+    let (mut c, pid, secret) = connect_with_key(port);
+    let mut b = b"SELECT 1 AS OF 1000000".to_vec();
+    b.push(0);
+    // simple query
+    c.send(b'Q', &b);
+    until_parked(&running, 1);
+    cancel(port, pid, secret);
+    let msgs = c.until_ready();
+    assert_eq!((error_code(&msgs).as_deref(), error_message(&msgs).as_deref()), (Some("57014"), Some("canceling statement due to user request")));
+    assert_eq!(parked_reads(&running), 0);
+    // the session goes on; a cancel without a running statement does nothing
+    cancel(port, pid, secret);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(first_values(&c.query("SELECT 7")), ["7"]);
+    // extended protocol
+    c.parse("", "SELECT 1 AS OF 1000000", &[]);
+    c.bind("", "", &[], 0);
+    c.execute("", 0);
+    c.send(b'S', &[]);
+    until_parked(&running, 1);
+    cancel(port, pid, secret);
+    let msgs = c.until_ready();
+    assert_eq!(error_code(&msgs).as_deref(), Some("57014"));
+    // a client that goes away
+    let (mut c2, _, _) = connect_with_key(port);
+    c2.send(b'Q', &b);
+    until_parked(&running, 1);
+    drop(c2);
+    until_parked(&running, 0);
+    running.shutdown();
+}

@@ -103,10 +103,11 @@ async fn run(st: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<QueryRes
     let started = Instant::now();
     let task = tokio::task::spawn_blocking(move || -> Result<QueryResponse, ApiError> {
         let (tx, rx) = crossbeam_channel::bounded(1);
+        let interrupts = std::sync::Arc::new(crate::coord::api::Interrupts::default());
         let msg = EngineMsg::Request(Request::Execute {
             stmt: Box::new(stmt),
             params: vec![],
-            vars: SessionVars { read_mode: read_mode.into() },
+            vars: SessionVars { read_mode: read_mode.into(), interrupts: Some(interrupts.clone()) },
             extra: String::new(),
             reply: tx,
         });
@@ -114,6 +115,9 @@ async fn run(st: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<QueryRes
         let res = match rx.recv_timeout(QUERY_TIMEOUT) {
             Ok(r) => r.map_err(statement_error)?,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // a read still waiting in the engine is dropped
+                interrupts.gone.store(true, std::sync::atomic::Ordering::Release);
+                let _ = engine.tx.send(EngineMsg::Wake);
                 return Err(ApiError::new(
                     StatusCode::GATEWAY_TIMEOUT,
                     "no result within 30 s (a fresh read waits for initial snapshots; try read mode \"latest\")",

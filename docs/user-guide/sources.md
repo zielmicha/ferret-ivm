@@ -356,7 +356,9 @@ different key — the source:
    failing cast gives NULL); new columns are NULL. The table's version is
    incremented;
 4. dependent materialized views are re-planned against the new definition
-   and swapped at that GSN;
+   and swapped at that GSN; indexes on the table move to its new version,
+   following their columns by name, and an index whose column is gone is
+   dropped (logged);
 5. the source re-snapshots the table from the beginning, which fills the new
    columns of existing rows. Fresh reads of the table wait for it.
 
@@ -388,13 +390,6 @@ Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
   change`). After the next checkpoint the engine **fails to start** because
   the view cannot be planned during recovery. Drop such views before making
   breaking upstream changes.
-- Indexes created on a replicated table (`CREATE INDEX`) are not rebuilt when
-  the table changes shape; they keep referring to the table's old dataflow
-  node. `SHOW ARRANGEMENTS` then crashes the engine thread (`dangling node`;
-  afterwards every statement fails with `engine is shutting down`), and if
-  the change dropped the indexed column, the engine panics during recovery
-  after the next checkpoint and the data directory cannot be started. Drop
-  indexes on replicated tables before changing their upstream schema.
 
 ### Tables added to or removed from the publication
 
@@ -442,11 +437,13 @@ Dropping a source **always cascades**: the source's tables and every object
 that depends on them — views, materialized views, indexes and sinks,
 transitively — are dropped with it. `CASCADE` is accepted and has no effect.
 
-The source thread is stopped and the replication slot is dropped in the
-background (`DROP_REPLICATION_SLOT`; a slot that no longer exists counts as
-dropped). Failed attempts — the upstream is unreachable, the slot still in
-use — are retried with a delay doubling from 250 ms up to 10 s, with a
-warning in the log at attempts 1, 2, 4, 8, ..., until the drop succeeds.
+The source thread is asked to stop (the engine does not wait for it: it may
+be in a connection attempt or a snapshot query), and the replication slot is
+dropped in the background (`DROP_REPLICATION_SLOT`; a slot that no longer
+exists counts as dropped). Failed attempts — the upstream is unreachable,
+the slot still in use, also by the stopping source's own session — are
+retried with a delay doubling from 250 ms up to 10 s, with a warning in the
+log at attempts 1, 2, 4, 8, ..., until the drop succeeds.
 Pending drops are saved in checkpoints (and re-derived from a `DROP SOURCE`
 replayed from the log), so a drop that has not succeeded when the engine
 stops is retried after the next start. Creating a source whose slot has the

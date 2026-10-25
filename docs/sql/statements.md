@@ -169,7 +169,7 @@ detail and hint. The engine's own errors use these SQLSTATEs most often:
 | `23505`, `23502` | unique (primary key) / not-null violation |
 | `55000` | object not in prerequisite state (e.g. `AS OF` before the retention frontier, table without primary key in a source) |
 | `55006` | data directory in use |
-| `57014` | query canceled (`SUBSCRIBE` cancelled) |
+| `57014` | query canceled (`SUBSCRIBE`, a waiting read or queued DML cancelled) |
 | `57P01` | engine shutting down |
 | `08006` | connection failure (upstream) |
 | `XX000`, `XX001` | internal error, data corrupted |

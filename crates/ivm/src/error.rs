@@ -127,6 +127,7 @@ pub mod codes {
     pub const GROUPING_ERROR: &str = "42803";
     pub const WRONG_OBJECT_TYPE: &str = "42809";
     pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
+    pub const INVALID_TABLE_DEFINITION: &str = "42P16";
     pub const INVALID_RECURSION: &str = "42P19";
     pub const WINDOWING_ERROR: &str = "42P20";
     pub const UNDEFINED_PARAMETER: &str = "42P02";

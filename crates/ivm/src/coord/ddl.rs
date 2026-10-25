@@ -146,10 +146,8 @@ impl Engine {
                         }
                         sql_bail!(codes::DUPLICATE_TABLE, "relation \"{name}\" already exists");
                     }
-                    let bq = crate::sql::plan_query(&self.catalog, &cv.query, vec![])?;
-                    if cv.materialized {
-                        check_deterministic(&bq.rel)?;
-                    }
+                    // planning, the determinism check and the column names
+                    self.view_def(cv, false)?;
                 }
                 ast::Statement::CreateTable(ct) => {
                     let (_, name) = object_name(&ct.name)?;
@@ -182,6 +180,9 @@ impl Engine {
                 };
                 self.check_source_tables(name, &self.new_source_tables(src.id, parse_discovered(&extra)?))?;
             }
+            Statement::CreateSink { name, from, key, .. } => {
+                self.check_sink(name, from, key.as_deref())?;
+            }
             _ => {}
         }
         let req = self.alloc_req();
@@ -212,6 +213,9 @@ impl Engine {
                 ast::Statement::CreateView(cv) => self.apply_create_view(gsn, sql, &cv),
                 ast::Statement::CreateIndex(ci) => self.apply_create_index(gsn, sql, &ci),
                 ast::Statement::Drop { object_type, if_exists, names, cascade, .. } => {
+                    // every name is resolved and checked before anything is
+                    // dropped: the statement is atomic, as in PostgreSQL
+                    let mut targets: Vec<ObjectId> = Vec::new();
                     for n in &names {
                         let (_, name) = object_name(n)?;
                         let Some(obj) = self.catalog.by_name(&name).cloned() else {
@@ -236,7 +240,21 @@ impl Engine {
                         {
                             sql_bail!(codes::WRONG_OBJECT_TYPE, "cannot drop source table \"{name}\"; drop the source instead");
                         }
-                        self.drop_with_dependents(obj.id, cascade)?;
+                        if !targets.contains(&obj.id) {
+                            targets.push(obj.id);
+                        }
+                    }
+                    // objects dropped by the same statement do not hold
+                    // each other back
+                    if !cascade {
+                        for &t in &targets {
+                            self.check_dependents(t, &targets)?;
+                        }
+                    }
+                    for t in targets {
+                        if self.catalog.get(t).is_some() {
+                            self.drop_with_dependents(t, true)?;
+                        }
                     }
                     Ok(ExecResult::Command {
                         tag: match object_type {
@@ -316,15 +334,7 @@ impl Engine {
                 Ok(ExecResult::Command { tag: "DROP SOURCE".into() })
             }
             Statement::CreateSink { name, from, conninfo, table, key } => {
-                if self.catalog.by_name(&name).is_some() {
-                    sql_bail!(codes::DUPLICATE_OBJECT, "sink \"{name}\" already exists");
-                }
-                let Some(v) = self.catalog.by_name(&from).cloned() else {
-                    sql_bail!(codes::UNDEFINED_TABLE, "relation \"{from}\" does not exist");
-                };
-                if !matches!(v.kind, ObjectKind::MaterializedView(_) | ObjectKind::Table(_)) {
-                    sql_bail!(codes::WRONG_OBJECT_TYPE, "sink source \"{from}\" must be a table or materialized view");
-                }
+                let v = self.check_sink(&name, &from, key.as_deref())?;
                 let id = self.catalog.alloc_id();
                 let def = SinkDef { from: v.id, conninfo, table, key };
                 self.catalog.insert(CatalogObject {
@@ -336,7 +346,8 @@ impl Engine {
                 });
                 // (also while replaying: sinks receive replayed records)
                 if let Some(h) = self.handle.clone() {
-                    self.start_sink(id, &name, &def, &h)?;
+                    // the sink is durable now; a failure to start it is not a DDL error
+                    self.start_sink_or_mark_broken(id, &name, &def, &h);
                 }
                 Ok(ExecResult::Command { tag: "CREATE SINK".into() })
             }
@@ -379,6 +390,52 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Can sink `name` read relation `from` with this key? Returns the
+    /// relation. Checked before logging and again on apply: the sink thread
+    /// creates its target table with the key as primary key, and would
+    /// otherwise retry an impossible definition forever.
+    fn check_sink(&self, name: &str, from: &str, key: Option<&[String]>) -> Result<CatalogObject> {
+        if self.catalog.by_name(name).is_some() {
+            sql_bail!(codes::DUPLICATE_OBJECT, "sink \"{name}\" already exists");
+        }
+        let Some(v) = self.catalog.by_name(from).cloned() else {
+            sql_bail!(codes::UNDEFINED_TABLE, "relation \"{from}\" does not exist");
+        };
+        let columns = match &v.kind {
+            ObjectKind::MaterializedView(d) => &d.columns,
+            ObjectKind::Table(t) => &t.columns,
+            _ => sql_bail!(codes::WRONG_OBJECT_TYPE, "sink source \"{from}\" must be a table or materialized view"),
+        };
+        if let Some(e) = self.broken_error(v.id) {
+            return Err(e);
+        }
+        let key = key.unwrap_or_default();
+        for (i, k) in key.iter().enumerate() {
+            let Some(c) = columns.iter().find(|c| &c.name == k) else {
+                sql_bail!(codes::UNDEFINED_COLUMN, "sink key column \"{k}\" does not exist in \"{from}\"");
+            };
+            if key[..i].contains(k) {
+                sql_bail!(codes::DUPLICATE_COLUMN, "column \"{k}\" appears twice in the sink key");
+            }
+            fn has_equality(t: &crate::types::SqlType) -> bool {
+                use crate::types::SqlType as T;
+                match t {
+                    T::Json | T::JsonPath => false,
+                    T::Array(e) => has_equality(e),
+                    _ => true,
+                }
+            }
+            if !has_equality(&c.ty.ty) {
+                sql_bail!(
+                    codes::FEATURE_NOT_SUPPORTED,
+                    "sink key column \"{k}\" has type {}, which cannot be part of a primary key",
+                    crate::types::format_type(&c.ty.ty, c.ty.typmod)
+                );
+            }
+        }
+        Ok(v)
     }
 
     /// Discovered tables a source does not replicate yet.
@@ -462,14 +519,23 @@ impl Engine {
         // new definitions were planned with plan_query before
         let bq = crate::sql::plan_stored_query(&self.catalog, &q)?;
         let rel = bq.into_rel();
+        // (a view over a broken one cannot be built either)
+        self.check_broken(&rel)?;
         let node_mark = self.graph.node_count();
         let arr_mark = self.graph.arr_count();
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
         let lowered = {
             let mut lw = Lowerer { g: &mut self.graph, env: &mut self.env, objects: &objects };
-            let l = lw.lower(&rel)?;
-            lw.materialize(l)
+            lw.lower(&rel).map(|l| lw.materialize(l))
+        };
+        let lowered = match lowered {
+            Ok(n) => n,
+            Err(e) => {
+                // what lowering created before it failed is unreferenced
+                self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
+                return Err(e);
+            }
         };
         self.graph.retain_node(lowered);
         let arr = match self.graph.node(lowered).arrangements.first().copied() {
@@ -487,13 +553,30 @@ impl Engine {
     }
 
     /// Definition (query text and output columns) of CREATE [MATERIALIZED]
-    /// VIEW against the current catalog.
-    fn view_def(&self, cv: &ast::CreateView) -> Result<ViewDef> {
-        let bq = crate::sql::plan_query(&self.catalog, &cv.query, vec![])?;
+    /// VIEW against the current catalog. `stored`: a logged statement or a
+    /// stored definition, which earlier versions may have accepted with a
+    /// parameter placeholder (statements are checked with `stored` false
+    /// before they are logged).
+    fn view_def(&self, cv: &ast::CreateView, stored: bool) -> Result<ViewDef> {
+        let bq = if stored {
+            crate::sql::plan_stored_query(&self.catalog, &cv.query)?
+        } else {
+            crate::sql::plan_query(&self.catalog, &cv.query, vec![])?
+        };
         if cv.materialized {
             check_deterministic(&bq.rel)?;
         }
+        self.check_broken(&bq.rel)?;
         let mut names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
+        // as in PostgreSQL: the column list renames the leading columns and
+        // must not be longer than the query's select list
+        if cv.columns.len() > names.len() {
+            sql_bail!(
+                codes::SYNTAX_ERROR,
+                "{}",
+                if cv.materialized { "too many column names were specified" } else { "CREATE VIEW specifies more column names than columns" }
+            );
+        }
         for (n, c) in names.iter_mut().zip(&cv.columns) {
             *n = ident(&c.name);
         }
@@ -506,7 +589,7 @@ impl Engine {
     fn view_def_of_sql(&self, create_sql: &str) -> Result<ViewDef> {
         match parse_statement(create_sql)? {
             Statement::Sql(s) => match *s {
-                ast::Statement::CreateView(cv) => self.view_def(&cv),
+                ast::Statement::CreateView(cv) => self.view_def(&cv, true),
                 _ => sql_bail!(codes::INTERNAL_ERROR, "not a view definition: {create_sql}"),
             },
             _ => sql_bail!(codes::INTERNAL_ERROR, "not a view definition: {create_sql}"),
@@ -528,7 +611,7 @@ impl Engine {
                 sql_bail!(codes::WRONG_OBJECT_TYPE, "\"{name}\" is not a view");
             }
         }
-        let def = self.view_def(cv)?;
+        let def = self.view_def(cv, true)?;
         let query_sql = def.sql.clone();
         let id = match &existing {
             Some(e) => e.id,
@@ -583,7 +666,7 @@ impl Engine {
         };
         for o in self.catalog.objects.values() {
             match &o.kind {
-                ObjectKind::Index(i) if i.on == old.id && !new_cols.is_some_and(|c| index_fits(&i.columns, old_cols, c)) => {
+                ObjectKind::Index(i) if i.on == old.id && !new_cols.is_some_and(|c| remap_index(&i.columns, old_cols, c).is_some()) => {
                     return refuse(format!("index \"{}\" depends on its columns", o.name));
                 }
                 ObjectKind::Sink(s) if s.from == old.id && !new_cols.is_some_and(|c| same_columns(c, old_cols)) => {
@@ -596,12 +679,14 @@ impl Engine {
         let mut cat = self.catalog.clone();
         cat.insert(CatalogObject { kind: new.clone(), ..old.clone() });
         for o in self.catalog.objects.values() {
+            // (a broken view does not plan, whatever the replacement)
             if let ObjectKind::MaterializedView(v) = &o.kind
                 && o.id != old.id
+                && !self.rt.broken.contains_key(&o.id)
             {
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
                 // (it inlines the views it reads: they must keep it deterministic)
-                if let Err(e) = crate::sql::plan_query(&cat, &q, vec![]).and_then(|bq| check_deterministic(&bq.rel)) {
+                if let Err(e) = crate::sql::plan_stored_query(&cat, &q).and_then(|bq| check_deterministic(&bq.rel)) {
                     return refuse(format!("materialized view \"{}\" would no longer be valid: {}", o.name, e.message));
                 }
             }
@@ -613,7 +698,8 @@ impl Engine {
     /// re-plan the materialized views reading it (directly or through other
     /// views) so that they read the new version, as a restart would. A view
     /// that no longer plans is dropped together with its indexes and sinks
-    /// (and, in turn, the views reading it).
+    /// (and, in turn, the views reading it); a broken view is rebuilt if it
+    /// plans now, and otherwise stays broken.
     pub(crate) fn replan_dependents(&mut self, gsn: Gsn, changed: ObjectId) -> Result<()> {
         let objects: Vec<CatalogObject> = self.catalog.objects.values().cloned().collect();
         let order: Vec<(CatalogObject, Result<Vec<ObjectId>>)> =
@@ -642,6 +728,10 @@ impl Engine {
                 Err(e) => Err(e),
             };
             if let Err(e) = res {
+                if let std::collections::btree_map::Entry::Occupied(mut b) = self.rt.broken.entry(o.id) {
+                    b.insert(e.message);
+                    continue;
+                }
                 log::error!("materialized view {} is dropped: it is no longer valid after a change to object {changed}: {e}", o.name);
                 self.drop_view_and_attachments(o.id)?;
             }
@@ -673,6 +763,9 @@ impl Engine {
     /// fragments), hydrate it, switch readers and subscribers at `gsn`, and
     /// release the old version.
     fn replace_view(&mut self, gsn: Gsn, id: ObjectId, name: &str, sql: &str, def: ViewDef) -> Result<ExecResult> {
+        if self.rt.broken.contains_key(&id) {
+            return self.repair_view(gsn, id, name, sql, def);
+        }
         let old = self.rt.views.remove(&id).expect("view runtime");
         let old_rows = self.graph.scan_arr(&mut self.env, old.arr, crate::storage::ReadAt::Latest)?;
         let old_cat = self.catalog.get(id).cloned();
@@ -691,33 +784,13 @@ impl Engine {
             }
             return Err(e);
         }
-        // indexes on the view move to the new version; one whose columns
-        // are gone is dropped (user replacements are checked beforehand)
+        // indexes on the view move to the new version (user replacements
+        // are checked beforehand)
         let old_cols = match old_cat.as_ref().map(|o| &o.kind) {
             Some(ObjectKind::MaterializedView(v)) => v.columns.clone(),
             _ => vec![],
         };
-        let indexes: Vec<(ObjectId, String, IndexDef)> = self
-            .catalog
-            .objects
-            .values()
-            .filter_map(|o| match &o.kind {
-                ObjectKind::Index(i) if i.on == id => Some((o.id, o.name.clone(), i.clone())),
-                _ => None,
-            })
-            .collect();
-        let mut old_index_arrs = Vec::new();
-        for (iid, iname, idef) in indexes {
-            if let Some(a) = self.rt.indexes.remove(&iid) {
-                old_index_arrs.push(a);
-            }
-            if index_fits(&idef.columns, &old_cols, &def.columns) {
-                self.create_index_rt(iid, &idef)?;
-            } else {
-                log::error!("index {iname} is dropped: its columns are gone from materialized view {name}");
-                self.catalog.remove(iid);
-            }
-        }
+        let old_index_arrs = self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
         self.graph.hydrate(&mut self.env, gsn)?;
         // the new root's error records (also when it is shared and was
         // hydrated long ago, or is the old version's own root)
@@ -776,6 +849,85 @@ impl Engine {
         Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
     }
 
+    /// Build a broken materialized view (it has no dataflow) under a new or
+    /// re-planned definition: on success it is maintained again, its indexes
+    /// are rebuilt (or dropped with their columns) and its sinks start.
+    fn repair_view(&mut self, gsn: Gsn, id: ObjectId, name: &str, sql: &str, def: ViewDef) -> Result<ExecResult> {
+        let old_cat = self.catalog.get(id).cloned();
+        self.catalog.insert(CatalogObject {
+            id,
+            name: name.to_string(),
+            kind: ObjectKind::MaterializedView(def.clone()),
+            created_gsn: gsn,
+            create_sql: sql.to_string(),
+        });
+        if let Err(e) = self.create_view_rt(id, &def.sql) {
+            if let Some(o) = old_cat {
+                self.catalog.insert(o);
+            }
+            return Err(e);
+        }
+        self.rt.broken.remove(&id);
+        log::info!("materialized view {name} is maintained again");
+        let old_cols = match old_cat.as_ref().map(|o| &o.kind) {
+            Some(ObjectKind::MaterializedView(v)) => v.columns.clone(),
+            _ => vec![],
+        };
+        // (broken views have no index arrangements to release)
+        self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
+        self.graph.hydrate(&mut self.env, gsn)?;
+        let errs = self.graph.errors_of(self.rt.views[&id].node);
+        merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
+        // (also while replaying: sinks receive replayed records)
+        if let Some(handle) = self.handle.clone() {
+            let sinks: Vec<(ObjectId, String, SinkDef)> = self
+                .catalog
+                .objects
+                .values()
+                .filter_map(|o| match &o.kind {
+                    ObjectKind::Sink(s) if s.from == id && self.rt.broken.contains_key(&o.id) => Some((o.id, o.name.clone(), s.clone())),
+                    _ => None,
+                })
+                .collect();
+            for (sid, sname, sdef) in sinks {
+                self.start_sink_or_mark_broken(sid, &sname, &sdef, &handle);
+            }
+        }
+        Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
+    }
+
+    /// Move the indexes on relation `on` to its new version, whose columns
+    /// are `new` (previously `old`): each follows its key columns by name,
+    /// and one whose columns are gone is dropped (logged). Returns the
+    /// arrangements of the old version, to release once nothing reads them.
+    fn move_indexes(&mut self, on: ObjectId, what: &str, old: &[Column], new: &[Column]) -> Vec<ArrId> {
+        let indexes: Vec<CatalogObject> =
+            self.catalog.objects.values().filter(|o| matches!(&o.kind, ObjectKind::Index(i) if i.on == on)).cloned().collect();
+        let mut old_arrs = Vec::new();
+        for o in indexes {
+            let ObjectKind::Index(idef) = &o.kind else { continue };
+            if let Some(a) = self.rt.indexes.remove(&o.id) {
+                old_arrs.push(a);
+            }
+            self.rt.broken.remove(&o.id);
+            match remap_index(&idef.columns, old, new) {
+                Some(columns) => {
+                    let idef = IndexDef { on, columns };
+                    if let Err(e) = self.create_index_rt(o.id, &idef) {
+                        log::error!("index {} is broken: {}", o.name, e.message);
+                        self.rt.broken.insert(o.id, e.message);
+                    }
+                    self.catalog.insert(CatalogObject { kind: ObjectKind::Index(idef), ..o });
+                }
+                None => {
+                    log::error!("index {} is dropped: its columns are gone from {what}", o.name);
+                    self.catalog.remove(o.id);
+                }
+            }
+        }
+        old_arrs
+    }
+
     fn apply_create_index(&mut self, gsn: Gsn, sql: &str, ci: &ast::CreateIndex) -> Result<ExecResult> {
         let (_, tname) = object_name(&ci.table_name)?;
         let Some(target) = self.catalog.by_name(&tname).cloned() else {
@@ -816,13 +968,15 @@ impl Engine {
     }
 
     pub(crate) fn create_index_rt(&mut self, id: ObjectId, def: &IndexDef) -> Result<()> {
-        let node = self
-            .rt
-            .tables
-            .get(&def.on)
-            .copied()
-            .or_else(|| self.rt.views.get(&def.on).map(|v| v.node))
-            .ok_or_else(|| SqlError::internal("index target without dataflow"))?;
+        let node = match self.rt.tables.get(&def.on).copied().or_else(|| self.rt.views.get(&def.on).map(|v| v.node)) {
+            Some(n) => n,
+            None => return Err(self.broken_error(def.on).unwrap_or_else(|| SqlError::internal("index target without dataflow"))),
+        };
+        // (key columns beyond the relation's width would panic the layout)
+        let width = self.graph.node(node).schema.len();
+        if let Some(c) = def.columns.iter().find(|c| **c >= width) {
+            sql_bail!(codes::UNDEFINED_COLUMN, "index column {} does not exist in its relation ({width} columns)", c + 1);
+        }
         let key: Vec<crate::expr::Expr> = def.columns.iter().map(|c| crate::expr::Expr::Column(*c)).collect();
         let n = key.len();
         let arr = self.graph.add_arrangement(&mut self.env, node, key, vec![SortSpec::ASC; n], vec![]);
@@ -831,11 +985,17 @@ impl Engine {
         Ok(())
     }
 
-    fn drop_with_dependents(&mut self, id: ObjectId, cascade: bool) -> Result<()> {
+    /// Fail unless object `id` can be dropped without CASCADE when the
+    /// objects in `dropped` go too. As in PostgreSQL, a relation's indexes
+    /// go with it: only views, sinks and a source's tables need CASCADE.
+    fn check_dependents(&self, id: ObjectId, dropped: &[ObjectId]) -> Result<()> {
         let deps = self.catalog.dependents(id);
-        if !deps.is_empty() && !cascade {
+        let blocking = deps
+            .iter()
+            .find(|d| !dropped.contains(d) && !matches!(self.catalog.get(**d).map(|o| &o.kind), Some(ObjectKind::Index(_))));
+        if let Some(&first) = blocking {
             let obj = self.catalog.get(id).unwrap();
-            let dep = self.catalog.get(deps[0]).unwrap();
+            let dep = self.catalog.get(first).unwrap();
             return Err(SqlError::new(
                 codes::DEPENDENT_OBJECTS_STILL_EXIST,
                 format!("cannot drop {} {} because other objects depend on it", obj.kind.name(), obj.name),
@@ -843,6 +1003,14 @@ impl Engine {
             .with_detail(format!("{} {} depends on {} {}", dep.kind.name(), dep.name, obj.kind.name(), obj.name))
             .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
         }
+        Ok(())
+    }
+
+    fn drop_with_dependents(&mut self, id: ObjectId, cascade: bool) -> Result<()> {
+        if !cascade {
+            self.check_dependents(id, &[])?;
+        }
+        let deps = self.catalog.dependents(id);
         for d in deps {
             if self.catalog.get(d).is_some() {
                 self.drop_with_dependents(d, true)?;
@@ -853,6 +1021,18 @@ impl Engine {
 
     pub(crate) fn drop_object(&mut self, id: ObjectId) -> Result<()> {
         let Some(obj) = self.catalog.remove(id) else { return Ok(()) };
+        self.rt.broken.remove(&id);
+        // subscriptions reading it (directly, through views or in a query)
+        // end with an error
+        for s in self.subs.iter() {
+            if s.reads.contains(&id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                    codes::UNDEFINED_TABLE,
+                    format!("{} \"{}\" was dropped", obj.kind.name(), obj.name),
+                )));
+                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         match obj.kind {
             ObjectKind::Table(_) => {
                 if let Some(n) = self.rt.tables.remove(&id) {
@@ -861,15 +1041,6 @@ impl Engine {
             }
             ObjectKind::MaterializedView(_) => {
                 if let Some(v) = self.rt.views.remove(&id) {
-                    for s in self.subs.iter() {
-                        if s.view == Some(id) {
-                            let _ = s.tx.send(SubEvent::Error(SqlError::new(
-                                codes::UNDEFINED_TABLE,
-                                format!("materialized view \"{}\" was dropped", obj.name),
-                            )));
-                            s.cancel.store(true, std::sync::atomic::Ordering::Release);
-                        }
-                    }
                     self.graph.release_arr(&mut self.env, v.arr)?;
                     self.graph.release_node(&mut self.env, v.node)?;
                 }
@@ -880,8 +1051,10 @@ impl Engine {
                 }
             }
             ObjectKind::Source(def) => {
+                // (the engine thread does not wait for the source thread;
+                // dropping the slot retries until its session let go of it)
                 if let Some(h) = self.source_handles.remove(&id) {
-                    h.stop();
+                    let _ = h.stop();
                 }
                 // recorded also when replaying: the drop may not have
                 // succeeded before the restart (it is retried after it)
@@ -889,12 +1062,12 @@ impl Engine {
                 self.source_states.remove(&id);
                 // a dropped source no longer holds back reads waiting for an LSN
                 self.source_lsns.remove(&id);
-                self.lsn_map.retain(|(s, _, _)| *s != id);
                 self.shared.source_lsn.lock().remove(&id);
             }
             ObjectKind::Sink(_) => {
+                // (the engine thread does not wait for the sink thread)
                 if let Some(h) = self.sink_handles.remove(&id) {
-                    h.stop();
+                    let _ = h.stop();
                 }
             }
             ObjectKind::View(_) => {}
@@ -946,31 +1119,15 @@ impl Engine {
         let tree = arr.tree;
         self.env.apply(tree, &mut ups, gsn)?;
         self.catalog.insert(CatalogObject { kind: ObjectKind::Table(def.clone()), ..obj.clone() });
-        // indexes on the table move to the new version (or go with their columns)
-        let indexes: Vec<(ObjectId, String, IndexDef)> = self
-            .catalog
-            .objects
-            .values()
-            .filter_map(|o| match &o.kind {
-                ObjectKind::Index(i) if i.on == table => Some((o.id, o.name.clone(), i.clone())),
-                _ => None,
-            })
-            .collect();
-        for (iid, iname, idef) in indexes {
-            if let Some(a) = self.rt.indexes.remove(&iid) {
-                self.graph.release_arr(&mut self.env, a)?;
-            }
-            if index_fits(&idef.columns, &old_columns, &columns) {
-                self.create_index_rt(iid, &idef)?;
-            } else {
-                log::error!("index {iname} is dropped: its columns are gone from table {}", obj.name);
-                self.catalog.remove(iid);
-            }
+        // indexes on the table move to the new version
+        for a in self.move_indexes(table, &format!("table {}", obj.name), &old_columns, &columns) {
+            self.graph.release_arr(&mut self.env, a)?;
         }
         self.graph.hydrate(&mut self.env, gsn)?;
-        // subscribers to the table were promised the old columns
+        // subscribers to the table were promised the old columns (and
+        // queries over it would go on reading the old version)
         for s in self.subs.iter() {
-            if s.node == old_node {
+            if s.reads.contains(&table) {
                 let _ = s.tx.send(SubEvent::Error(SqlError::new(
                     codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     format!("table \"{}\" changed its columns upstream", obj.name),
@@ -996,25 +1153,22 @@ impl Engine {
     fn restart_sinks(&mut self, sinks: Vec<ObjectId>) -> Result<()> {
         for id in sinks {
             if let Some(h) = self.sink_handles.remove(&id) {
-                h.stop();
+                let _ = h.stop();
             }
             if let (Some(o), Some(handle)) = (self.catalog.get(id).cloned(), self.handle.clone())
                 && let ObjectKind::Sink(sd) = &o.kind
             {
-                self.start_sink(id, &o.name, sd, &handle)?;
+                self.start_sink_or_mark_broken(id, &o.name, sd, &handle);
             }
         }
         Ok(())
     }
 
     pub(crate) fn start_sink(&mut self, id: ObjectId, name: &str, def: &SinkDef, handle: &EngineHandle) -> Result<()> {
-        let node = self
-            .rt
-            .views
-            .get(&def.from)
-            .map(|v| v.node)
-            .or_else(|| self.rt.tables.get(&def.from).copied())
-            .ok_or_else(|| SqlError::internal("sink source without dataflow"))?;
+        let node = match self.rt.views.get(&def.from).map(|v| v.node).or_else(|| self.rt.tables.get(&def.from).copied()) {
+            Some(n) => n,
+            None => return Err(self.broken_error(def.from).unwrap_or_else(|| SqlError::internal("sink source without dataflow"))),
+        };
         let columns = match self.catalog.get(def.from).map(|o| &o.kind) {
             Some(ObjectKind::MaterializedView(v)) => v.columns.clone(),
             Some(ObjectKind::Table(t)) => t.columns.clone(),
@@ -1032,10 +1186,10 @@ fn same_columns(a: &[Column], b: &[Column]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name && x.ty.ty == y.ty.ty && x.ty.typmod == y.ty.typmod)
 }
 
-/// Do index key columns (positions into `old`) denote the same columns in
-/// `new`?
-fn index_fits(key: &[usize], old: &[Column], new: &[Column]) -> bool {
-    key.iter().all(|&k| k < new.len() && old.get(k).is_some_and(|c| c.name == new[k].name))
+/// Index key columns (positions into `old`) at the positions of the same
+/// columns, by name, in `new`; None if one of them is gone.
+fn remap_index(key: &[usize], old: &[Column], new: &[Column]) -> Option<Vec<usize>> {
+    key.iter().map(|&k| old.get(k).and_then(|c| new.iter().position(|n| n.name == c.name))).collect()
 }
 
 fn object_type_name(t: ast::ObjectType) -> &'static str {
@@ -1095,6 +1249,10 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
     if ct.query.is_some() {
         sql_bail!(codes::FEATURE_NOT_SUPPORTED, "CREATE TABLE AS is not supported");
     }
+    let (_, table) = object_name(&ct.name)?;
+    let multiple_keys = || {
+        Err(SqlError::new(codes::INVALID_TABLE_DEFINITION, format!("multiple primary keys for table \"{table}\" are not allowed")))
+    };
     let mut columns = Vec::new();
     let mut pk: Vec<usize> = Vec::new();
     for (i, c) in ct.columns.iter().enumerate() {
@@ -1105,6 +1263,11 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
                 ast::ColumnOption::NotNull => nullable = false,
                 ast::ColumnOption::Null => nullable = true,
                 ast::ColumnOption::PrimaryKey(_) => {
+                    // one column-level key is the whole key: a second one
+                    // is a second primary key, not a composite one
+                    if !pk.is_empty() {
+                        return multiple_keys();
+                    }
                     pk.push(i);
                     nullable = false;
                 }
@@ -1122,7 +1285,7 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
     for con in &ct.constraints {
         if let ast::TableConstraint::PrimaryKey(p) = con {
             if !pk.is_empty() {
-                sql_bail!(codes::INVALID_COLUMN_REFERENCE, "multiple primary keys for table are not allowed");
+                return multiple_keys();
             }
             for ic in &p.columns {
                 let ast::Expr::Identifier(id) = &ic.column.expr else {
@@ -1132,6 +1295,9 @@ pub(crate) fn table_def_from_ast(ct: &ast::CreateTable) -> Result<TableDef> {
                 let pos = columns.iter().position(|c| c.name == n).ok_or_else(|| {
                     SqlError::new(codes::UNDEFINED_COLUMN, format!("column \"{n}\" named in key does not exist"))
                 })?;
+                if pk.contains(&pos) {
+                    sql_bail!(codes::DUPLICATE_COLUMN, "column \"{n}\" appears twice in primary key constraint");
+                }
                 columns[pos].ty.nullable = false;
                 pk.push(pos);
             }

@@ -103,12 +103,16 @@ pub struct Manifest {
 const MAX_MANIFEST_BYTES: u64 = 8 << 20;
 
 impl Manifest {
-    /// Open (creating if needed) and return the last valid record.
+    /// Open (creating if needed) and return the last valid record. A
+    /// manifest with contents but no valid record is refused (nothing is
+    /// modified): it may have described a checkpoint, and the store's
+    /// segment files are only readable through it.
     pub fn open(dir: &Path) -> Result<(Manifest, Option<CheckpointRecord>)> {
         let path = dir.join("MANIFEST");
         let mut last = None;
         let mut valid_len = 0u64;
-        if path.exists() {
+        let existed = path.exists();
+        if existed {
             let mut data = Vec::new();
             File::open(&path)?.read_to_end(&mut data)?;
             let mut pos = 0usize;
@@ -126,9 +130,21 @@ impl Manifest {
                 pos += 8 + len;
                 valid_len = pos as u64;
             }
+            if last.is_none() && !data.is_empty() {
+                return Err(SqlError::corrupt(format!(
+                    "{} has no valid checkpoint record ({} bytes); refusing to start, the store is left untouched \
+                     (if the engine crashed during its first checkpoint, remove the store directory: it is rebuilt from the input log)",
+                    path.display(),
+                    data.len()
+                )));
+            }
         }
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-        // drop a torn tail
+        if !existed {
+            // the manifest must not vanish after the segments it describes
+            File::open(dir)?.sync_all()?;
+        }
+        // drop a torn tail (after the last valid record)
         file.set_len(valid_len)?;
         Ok((Manifest { path, file, len: valid_len }, last))
     }

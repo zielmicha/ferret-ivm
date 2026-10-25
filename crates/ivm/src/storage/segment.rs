@@ -36,8 +36,12 @@ impl SegmentStore {
     pub fn open(dir: &Path, active_id: u32, active_len: u64, max_segment_bytes: u64) -> Result<SegmentStore> {
         std::fs::create_dir_all(dir)?;
         let path = segment_path(dir, active_id);
+        let created = !path.exists();
         let f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
         f.set_len(active_len)?;
+        if created {
+            File::open(dir)?.sync_all()?;
+        }
         Ok(SegmentStore {
             dir: dir.to_path_buf(),
             active_id,
@@ -98,6 +102,8 @@ impl SegmentStore {
         self.readers.insert(self.active_id, old);
         self.active_id += 1;
         self.written_len = 0;
+        // the new file must exist after a crash once a checkpoint refers to it
+        File::open(&self.dir)?.sync_all()?;
         Ok(())
     }
 

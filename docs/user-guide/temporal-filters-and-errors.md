@@ -32,7 +32,7 @@ Where the clock is used:
 | Context | `now()` (and `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date`) |
 |---|---|
 | materialized views, `SUBSCRIBE (query)` | only in temporal filters (below), evaluated against the logical clock |
-| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN (except across a restart: reads as of a GSN older than the last checkpoint then see the checkpoint's clock) |
+| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN, also across restarts (the checkpoint keeps the last 100,000 clock ticks of the retention window; a read as of an older GSN after a restart sees the oldest kept tick's clock) |
 | `INSERT`/`UPDATE`/`DELETE` | the wall clock when the statement runs (the resulting values are logged) |
 
 `clock_timestamp()` always returns the wall clock and is rejected in
@@ -147,7 +147,7 @@ INSERT INTO t VALUES (1, 1), (2, 2);
 CREATE MATERIALIZED VIEW e AS SELECT id, 10 / (x - 1) AS q FROM t;
 
 SELECT * FROM e;          -- ERROR:  division by zero
-SHOW VIEWS;               -- e | materialized | 1 | 1   (one error record)
+SHOW VIEWS;               -- e | materialized | 1 | 1 | ok   (one error record)
 DELETE FROM t WHERE id = 1;
 SELECT * FROM e;          -- 2 | 10
 ```
@@ -178,8 +178,8 @@ internal errors (`XX...` SQLSTATEs) and I/O errors (`58...`) — are not turned
 into records. Such an error while applying a log record stops the engine
 thread; the server then answers every statement with
 `engine is shutting down` until it is restarted. Any other error that
-escapes the dataflow is logged, and the record stays half-applied (see the
-last deviation below).
+escapes the dataflow (a bug) is logged, the record is not applied again (it
+may be half-applied), and the statement that wrote it fails.
 
 Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
 
@@ -204,11 +204,3 @@ Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
   the same error.
 - Error records are **not versioned**: an `AS OF` read checks the view's
   current error records, whatever they were at the read's GSN.
-- Errors inside **`WITH RECURSIVE`** maintenance and errors computing an
-  **index key** (for example a join on `a.x + 1 = b.y` when `a.x + 1`
-  overflows) do not become error records; they abort the processing of the
-  log record. The change is then half-applied (the base table is updated,
-  downstream views are not), the DML statement never gets a reply, and every
-  later DML statement waits forever; restarting replays the record and fails
-  again (`ivm: failed to start: ...`) unless a checkpoint was taken after
-  it.
