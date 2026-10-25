@@ -10,6 +10,7 @@ use crate::sql::plan::ObjectId;
 use crate::types::Column;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use postgres::discover;
@@ -21,6 +22,41 @@ pub struct SourceTable {
     pub upstream: (String, String),
     pub columns: Vec<Column>,
     pub pk: Vec<usize>,
+}
+
+/// Live counters of a source, updated by its thread with relaxed atomic
+/// stores and read by the web UI (see `Shared::source_gauges`).
+#[derive(Default, Debug)]
+pub struct SourceGauges {
+    /// Upstream end of WAL, as last reported by the server.
+    pub wal_end: AtomicU64,
+    /// Server clock of the last message (microseconds since 2000-01-01).
+    pub server_time: AtomicI64,
+    /// Local wall clock (Unix microseconds) when the last message arrived.
+    pub received_at: AtomicI64,
+    /// Transactions with changes handed to the input log.
+    pub commits: AtomicU64,
+    /// Row changes in those transactions (including snapshot rows).
+    pub changes: AtomicU64,
+}
+
+impl SourceGauges {
+    pub fn upstream(&self, wal_end: u64, server_time: i64) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0);
+        self.wal_end.fetch_max(wal_end, Ordering::Relaxed);
+        self.server_time.store(server_time, Ordering::Relaxed);
+        self.received_at.store(now, Ordering::Relaxed);
+    }
+
+    pub fn commit(&self, changes: usize) {
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        self.changes.fetch_add(changes as u64, Ordering::Relaxed);
+    }
+}
+
+/// The gauges of source `id` (created on first use).
+pub fn gauges(shared: &crate::coord::api::Shared, id: ObjectId) -> Arc<SourceGauges> {
+    shared.source_gauges.lock().entry(id).or_default().clone()
 }
 
 pub enum SourceCtl {
