@@ -504,6 +504,7 @@ impl<'a> Lowerer<'a> {
                     key: pairs.iter().map(|(_, o, _)| o.clone()).collect(),
                     null_safe: pairs.iter().map(|(_, _, ns)| *ns).collect(),
                     filters,
+                    decode: Default::default(),
                 });
             }
             paths.push(DeltaPath { source: src, source_filters, steps });

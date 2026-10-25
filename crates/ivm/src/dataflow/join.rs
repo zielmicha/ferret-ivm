@@ -37,6 +37,9 @@ pub struct LookupStep {
     pub null_safe: Vec<bool>,
     /// Predicates over the joined row checked after this step.
     pub filters: Vec<Expr>,
+    /// Columns of the looked-up entries the input's MFP reads (computed on
+    /// first use; not part of the plan's identity).
+    pub decode: std::sync::OnceLock<Option<super::layout::PartialDecode>>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,35 +126,40 @@ struct Ctx<'a> {
     pres_delta: Vec<Option<FxHashMap<Vec<u8>, i64>>>,
 }
 
-/// Rows of input `step.input` matching the joined row (post-MFP).
-fn lookup(env: &mut Env, cx: &Ctx, step: &LookupStep, row: &[Datum], at: ReadAt) -> Result<Vec<(Row, i64)>> {
+/// Key values of a lookup step for a joined row (None: matches nothing).
+fn lookup_key(step: &LookupStep, row: &[Datum]) -> Option<Vec<Datum>> {
     let mut key = Vec::with_capacity(step.key.len());
     for (k, safe) in step.key.iter().zip(&step.null_safe) {
-        let v = match k.eval(row) {
-            Ok(v) => v,
-            Err(_) => return Ok(vec![]),
-        };
+        let v = k.eval(row).ok()?;
         if v.is_null() && !safe {
-            return Ok(vec![]);
+            return None;
         }
         key.push(v);
     }
+    Some(key)
+}
+
+/// Rows of input `step.input` matching an encoded key (post-MFP); for
+/// presence inputs, whether the key is present (the row is then the key).
+fn lookup_prefix(env: &mut Env, cx: &Ctx, step: &LookupStep, prefix: &[u8], at: ReadAt) -> Result<Vec<(Row, i64)>> {
     let inp = &cx.p.inputs[step.input];
     if let Some(parr) = inp.presence {
-        let prefix = cx.g.arr(parr).layout.encode_prefix(&key);
-        let c = presence_count(env, cx.g, parr, &prefix, at, cx.pres_delta[step.input].as_ref())?;
-        return Ok(if c > 0 { vec![(key, 1)] } else { vec![] });
+        let c = presence_count(env, cx.g, parr, prefix, at, cx.pres_delta[step.input].as_ref())?;
+        return Ok(if c > 0 { vec![(Vec::new(), 1)] } else { vec![] });
     }
-    let raw = cx.g.lookup(env, step.arr, &key, at)?;
-    let mut out = Vec::with_capacity(raw.len());
-    for (r, w) in raw {
-        if w <= 0 {
-            continue;
-        }
-        if let Ok(Some(post)) = inp.mfp.eval(&r) {
+    let a = cx.g.arr(step.arr);
+    // only the columns the input's MFP reads are decoded
+    let plan = step.decode.get_or_init(|| a.layout.decode_plan(&inp.mfp.input_columns())).as_ref();
+    let mut out = Vec::new();
+    env.for_each_prefix(a.tree, prefix, &mut |k, h| {
+        let w = h.weight(at);
+        if w > 0
+            && let Ok(Some(post)) = inp.mfp.eval(&a.layout.decode_row_with(k, plan)?)
+        {
             out.push((post, w));
         }
-    }
+        Ok(true)
+    })?;
     Ok(out)
 }
 
@@ -177,15 +185,39 @@ fn run_path(env: &mut Env, cx: &Ctx, path: &DeltaPath, start: Vec<(Row, i64)>, g
             }
         };
         let inp = &cx.p.inputs[step.input];
+        let arr = inp.presence.unwrap_or(step.arr);
+        let layout = &cx.g.arr(arr).layout;
+        // rows with equal encoded keys share one lookup: (key, row index, key values)
+        let mut keyed: Vec<(Vec<u8>, usize, Vec<Datum>)> = Vec::with_capacity(frontier.len());
+        for (i, (row, _)) in frontier.iter().enumerate() {
+            if let Some(key) = lookup_key(step, row) {
+                keyed.push((layout.encode_prefix(&key), i, key));
+            }
+        }
+        if keyed.len() > 1 {
+            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        }
         let mut next = Vec::new();
-        for (row, w) in &frontier {
-            for (post, mw) in lookup(env, cx, step, row, at)? {
-                let mut r = row.clone();
-                r[inp.offset..inp.offset + inp.width].clone_from_slice(&post);
-                if step.filters.iter().all(|f| f.eval_pred(&r).unwrap_or(false)) {
-                    next.push((r, w * mw));
+        let mut j = 0;
+        while j < keyed.len() {
+            let mut end = j + 1;
+            while end < keyed.len() && keyed[end].0 == keyed[j].0 {
+                end += 1;
+            }
+            let matches = lookup_prefix(env, cx, step, &keyed[j].0, at)?;
+            for (_, i, key) in &keyed[j..end] {
+                let (row, w) = &frontier[*i];
+                for (post, mw) in &matches {
+                    let mut r = row.clone();
+                    // a presence input's row is the probing key itself
+                    let post = if inp.presence.is_some() { key } else { post };
+                    r[inp.offset..inp.offset + inp.width].clone_from_slice(post);
+                    if step.filters.iter().all(|f| f.eval_pred(&r).unwrap_or(false)) {
+                        next.push((r, w * mw));
+                    }
                 }
             }
+            j = end;
         }
         frontier = next;
     }
