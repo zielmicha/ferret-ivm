@@ -91,7 +91,9 @@ fn type_info(t: &SqlType) -> (&'static str, i16, &'static str) {
         T::Jsonb => ("jsonb", -1, "U"),
         T::JsonPath => ("jsonpath", -1, "U"),
         T::Oid => ("oid", 4, "N"),
-        T::Array(_) | T::Unknown => ("unknown", -2, "X"),
+        // arrays are varlena (callers name them after their element type)
+        T::Array(_) => ("_array", -1, "A"),
+        T::Unknown => ("unknown", -2, "X"),
     }
 }
 

@@ -547,3 +547,15 @@ fn scalar_subquery_cardinality_errors_only_where_evaluated() {
     assert_eq!(rows(&h, "SELECT * FROM g ORDER BY id"), vec!["1|100", "2|", "3|", "4|", "5|"]);
     running.shutdown();
 }
+
+#[test]
+fn pg_attribute_describes_array_columns_as_varlena() {
+    let running = start("attlen");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE arrs (id int PRIMARY KEY, a int[], t text[])");
+    assert_eq!(
+        rows(&h, "SELECT attname, attlen, attbyval, attstorage, attndims FROM pg_attribute WHERE attrelid = 'arrs'::regclass AND attnum > 0 ORDER BY attnum"),
+        vec!["id|4|t|p|0", "a|-1|f|x|1", "t|-1|f|x|1"]
+    );
+    running.shutdown();
+}
