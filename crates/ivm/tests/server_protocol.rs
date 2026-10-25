@@ -476,3 +476,24 @@ fn set_rejects_settings_the_server_cannot_honor() {
     assert_eq!(first_values(&c.query("SELECT '01/02/2024'::date")), vec!["2024-01-02"]);
     running.shutdown();
 }
+
+#[test]
+fn show_reports_fixed_settings() {
+    let (running, port) = start("showfixed");
+    let mut c = Conn::connect(port);
+    // used to fail with "unrecognized configuration parameter"; tools run
+    // SHOW search_path when they connect
+    for (name, value) in [
+        ("search_path", "\"$user\", public"),
+        ("extra_float_digits", "1"),
+        ("bytea_output", "hex"),
+        ("is_superuser", "on"),
+        ("default_transaction_isolation", "serializable"),
+        ("transaction_read_only", "off"),
+    ] {
+        assert_eq!(first_values(&c.query(&format!("SHOW {name}"))), vec![value], "{name}");
+    }
+    c.query("SET search_path = public");
+    assert_eq!(first_values(&c.query("SHOW search_path")), vec!["public"]);
+    running.shutdown();
+}

@@ -214,8 +214,18 @@ impl Session {
             pending_copy: false,
         };
         s.settings.insert("application_name".into(), app);
-        // read-only settings clients SHOW (besides those reported above)
-        for (k, v) in [("server_version_num", "170000"), ("integer_datetimes", "on"), ("max_identifier_length", "63")] {
+        // settings clients SHOW (besides those reported above)
+        for (k, v) in [
+            ("server_version_num", "170000"),
+            ("integer_datetimes", "on"),
+            ("max_identifier_length", "63"),
+            ("search_path", "\"$user\", public"),
+            ("extra_float_digits", "1"),
+            ("bytea_output", "hex"),
+            ("is_superuser", "on"),
+            ("default_transaction_isolation", "serializable"),
+            ("transaction_read_only", "off"),
+        ] {
             s.settings.insert(k.into(), v.into());
         }
         // the session's read mode, also before any SET
