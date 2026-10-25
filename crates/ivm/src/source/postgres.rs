@@ -520,14 +520,22 @@ impl PgSource {
                 rel.columns.iter().enumerate().filter(|(_, c)| c.is_key).map(|(i, _)| i).collect()
             };
             log::info!("source table {}.{} changed shape; re-snapshotting", t.upstream.0, t.upstream.1);
+            // The schema change is logged now, before the commit of the
+            // transaction announcing it: its changes to the table so far
+            // were decoded in the old shape and must take the new one.
+            if let Some(txn) = &mut self.txn {
+                reshape_changes(&mut txn.changes, &t, table, &columns, &pk);
+            }
             self.engine.log(LogRecord::Schema { source: self.id, table, columns: columns.clone(), pk: pk.clone() })?;
             let nt = SourceTable { id: table, upstream: t.upstream.clone(), columns: columns.clone(), pk };
             self.tables.insert(table, nt);
-            // re-snapshot to fill new columns of existing rows
+            // re-snapshot to fill new columns of existing rows; logged at
+            // once so that a restart does not forget it
             self.state.tables.insert(table, SnapState::default());
             if self.chunk.as_ref().is_some_and(|c| c.table == table) {
                 self.chunk = None;
             }
+            self.log_progress(self.durable_lsn)?;
             let cols2: Vec<Option<usize>> = rel.columns.iter().enumerate().map(|(i, _)| Some(i)).collect();
             self.rels.insert(rel.id, RelMap { table, cols: cols2 });
             return Ok(());
@@ -707,6 +715,47 @@ impl PgSource {
         *self.status.lock() = format!("snapshotting {}.{}", t.upstream.0, t.upstream.1);
         Ok(())
     }
+}
+
+/// Rewrite the changes to `table` (decoded with the columns of `old`) for
+/// its new columns and key: values move by column name and are cast to the
+/// new types (NULL where that fails), as the engine converts stored rows. A
+/// delete by a key that changed columns cannot be converted and is dropped
+/// (the table is re-snapshotted anyway).
+fn reshape_changes(changes: &mut Vec<(ObjectId, TableChange)>, old: &SourceTable, table: ObjectId, columns: &[Column], pk: &[usize]) {
+    let pos = |name: &str| columns.iter().position(|c| c.name == name);
+    let cast = |v: &Datum, c: &Column| crate::expr::cast::cast_datum(v, &c.ty.ty, c.ty.typmod, true).unwrap_or(Datum::Null);
+    let reshape = |row: &Row| -> Row {
+        columns
+            .iter()
+            .map(|c| match old.columns.iter().position(|o| o.name == c.name) {
+                Some(i) => row.get(i).map(|v| cast(v, c)).unwrap_or(Datum::Null),
+                None => Datum::Null,
+            })
+            .collect()
+    };
+    let same_key = old.pk.len() == pk.len() && old.pk.iter().zip(pk).all(|(o, n)| old.columns[*o].name == columns[*n].name);
+    changes.retain_mut(|(t, ch)| {
+        if *t != table {
+            return true;
+        }
+        match ch {
+            TableChange::Upsert { row, unchanged } => {
+                *row = reshape(row);
+                *unchanged = unchanged.iter().filter_map(|u| old.columns.get(*u).and_then(|c| pos(&c.name))).collect();
+            }
+            TableChange::Insert { row } | TableChange::Remove { row } => *row = reshape(row),
+            TableChange::Delete { key } => {
+                if !same_key {
+                    log::warn!("delete by a key whose columns changed upstream in the same transaction is dropped");
+                    return false;
+                }
+                *key = key.iter().zip(pk).map(|(v, p)| cast(v, &columns[*p])).collect();
+            }
+            TableChange::Truncate => {}
+        }
+        true
+    });
 }
 
 fn parse_text_row(r: &[Option<String>], t: &SourceTable) -> Result<Row> {
@@ -889,6 +938,144 @@ fn _fmt(d: &Datum) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord::api::Shared;
+    use crate::coord::seq::SeqMsg;
+    use pgproto::pgoutput::RelationColumn;
+
+    /// An engine handle whose sequencer acknowledges every append at once
+    /// and keeps the records.
+    fn fake_engine() -> (EngineHandle, Arc<Mutex<Vec<LogRecord>>>) {
+        let (etx, _) = crossbeam_channel::unbounded();
+        let (stx, srx) = crossbeam_channel::unbounded::<SeqMsg>();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let l2 = log.clone();
+        std::thread::spawn(move || {
+            let mut gsn = 0;
+            for m in srx {
+                if let SeqMsg::Append { rec, ack } = m {
+                    gsn += 1;
+                    l2.lock().push(rec);
+                    if let Some(a) = ack {
+                        let _ = a.send(gsn);
+                    }
+                }
+            }
+        });
+        (EngineHandle { tx: etx, seq: stx, shared: Arc::new(Shared::default()) }, log)
+    }
+
+    fn int_cols(names: &[&str]) -> Vec<Column> {
+        names.iter().map(|n| Column::new(*n, ColumnType::new(SqlType::Int4))).collect()
+    }
+
+    /// Table 10, upstream public.t, with int columns; first column the key.
+    fn table(names: &[&str], pk: Vec<usize>) -> SourceTable {
+        SourceTable { id: 10, upstream: ("public".into(), "t".into()), columns: int_cols(names), pk }
+    }
+
+    fn source(tables: Vec<SourceTable>, state: SourceState) -> (PgSource, Arc<Mutex<Vec<LogRecord>>>) {
+        let (engine, log) = fake_engine();
+        let src = PgSource {
+            id: 1,
+            def: SourceDef { conninfo: String::new(), publication: "p".into(), slot: "s".into(), tables: None },
+            engine,
+            tables: tables.into_iter().map(|t| (t.id, t)).collect(),
+            rels: HashMap::new(),
+            state,
+            resume_lsn: 0,
+            durable_lsn: 0,
+            txn: None,
+            chunk: None,
+            query: None,
+            status: Arc::new(Mutex::new(String::new())),
+            seq: 0,
+            inflight: std::collections::VecDeque::new(),
+            pending_wal_end: 0,
+            unmapped_rels: HashMap::new(),
+        };
+        (src, log)
+    }
+
+    fn done_state(table: ObjectId) -> SourceState {
+        let mut st = SourceState { slot_created: true, ..Default::default() };
+        st.tables.insert(table, SnapState { done: true, boundary: None });
+        st
+    }
+
+    const REL: u32 = 777;
+
+    fn relation(names: &[&str], keys: usize) -> LogicalMessage {
+        LogicalMessage::Relation(Relation {
+            id: REL,
+            namespace: "public".into(),
+            name: "t".into(),
+            replica_identity: b'd',
+            columns: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| RelationColumn { is_key: i < keys, name: n.to_string(), type_oid: 23, type_modifier: -1 })
+                .collect(),
+        })
+    }
+
+    fn begin(xid: u32) -> LogicalMessage {
+        LogicalMessage::Begin { final_lsn: Lsn(0), commit_time: 0, xid }
+    }
+
+    fn commit(end: u64) -> LogicalMessage {
+        LogicalMessage::Commit { flags: 0, commit_lsn: Lsn(end - 1), end_lsn: Lsn(end), commit_time: 0 }
+    }
+
+    fn insert(vals: &[i32]) -> LogicalMessage {
+        LogicalMessage::Insert { relation_id: REL, new: vals.iter().map(|v| TupleValue::Text(v.to_string().into_bytes())).collect() }
+    }
+
+    /// A schema change resets the table's snapshot state and logs it at once:
+    /// the re-snapshot used to be recorded only with the next chunk, so a
+    /// restart in between left new columns NULL for good.
+    #[test]
+    fn schema_change_logs_the_resnapshot() {
+        let (mut src, log) = source(vec![table(&["id", "a"], vec![0])], done_state(10));
+        src.handle_message(begin(5)).unwrap();
+        src.handle_message(relation(&["id", "a", "b"], 1)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.drain_acks(true).unwrap();
+        let recs = log.lock();
+        assert!(matches!(&recs[0], LogRecord::Schema { table: 10, columns, .. } if columns.len() == 3), "{recs:?}");
+        match &recs[1] {
+            LogRecord::Progress { state, .. } => {
+                let st: SourceState = serde_json::from_str(state).unwrap();
+                assert!(!st.tables[&10].done);
+            }
+            other => panic!("expected the reset snapshot state, got {other:?}"),
+        }
+    }
+
+    /// Changes decoded before a schema change in the same transaction are
+    /// logged after the Schema record, so they take the new shape.
+    #[test]
+    fn changes_before_a_schema_change_take_the_new_shape() {
+        let (mut src, log) = source(vec![table(&["id", "a", "c"], vec![0])], done_state(10));
+        src.handle_message(begin(5)).unwrap();
+        src.handle_message(relation(&["id", "a", "c"], 1)).unwrap();
+        src.handle_message(insert(&[1, 2, 3])).unwrap();
+        // c dropped, b added
+        src.handle_message(relation(&["id", "b", "a"], 1)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.drain_acks(true).unwrap();
+        let recs = log.lock();
+        let changes = recs
+            .iter()
+            .find_map(|r| match r {
+                LogRecord::Commit { changes, .. } => Some(changes.clone()),
+                _ => None,
+            })
+            .expect("commit");
+        match &changes[..] {
+            [(10, TableChange::Upsert { row, .. })] => assert_eq!(row, &vec![Datum::Int4(1), Datum::Null, Datum::Int4(2)]),
+            other => panic!("unexpected changes {other:?}"),
+        }
+    }
 
     #[test]
     fn xid_visibility_across_epochs() {

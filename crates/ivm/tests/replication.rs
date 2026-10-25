@@ -250,3 +250,20 @@ fn refreshed_tables_announced_earlier_are_replicated() {
     up.exec("UPDATE b SET v = 10 WHERE id = 1");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM b ORDER BY id"), ["1|10", "2|2"]);
 }
+
+/// One upstream transaction changing rows before and after an ALTER TABLE:
+/// the rows decoded in the old shape used to reach the engine after the
+/// schema change and panic it (on every restart, too).
+#[test]
+fn ddl_and_dml_in_one_upstream_transaction() {
+    let (mut up, mut ivm, dir) = setup("txn-ddl", &["CREATE TABLE t (id int PRIMARY KEY, a int)", "INSERT INTO t VALUES (1, 1)"]);
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), ["1|1"]);
+    up.exec("BEGIN; INSERT INTO t VALUES (2, 2); ALTER TABLE t ADD COLUMN b int DEFAULT 0; INSERT INTO t VALUES (3, 3, 3); UPDATE t SET a = 10 WHERE id = 1; COMMIT");
+    let want = ["1|10|0", "2|2|0", "3|3|3"];
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), want);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM v ORDER BY id"), ["1|10", "2|2", "3|3"]);
+    ivm.shutdown();
+    let mut ivm = Ivm::start(&dir);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), want);
+}
