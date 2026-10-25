@@ -547,9 +547,16 @@ impl Engine {
                 self.source_states.insert(source, state);
                 self.snap_epoch += 1;
             }
-            LogRecord::Schema { source: _, table, columns, pk } => {
+            LogRecord::Schema { source, table, columns, pk } => {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
                 self.processed = gsn;
+                // The source snapshots the table again to fill in the new
+                // columns; until it logs progress, its last logged state has
+                // the snapshot done, and a restart would never redo it.
+                if let Some(state) = self.source_states.get_mut(&source) {
+                    *state = crate::source::postgres::snapshot_again(state, table);
+                }
+                self.snap_epoch += 1;
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }

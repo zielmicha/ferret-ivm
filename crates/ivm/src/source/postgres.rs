@@ -134,6 +134,14 @@ pub struct SourceState {
     pub tables: BTreeMap<ObjectId, SnapState>,
 }
 
+/// A source's logged `state` with the snapshot of `table` to be done again
+/// (as the source does on a schema change).
+pub fn snapshot_again(state: &str, table: ObjectId) -> String {
+    let mut s: SourceState = serde_json::from_str(state).unwrap_or_default();
+    s.tables.insert(table, SnapState::default());
+    serde_json::to_string(&s).unwrap()
+}
+
 /// Mapping of an upstream relation onto a catalog table.
 struct RelMap {
     table: ObjectId,

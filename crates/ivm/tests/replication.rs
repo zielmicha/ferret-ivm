@@ -62,6 +62,14 @@ fn assert_caught_up(h: &EngineHandle, up: &mut Client, queries: &[&str]) {
     }
 }
 
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Updates that change a row's primary key but not its TOASTed columns
 /// replicate the new key with "unchanged TOAST" placeholders. Their values
 /// were taken from the old key tuple, which carries only the key, so they
@@ -219,6 +227,60 @@ fn resnapshots_keep_deletes() {
     .unwrap();
     assert_caught_up(&h, &mut up, &["SELECT id, n, x FROM t ORDER BY id"]);
     assert_eq!(rows(&h, "SELECT * FROM v"), upstream_rows(&mut up, "SELECT count(*), sum(n) FROM t"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Should the engine stop after an upstream schema change but before the
+/// re-snapshot that fills in the new columns has logged progress, the
+/// recovered source state still had the table's snapshot done: it was
+/// never redone, and existing rows kept NULL in the new column in place of
+/// its default.
+#[test]
+fn resnapshots_resume_after_a_crash() {
+    let pg = TempCluster::start(ClusterOptions::default()).expect("start postgres");
+    let conninfo = pg.conninfo("postgres");
+    let mut up = connect(&conninfo);
+    up.simple_query(
+        "CREATE TABLE t (id int PRIMARY KEY, n int);
+         INSERT INTO t SELECT g, g FROM generate_series(1, 6) g;
+         CREATE PUBLICATION p FOR TABLE t;",
+    )
+    .unwrap();
+    let dir = scratch("resnapshot-crash");
+    let running = coord::start(config(&dir)).unwrap();
+    create_source(&running.handle, &conninfo);
+    assert_caught_up(&running.handle, &mut up, &["SELECT count(*) FROM t"]);
+    running.shutdown();
+
+    // while the engine is down: a new column, which existing rows get with
+    // its default without a replicated change, and a change bringing the
+    // new shape into the replication stream
+    up.simple_query("ALTER TABLE t ADD COLUMN x int DEFAULT 7; UPDATE t SET n = -1 WHERE id = 1;").unwrap();
+    // hold back the re-snapshot: its first chunk waits for this lock
+    let mut locker = connect(&conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE").unwrap();
+    let running = coord::start(config(&dir)).unwrap();
+    let h = running.handle.clone();
+    let chunk_waiting = |up: &mut Client| {
+        upstream_rows(up, "SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND backend_type = 'client backend'")
+    };
+    wait_until("the schema change", || {
+        let stmt = ivm::sql::parse_statement("SELECT x FROM t AS OF LATEST").unwrap();
+        h.execute(stmt, vec![], SessionVars::default(), String::new()).is_ok()
+    });
+    wait_until("the re-snapshot to wait for the lock", || !chunk_waiting(&mut up).is_empty());
+    // stop the engine: the source, once its chunk query fails, sees the
+    // stop request and logs nothing more
+    let crashing = std::thread::spawn(move || running.crash());
+    for pid in chunk_waiting(&mut up) {
+        up.simple_query(&format!("SELECT pg_terminate_backend({pid})")).unwrap();
+    }
+    crashing.join().unwrap();
+    locker.simple_query("ROLLBACK").unwrap();
+
+    let running = coord::start(config(&dir)).unwrap();
+    assert_caught_up(&running.handle, &mut up, &["SELECT id, n, x FROM t ORDER BY id"]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
