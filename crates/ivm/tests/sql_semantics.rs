@@ -359,3 +359,38 @@ fn nullif_keeps_the_type_of_its_first_argument() {
     assert_eq!(rows(&h, "SELECT nullif(1, 2.5), pg_typeof(nullif(1, 2.5))"), vec!["1|numeric"]);
     running.shutdown();
 }
+
+fn column_names(h: &EngineHandle, sql: &str) -> Vec<String> {
+    match try_exec(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        ExecResult::Query { columns, .. } => columns.iter().map(|c| c.name.clone()).collect(),
+        other => panic!("{sql}: expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn explicit_casts_of_literals_truncate() {
+    let running = start("cast-truncate");
+    let h = running.handle.clone();
+    // used to fail with 'value too long' (assignment rules)
+    assert_eq!(rows(&h, "SELECT 'abcdef'::varchar(3), CAST('abcdef' AS char(2)), varchar(3) 'abcdef'"), vec!["abc|ab|abc"]);
+    assert_eq!(rows(&h, "SELECT 'ab'::char(4) || '#', 'abc   '::varchar(3)::text || '#'"), vec!["ab#|abc#"]);
+    // assignment still rejects them
+    exec(&h, "CREATE TABLE v3 (id int PRIMARY KEY, s varchar(3))");
+    assert!(try_exec(&h, "INSERT INTO v3 VALUES (1, 'abcdef')").is_err());
+    running.shutdown();
+}
+
+#[test]
+fn output_column_names_follow_postgresql() {
+    let running = start("colnames");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    let q = "SELECT CASE WHEN a > 1 THEN 1 ELSE b END, CASE WHEN a > 1 THEN b END, a::text::int, 1::text::int, '{}'::int[], \
+             (SELECT b FROM t1 LIMIT 1)::text, true::int, date '2024-01-01'::text, coalesce(a, 1)::text, \
+             trim(leading 'x' from 'xa'), trim(trailing 'x' from 'ax'), x.y FROM t1, (SELECT 1 AS y) x LIMIT 1";
+    assert_eq!(
+        column_names(&h, q),
+        vec!["b", "case", "a", "int4", "int4", "b", "int4", "text", "coalesce", "ltrim", "rtrim", "y"]
+    );
+    running.shutdown();
+}

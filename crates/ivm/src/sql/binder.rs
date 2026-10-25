@@ -1410,49 +1410,72 @@ pub(crate) fn apply_alias_names(names: &mut [String], alias: &[String], table: &
     Ok(())
 }
 
-/// PostgreSQL's output column naming.
+/// PostgreSQL's output column naming (FigureColname).
 pub(crate) fn derive_name(e: &ast::Expr) -> String {
+    figure_colname(e).0
+}
+
+/// A column name for `e` and its strength (PostgreSQL's FigureColnameInternal):
+/// 2 for names of columns, functions and the like, 1 for type names from
+/// casts, 0 for nothing better than "?column?". A cast or CASE takes its
+/// argument's (ELSE result's) name when that is strong.
+fn figure_colname(e: &ast::Expr) -> (String, u8) {
+    let strong = |n: &str| (n.to_string(), 2);
     match e {
-        ast::Expr::Identifier(i) => ident(i),
-        ast::Expr::CompoundIdentifier(v) => v.last().map(ident).unwrap_or_default(),
-        ast::Expr::Function(f) => f.name.0.last().and_then(|p| p.as_ident()).map(ident).unwrap_or_else(|| "?column?".into()),
-        ast::Expr::Cast { expr, data_type, .. } => match &**expr {
-            ast::Expr::Value(_) => type_name_for_alias(data_type),
-            other => {
-                let n = derive_name(other);
-                if n == "?column?" { type_name_for_alias(data_type) } else { n }
-            }
+        ast::Expr::Identifier(i) => (ident(i), 2),
+        ast::Expr::CompoundIdentifier(v) => (v.last().map(ident).unwrap_or_default(), 2),
+        ast::Expr::Function(f) => match f.name.0.last().and_then(|p| p.as_ident()) {
+            Some(i) => (ident(i), 2),
+            None => ("?column?".into(), 0),
         },
-        ast::Expr::Nested(inner) => derive_name(inner),
-        ast::Expr::Case { .. } => "case".into(),
-        ast::Expr::Exists { .. } => "exists".into(),
-        ast::Expr::Array(_) => "array".into(),
-        ast::Expr::Extract { .. } => "extract".into(),
-        ast::Expr::Substring { .. } => "substring".into(),
-        ast::Expr::Position { .. } => "position".into(),
-        ast::Expr::Trim { .. } => "btrim".into(),
-        ast::Expr::Ceil { .. } => "ceil".into(),
-        ast::Expr::Floor { .. } => "floor".into(),
-        ast::Expr::Overlay { .. } => "overlay".into(),
+        ast::Expr::Cast { expr, data_type, .. } => {
+            let (n, st) = figure_colname(expr);
+            match type_name_for_alias(data_type) {
+                Some(t) if st <= 1 => (t, 1),
+                _ => (n, st),
+            }
+        }
+        ast::Expr::Nested(inner) | ast::Expr::Collate { expr: inner, .. } => figure_colname(inner),
+        ast::Expr::Case { else_result, .. } => {
+            let (n, st) = else_result.as_deref().map(figure_colname).unwrap_or(("?column?".into(), 0));
+            if st <= 1 { ("case".into(), 1) } else { (n, st) }
+        }
+        ast::Expr::Exists { .. } => strong("exists"),
+        ast::Expr::Array(_) => strong("array"),
+        ast::Expr::Extract { .. } => strong("extract"),
+        ast::Expr::Substring { .. } => strong("substring"),
+        ast::Expr::Position { .. } => strong("position"),
+        ast::Expr::Trim { trim_where, .. } => strong(match trim_where {
+            Some(ast::TrimWhereField::Leading) => "ltrim",
+            Some(ast::TrimWhereField::Trailing) => "rtrim",
+            _ => "btrim",
+        }),
+        ast::Expr::Ceil { .. } => strong("ceil"),
+        ast::Expr::Floor { .. } => strong("floor"),
+        ast::Expr::Overlay { .. } => strong("overlay"),
         ast::Expr::Subquery(q) => match &*q.body {
             ast::SetExpr::Select(s) if s.projection.len() == 1 => match &s.projection[0] {
-                ast::SelectItem::UnnamedExpr(e) => derive_name(e),
-                ast::SelectItem::ExprWithAlias { alias, .. } => ident(alias),
-                _ => "?column?".into(),
+                ast::SelectItem::UnnamedExpr(e) => figure_colname(e),
+                ast::SelectItem::ExprWithAlias { alias, .. } => (ident(alias), 2),
+                _ => ("?column?".into(), 0),
             },
-            _ => "?column?".into(),
+            _ => ("?column?".into(), 0),
         },
-        ast::Expr::TypedString(ts) => type_name_for_alias(&ts.data_type),
-        ast::Expr::Interval(_) => "interval".into(),
-        ast::Expr::AtTimeZone { .. } => "timezone".into(),
-        ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => "bool".into(),
-        _ => "?column?".into(),
+        ast::Expr::TypedString(ts) => match type_name_for_alias(&ts.data_type) {
+            Some(t) => (t, 1),
+            None => ("?column?".into(), 0),
+        },
+        ast::Expr::Interval(_) => ("interval".into(), 1),
+        ast::Expr::AtTimeZone { .. } => strong("timezone"),
+        ast::Expr::Value(v) if matches!(v.value, ast::Value::Boolean(_)) => ("bool".into(), 1),
+        _ => ("?column?".into(), 0),
     }
 }
 
-fn type_name_for_alias(dt: &ast::DataType) -> String {
-    match super::binder_expr::sql_type_of(dt) {
-        Ok((t, _)) => match t {
+/// The type name a cast contributes to a column name (arrays: the element's).
+fn type_name_for_alias(dt: &ast::DataType) -> Option<String> {
+    let name = |t: SqlType| -> String {
+        match t {
             SqlType::Int2 => "int2".into(),
             SqlType::Int4 => "int4".into(),
             SqlType::Int8 => "int8".into(),
@@ -1464,10 +1487,13 @@ fn type_name_for_alias(dt: &ast::DataType) -> String {
             SqlType::Timestamp => "timestamp".into(),
             SqlType::TimestampTz => "timestamptz".into(),
             SqlType::Time => "time".into(),
-            SqlType::Array(_) => "?column?".into(),
             other => other.name(),
-        },
-        Err(_) => "?column?".into(),
+        }
+    };
+    match super::binder_expr::sql_type_of(dt) {
+        Ok((SqlType::Array(e), _)) => Some(name(*e)),
+        Ok((t, _)) => Some(name(t)),
+        Err(_) => None,
     }
 }
 

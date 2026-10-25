@@ -9,7 +9,7 @@ use crate::expr::func::{func_def, resolve};
 use crate::expr::{BoolTest, CaseExpr, Expr, LikeExpr, SubqueryExpr, SubqueryKind};
 use crate::sql_bail;
 use crate::types::encoding::SortSpec;
-use crate::types::text::parse_datum;
+use crate::types::text::{apply_typmod, parse_datum};
 use crate::types::{typmod, ColumnType, Datum, SqlType};
 use sqlparser::ast;
 use std::sync::Arc;
@@ -573,7 +573,8 @@ impl<'a> Binder<'a> {
                     ast::Value::EscapedStringLiteral(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let d = parse_datum(&s, &t, tm)?;
+                // `type 'string'` is a cast: too long strings are truncated
+                let d = apply_typmod(parse_datum(&s, &t, -1)?, &t, tm, true)?;
                 Ok(Expr::Literal(d, t))
             }
             E::Interval(iv) => {
@@ -818,7 +819,8 @@ impl<'a> Binder<'a> {
                     self.note_param_type(i, t);
                     Ok(Expr::Literal(Datum::Null, t.clone()))
                 }
-                None => Ok(Expr::Literal(parse_datum(&s, t, tm)?, t.clone())),
+                // an explicit cast: too long strings are truncated
+                None => Ok(Expr::Literal(apply_typmod(parse_datum(&s, t, -1)?, t, tm, true)?, t.clone())),
             },
             Expr::Literal(Datum::Null, _) => Ok(Expr::Literal(Datum::Null, t.clone())),
             x => {
