@@ -596,8 +596,16 @@ impl<'a> Binder<'a> {
                         let n = name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default();
                         matches!(n.as_str(), "regclass" | "regtype" | "regnamespace").then_some(n)
                     }
+                    ast::DataType::Regclass => Some("regclass".to_string()),
                     _ => None,
                 };
+                // and read names: 'users'::regclass is the OID of users (kept
+                // an oid, so that it compares with oid columns)
+                if let (Some(kind), Expr::Literal(Datum::Text(name), SqlType::Unknown | SqlType::Text)) = (&reg, &x)
+                    && name.trim().parse::<i64>().is_err()
+                {
+                    return Ok(Expr::Literal(Datum::Oid(self.reg_name_oid(kind, name)?), SqlType::Oid));
+                }
                 let x = self.explicit_cast(x, &t, tm, ctx)?;
                 match reg {
                     Some(kind) => Ok(self.oid_lookup(x, &kind, true)),
@@ -1007,6 +1015,56 @@ impl<'a> Binder<'a> {
             return else_;
         }
         Expr::Case(Box::new(crate::expr::CaseExpr { whens, else_, ty: SqlType::Text }))
+    }
+
+    /// The OID named by the input of a reg* type (regclassin etc.): a
+    /// possibly schema-qualified, possibly quoted name.
+    fn reg_name_oid(&self, kind: &str, input: &str) -> Result<u32> {
+        let defs = self.catalog.definitions(kind);
+        let find = |n: &str| defs.iter().find(|(_, d)| d == n).map(|(o, _)| *o);
+        if kind == "regtype" {
+            if let Some(o) = find(input.trim()) {
+                return Ok(o);
+            }
+            let ty = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+                .try_with_sql(input)
+                .and_then(|mut p| p.parse_data_type())
+                .ok()
+                .and_then(|dt| sql_type_of(&dt).ok());
+            return match ty {
+                Some((t, _)) => Ok(t.oid()),
+                None => Err(SqlError::new(codes::UNDEFINED_OBJECT, format!("type \"{input}\" does not exist"))),
+            };
+        }
+        // the last dotted part, unquoted (else lowercased)
+        let mut parts = Vec::new();
+        let mut cur = String::new();
+        let (mut quoted, mut chars) = (false, input.trim().chars().peekable());
+        let mut was_quoted = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => {
+                    quoted = !quoted;
+                    was_quoted = true;
+                }
+                '.' if !quoted => {
+                    parts.push((std::mem::take(&mut cur), was_quoted));
+                    was_quoted = false;
+                }
+                c => cur.push(c),
+            }
+        }
+        parts.push((cur, was_quoted));
+        let (name, q) = parts.last().cloned().unwrap_or_default();
+        let name = if q { name } else { name.to_lowercase() };
+        find(&name).ok_or_else(|| match kind {
+            "regnamespace" => SqlError::new("3F000", format!("schema \"{name}\" does not exist")),
+            _ => SqlError::new(codes::UNDEFINED_TABLE, format!("relation \"{input}\" does not exist")),
+        })
     }
 
     /// (start, end|length) OVERLAPS (start, end|length).

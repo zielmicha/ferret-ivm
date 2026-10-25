@@ -483,3 +483,24 @@ fn group_by_primary_key_through_using_and_lateral() {
     assert!(try_rows(&h, "SELECT s.id, s.a FROM (SELECT DISTINCT * FROM t1) s GROUP BY s.id").is_err());
     running.shutdown();
 }
+
+#[test]
+fn reg_types_accept_names() {
+    let running = start("regclass");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // used to fail: invalid input syntax for type oid: "t1"
+    assert_eq!(
+        rows(&h, "SELECT attname FROM pg_attribute WHERE attrelid = 't1'::regclass AND attnum > 0 ORDER BY attnum"),
+        vec!["id", "a", "b", "c", "s", "d", "ts"]
+    );
+    assert_eq!(
+        rows(&h, "SELECT 'public.t1'::regclass = (SELECT oid FROM pg_class WHERE relname = 't1'), '\"t1\"'::regclass = 't1'::regclass"),
+        vec!["t|t"]
+    );
+    assert!(try_rows(&h, "SELECT 'nope'::regclass").unwrap_err().contains("does not exist"));
+    assert_eq!(rows(&h, "SELECT 'integer'::regtype::oid, 'int4'::regtype::oid, 'text[]'::regtype::oid, 'public'::regnamespace::oid"), vec!["23|23|1009|2200"]);
+    // OIDs still print as names
+    assert_eq!(rows(&h, "SELECT (SELECT oid FROM pg_class WHERE relname = 't2')::regclass"), vec!["t2"]);
+    running.shutdown();
+}
