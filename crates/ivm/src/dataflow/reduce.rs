@@ -133,8 +133,11 @@ fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Res
                     _ => 0,
                 };
                 let col = agg.arg.unwrap();
+                // the n non-null values follow the group's NULLs when the
+                // ORDER BY column sorts NULLs first (DESC, NULLS FIRST)
+                let skip = if layout.specs.get(ng).is_some_and(|s| s.nulls_first) { summary.count - n } else { 0 };
                 let mut get = |k: i64| -> Result<Datum> {
-                    match env.nth(tree, lo, hib, k)? {
+                    match env.nth(tree, lo, hib, skip + k)? {
                         Some((key, _, _)) => Ok(layout.decode_row(&key)?[col].clone()),
                         None => Ok(Datum::Null),
                     }

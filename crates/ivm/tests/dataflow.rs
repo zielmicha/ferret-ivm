@@ -170,3 +170,33 @@ fn adhoc_distinct_aggregates() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Maintained percentiles read order statistics through the index; the
+/// non-null values follow the group's NULLs when the ORDER BY sorts NULLs
+/// first (DESC, NULLS FIRST). Expected rows are PostgreSQL's.
+#[test]
+fn percentiles_with_nulls_first() {
+    let dir = tmpdir("percentile-nulls");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, x int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 1), (2, 1, 1), (3, 1, 2), (4, 1, NULL), (5, 2, NULL), (6, 2, 7), (7, 1, 9), (8, 3, NULL)");
+    let grouped = "SELECT g, percentile_disc(0.5) WITHIN GROUP (ORDER BY x DESC) AS a, percentile_cont(0.5) WITHIN GROUP (ORDER BY x DESC) AS b, \
+                   percentile_disc(0.25) WITHIN GROUP (ORDER BY x NULLS FIRST) AS c, percentile_cont(0.25) WITHIN GROUP (ORDER BY x DESC NULLS LAST) AS d \
+                   FROM t GROUP BY g";
+    let global = "SELECT percentile_disc(0.9) WITHIN GROUP (ORDER BY x DESC) AS a, percentile_cont(0.1) WITHIN GROUP (ORDER BY x NULLS FIRST) AS b FROM t";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW pg AS {grouped}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW pa AS {global}"));
+    let check = |want_g: &[&str], want_a: &[&str]| {
+        assert_eq!(rows(&h, "SELECT * FROM pg ORDER BY g"), want_g);
+        assert_eq!(rows(&h, &format!("{grouped} ORDER BY g")), want_g);
+        assert_eq!(rows(&h, "SELECT * FROM pa"), want_a);
+        assert_eq!(rows(&h, global), want_a);
+    };
+    check(&["1|2|1.5|1|3.75", "2|7|7|7|7", "3||||"], &["1|1"]);
+    exec(&h, "INSERT INTO t VALUES (9, 2, NULL), (10, 2, 3), (11, 3, 5)");
+    exec(&h, "DELETE FROM t WHERE id = 3");
+    check(&["1|1|1|1|5", "2|7|5|3|6", "3|5|5|5|5"], &["1|1"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
