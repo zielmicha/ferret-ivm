@@ -927,6 +927,11 @@ impl<'a> Binder<'a> {
             proj_exprs.push(win_rewrite(post(e)?));
         }
         let visible = proj_exprs.len();
+        let fp = |e: &Expr| {
+            let mut v = Vec::new();
+            e.fingerprint(&mut v);
+            v
+        };
         let mut order = Vec::new();
         let mut extra: Vec<Expr> = Vec::new();
         for (target, spec) in order_items {
@@ -934,16 +939,11 @@ impl<'a> Binder<'a> {
                 OrderTarget::Output(c) => c,
                 OrderTarget::Expr(e) => {
                     let e = win_rewrite(post(&e)?);
-                    let mut fp = Vec::new();
-                    e.fingerprint(&mut fp);
-                    match proj_exprs.iter().position(|p| {
-                        let mut f2 = Vec::new();
-                        p.fingerprint(&mut f2);
-                        f2 == fp
-                    }) {
+                    let f = fp(&e);
+                    match proj_exprs.iter().position(|p| fp(p) == f) {
                         Some(c) => c,
                         None => {
-                            if s.distinct.is_some() {
+                            if matches!(s.distinct, Some(ast::Distinct::Distinct)) {
                                 sql_bail!(
                                     codes::INVALID_COLUMN_REFERENCE,
                                     "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
@@ -957,7 +957,29 @@ impl<'a> Binder<'a> {
             };
             order.push(SortKey { col, spec });
         }
-        let out_exprs = proj_exprs.clone();
+        // DISTINCT ON targets: output columns (alias, ordinal or the same
+        // expression) or further helper columns
+        let mut distinct_on = Vec::new();
+        if let Some(ast::Distinct::On(exprs)) = &s.distinct {
+            for e in exprs {
+                let c = match self.order_by_output_ref(e, &names, visible, Some(&proj_exprs))? {
+                    Some(c) => c,
+                    None => {
+                        let ex = self.bind_expr(e, &Ctx::plain(&scope, "DISTINCT ON"))?;
+                        let ex = win_rewrite(post(&ex)?);
+                        let f = fp(&ex);
+                        match proj_exprs.iter().chain(extra.iter()).position(|p| fp(p) == f) {
+                            Some(c) => c,
+                            None => {
+                                extra.push(ex);
+                                visible + extra.len() - 1
+                            }
+                        }
+                    }
+                };
+                distinct_on.push(c);
+            }
+        }
         let mut all_out = proj_exprs;
         all_out.extend(extra);
         let base = rel.arity();
@@ -974,47 +996,12 @@ impl<'a> Binder<'a> {
             Some(ast::Distinct::Distinct) => {
                 rel = Rel::Distinct { input: Box::new(rel) };
             }
-            Some(ast::Distinct::On(exprs)) => {
-                // DISTINCT ON expressions are bound against the select list scope
-                let out_scope = Scope::new(
-                    names_all
-                        .iter()
-                        .zip(rel.schema())
-                        .map(|(n, t)| ScopeItem { table: None, name: n.clone(), ty: t, hidden: false })
-                        .collect(),
-                );
-                let mut group = Vec::new();
-                let mut extra = Vec::new();
-                for e in exprs {
-                    let c = match self.order_by_output_ref(e, &names_all, visible, Some(&out_exprs))? {
-                        Some(c) => c,
-                        None => {
-                            // expression over input columns: must match a select expression
-                            let ex = self.bind_expr(e, &Ctx::plain(&scope, "DISTINCT ON"))?;
-                            let ex = post(&ex)?;
-                            match self.find_matching_output(&rel, &ex) {
-                                Some(c) => c,
-                                None => {
-                                    let _ = &out_scope;
-                                    extra.push(ex);
-                                    usize::MAX
-                                }
-                            }
-                        }
-                    };
-                    if c == usize::MAX {
-                        sql_bail!(codes::FEATURE_NOT_SUPPORTED, "DISTINCT ON expressions must appear in the select list");
-                    }
-                    group.push(c);
-                }
-                rel = Rel::TopK { input: Box::new(rel), group, order: order.clone(), limit: Some(1), offset: 0, with_ties: false };
+            Some(ast::Distinct::On(_)) => {
+                // the first row of each group in ORDER BY order
+                rel = Rel::TopK { input: Box::new(rel), group: distinct_on, order: order.clone(), limit: Some(1), offset: 0, with_ties: false };
             }
         }
         Ok(BoundQuery { rel, names: names_all, visible, order, limit, offset, with_ties: false })
-    }
-
-    fn find_matching_output(&self, _rel: &Rel, _e: &Expr) -> Option<usize> {
-        None
     }
 
     /// Group-by item: output ordinal, output alias (if not an input column), or expression.

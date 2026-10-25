@@ -438,3 +438,21 @@ fn interval_field_qualifiers_and_int2_shifts() {
     assert_eq!(rows(&h, "SELECT 1::int2 << 16, 1::int2 << 15, (-8)::int2 >> 1, 1 << 33"), vec!["0|-32768|-4|2"]);
     running.shutdown();
 }
+
+#[test]
+fn distinct_on_with_expressions_outside_the_select_list() {
+    let running = start("distinct-on");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // both used to be rejected ('must appear in the select list')
+    assert_eq!(rows(&h, "SELECT DISTINCT ON (a + 1) a, id FROM t1 ORDER BY a + 1, id"), vec!["1|1", "2|2", "3|5", "|3"]);
+    assert_eq!(rows(&h, "SELECT DISTINCT ON (b) id FROM t1 ORDER BY b, id"), vec!["1", "4", "3", "2"]);
+    let q = "SELECT DISTINCT ON (a) a, id FROM t1 ORDER BY a, b DESC NULLS LAST, id";
+    assert_eq!(rows(&h, q), vec!["1|1", "2|4", "3|5", "|3"]);
+    exec(&h, &format!("CREATE MATERIALIZED VIEW don AS {q}"));
+    exec(&h, "UPDATE t1 SET b = 99 WHERE id = 2");
+    assert_eq!(rows(&h, "SELECT * FROM don ORDER BY a"), vec!["1|1", "2|2", "3|5", "|3"]);
+    // plain DISTINCT still requires ORDER BY expressions in the select list
+    assert!(try_rows(&h, "SELECT DISTINCT a FROM t1 ORDER BY b").is_err());
+    running.shutdown();
+}
