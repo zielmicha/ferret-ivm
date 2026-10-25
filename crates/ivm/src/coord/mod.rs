@@ -360,37 +360,7 @@ pub fn start(cfg: Config) -> Result<Running> {
         &cfg.data_dir.join("store"),
         EnvOptions { cache_bytes: cfg.cache_bytes, ..Default::default() },
     )?;
-    let mut engine = Engine {
-        cfg: cfg.clone(),
-        env,
-        graph: Graph::new(),
-        catalog: Catalog::new(),
-        rt: Runtime::default(),
-        processed: 0,
-        seq: stx.clone(),
-        shared: shared.clone(),
-        pending: HashMap::new(),
-        parked: Vec::new(),
-        subs: Vec::new(),
-        next_req: 1,
-        dml_inflight: None,
-        dml_queue: VecDeque::new(),
-        dml_counts: HashMap::new(),
-        deferred: Vec::new(),
-        last_checkpoint: Instant::now(),
-        records_since_checkpoint: 0,
-        replaying: true,
-        snap_epoch: 0,
-        snap_epoch_seen: 0,
-        loading: (0, std::collections::HashSet::new()),
-        source_states: HashMap::new(),
-        source_lsns: HashMap::new(),
-        handle: None,
-        source_handles: HashMap::new(),
-        sink_handles: HashMap::new(),
-        clock: 0,
-        ticks: VecDeque::new(),
-    };
+    let mut engine = Engine::new(cfg.clone(), env, stx.clone(), shared.clone());
     engine.recover(recovered)?;
     // Sinks start from the checkpoint's state and receive the replayed
     // records like live ones: a target that is as far as the checkpoint
@@ -442,6 +412,41 @@ pub fn start(cfg: Config) -> Result<Running> {
 }
 
 impl Engine {
+    /// An engine with an empty catalog over `env`, before recovery.
+    fn new(cfg: Config, env: Env, seq: Sender<SeqMsg>, shared: Arc<Shared>) -> Engine {
+        Engine {
+            cfg,
+            env,
+            graph: Graph::new(),
+            catalog: Catalog::new(),
+            rt: Runtime::default(),
+            processed: 0,
+            seq,
+            shared,
+            pending: HashMap::new(),
+            parked: Vec::new(),
+            subs: Vec::new(),
+            next_req: 1,
+            dml_inflight: None,
+            dml_queue: VecDeque::new(),
+            dml_counts: HashMap::new(),
+            deferred: Vec::new(),
+            last_checkpoint: Instant::now(),
+            records_since_checkpoint: 0,
+            replaying: true,
+            snap_epoch: 0,
+            snap_epoch_seen: 0,
+            loading: (0, std::collections::HashSet::new()),
+            source_states: HashMap::new(),
+            source_lsns: HashMap::new(),
+            handle: None,
+            source_handles: HashMap::new(),
+            sink_handles: HashMap::new(),
+            clock: 0,
+            ticks: VecDeque::new(),
+        }
+    }
+
     fn recover(&mut self, recovered: Option<crate::storage::Recovered>) -> Result<()> {
         let Some(rec) = recovered else { return Ok(()) };
         let app: AppState = serde_json::from_slice(&rec.app)
@@ -1005,5 +1010,44 @@ pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &Err
         if *v == 0 {
             map.remove(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::parser::SubscribeTarget;
+
+    /// An engine on a scratch store without its threads: statements are
+    /// applied by calling it directly, and nothing is logged.
+    fn engine(dir: &std::path::Path) -> Engine {
+        let (env, _) = Env::open(&dir.join("store"), EnvOptions::default()).unwrap();
+        let (seq, _) = unbounded();
+        let mut e = Engine::new(Config { data_dir: dir.to_path_buf(), ..Default::default() }, env, seq, Arc::new(Shared::default()));
+        e.replaying = false;
+        e
+    }
+
+    /// A subscription whose query fails to lower releases the operators
+    /// built before the failure (create_view_rt did; subscribe left them in
+    /// the graph, where they stayed and were maintained for good).
+    #[test]
+    fn a_subscription_that_fails_to_lower_releases_what_it_built() {
+        let tmp = crate::testkit::TempDir::new("coord-sub-lowering");
+        let mut e = engine(tmp.path());
+        e.apply_ddl(1, "CREATE TABLE t (id int PRIMARY KEY, a int)", "").unwrap();
+        e.apply_ddl(2, "CREATE MATERIALIZED VIEW m AS SELECT id, a FROM t", "").unwrap();
+        e.processed = 2;
+        // m without its dataflow: a query reading it fails to lower after
+        // the operators of the aggregate before it were built
+        let m = e.catalog.by_name("m").unwrap().id;
+        e.rt.views.remove(&m);
+        let (nodes, arrs) = (e.graph.live_nodes().count(), e.graph.live_arrangements().count());
+        let text = "SELECT s.a, s.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) s JOIN m ON m.id = s.a";
+        let q = crate::sql::parser::parse_single_query(text).unwrap();
+        let err = e.subscribe(SubscribeTarget::Query(Box::new(q), text.to_string()), true, false, vec![]).unwrap_err();
+        assert!(err.message.contains("has no dataflow"), "{}", err.message);
+        assert_eq!((e.graph.live_nodes().count(), e.graph.live_arrangements().count()), (nodes, arrs));
+        assert!(e.subs.is_empty());
     }
 }

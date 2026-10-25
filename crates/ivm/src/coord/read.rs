@@ -393,7 +393,7 @@ impl Engine {
         self.parked = still;
     }
 
-    fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
+    pub(super) fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
         let mut view = None;
         let (node, pinned, columns, reads): (NodeId, Option<NodeId>, Vec<ResultColumn>, Vec<ObjectId>) = match target {
             SubscribeTarget::Name(name) => {
@@ -455,14 +455,24 @@ impl Engine {
                 let arr_mark = self.graph.arr_count();
                 let rt = &self.rt;
                 let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-                let node = {
+                let lowered = {
                     let mut lw = Lowerer { g: &mut self.graph, env: &mut self.env, objects: &objects };
-                    let l = lw.lower(&rel)?;
-                    lw.materialize(l)
+                    lw.lower(&rel).map(|l| lw.materialize(l))
+                };
+                let node = match lowered {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // what lowering created before it failed is unreferenced
+                        self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
+                        return Err(e);
+                    }
                 };
                 self.graph.retain_node(node);
                 self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-                self.graph.hydrate(&mut self.env, self.processed)?;
+                if let Err(e) = self.graph.hydrate(&mut self.env, self.processed) {
+                    let _ = self.graph.release_node(&mut self.env, node);
+                    return Err(e);
+                }
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
                 (node, Some(node), cols, reads)
             }
