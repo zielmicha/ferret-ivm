@@ -158,6 +158,9 @@ pub struct Binder<'a> {
     pub params: Vec<ParamSlot>,
     pub(crate) next_rec_id: u64,
     view_depth: usize,
+    /// Binding a stored view definition: a parameter placeholder binds as
+    /// NULL, as it did when such definitions were still accepted.
+    pub(crate) stored_definition: bool,
     /// Nesting depth of the expression being bound (see MAX_EXPR_DEPTH).
     pub(crate) expr_depth: usize,
     /// WINDOW clause of the SELECT being bound.
@@ -195,6 +198,7 @@ impl<'a> Binder<'a> {
             params: Vec::new(),
             next_rec_id: 1,
             view_depth: 0,
+            stored_definition: false,
             expr_depth: 0,
             named_windows: Vec::new(),
         }
@@ -1359,6 +1363,7 @@ impl<'a> Binder<'a> {
                 let stmt = super::parser::parse_single_query(&sql)?;
                 let mut sub = Binder::new(self.catalog);
                 sub.view_depth = self.view_depth + 1;
+                sub.stored_definition = true;
                 sub.next_rec_id = self.next_rec_id + 1000;
                 let bq = sub.bind_query(&stmt)?.resolve_unknowns(&mut sub)?;
                 self.next_rec_id = sub.next_rec_id;

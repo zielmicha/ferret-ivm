@@ -1057,7 +1057,10 @@ impl<'a> Binder<'a> {
                     .trim_start_matches('$')
                     .parse()
                     .map_err(|_| SqlError::syntax(format!("bad parameter placeholder {p}")))?;
-                if n == 0 {
+                // statements are described with a slot for every parameter
+                // they use; elsewhere a missing one is an error (it used to
+                // bind as NULL, also into view definitions)
+                if n == 0 || (n > self.params.len() && !self.stored_definition) {
                     sql_bail!(codes::UNDEFINED_PARAMETER, "there is no parameter ${n}");
                 }
                 while self.params.len() < n {

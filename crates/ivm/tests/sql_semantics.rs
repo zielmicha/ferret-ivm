@@ -885,3 +885,23 @@ fn group_by_empty_grouping_set() {
     assert!(err.contains("must appear in the GROUP BY clause"), "{err}");
     running.shutdown();
 }
+
+#[test]
+fn parameters_must_be_supplied() {
+    let running = start("missing-params");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // a $n without a value used to bind as NULL: SELECT $1 returned NULL and
+    // the view definitions below were stored with a "$1" in them
+    for q in [
+        "SELECT $1",
+        "SELECT count(*) FROM t1 WHERE a > $1",
+        "CREATE MATERIALIZED VIEW pm AS SELECT * FROM t1 WHERE a > $1",
+        "CREATE VIEW pv AS SELECT $2 AS x",
+    ] {
+        let err = try_exec(&h, q).unwrap_err();
+        assert!(err.contains("there is no parameter $"), "{q}: {err}");
+    }
+    assert!(try_rows(&h, "SELECT count(*) FROM pm").is_err());
+    running.shutdown();
+}

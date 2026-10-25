@@ -715,7 +715,10 @@ impl Session {
                 .prepared
                 .get(name)
                 .ok_or_else(|| SqlError::new(codes::INVALID_SQL_STATEMENT_NAME, format!("prepared statement \"{name}\" does not exist")))?;
-            let params: Vec<ParamSlot> = p.param_types.iter().map(|t| ParamSlot { ty: t.clone(), value: None }).collect();
+            // a slot for every parameter used, typed or still unknown
+            let params: Vec<ParamSlot> = (0..p.nparams)
+                .map(|i| ParamSlot { ty: p.param_types.get(i).cloned().unwrap_or(SqlType::Unknown), value: None })
+                .collect();
             (parse_statement(&p.text)?, params, vec![], true)
         } else {
             let p = self

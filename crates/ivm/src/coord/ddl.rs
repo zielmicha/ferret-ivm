@@ -423,7 +423,8 @@ impl Engine {
     /// Plan and lower a materialized view; pins its root and read arrangement.
     pub(crate) fn create_view_rt(&mut self, id: ObjectId, sql: &str) -> Result<()> {
         let q = crate::sql::parser::parse_single_query(sql)?;
-        let bq = crate::sql::plan_query(&self.catalog, &q, vec![])?;
+        // new definitions were planned with plan_query before
+        let bq = crate::sql::plan_stored_query(&self.catalog, &q)?;
         let rel = bq.into_rel();
         let node_mark = self.graph.node_count();
         let arr_mark = self.graph.arr_count();
