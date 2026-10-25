@@ -706,6 +706,11 @@ impl<'a> Binder<'a> {
                             uses_sets = true;
                             sets.iter().map(|l| bind_list(self, l, &mut group_exprs)).collect::<Result<_>>()?
                         }
+                        // (): the empty grouping set
+                        ast::Expr::Tuple(v) if v.is_empty() => {
+                            uses_sets = true;
+                            vec![vec![]]
+                        }
                         e => vec![vec![bind_one(self, e, &mut group_exprs)?]],
                     };
                     let mut next = Vec::with_capacity(combos.len() * alts.len());

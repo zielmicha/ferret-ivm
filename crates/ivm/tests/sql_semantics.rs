@@ -870,3 +870,18 @@ fn strict_calls_evaluate_every_argument() {
     assert_eq!(rows(&h, "SELECT a + b, lpad(s, a, '*') FROM t1 WHERE id IN (2, 3) ORDER BY id"), vec!["|*b", "|"]);
     running.shutdown();
 }
+
+#[test]
+fn group_by_empty_grouping_set() {
+    let running = start("group-by-empty");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // GROUP BY () used to fail with "row constructors are not supported"
+    assert_eq!(rows(&h, "SELECT count(*) FROM t1 GROUP BY ()"), vec!["5"]);
+    assert_eq!(rows(&h, "SELECT 1 FROM t1 GROUP BY ()"), vec!["1"]);
+    assert_eq!(rows(&h, "SELECT count(*) FROM t1 WHERE false GROUP BY ()"), vec!["0"]);
+    assert_eq!(rows(&h, "SELECT s, count(*) FROM t1 GROUP BY s, () ORDER BY s"), vec!["a|2", "b|1", "c|1", "|1"]);
+    let err = try_rows(&h, "SELECT a FROM t1 GROUP BY ()").unwrap_err();
+    assert!(err.contains("must appear in the GROUP BY clause"), "{err}");
+    running.shutdown();
+}
