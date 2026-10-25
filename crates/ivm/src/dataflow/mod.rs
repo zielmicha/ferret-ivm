@@ -157,10 +157,25 @@ pub struct Graph {
 
 /// Error state that must survive restarts, by node fingerprint: the error
 /// records in the contents of arranged nodes (views created later over
-/// them must see them).
+/// them must see them), and the error state of operators that remember
+/// which of their groups are in error (to retract the error when the group
+/// recovers).
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ErrorState {
     pub nodes: Vec<(Vec<u8>, Vec<((String, String), i64)>)>,
+    #[serde(default)]
+    pub operators: Vec<(Vec<u8>, Vec<(Vec<u8>, (String, String))>)>,
+}
+
+/// Groups of an operator currently in error, by group key prefix.
+pub type OpErrors = Arc<parking_lot::Mutex<BTreeMap<Vec<u8>, (String, String)>>>;
+
+/// The per-group error state of an operator, if it keeps one.
+fn operator_errors(kind: &NodeKind) -> Option<&OpErrors> {
+    match kind {
+        NodeKind::Reduce(p) => Some(&p.errors),
+        _ => None,
+    }
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -583,6 +598,12 @@ impl Graph {
             {
                 st.nodes.push((n.fp.clone(), m.iter().map(|(e, w)| (e.clone(), *w)).collect()));
             }
+            if let Some(errs) = operator_errors(&n.kind) {
+                let errs = errs.lock();
+                if !errs.is_empty() {
+                    st.operators.push((n.fp.clone(), errs.iter().map(|(k, e)| (k.clone(), e.clone())).collect()));
+                }
+            }
         }
         st
     }
@@ -593,6 +614,13 @@ impl Graph {
         for (fp, errs) in st.nodes {
             if let Some(&id) = self.node_by_fp.get(&fp) {
                 self.set_errors(id, &errs);
+            }
+        }
+        for (fp, groups) in st.operators {
+            if let Some(&id) = self.node_by_fp.get(&fp)
+                && let Some(errs) = operator_errors(&self.node(id).kind)
+            {
+                *errs.lock() = groups.into_iter().collect();
             }
         }
     }

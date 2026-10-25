@@ -293,3 +293,44 @@ fn errors_of_shared_nodes() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A group whose aggregate fails is remembered so that its error record
+/// retracts when the group recovers: also for a global aggregate that was
+/// already failing when the view was created, and after a restart.
+#[test]
+fn aggregate_errors_retract_after_recovery() {
+    let dir = tmpdir("agg-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE f (id int PRIMARY KEY, g int, x float8)");
+    exec(&h, "CREATE MATERIALIZED VIEW grouped AS SELECT g, sum(x) AS s FROM f GROUP BY g");
+    exec(&h, "INSERT INTO f VALUES (1, 1, 1e308), (2, 1, 1e308), (3, 2, 1), (4, 3, 1e308), (5, 3, 1e308), (6, 4, 1e308), (7, 4, 1e308)");
+    exec(&h, "CREATE MATERIALIZED VIEW total AS SELECT sum(x) AS s FROM f"); // failing when created
+    exec(&h, "CREATE MATERIALIZED VIEW total2 AS SELECT sum(x) AS s FROM f WHERE g = 4");
+    let overflow = Some("22003 value out of range: overflow".to_string());
+    for v in ["grouped", "total", "total2"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), overflow, "{v}");
+    }
+    // recovery without a restart
+    exec(&h, "DELETE FROM f WHERE id = 7");
+    assert_eq!(rows(&h, "SELECT * FROM total2"), rows(&h, "SELECT sum(x) FROM f WHERE g = 4"));
+    // and after one
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    for v in ["grouped", "total"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), overflow, "{v}");
+    }
+    exec(&h, "DELETE FROM f WHERE id IN (2, 4, 5)");
+    exec(&h, "DELETE FROM f WHERE id = 6");
+    assert_eq!(rows(&h, "SELECT * FROM grouped ORDER BY g"), rows(&h, "SELECT g, sum(x) FROM f GROUP BY g ORDER BY g"));
+    assert_eq!(rows(&h, "SELECT * FROM total"), rows(&h, "SELECT sum(x) FROM f"));
+    assert_eq!(rows(&h, "SELECT count(*) FROM grouped").join(","), "2");
+    // a new failure is reported again
+    exec(&h, "INSERT INTO f VALUES (8, 2, 1e308), (9, 2, 1e308)");
+    for v in ["grouped", "total"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), overflow, "{v}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -50,8 +50,9 @@ pub struct ReducePlan {
     pub slots: Vec<Vec<usize>>,
     pub input_arr: ArrId,
     pub out_arr: ArrId,
-    /// Groups currently in error (so the error retracts when they recover).
-    pub errors: Arc<parking_lot::Mutex<BTreeMap<Vec<u8>, (String, String)>>>,
+    /// Groups currently in error (so the error retracts when they recover);
+    /// checkpointed with the graph's error state.
+    pub errors: super::OpErrors,
     pub cache: GroupCache,
 }
 
@@ -327,11 +328,19 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
     let layout = a.layout.clone();
     let tree = a.tree;
     let ng = p.group_key.len();
+    // the snapshot rebuilds the operator's state (hydration)
+    let mut errors = p.errors.lock();
+    errors.clear();
     if ng == 0 {
         match compute_group(g, env, p, &[])?.0 {
             Ok(Some(r)) => out.data.push((r, 1)),
             Ok(None) => {}
-            Err(e) => out.errs.push((err_record(&e), 1)),
+            Err(e) => {
+                // remembered like any group's, so that it retracts on recovery
+                let rec = err_record(&e);
+                errors.insert(Vec::new(), rec.clone());
+                out.errs.push((rec, 1));
+            }
         }
         return Ok(());
     }
@@ -349,7 +358,6 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
             prefixes.push(prefix);
         }
     }
-    let mut errors = p.errors.lock();
     for prefix in prefixes {
         match compute_group(g, env, p, &prefix)?.0 {
             Ok(Some(r)) => out.data.push((r, 1)),
