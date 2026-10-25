@@ -183,3 +183,52 @@ fn same_named_output_columns_are_ambiguous_only_if_different() {
     assert!(err.contains("ambiguous"), "{err}");
     running.shutdown();
 }
+
+#[test]
+fn aggregates_inside_window_aggregates() {
+    let running = start("window-of-agg");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // used to fail with 'aggregate function calls cannot be nested'
+    assert_eq!(
+        rows(&h, "SELECT a, count(*), sum(count(*)) OVER () FROM t1 GROUP BY a ORDER BY a"),
+        vec!["1|1|5", "2|2|5", "3|1|5", "|1|5"]
+    );
+    assert_eq!(
+        rows(&h, "SELECT a, sum(count(*)) OVER (ORDER BY a), avg(sum(b)) OVER () FROM t1 GROUP BY a ORDER BY a"),
+        vec!["1|1|22.5000000000000000", "2|3|22.5000000000000000", "3|4|22.5000000000000000", "|5|22.5000000000000000"]
+    );
+    exec(&h, "CREATE MATERIALIZED VIEW share AS SELECT a, count(*) * 100 / sum(count(*)) OVER () AS pct FROM t1 GROUP BY a");
+    let pct = |v: [&str; 4]| -> Vec<String> { ["1", "2", "3", ""].iter().zip(v).map(|(a, p)| format!("{a}|{p}")).collect() };
+    assert_eq!(rows(&h, "SELECT * FROM share ORDER BY a"), pct(["20.0000000000000000", "40.0000000000000000", "20.0000000000000000", "20.0000000000000000"]));
+    exec(&h, "INSERT INTO t1 VALUES (6, 2, 0, 0, 'z', NULL, NULL)");
+    assert_eq!(rows(&h, "SELECT * FROM share ORDER BY a"), pct(["16.6666666666666667", "50.0000000000000000", "16.6666666666666667", "16.6666666666666667"]));
+    // a window function over outer columns is evaluated in the subquery
+    assert_eq!(
+        rows(&h, "SELECT (SELECT sum(t1.a) OVER () FROM t2 LIMIT 1) FROM t1 WHERE id < 6 ORDER BY 1"),
+        vec!["5", "10", "10", "15", ""]
+    );
+    running.shutdown();
+}
+
+#[test]
+fn aggregates_of_outer_columns_are_rejected() {
+    let running = start("outer-agg");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // PostgreSQL evaluates max(t1.a) over the rows of the outer query (one
+    // result row); evaluating it in the subquery gave one row per t1 row
+    for sql in [
+        "SELECT (SELECT max(t1.a) FROM t2 LIMIT 1) FROM t1",
+        "SELECT id, (SELECT count(*) FILTER (WHERE t1.a > 1) FROM t2) FROM t1",
+        "SELECT (SELECT string_agg(t1.s, ',') FROM t2) FROM t1",
+    ] {
+        let err = try_rows(&h, sql).unwrap_err();
+        assert!(err.contains("not supported"), "{sql}: {err}");
+    }
+    assert!(try_rows(&h, "SELECT a FROM t1 GROUP BY a HAVING EXISTS (SELECT 1 FROM t2 WHERE t2.x = max(t1.b))").is_err());
+    // aggregates mixing local and outer columns are local
+    assert_eq!(rows(&h, "SELECT (SELECT max(t1.a + t2.x) FROM t2) FROM t1 ORDER BY 1"), vec!["6", "7", "7", "8", ""]);
+    assert_eq!(rows(&h, "SELECT (SELECT count(*) FROM t2 WHERE t2.x = t1.a) FROM t1 ORDER BY id"), vec!["1", "2", "0", "2", "0"]);
+    running.shutdown();
+}

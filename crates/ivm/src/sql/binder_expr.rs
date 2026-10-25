@@ -1162,7 +1162,7 @@ impl<'a> Binder<'a> {
             return self.bind_window(&name, f, &args, dup, star, ctx);
         }
         if is_aggregate_name(&name) {
-            return self.bind_aggregate(&name, f, &args, dup, &order, star, ctx);
+            return self.bind_aggregate(&name, f, &args, dup, &order, star, ctx, None);
         }
         if WINDOW_ONLY.contains(&name.as_str()) {
             sql_bail!(codes::WINDOWING_ERROR, "window function {name} requires an OVER clause");
@@ -1310,6 +1310,9 @@ impl<'a> Binder<'a> {
         order_by: &[ast::OrderByExpr],
         star: bool,
         ctx: &Ctx,
+        // context for the arguments, FILTER and ORDER BY when it is not the
+        // aggregate's own (window aggregates: they may contain aggregates)
+        args_ctx: Option<&Ctx>,
     ) -> Result<Expr> {
         let Some(collector) = ctx.collector else {
             sql_bail!(codes::GROUPING_ERROR, "aggregate functions are not allowed in {}", ctx.clause);
@@ -1317,12 +1320,13 @@ impl<'a> Binder<'a> {
         if ctx.in_agg {
             sql_bail!(codes::GROUPING_ERROR, "aggregate function calls cannot be nested");
         }
-        let inner = Ctx { scope: ctx.scope, collector: ctx.collector, in_agg: true, clause: ctx.clause };
+        let own = Ctx { scope: ctx.scope, collector: ctx.collector, in_agg: true, clause: ctx.clause };
+        let inner = args_ctx.unwrap_or(&own);
         let mut bound = Vec::new();
         if !star {
             for a in args {
                 match a {
-                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => bound.push(self.bind_expr(e, &inner)?),
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => bound.push(self.bind_expr(e, inner)?),
                     _ => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "unsupported aggregate argument"),
                 }
             }
@@ -1330,15 +1334,30 @@ impl<'a> Binder<'a> {
         let distinct = matches!(dup, Some(ast::DuplicateTreatment::Distinct));
         let filter = match &f.filter {
             Some(fe) => {
-                let e = self.bind_expr(fe, &inner)?;
+                let e = self.bind_expr(fe, inner)?;
                 Some(self.coerce_bool(e, "FILTER")?)
             }
             None => None,
         };
         let mut order: Vec<(Expr, SortSpec)> = Vec::new();
         for ob in order_by.iter().chain(f.within_group.iter()) {
-            let e = self.bind_expr(&ob.expr, &inner)?;
+            let e = self.bind_expr(&ob.expr, inner)?;
             order.push((e, super::binder::sort_spec(&ob.options)));
+        }
+        // An aggregate whose arguments reference only columns of enclosing
+        // queries belongs to the nearest such query in PostgreSQL (it is
+        // evaluated over that query's rows); evaluating it over this
+        // query's rows would silently give other results. (Window
+        // aggregates are always evaluated at their own level.)
+        let (mut local, mut outer) = (false, false);
+        for e in bound.iter().chain(filter.iter()).chain(order.iter().map(|(e, _)| e)) {
+            var_levels(e, &mut local, &mut outer);
+        }
+        if outer && !local && args_ctx.is_none() {
+            sql_bail!(
+                codes::FEATURE_NOT_SUPPORTED,
+                "aggregate functions whose arguments reference only columns of an outer query are not supported"
+            );
         }
         let mut types: Vec<SqlType> = bound.iter().map(|b| self.ty_of(b, ctx)).collect();
         use AggFunc as A;
@@ -1657,7 +1676,8 @@ impl<'a> Binder<'a> {
                 let tmp = std::cell::RefCell::new(super::binder::Collector::default());
                 let tctx = Ctx { scope: ctx.scope, collector: Some(&tmp), in_agg: false, clause: ctx.clause };
                 let fcopy = ast::Function { over: None, ..f.clone() };
-                let _ = self.bind_aggregate(agg, &fcopy, args, dup, &[], star, &tctx)?;
+                // aggregates in the arguments belong to the query's aggregation
+                let _ = self.bind_aggregate(agg, &fcopy, args, dup, &[], star, &tctx, Some(&actx))?;
                 let mut t = tmp.into_inner();
                 if t.aggs.len() != 1 {
                     sql_bail!(codes::FEATURE_NOT_SUPPORTED, "unsupported window aggregate");
@@ -2013,6 +2033,20 @@ impl<'a> Binder<'a> {
             ordinality,
         };
         Ok((rel, Scope::from_table(&tname, &names, &out), lateral))
+    }
+}
+
+/// Whether `e` references columns of the current query (`local`) or of
+/// enclosing queries (`outer`).
+fn var_levels(e: &Expr, local: &mut bool, outer: &mut bool) {
+    match e {
+        Expr::Column(_) => *local = true,
+        Expr::Outer(..) => *outer = true,
+        _ => {
+            for c in e.children() {
+                var_levels(c, local, outer);
+            }
+        }
     }
 }
 
