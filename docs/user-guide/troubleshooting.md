@@ -318,7 +318,7 @@ test, with workarounds.
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| Session settings: `RESET` (also `RESET ALL`) does not undo a `SET`; `set_config()` changes nothing; `current_setting()` reports the server's fixed settings | after `SET read_mode = latest; RESET read_mode` the session still reads `latest`; `current_setting()` ignores values changed with `SET` (and fails for `read_mode`), and its `application_name` is always empty | `SET` the value wanted; use `SHOW` |
+| `set_config()` changes nothing (it returns its value) | `SELECT set_config('read_mode', 'latest', false)` leaves the session's settings as they were | use `SET` |
 
 ### Time travel
 

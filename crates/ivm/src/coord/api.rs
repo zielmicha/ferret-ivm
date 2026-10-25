@@ -52,6 +52,10 @@ pub struct SessionVars {
     pub read_mode: String,
     /// Interrupts of the session's statements (None: never interrupted).
     pub interrupts: Option<Arc<Interrupts>>,
+    /// The session's settings by lowercase name (what `SET` set, and the
+    /// values the session started with), for current_setting(); others
+    /// are the server's fixed settings.
+    pub settings: Arc<std::collections::BTreeMap<String, String>>,
 }
 
 /// Interrupts of a session's statement, set by the session thread and

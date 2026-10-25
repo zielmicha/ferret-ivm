@@ -543,6 +543,50 @@ fn subscribe_rows_follow_the_result_formats() {
     running.shutdown();
 }
 
+/// RESET (also RESET ALL, and SET ... TO DEFAULT) undoes a SET, and
+/// current_setting() reports the session's settings, so a virtual view
+/// sees those of the session reading it. RESET used to change nothing, and
+/// current_setting() reported the server's fixed settings only.
+#[test]
+fn reset_and_current_setting_follow_the_session() {
+    let (running, port) = start("reset");
+    let mut c = Conn::connect(port);
+    let value = |c: &mut Conn, sql: &str| -> String {
+        let msgs = c.query(sql);
+        assert_eq!(error_message(&msgs), None, "{sql}");
+        first_values(&msgs).remove(0)
+    };
+    for reset in ["RESET read_mode", "RESET ALL", "SET read_mode TO DEFAULT", "SET ivm.read_mode = DEFAULT"] {
+        c.query("SET read_mode = latest");
+        assert_eq!(value(&mut c, "SELECT current_setting('read_mode')"), "latest");
+        c.query(reset);
+        assert_eq!(value(&mut c, "SHOW read_mode"), "fresh", "{reset}");
+        assert_eq!(value(&mut c, "SELECT current_setting('ivm.read_mode')"), "fresh", "{reset}");
+    }
+    // application_name: back to the startup value (none), reported to the client
+    c.query("SET application_name = 'other'");
+    assert_eq!(value(&mut c, "SELECT current_setting('application_name')"), "other");
+    let msgs = c.query("RESET application_name");
+    let status: Vec<&Vec<u8>> = msgs.iter().filter(|m| m.0 == b'S').map(|m| &m.1).collect();
+    assert_eq!(status, [&b"application_name\0\0".to_vec()]);
+    assert_eq!(value(&mut c, "SELECT current_setting('application_name')"), "");
+    // custom settings, seen by a virtual view as the reading session has them
+    c.query("SET myapp.user_id = '42'");
+    c.query("SET search_path = public");
+    c.query("CREATE VIEW who AS SELECT current_setting('myapp.user_id', true) AS u");
+    assert_eq!(value(&mut c, "SELECT u FROM who"), "42");
+    let mut other = Conn::connect(port);
+    assert_eq!(value(&mut other, "SELECT u FROM who"), "NULL");
+    c.query("RESET ALL");
+    assert_eq!(value(&mut c, "SELECT u FROM who"), "NULL");
+    assert_eq!(value(&mut c, "SHOW search_path"), "\"$user\", public");
+    assert_eq!(value(&mut c, "SELECT current_setting('search_path')"), "\"$user\", public");
+    // the server's settings, as before
+    assert_eq!(value(&mut c, "SELECT current_setting('TimeZone')"), "UTC");
+    assert!(error_message(&c.query("SELECT current_setting('nope')")).unwrap_or_default().contains("unrecognized configuration parameter"));
+    running.shutdown();
+}
+
 #[test]
 fn show_read_mode_before_set() {
     let (running, port) = start("readmode");

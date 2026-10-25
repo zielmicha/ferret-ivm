@@ -97,6 +97,8 @@ struct Session {
     /// (shared with the engine through `vars`).
     interrupts: Arc<Interrupts>,
     settings: HashMap<String, String>,
+    /// The settings the session started with: what RESET restores.
+    defaults: HashMap<String, String>,
     /// The statement being run is COPY (SUBSCRIBE ...) TO STDOUT.
     pending_copy: bool,
 }
@@ -235,12 +237,13 @@ impl Session {
             reader,
             writer,
             out,
-            vars: SessionVars { read_mode: "fresh".into(), interrupts: Some(interrupts.clone()) },
+            vars: SessionVars { read_mode: "fresh".into(), interrupts: Some(interrupts.clone()), ..Default::default() },
             prepared: HashMap::new(),
             portals: HashMap::new(),
             in_txn: false,
             interrupts,
             settings: HashMap::new(),
+            defaults: HashMap::new(),
             pending_copy: false,
         };
         s.settings.insert("application_name".into(), app);
@@ -262,7 +265,60 @@ impl Session {
         for k in ["read_mode", "ivm.read_mode"] {
             s.settings.insert(k.into(), s.vars.read_mode.clone());
         }
+        s.defaults = s.settings.clone();
+        s.settings_changed();
         s.main_loop()
+    }
+
+    /// Hand the session's settings to the engine (for current_setting()).
+    fn settings_changed(&mut self) {
+        self.vars.settings = Arc::new(self.settings.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    }
+
+    /// RESET name (and SET name TO DEFAULT): back to the value the session
+    /// started with, or to the server's (no session value).
+    fn reset_setting(&mut self, name: &str) {
+        let before = self.settings.get(name).cloned();
+        match self.defaults.get(name) {
+            Some(v) => {
+                self.settings.insert(name.to_string(), v.clone());
+            }
+            None => {
+                self.settings.remove(name);
+            }
+        }
+        match name {
+            "read_mode" | "ivm.read_mode" => {
+                let v = self.defaults.get("read_mode").cloned().unwrap_or_else(|| "fresh".into());
+                self.vars.read_mode = v.clone();
+                for k in ["read_mode", "ivm.read_mode"] {
+                    self.settings.insert(k.into(), v.clone());
+                }
+            }
+            "application_name" if self.settings.get(name) != before.as_ref() => {
+                let v = self.settings.get(name).cloned().unwrap_or_default();
+                self.out.parameter_status("application_name", &v);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_reset(&mut self, reset: &sqlparser::ast::Reset) -> Result<ExecResult> {
+        use sqlparser::ast::Reset as R;
+        match reset {
+            R::ALL => {
+                let mut names: Vec<String> = self.settings.keys().chain(self.defaults.keys()).cloned().collect();
+                names.sort();
+                names.dedup();
+                for n in names {
+                    self.reset_setting(&n);
+                }
+            }
+            R::ConfigurationParameter(name) => self.reset_setting(&name.to_string().to_lowercase().replace(' ', "_")),
+            R::SessionAuthorization => {}
+        }
+        self.settings_changed();
+        Ok(ExecResult::Command { tag: "RESET".into() })
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -378,8 +434,7 @@ impl Session {
                     self.portals.clear();
                     Some(Ok(ExecResult::Command { tag: "ROLLBACK".into() }))
                 }
-                // settings are fixed or kept per session: nothing to reset
-                sqlparser::ast::Statement::Reset(_) => Some(Ok(ExecResult::Command { tag: "RESET".into() })),
+                sqlparser::ast::Statement::Reset(r) => Some(self.handle_reset(&r.reset)),
                 sqlparser::ast::Statement::ShowVariable { variable } => {
                     let name = variable.iter().map(|i| i.value.to_lowercase()).collect::<Vec<_>>().join("_");
                     self.settings.get(&name).map(|v| {
@@ -404,6 +459,14 @@ impl Session {
     fn handle_set(&mut self, set: &sqlparser::ast::Set) -> Result<ExecResult> {
         use sqlparser::ast::Set as S;
         let (name, value) = match set {
+            // SET name TO DEFAULT is RESET name
+            S::SingleAssignment { variable, values, .. }
+                if matches!(values.as_slice(), [sqlparser::ast::Expr::Identifier(i)] if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("default")) =>
+            {
+                self.reset_setting(&variable.to_string().to_lowercase().replace(' ', "_"));
+                self.settings_changed();
+                return Ok(ExecResult::Command { tag: "SET".into() });
+            }
             S::SingleAssignment { variable, values, .. } => {
                 let v = values.iter().map(|e| e.to_string().trim_matches('\'').to_string()).collect::<Vec<_>>().join(",");
                 (variable.to_string().to_lowercase(), v)
@@ -423,6 +486,7 @@ impl Session {
                 for k in ["read_mode", "ivm.read_mode"] {
                     self.settings.insert(k.into(), v.clone());
                 }
+                self.settings_changed();
                 return Ok(ExecResult::Command { tag: "SET".into() });
             }
             "timezone" | "time zone" => {
@@ -469,6 +533,7 @@ impl Session {
             self.out.parameter_status("application_name", &value);
         }
         self.settings.insert(name.replace(' ', "_"), value);
+        self.settings_changed();
         Ok(ExecResult::Command { tag: "SET".into() })
     }
 

@@ -197,9 +197,11 @@ For the fixed settings, any other value (another time zone or encoding,
 `DateStyle = 'ISO, DMY'` or `German`, `IntervalStyle = iso_8601`,
 `bytea_output = escape`, `standard_conforming_strings = off`) fails with
 SQLSTATE `0A000` (`... is not supported`) rather than being accepted without
-effect. `SET TRANSACTION ...`, `RESET` (also `RESET ALL`), `DISCARD` and
-`DEALLOCATE` are accepted and change nothing; in particular `RESET` does not
-undo a `SET`.
+effect. `RESET name` (and `SET name TO DEFAULT`) restores the value the
+session started with — the `application_name` of the startup message,
+`read_mode = fresh`, the values `SHOW` reports below — or removes the
+session's value; `RESET ALL` does so for every setting. `SET TRANSACTION
+...`, `DISCARD` and `DEALLOCATE` are accepted and change nothing.
 
 `SHOW name` returns the value set in the session if there is one; otherwise
 the session or the engine answers for:
@@ -225,10 +227,12 @@ the session or the engine answers for:
 
 Any other name fails with `unrecognized configuration parameter` (SQLSTATE
 `42704`). `SHOW ALL` lists only `server_version`, `timezone` and
-`datestyle`. For clients that use them, `current_setting(name [,
-missing_ok])` returns the server's fixed settings (the values above, not
-values changed with `SET`, and not `read_mode`), and `set_config(name,
-value, is_local)` returns `value` without changing or checking anything.
+`datestyle`. `current_setting(name [, missing_ok])` returns the session's
+value — any name set with `SET` (custom names such as `myapp.user_id`
+included), `read_mode` and the other values the session starts with — and
+otherwise the server's fixed settings above; a virtual view calling it sees
+the settings of the session that reads it. `set_config(name, value,
+is_local)` returns `value` without changing or checking anything.
 
 ## SUBSCRIBE
 

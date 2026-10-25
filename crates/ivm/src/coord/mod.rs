@@ -691,7 +691,10 @@ impl Engine {
     fn run_execute(&mut self, req: Request, handle: &EngineHandle) {
         match req {
             Request::Execute { stmt, params, vars, extra, reply } => {
-                match self.execute(*stmt, params, vars, extra, reply.clone(), handle) {
+                // (current_setting() in the statement reads the session's settings)
+                let settings = vars.settings.clone();
+                let r = crate::expr::with_session_settings(settings, || self.execute(*stmt, params, vars, extra, reply.clone(), handle));
+                match r {
                     Ok(Some(res)) => {
                         let _ = reply.send(Ok(res));
                     }
