@@ -274,7 +274,16 @@ impl<'a> Binder<'a> {
             );
         };
         let distinct = !matches!(set_quantifier, ast::SetQuantifier::All);
-        let (base, mut names) = self.bind_set_expr(left)?;
+        let (mut base, mut names) = self.bind_set_expr(left)?;
+        // the non-recursive term fixes the column types: untyped ones are text
+        let schema = base.schema();
+        if schema.iter().any(|c| c.ty == SqlType::Unknown) {
+            let target: Vec<ColumnType> = schema
+                .iter()
+                .map(|c| if c.ty == SqlType::Unknown { ColumnType::new(SqlType::Text).nullable(c.nullable) } else { c.clone() })
+                .collect();
+            base = self.coerce_rel(base, &target, "UNION")?;
+        }
         apply_alias_names(&mut names, alias_cols, name)?;
         let id = self.next_rec_id;
         self.next_rec_id += 1;

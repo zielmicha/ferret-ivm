@@ -135,6 +135,8 @@ fn untyped_literals_in_query_outputs_resolve_to_text() {
     }
     assert_eq!(column_types(&h, "SELECT 'abc', NULL"), vec!["text", "text"]);
     assert_eq!(column_types(&h, "SELECT * FROM mu"), vec!["text"]);
+    let rec = "WITH RECURSIVE t(n) AS (SELECT 'a' UNION ALL SELECT n || 'b' FROM t WHERE length(n) < 3) SELECT n, pg_typeof(n) FROM t ORDER BY n";
+    assert_eq!(rows(&h, rec), vec!["a|text", "ab|text", "abb|text"]);
     // set operations still unify untyped branches with the others
     assert_eq!(rows(&h, "SELECT '1' UNION SELECT 2 ORDER BY 1"), vec!["1", "2"]);
     assert_eq!(column_types(&h, "SELECT '1' UNION SELECT 2"), vec!["integer"]);
