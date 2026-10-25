@@ -40,7 +40,8 @@ decorrelated subqueries — is checked (`check_deterministic` in
    |---|---|
    | `random()`, `gen_random_uuid()`, `clock_timestamp()`, `set_config()` | volatile |
    | `now()`, `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date` | stable (the clock) |
-   | `current_setting()` | stable |
+   | `current_setting()` | stable (the session) |
+   | `pg_backend_pid()` | stable (the process) |
 
    ```
    ERROR:  function random() is not allowed in a materialized view
@@ -66,13 +67,13 @@ valid: ...`) when a materialized view reading it would then no longer plan
 or would fail the check.
 
 All other functions are immutable — including those that are only stable in
-PostgreSQL because they depend on the session time zone, which is fixed to
-UTC here (`to_char(timestamptz, ...)`, `date_trunc(text, timestamptz)`,
-`timestamp` ↔ `timestamptz` casts), and the session-independent catalog
-helpers (`version()`, `current_user`, ...). One of them is not a constant:
-`pg_backend_pid()` returns the process id, which changes when the engine
-restarts, yet is accepted
-([Known problems](../user-guide/troubleshooting.md#known-problems)).
+PostgreSQL because they depend on session settings that are fixed here (the
+time zone is UTC: `to_char(timestamptz, ...)`, `date_trunc(text,
+timestamptz)`, `timestamp` ↔ `timestamptz` casts; `DateStyle` and
+`extra_float_digits` for the text of values in `concat`, `format` or
+`to_json`), and the catalog helpers for client tools, which return
+constants here (`version()`, `current_user`, `has_table_privilege`,
+`pg_relation_size`, `pg_is_in_recovery`, ...).
 
 ## What is pinned down instead
 

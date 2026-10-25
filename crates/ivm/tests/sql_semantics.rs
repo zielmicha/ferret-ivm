@@ -540,6 +540,31 @@ fn current_setting_reports_server_settings() {
     running.shutdown();
 }
 
+/// pg_backend_pid() is the server's process id, which changes when it
+/// restarts: like the other functions whose value depends on the process or
+/// the session, materialized views reject it. It counted as immutable, so a
+/// view stored the id, and rows computed before and after a restart
+/// differed.
+#[test]
+fn process_dependent_functions_are_rejected_in_maintained_views() {
+    let running = start("backend-pid");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    assert_eq!(rows(&h, "SELECT pg_backend_pid() = pg_backend_pid(), pg_backend_pid() > 0"), vec!["t|t"]);
+    for sql in [
+        "CREATE MATERIALIZED VIEW v AS SELECT pg_backend_pid() AS pid",
+        "CREATE MATERIALIZED VIEW v AS SELECT id FROM t WHERE id <> pg_backend_pid()",
+        "SUBSCRIBE (SELECT id, pg_backend_pid() FROM t)",
+    ] {
+        let err = try_exec(&h, sql).unwrap_err();
+        assert!(err.contains("function pg_backend_pid() is not allowed in a materialized view"), "{sql}: {err}");
+    }
+    // virtual views may use it
+    exec(&h, "CREATE VIEW vv AS SELECT pg_backend_pid() > 0 AS ok");
+    assert_eq!(rows(&h, "SELECT ok FROM vv"), vec!["t"]);
+    running.shutdown();
+}
+
 #[test]
 fn scalar_subquery_cardinality_errors_only_where_evaluated() {
     let running = start("scalar-cardinality");

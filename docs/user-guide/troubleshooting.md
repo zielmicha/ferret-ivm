@@ -91,7 +91,8 @@ stayed connected for 10 s.
 ### A statement is rejected
 
 - `function f() is not allowed in a materialized view` — non-deterministic
-  functions (`random()`, `clock_timestamp()`, `gen_random_uuid()`); see
+  functions (`random()`, `clock_timestamp()`, `gen_random_uuid()`,
+  `current_setting()`, `pg_backend_pid()`); see
   [Maintained views](../sql/maintained-views.md).
 - `now() is only supported in temporal filters of maintained views` — see
   [Temporal filters](temporal-filters-and-errors.md#accepted-forms).
@@ -307,7 +308,6 @@ test, with workarounds.
 | Errors in join conditions of maintained views — a non-equality condition, the non-equality part of a join condition (`ON a.id = b.id AND a.x / b.y > 1`), `WHERE` conditions the optimizer moves into a join, and such conditions of `EXISTS`/`IN` subqueries — count as "no match" | the joined row is missing (in an outer join: NULL-padded) and no error record is created, where PostgreSQL fails; the same query ad hoc fails | guard the expression (`CASE WHEN b.y <> 0 THEN ... END`, `NULLIF`) |
 | A `SUBSCRIBE (query)` keeps the dataflow it was built with | after a materialized view it reads is replaced with `CREATE OR REPLACE`, it goes on with the view's former definition; after an upstream schema change re-plans such a view, it receives no more changes (it stays open and reports progress). `SUBSCRIBE TO` the view itself is not affected | subscribe to the view itself, or subscribe again after such changes |
 | `real` compared with an integer or `numeric` value is compared in `real` (there are no cross-type comparison operators; arithmetic is done in `double precision`, as in PostgreSQL) | `0.1::real = 0.1` is true (PostgreSQL: false) | cast to `double precision` |
-| `pg_backend_pid()` counts as immutable, so materialized views accept it | the view stores the process id, which changes at every restart: rows computed before and after a restart differ, and a recomputed view would not match the maintained one | do not use it in materialized views |
 | An upstream change that drops a materialized view (it no longer plans) leaves the virtual views over it in the catalog | reads of such a virtual view fail with `relation "m" does not exist` | drop or replace the virtual view |
 | A string literal continued on the next line (`'foo'` newline `'bar'`) | in a select list the second literal becomes a column alias (`foo` in a column `bar`; PostgreSQL returns `foobar`), elsewhere a syntax error | use `\|\|` |
 

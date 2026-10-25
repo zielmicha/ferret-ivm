@@ -1638,7 +1638,10 @@ pub fn register(b: &mut Builder) {
         b.last().volatility = Volatility::Stable;
         b.last().can_return_null = true;
     }
+    // the process id changes when the server restarts (stable, as in
+    // PostgreSQL: maintained views must not store it)
     b.fnn("pg_backend_pid", vec![], T::Int4, backend_pid);
+    b.last().volatility = Volatility::Stable;
     b.fnn("pg_is_in_recovery", vec![], T::Bool, always_false);
     {
         // GROUPING(...): replaced by the binder after aggregation
