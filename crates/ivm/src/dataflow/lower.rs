@@ -276,6 +276,7 @@ impl<'a> Lowerer<'a> {
                     distinct: *distinct,
                     sources,
                     out_arr: usize::MAX,
+                    errors: Default::default(),
                 };
                 let full = Layout::full(columns);
                 let node = self.g.add_node_with_output_arr(
@@ -387,9 +388,61 @@ impl<'a> Lowerer<'a> {
             }
             residual.push(c);
         }
+        let sizes: Vec<i64> = inputs
+            .iter()
+            .map(|s| {
+                self.g.node(s.node).arrangements.first().map(|a| self.env.tree_count(self.g.arr(*a).tree)).unwrap_or(1_000_000)
+            })
+            .collect();
+        // Arrangement keys are evaluated on every row of the arranged node.
+        // A key that is not a plain column of an input's node (computed by
+        // its MFP or by the join condition) would be evaluated on rows the
+        // MFP filters out too, and a key that fails would abort the whole
+        // step. Such inputs are materialized with their computed keys as
+        // extra columns: their arrangements are then keyed by columns, and
+        // expression errors become error records of the materialized node.
+        let mut inputs = inputs;
+        let mut extra_keys: Vec<Vec<Expr>> = vec![Vec::new(); n];
+        for j in 0..n {
+            if inputs[j].presence.is_some() {
+                continue;
+            }
+            let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
+            let mut computed = false;
+            let mut extra: Vec<Expr> = Vec::new();
+            for e in &edges {
+                for (side, ex) in [(e.a, &e.ea), (e.b, &e.eb)] {
+                    if side != j {
+                        continue;
+                    }
+                    let local = ex.remapped(&|c| c - offsets[j]);
+                    if local.substitute(&defs).as_column().is_some() {
+                        continue;
+                    }
+                    computed = true;
+                    if local.as_column().is_none() && !extra.iter().any(|x| same_expr(x, &local)) {
+                        extra.push(local);
+                    }
+                }
+            }
+            if !computed {
+                continue;
+            }
+            let s = &inputs[j];
+            let (width, schema) = (s.width, s.schema.clone());
+            let mut l = Lowered { node: s.node, mfp: s.mfp.clone(), schema: s.schema.clone() };
+            for e in &extra {
+                l.mfp.add_map(e.clone());
+                l.schema.push(e.column_type(&schema));
+            }
+            let node = self.materialize(l);
+            let mut mfp = Mfp::identity(width + extra.len());
+            mfp.project(&(0..width).collect::<Vec<_>>());
+            inputs[j] = JoinInputSpec { node, mfp, width, schema, presence: None, exact: false };
+            extra_keys[j] = extra;
+        }
         let mut join_inputs = Vec::with_capacity(n);
         let mut nodes = Vec::with_capacity(n);
-        let mut sizes = Vec::with_capacity(n);
         for (i, s) in inputs.iter().enumerate() {
             join_inputs.push(JoinInput {
                 node: s.node,
@@ -397,16 +450,9 @@ impl<'a> Lowerer<'a> {
                 width: s.width,
                 offset: offsets[i],
                 presence: s.presence,
+                exact: s.exact,
             });
             nodes.push(s.node);
-            let size = self
-                .g
-                .node(s.node)
-                .arrangements
-                .first()
-                .map(|a| self.env.tree_count(self.g.arr(*a).tree))
-                .unwrap_or(1_000_000);
-            sizes.push(size);
         }
         // the joined row schema
         let mut schema = Vec::with_capacity(width);
@@ -463,15 +509,20 @@ impl<'a> Lowerer<'a> {
                 let (j, _) = best.unwrap();
                 // key columns for j: pairs (expr over j's raw rows, expr over joined row)
                 let mut pairs: Vec<(Expr, Expr, bool)> = Vec::new();
+                // keyed by the values of an exact presence input: match by identity
+                let mut exact = false;
                 for e in &edges {
                     let (je, oe, other) = if e.a == j { (&e.ea, &e.eb, e.b) } else if e.b == j { (&e.eb, &e.ea, e.a) } else { continue };
                     if !bound.contains(&other) {
                         continue;
                     }
+                    exact |= inputs[other].exact;
                     // j-side expr over j's local post-mfp columns -> raw node columns
                     let local = je.remapped(&|c| c - offsets[j]);
                     let raw = if inputs[j].presence.is_some() {
                         local
+                    } else if let Some(k) = extra_keys[j].iter().position(|x| same_expr(x, &local)) {
+                        Expr::Column(inputs[j].width + k)
                     } else {
                         let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
                         local.substitute(&defs)
@@ -504,6 +555,7 @@ impl<'a> Lowerer<'a> {
                     key: pairs.iter().map(|(_, o, _)| o.clone()).collect(),
                     null_safe: pairs.iter().map(|(_, _, ns)| *ns).collect(),
                     filters,
+                    exact,
                 });
             }
             paths.push(DeltaPath { source: src, source_filters, steps });
@@ -551,7 +603,7 @@ impl<'a> Lowerer<'a> {
         }
         let specs: Vec<JoinInputSpec> = inputs
             .into_iter()
-            .map(|l| JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None })
+            .map(|l| JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None, exact: false })
             .collect();
         let (plan, nodes, schema) = self.plan_join(specs, conds)?;
         let node = self.g.add_node(NodeKind::Join(plan), nodes, schema);
@@ -608,16 +660,19 @@ impl<'a> Lowerer<'a> {
                 let _ = &mut inputs;
                 self.lower_inner(inputs, conds)?
             };
-            let mut proj = joined;
-            proj.mfp.project(&(0..nl).collect::<Vec<_>>());
-            proj.schema.truncate(nl);
-            let matched = self.distinct(proj)?;
+            let mut matched = joined;
+            matched.mfp.project(&(0..nl).collect::<Vec<_>>());
+            matched.schema.truncate(nl);
             let pairs_all: Vec<(Expr, Expr, bool)> = (0..nl).map(|c| (Expr::Column(c), Expr::Column(c), true)).collect();
             let mut lf = l.clone();
             for p in &left_only {
                 lf.mfp.add_filter(p.clone());
             }
-            self.presence_join(lf, matched, pairs_all)?
+            // the matched rows are looked up exactly: rows that are equal but
+            // differ in representation (numeric scale, ...) may differ in
+            // whether they match, so neither a distinct nor a lookup by
+            // equality may conflate them
+            self.presence_join(lf, matched, pairs_all, true)?
         } else {
             let mut lf = l.clone();
             for p in &left_only {
@@ -637,7 +692,7 @@ impl<'a> Lowerer<'a> {
             rk.schema = rk.schema[base_w..].to_vec();
             let pairs_local: Vec<(Expr, Expr, bool)> =
                 pairs.iter().enumerate().map(|(i, (le, _, ns))| (le.clone(), Expr::Column(i), *ns)).collect();
-            self.presence_join(lf, rk, pairs_local)?
+            self.presence_join(lf, rk, pairs_local, false)?
         };
         if !anti {
             return Ok(semi);
@@ -646,8 +701,9 @@ impl<'a> Lowerer<'a> {
         self.union(vec![l, semi], vec![false, true])
     }
 
-    /// Semijoin of `l` with the key set of `r` (r's columns are the keys).
-    fn presence_join(&mut self, l: Lowered, r: Lowered, pairs: Vec<(Expr, Expr, bool)>) -> Result<Lowered> {
+    /// Semijoin of `l` with the key set of `r` (r's columns are the keys),
+    /// matching keys by equality or, if `exact`, by identity.
+    fn presence_join(&mut self, l: Lowered, r: Lowered, pairs: Vec<(Expr, Expr, bool)>, exact: bool) -> Result<Lowered> {
         let nl = l.schema.len();
         let k = r.schema.len();
         let r_schema = r.schema.clone();
@@ -655,8 +711,8 @@ impl<'a> Lowerer<'a> {
         let key: Vec<Expr> = (0..k).map(Expr::Column).collect();
         let parr = self.arrange(rnode, key, vec![SortSpec::ASC; k], vec![]);
         let inputs = vec![
-            JoinInputSpec { width: nl, node: l.node, mfp: l.mfp.clone(), schema: l.schema.clone(), presence: None },
-            JoinInputSpec { width: k, node: rnode, mfp: Mfp::identity(k), schema: r_schema, presence: Some(parr) },
+            JoinInputSpec { width: nl, node: l.node, mfp: l.mfp.clone(), schema: l.schema.clone(), presence: None, exact: false },
+            JoinInputSpec { width: k, node: rnode, mfp: Mfp::identity(k), schema: r_schema, presence: Some(parr), exact },
         ];
         let lschema = l.schema.clone();
         let conds: Vec<Expr> = pairs
@@ -855,23 +911,31 @@ impl<'a> Lowerer<'a> {
 
     fn lower_distinct_aggs(&mut self, input: &Rel, group: &[usize], aggs: &[AggCall]) -> Result<Lowered> {
         let ng = group.len();
-        // all DISTINCT aggregates over the same argument set can share one distinct input
-        let distinct_args: Vec<Vec<usize>> = {
-            let mut v: Vec<Vec<usize>> = aggs.iter().filter(|a| a.distinct).map(|a| a.args.clone()).collect();
+        // all DISTINCT aggregates over the same argument set and FILTER can
+        // share one distinct input
+        let distinct_args: Vec<(Vec<usize>, Option<usize>)> = {
+            let mut v: Vec<(Vec<usize>, Option<usize>)> = aggs.iter().filter(|a| a.distinct).map(|a| (a.args.clone(), a.filter)).collect();
             v.sort();
             v.dedup();
             v
         };
-        if distinct_args.len() == 1 && aggs.iter().all(|a| a.distinct && a.filter.is_none()) {
-            // Aggregate(Distinct(Project(group ++ args)))
-            let args = &distinct_args[0];
+        if distinct_args.len() == 1 && aggs.iter().all(|a| a.distinct) {
+            // Aggregate(Distinct(Project(group ++ args [++ filter])))
+            let (args, filter) = &distinct_args[0];
             let mut cols: Vec<usize> = group.to_vec();
             cols.extend(args.iter().copied());
+            // the FILTER flag is part of the distinct rows: a value counts once
+            // among the rows that pass the filter, and groups none of whose
+            // rows pass it still exist
+            if let Some(f) = filter {
+                cols.push(*f);
+            }
             let projected = Rel::Distinct { input: Box::new(input.clone().project(cols)) };
             let new_aggs: Vec<AggCall> = aggs
                 .iter()
                 .map(|a| AggCall {
                     distinct: false,
+                    filter: a.filter.map(|_| ng + args.len()),
                     args: a.args.iter().map(|x| ng + args.iter().position(|y| y == x).unwrap()).collect(),
                     order: a.order.iter().map(|k| SortKey { col: ng + args.iter().position(|y| *y == k.col).unwrap_or(0), spec: k.spec }).collect(),
                     ..a.clone()
@@ -892,12 +956,22 @@ pub struct JoinInputSpec {
     pub width: usize,
     pub schema: Vec<ColumnType>,
     pub presence: Option<ArrId>,
+    /// Presence matches exactly (see JoinInput::exact).
+    pub exact: bool,
 }
 
 impl From<Lowered> for JoinInputSpec {
     fn from(l: Lowered) -> Self {
-        JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None }
+        JoinInputSpec { width: l.schema.len(), node: l.node, mfp: l.mfp, schema: l.schema, presence: None, exact: false }
     }
+}
+
+/// Structural equality of expressions.
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    a.fingerprint(&mut x);
+    b.fingerprint(&mut y);
+    x == y
 }
 
 /// Equality of two expressions of the same (already aligned) type.

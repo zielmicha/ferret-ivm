@@ -23,10 +23,12 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-/// Default parent directory for cluster directories (override with the
-/// `PGPROTO_CLUSTER_DIR` environment variable or `ClusterOptions::base_dir`).
-pub const DEFAULT_BASE_DIR: &str =
-    "/tmp/claude-10001/-home-michal-r-ivm/9fd5bce0-8aca-41c1-adda-7faa045c1f78/scratchpad/clusters";
+/// Default parent directory for cluster directories: `pgproto-clusters` in
+/// the temporary directory (`$TMPDIR`, else `/tmp`). Override with the
+/// `PGPROTO_CLUSTER_DIR` environment variable or `ClusterOptions::base_dir`.
+pub fn default_base_dir() -> PathBuf {
+    std::env::temp_dir().join("pgproto-clusters")
+}
 /// Default PostgreSQL binary directory (override with `PG_BIN`).
 pub const DEFAULT_PG_BIN: &str = "/usr/lib/postgresql/17/bin";
 
@@ -209,7 +211,7 @@ fn resolve_dirs(opts: &ClusterOptions) -> (PathBuf, PathBuf) {
         .base_dir
         .clone()
         .or_else(|| std::env::var_os("PGPROTO_CLUSTER_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_BASE_DIR));
+        .unwrap_or_else(default_base_dir);
     (pg_bin, base)
 }
 

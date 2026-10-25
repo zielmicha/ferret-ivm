@@ -6,9 +6,9 @@ encoding UTF8, e.g.:
   initdb -D $D -U postgres --auth=trust --locale-provider=builtin \
          --builtin-locale=C.UTF-8 --locale=C -E UTF8
 
-Connection parameters come from PGFUNCS_PGHOST / PGFUNCS_PGPORT (defaults:
-the private cluster used during development). PGHOST/PGPORT are deliberately
-not used so that a developer's default server is never picked up by accident.
+Connection parameters come from PGFUNCS_PGHOST (socket directory or host)
+and PGFUNCS_PGPORT, which must be set. PGHOST/PGPORT are deliberately not
+used so that a developer's default server is never picked up by accident.
 
 Each case is a SQL statement with %s placeholders plus parameters. The
 statement must return exactly one row with one column (cast it to text in
@@ -25,13 +25,14 @@ import sys
 
 import psycopg2
 
-DEFAULT_HOST = "/tmp/claude-10001/-home-michal-r-ivm/9fd5bce0-8aca-41c1-adda-7faa045c1f78/scratchpad/s"
-
-
 def connect():
+    host = os.environ.get("PGFUNCS_PGHOST")
+    port = os.environ.get("PGFUNCS_PGPORT")
+    if not host or not port:
+        sys.exit("set PGFUNCS_PGHOST and PGFUNCS_PGPORT to a PostgreSQL 17 server (see the module docstring)")
     conn = psycopg2.connect(
-        host=os.environ.get("PGFUNCS_PGHOST", DEFAULT_HOST),
-        port=int(os.environ.get("PGFUNCS_PGPORT", "54405")),
+        host=host,
+        port=int(port),
         user="postgres",
         dbname="postgres",
     )

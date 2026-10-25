@@ -61,6 +61,12 @@ impl AggSpec {
             A::Max => vec![(AggKind::Max, self.arg_expr())],
             A::BoolAnd => vec![(AggKind::CountFalse, self.arg_expr()), (AggKind::CountNonNull, self.arg_expr())],
             A::BoolOr => vec![(AggKind::CountTrue, self.arg_expr()), (AggKind::CountNonNull, self.arg_expr())],
+            // squares of int8 values (up to 2^126) overflow i128 sums: those
+            // are summed as numerics (exactly, like PostgreSQL)
+            A::StddevSamp | A::StddevPop | A::VarSamp | A::VarPop if self.arg_type == SqlType::Int8 => {
+                let num = Expr::Cast(Box::new(self.arg_expr()), SqlType::Numeric, -1, false);
+                vec![(AggKind::SumNumeric, num.clone()), (AggKind::SumSqNumeric, num), (AggKind::CountNonNull, self.arg_expr())]
+            }
             A::StddevSamp | A::StddevPop | A::VarSamp | A::VarPop => vec![
                 (sum_kind(false), self.arg_expr()),
                 (sum_kind(true), self.arg_expr()),

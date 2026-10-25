@@ -4,3 +4,6 @@ target/
 /.worktrees/
 # scratch space for test runs and benchmarks
 .scratch/
+# Python bytecode caches (golden-data generators)
+__pycache__/
+*.pyc

@@ -489,12 +489,11 @@ impl Engine {
         }
         if cv.materialized {
             self.create_view_rt(id, &query_sql)?;
-            let errs = self.graph.hydrate(&mut self.env, gsn)?;
-            if let Some(v) = self.rt.views.get_mut(&id)
-                && let Some(e) = errs.get(&v.node)
-            {
-                merge_errors(&mut v.errors, e);
-            }
+            self.graph.hydrate(&mut self.env, gsn)?;
+            // the errors in the root's contents (also when it is shared with
+            // other views and was hydrated long ago)
+            let errs = self.graph.errors_of(self.rt.views[&id].node);
+            merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::MaterializedView(def), created_gsn: gsn, create_sql: sql.to_string() });
         } else {
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::View(def), created_gsn: gsn, create_sql: sql.to_string() });
@@ -524,11 +523,10 @@ impl Engine {
             }
             return Err(e);
         }
-        let errs = self.graph.hydrate(&mut self.env, gsn)?;
+        self.graph.hydrate(&mut self.env, gsn)?;
         let new_node = self.rt.views[&id].node;
-        if let Some(e) = errs.get(&new_node) {
-            merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, e);
-        }
+        let errs = self.graph.errors_of(new_node);
+        merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
         let new_arr = self.rt.views[&id].arr;
         let new_rows = self.graph.scan_arr(&mut self.env, new_arr, crate::storage::ReadAt::Latest)?;
         // subscribers see the change from the old to the new definition

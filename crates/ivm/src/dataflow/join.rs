@@ -12,6 +12,7 @@
 
 use super::mfp::Mfp;
 use super::*;
+use crate::types::datum::exact_cmp;
 use crate::types::Datum;
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,9 @@ pub struct JoinInput {
     /// For presence inputs: arrangement keyed by the presence key; the
     /// input's rows are the key values (width = key length).
     pub presence: Option<ArrId>,
+    /// Presence matches key values exactly, including the representation
+    /// of equal values (numeric scale, -0.0, ...), rather than by equality.
+    pub exact: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +41,9 @@ pub struct LookupStep {
     pub null_safe: Vec<bool>,
     /// Predicates over the joined row checked after this step.
     pub filters: Vec<Expr>,
+    /// Keys must be identical, including the representation of equal
+    /// values (lookups keyed by the values of an exact presence input).
+    pub exact: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +81,12 @@ impl JoinPlan {
             fp.extend_from_slice(cx.node(i.node));
             i.mfp.fingerprint(fp);
             match i.presence {
-                Some(a) => fp.extend_from_slice(cx.arr(a)),
+                Some(a) => {
+                    fp.extend_from_slice(cx.arr(a));
+                    if i.exact {
+                        fp.push(0xE0);
+                    }
+                }
                 None => fp.push(0),
             }
         }
@@ -94,6 +106,9 @@ impl JoinPlan {
                 fp.extend(s.null_safe.iter().map(|b| *b as u8));
                 for f in &s.filters {
                     f.fingerprint(fp);
+                }
+                if s.exact {
+                    fp.push(0xE1);
                 }
             }
         }
@@ -117,6 +132,13 @@ fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], at: ReadA
     })
 }
 
+/// Key of presence values in their arrangement: the canonical key prefix,
+/// or for exact presence the whole entry (values with their representation;
+/// presence arrangements are keyed by all columns, so it has no payload).
+fn presence_prefix(layout: &Layout, vals: &[Datum], exact: bool) -> Result<Vec<u8>> {
+    if exact { layout.encode_row(vals) } else { Ok(layout.encode_prefix(vals)) }
+}
+
 struct Ctx<'a> {
     g: &'a Graph,
     p: &'a JoinPlan,
@@ -138,14 +160,18 @@ fn lookup(env: &mut Env, cx: &Ctx, step: &LookupStep, row: &[Datum], at: ReadAt)
     }
     let inp = &cx.p.inputs[step.input];
     if let Some(parr) = inp.presence {
-        let prefix = cx.g.arr(parr).layout.encode_prefix(&key);
+        let prefix = presence_prefix(&cx.g.arr(parr).layout, &key, inp.exact)?;
         let c = presence_count(env, cx.g, parr, &prefix, at, cx.pres_delta[step.input].as_ref())?;
         return Ok(if c > 0 { vec![(key, 1)] } else { vec![] });
     }
     let raw = cx.g.lookup(env, step.arr, &key, at)?;
+    let layout = &cx.g.arr(step.arr).layout;
     let mut out = Vec::with_capacity(raw.len());
     for (r, w) in raw {
         if w <= 0 {
+            continue;
+        }
+        if step.exact && layout.key_values(&r)?.iter().zip(&key).any(|(a, b)| exact_cmp(a, b) != std::cmp::Ordering::Equal) {
             continue;
         }
         if let Ok(Some(post)) = inp.mfp.eval(&r) {
@@ -204,7 +230,7 @@ fn presence_deltas(g: &Graph, p: &JoinPlan, all: &FxHashMap<NodeId, Output>) -> 
                 if let Some(o) = all.get(&inp.node) {
                     for (row, w) in &o.data {
                         let kv = layout.key_values(row)?;
-                        *m.entry(layout.encode_prefix(&kv)).or_default() += w;
+                        *m.entry(presence_prefix(layout, &kv, inp.exact)?).or_default() += w;
                     }
                 }
                 v.push(Some(m));
@@ -237,7 +263,7 @@ pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all:
                 let new = presence_count(env, g, parr, prefix, ReadAt::Latest, None)?;
                 let old = new - dw;
                 if (old > 0) != (new > 0) {
-                    let (kv, _) = layout.decode_key_values(prefix)?;
+                    let kv = if src.exact { layout.decode_row(prefix)? } else { layout.decode_key_values(prefix)?.0 };
                     let mut row = vec![Datum::Null; p.width];
                     row[src.offset..src.offset + src.width].clone_from_slice(&kv);
                     start.push((row, if new > 0 { 1 } else { -1 }));
@@ -294,6 +320,19 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Res
     let path = p.paths.iter().find(|pa| pa.source == src).expect("path for every input");
     let inp = &p.inputs[src];
     let mut cache = FxHashMap::default();
+    // expression errors in the other regular inputs' maps count once per
+    // input row, as on their delta paths (lookups skip the failing rows)
+    for (i, other) in p.inputs.iter().enumerate() {
+        if i == src || other.presence.is_some() || other.mfp.steps.is_empty() {
+            continue;
+        }
+        let snap = super::ops::snapshot_node(g, env, other.node, &mut cache)?;
+        for (raw, w) in &snap.data {
+            if let Err(e) = other.mfp.eval(raw) {
+                out.errs.push((err_record(&e), *w));
+            }
+        }
+    }
     let snap = super::ops::owned(super::ops::snapshot_node(g, env, inp.node, &mut cache)?);
     let mut start = Vec::with_capacity(snap.data.len());
     for (raw, w) in snap.data {

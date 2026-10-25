@@ -7,7 +7,7 @@ use pgproto::testutil::{ClusterOptions, TempCluster, cleanup_stale_clusters};
 use pgproto::{Client, Config};
 
 fn test_base(name: &str) -> PathBuf {
-    let base = PathBuf::from(pgproto::testutil::DEFAULT_BASE_DIR)
+    let base = pgproto::testutil::default_base_dir()
         .join(format!("t-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
     base
