@@ -114,18 +114,37 @@ makes reads of the view fail until the offending rows are gone.
 
 ## Testing
 
-- `cargo test`: storage model tests (random operations, time travel,
-  incremental summaries vs recomputation, GC), engine tests (temporal filters,
-  aggregates under representation changes), and the golden suites of the
-  PostgreSQL ports (tens of thousands of cases recorded from PostgreSQL 17).
+- `cargo test --workspace` (about a minute once built; tests that need
+  PostgreSQL start private PostgreSQL 17 clusters from `PG_BIN`, default
+  `/usr/lib/postgresql/17/bin`):
+  - the golden suites of the PostgreSQL ports (tens of thousands of cases
+    recorded from PostgreSQL 17);
+  - property tests (proptest) of the storage engine against a model (random
+    operations, time travel, incremental summaries, GC, checkpoints, crashes
+    with torn files) and of the key and row encodings (key order is SQL
+    order, exact round trips);
+  - the self-differential test (`tests/selfdiff.rs`): random views over
+    random tables must equal their queries run ad hoc, through restarts,
+    crashes, subscriptions and views created, replaced and dropped;
+  - engine, dataflow, HTTP and replication tests (`crates/ivm/tests`),
+    mostly regression tests for specific bugs.
+
+  Property tests run `PROPTEST_CASES` cases (`PROPTEST_RNG_SEED` fixes the
+  seed); a failure shrinks to a minimal case, saved in a
+  `*.proptest-regressions` file and re-run first from then on. Longer
+  variants are `#[ignore]`d, as are tests of open bugs: see the module docs
+  of `crates/ivm/src/storage/tests.rs` and `crates/ivm/tests/selfdiff.rs`.
 - `ivm-difftest`: differential testing against a real PostgreSQL. It creates a
   random schema upstream, replicates it, defines random views (joins,
   subqueries, aggregates, grouping sets, windows, top-k, set operations,
-  LATERAL, ...) and after each of 20 rounds of random DML compares every view
-  with the same query run by PostgreSQL (`ivm-difftest --seed N --views 40`).
-  It starts a private PostgreSQL 17 cluster from `PG_BIN` (default
-  `/usr/lib/postgresql/17/bin`); `DIFFTEST_VERBOSE=1` prints the views and
-  details of any mismatch.
+  LATERAL, ...) and after each of 20 rounds of random DML compares every view,
+  and every replicated table, with PostgreSQL (`ivm-difftest --seed N --views
+  40`). `--restarts N` restarts or crashes the engine on the way (`--kill`:
+  SIGKILLs it as a child process), `--sinks N` writes views back to
+  PostgreSQL and checks the copies, `--schema-changes N` adds columns
+  upstream. It starts a private PostgreSQL 17 cluster from `PG_BIN`;
+  `DIFFTEST_VERBOSE=1` prints the views and details of any mismatch (more in
+  its module docs).
 
 ## Deviations from the design and limitations
 
