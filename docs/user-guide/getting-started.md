@@ -9,16 +9,17 @@ view over it.
 `ivm` is a Cargo workspace (`Cargo.toml` at the repository root) with five
 crates: the engine (`crates/ivm`) and four supporting libraries
 (`pgnumeric`, `pgdatetime`, `pgfuncs`, `pgproto`). The workspace crates have
-no build scripts, but one dependency (`psm`, pulled in by `sqlparser` through
-`recursive` and `stacker`) compiles a small assembly file, so a C toolchain
-(`cc`) must be installed.
+no build scripts, but two dependencies compile C or assembly code with the
+`cc` crate — `libmimalloc-sys` (the mimalloc allocator the binaries use) and
+`psm` (pulled in by `sqlparser` through `recursive` and `stacker`) — so a C
+toolchain (`cc`) must be installed.
 
 Requirements:
 
 - A recent stable Rust toolchain. `rust-toolchain.toml` selects the `stable`
   channel (with `clippy` and `rustfmt`); the code uses Rust 2024 edition
-  features and standard library APIs such as `File::try_lock`, which need
-  Rust 1.89 or newer.
+  features and recent standard library APIs such as `File::try_lock`
+  (Rust 1.89).
 - For the test suites that talk to a real server, and for `ivm-difftest`:
   PostgreSQL 17 server binaries (`initdb`, `pg_ctl`, `postgres`), by default
   in `/usr/lib/postgresql/17/bin` (see [Testing](../testing.md)).
@@ -27,12 +28,13 @@ Requirements:
 cargo build --release
 ```
 
-This produces two binaries:
+This produces three binaries:
 
 | Binary | Purpose |
 |---|---|
 | `target/release/ivm` | the server |
 | `target/release/ivm-difftest` | differential tester against a real PostgreSQL ([Testing](../testing.md#ivm-difftest)) |
+| `target/release/ivm-bench` | benchmark harness ([Testing](../testing.md#ivm-bench)) |
 
 Build profiles (from the workspace `Cargo.toml`): `dev` builds the workspace
 crates with `opt-level = 1` and all dependencies with `opt-level = 2`, with
@@ -43,7 +45,7 @@ debug info; `release` keeps line tables (`debug = 1`). A debug build
 To install the binaries into `~/.cargo/bin`:
 
 ```sh
-cargo install --path crates/ivm            # installs ivm and ivm-difftest
+cargo install --path crates/ivm            # installs ivm, ivm-difftest and ivm-bench
 cargo install --path crates/ivm --bin ivm  # just the server
 ```
 
@@ -57,9 +59,12 @@ access to the upstream PostgreSQL.
 ivm --data-dir ./ivm-data --listen 127.0.0.1:6875
 ```
 
-On start the engine opens (or creates) the data directory, recovers the last
-checkpoint, replays the input log written after it, restarts all sources and
-sinks, and then accepts connections. Log output goes to standard error.
+On start the server binds the listen address, opens (or creates) the data
+directory, recovers the last checkpoint, restarts the sinks, replays the
+input log written after the checkpoint, restarts the sources, and then
+accepts connections (a client that connects during recovery waits until
+then). Log output goes to standard error. See
+[Recovery](operations.md#recovery).
 
 ### Command-line flags
 
@@ -76,16 +81,24 @@ Every flag is parsed in `crates/ivm/src/main.rs`; defaults come from
 | `--retention-gsns N` | `1000` | Number of GSNs of history kept for `AS OF` reads. Older versions are consolidated, and older input-log segments may be deleted. |
 | `--tick-ms N` | `1000` | Interval of logged wall-clock ticks, which define `now()`. `0` disables ticks; `now()` then stays at the last logged tick (2000-01-01 00:00:00 UTC on a data directory that never had one). |
 | `--no-sync` | off (fsync on) | Do not `fsync` the input log after each commit batch. Faster, but an operating-system crash or power loss can lose changes that were already acknowledged to sources and clients; see [Operations](operations.md#durability-and---no-sync). |
+| `--http-listen ADDR` | off | Serve the [web UI](../web-ui.md) and its JSON API on `ADDR` (`host:port`, e.g. `127.0.0.1:6876`). With `--password`, every HTTP request needs Basic authentication with that password (any user name). |
 | `-h`, `--help` | | Print usage and exit with status 2. |
 
 Any unknown flag, a missing value or an unparsable number also prints the
-usage text and exits with status 2. The listen address is bound before
-recovery: if that fails, the process prints `ivm: cannot listen on <addr>:
-<reason>` (for example `Address already in use`) and exits with status 1. If
-the engine cannot start (for example the data directory is locked or
-recovery fails) it prints `ivm: failed to start: <reason>` and exits with
-status 1; so does a web UI that cannot start, and a server whose engine stops
-because of an error.
+usage text and exits with status 2.
+
+Exit statuses and start-up failures:
+
+| Situation | Message on standard error | Status |
+|---|---|---|
+| bad command-line arguments, `--help` | the usage text | 2 |
+| the listen address cannot be bound (it is bound before recovery) | `ivm: cannot listen on <addr>: <reason>` (for example `Address already in use`) | 1 |
+| the engine cannot start (the data directory is locked, recovery fails, ...) | `ivm: failed to start: <reason>` | 1 |
+| the web UI cannot start | `ivm: cannot start the web UI: <reason>` | 1 |
+| the engine stops by itself after an error, or the listener fails | `ivm: the engine stopped` (the cause is logged before), `ivm: server error: <reason>` | 1 |
+| a requested shutdown (below) whose final checkpoint succeeded | | 0 |
+| a requested shutdown during which a thread failed or the final checkpoint failed | | 1 |
+| a second `SIGINT`/`SIGTERM` | `ivm: second signal, exiting without a final checkpoint` | 1 |
 
 There is no configuration file. Two environment variables affect the server:
 
@@ -99,8 +112,10 @@ There is no configuration file. Two environment variables affect the server:
 Three ways request a graceful shutdown: `SIGINT` (Ctrl-C), `SIGTERM`, and a
 stop file — every 500 ms the process checks for a file named `.ivm-stop` in
 its **current working directory** (not the data directory) and deletes it
-when it appears. The server then stops sources and sinks, takes a final
-checkpoint, and exits with status 0 (status 1 if the checkpoint fails). A
+when it appears. The server then asks sources and sinks to stop (sinks first
+record everything applied as their progress), stops the sequencer, takes a
+final checkpoint, waits up to 5 s for source and sink threads, and exits
+with status 0 (status 1 if the checkpoint or another thread failed). A
 request during recovery takes effect once recovery has finished.
 
 A second signal exits at once (status 1), without the final checkpoint.
@@ -123,7 +138,7 @@ psql -h 127.0.0.1 -p 6875 -U ivm
 ```
 
 - **User and database names** are not checked; any values work. The session
-  reports itself as user `ivm` in database `ivm` (for example
+  reports itself as user `ivm` in database `ivm` (`current_user`,
   `current_database()`).
 - **Authentication**: none by default. With `--password`, the server requests
   a cleartext password (`AuthenticationCleartextPassword`); a wrong password
@@ -155,7 +170,8 @@ Supported protocol features:
 
 Not supported: `DECLARE`/`FETCH` cursors (so named "server-side cursors" in
 psycopg and similar drivers fail; use the protocol-level row limit instead),
-`COPY` in any other form, the function-call protocol, `LISTEN`/`NOTIFY`, TLS.
+`COPY` in any other form, the function-call protocol (answered with an
+error), `LISTEN`/`NOTIFY`, TLS.
 
 Transactions are not supported. `BEGIN`, `COMMIT` and `ROLLBACK` are accepted
 and only change the transaction status reported in `ReadyForQuery`; every
@@ -163,10 +179,12 @@ statement is applied on its own as soon as it runs, and **`ROLLBACK` does not
 undo anything**. Drivers that wrap statements in transactions work, but
 without transactional semantics. See [Reads](reads.md#transactions).
 
-`SET` accepts any parameter name; a few are validated (see
-[Session settings](reads.md#session-settings)). Drivers that set
-`TimeZone` to something other than UTC, or `client_encoding` to something
-other than UTF-8, get an error.
+`SET` accepts any parameter name; the settings the engine fixes are
+validated (see [Session settings](reads.md#session-settings)). Drivers that
+set `TimeZone` to something other than UTC, `client_encoding` to something
+other than UTF-8, or `DateStyle`, `IntervalStyle`, `bytea_output` or
+`standard_conforming_strings` to a value other than the one in effect, get
+an error.
 
 ## A first session
 
