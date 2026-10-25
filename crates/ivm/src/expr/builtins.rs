@@ -1559,6 +1559,8 @@ pub fn register(b: &mut Builder) {
         ("pg_get_constraintdef", vec![P::T(T::Oid), P::T(T::Bool)]),
         ("pg_get_viewdef", vec![P::T(T::Oid)]),
         ("pg_get_viewdef", vec![P::T(T::Oid), P::T(T::Bool)]),
+        ("pg_get_ruledef", vec![P::T(T::Oid)]),
+        ("pg_get_ruledef", vec![P::T(T::Oid), P::T(T::Bool)]),
         ("pg_get_triggerdef", vec![P::T(T::Oid)]),
         ("pg_get_partkeydef", vec![P::T(T::Oid)]),
         ("pg_get_statisticsobjdef_columns", vec![P::T(T::Oid)]),

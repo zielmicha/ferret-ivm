@@ -719,3 +719,17 @@ fn distinct_aggregates_order_by_their_arguments() {
     );
     running.shutdown();
 }
+
+#[test]
+fn sql_value_functions_and_catalog_helpers() {
+    let running = start("value-functions");
+    let h = running.handle.clone();
+    // the parser reads these as function calls, which did not exist
+    assert_eq!(
+        rows(&h, "SELECT current_user, session_user, user, current_catalog, current_role, pg_typeof(current_user)"),
+        vec!["ivm|ivm|ivm|ivm|ivm|name"]
+    );
+    // used by psql's \\d+ on views
+    assert_eq!(rows(&h, "SELECT pg_get_ruledef(0::oid, true) IS NULL"), vec!["t"]);
+    running.shutdown();
+}

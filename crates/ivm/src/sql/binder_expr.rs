@@ -1559,6 +1559,10 @@ impl<'a> Binder<'a> {
                 return Ok(Expr::Literal(Datum::text(&types[0].name()), SqlType::Text));
             }
             "version" => return Ok(Expr::Literal(Datum::text("PostgreSQL 17.0 (ivm)"), SqlType::Text)),
+            // SQL value functions the parser reads as function calls
+            "current_user" | "session_user" | "user" | "current_role" | "current_catalog" if bound.is_empty() => {
+                return Ok(Expr::Literal(Datum::text("ivm"), SqlType::Name));
+            }
             "current_database" => return Ok(Expr::Literal(Datum::text("ivm"), SqlType::Name)),
             "current_schema" => return Ok(Expr::Literal(Datum::text("public"), SqlType::Name)),
             "generate_series" | "unnest" | "jsonb_array_elements" | "jsonb_array_elements_text" | "jsonb_each"

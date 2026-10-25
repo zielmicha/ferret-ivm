@@ -431,3 +431,14 @@ fn subscribe_through_the_extended_protocol_is_described() {
     c.sync();
     running.shutdown();
 }
+
+#[test]
+fn show_read_mode_before_set() {
+    let (running, port) = start("readmode");
+    let mut c = Conn::connect(port);
+    // used to fail: unrecognized configuration parameter
+    assert_eq!(first_values(&c.query("SHOW read_mode")), vec!["fresh"]);
+    c.query("SET ivm.read_mode = latest");
+    assert_eq!(first_values(&c.query("SHOW read_mode")), vec!["latest"]);
+    running.shutdown();
+}

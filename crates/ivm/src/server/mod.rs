@@ -218,6 +218,10 @@ impl Session {
         for (k, v) in [("server_version_num", "170000"), ("integer_datetimes", "on"), ("max_identifier_length", "63")] {
             s.settings.insert(k.into(), v.into());
         }
+        // the session's read mode, also before any SET
+        for k in ["read_mode", "ivm.read_mode"] {
+            s.settings.insert(k.into(), s.vars.read_mode.clone());
+        }
         s.main_loop()
     }
 
@@ -375,7 +379,11 @@ impl Session {
                 if v != "fresh" && v != "latest" {
                     return Err(SqlError::new(codes::INVALID_PARAMETER_VALUE, format!("invalid value for read_mode: \"{value}\"")));
                 }
-                self.vars.read_mode = v;
+                self.vars.read_mode = v.clone();
+                for k in ["read_mode", "ivm.read_mode"] {
+                    self.settings.insert(k.into(), v.clone());
+                }
+                return Ok(ExecResult::Command { tag: "SET".into() });
             }
             "timezone" | "time zone" => {
                 let v = value.to_lowercase();
