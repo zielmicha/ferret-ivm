@@ -316,10 +316,7 @@ impl PgSource {
                     let ok: Row = pk.iter().map(|c| o[*c].clone()).collect();
                     let nk: Row = pk.iter().map(|c| row[*c].clone()).collect();
                     if pk_bytes(o, &pk) != pk_bytes(&row, &pk) && !ok.iter().any(|d| d.is_null()) {
-                        let kb = pk_bytes(o, &pk);
-                        if self.snapshot_filter(table, &kb).is_some() {
-                            self.push_change(table, TableChange::Delete { key: ok });
-                        }
+                        self.push_delete(table, o, ok);
                     }
                     let _ = nk;
                 }
@@ -339,11 +336,8 @@ impl PgSource {
                     }
                     return Ok(());
                 }
-                let kb = pk_bytes(&row, &pk);
-                if self.snapshot_filter(table, &kb).is_some() {
-                    let key: Row = pk.iter().map(|c| row[*c].clone()).collect();
-                    self.push_change(table, TableChange::Delete { key });
-                }
+                let key: Row = pk.iter().map(|c| row[*c].clone()).collect();
+                self.push_delete(table, &row, key);
             }
             LogicalMessage::Truncate { relation_ids, .. } => {
                 for r in relation_ids {
@@ -447,6 +441,19 @@ impl PgSource {
             Some(t) => t.changes.push((table, ch)),
             None => log::warn!("change outside a transaction ignored"),
         }
+    }
+
+    /// Delete primary key `key` (the key columns of `row`). Unlike inserts
+    /// and updates, a delete is not left to a snapshot that has yet to read
+    /// the key: the engine may hold the row all the same (from before the
+    /// re-snapshot after a schema change, or from a chunk logged before a
+    /// restart whose progress was not), and a deleted row is not there to be
+    /// read. Deleting a key the engine does not hold changes nothing.
+    fn push_delete(&mut self, table: ObjectId, row: &[Datum], key: Row) {
+        let kb = pk_bytes(row, &self.tables[&table].pk);
+        // (drops the key from the chunk in flight where the stream wins)
+        let _ = self.snapshot_filter(table, &kb);
+        self.push_change(table, TableChange::Delete { key });
     }
 
     fn push_upsert(&mut self, table: ObjectId, mut row: Row, unchanged: Vec<usize>, old: Option<Row>) -> Result<()> {
