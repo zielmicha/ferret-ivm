@@ -106,6 +106,18 @@ impl Mfp {
         Ok(Some(self.projection.iter().map(|c| ext[*c].clone()).collect()))
     }
 
+    /// Input columns the steps and the projection read.
+    pub fn input_columns(&self) -> Vec<usize> {
+        let mut cols: Vec<usize> = self.projection.iter().copied().filter(|c| *c < self.input_arity).collect();
+        for s in &self.steps {
+            let (MfpStep::Map(e) | MfpStep::Filter(e)) = s;
+            cols.extend(e.column_set().into_iter().filter(|c| *c < self.input_arity));
+        }
+        cols.sort();
+        cols.dedup();
+        cols
+    }
+
     /// Output schema.
     pub fn schema(&self, input: &[ColumnType]) -> Vec<ColumnType> {
         let mut ext: Vec<ColumnType> = input.to_vec();

@@ -28,8 +28,8 @@ Requirements and environment:
 Only the `pgproto` integration tests (`client`, `replication`,
 `server_codec`, `testutil`), the engine's replication tests
 (`crates/ivm/tests/replication.rs`) and `ivm-difftest` need PostgreSQL
-binaries; all other tests are self-contained. Golden tests read recorded data and need no
-server.
+binaries; all other tests are self-contained. Golden tests read recorded
+data and need no server.
 
 `TempCluster` (`crates/pgproto/src/testutil.rs`) creates a throwaway cluster
 in `<base>/<pid>-<n>/`: `initdb` with user `postgres`, encoding UTF-8 and the
@@ -49,10 +49,10 @@ created with `keep: true`.
 
 | Suite | What it covers |
 |---|---|
-| unit tests (`cargo test -p ivm --lib`) | input-log round trip, torn-tail truncation and corruption before the tail (`log.rs`); exact float sums (`storage/summary.rs`); the sequencer's ticks under load (`coord/seq.rs`); statement splitting, the engine's own statement parser, planning panics turned into errors (`sql`); the source's snapshot chunks against a fake engine: truncates and keyless changes around a chunk, schema changes in the middle of a transaction, transaction-id visibility across epochs (`source/postgres.rs`); introspection and the web UI's assets (`coord/inspect.rs`, `http`) |
-| type property tests (`types/tests.rs`, proptest) | over random values of every column type (numerics of any scale, floats with NaN payloads and signed zeros, intervals, json, arrays with bounds and NULLs, ...): key order equals SQL order, for single values and composite keys; keys decode to the canonical value and, with the fidelity suffix, to the exact one; values and rows round-trip through the row codec, text I/O and binary send/recv; prefix successors bound every extension. Plus key order on a table of edge values per type (`types/encoding.rs`) |
+| unit tests (`cargo test -p ivm --lib`) | input-log round trip, torn-tail truncation and corruption before the tail (`log.rs`); exact float sums (`storage/summary.rs`); the sequencer's ticks under load (`coord/seq.rs`); statement splitting, the engine's own statement parser, planning panics turned into errors (`sql`); the source's snapshot chunks against a fake engine: truncates and keyless changes around a chunk, schema changes in the middle of a transaction, transaction-id visibility across epochs (`source/postgres.rs`); introspection and the web UI's assets (`coord/inspect.rs`, `http`); skipping key columns and fidelity suffixes without decoding them, on edge values (`types/encoding.rs`) |
+| type property tests (`types/tests.rs`, proptest) | over random values of every column type (numerics of any scale, floats with NaN payloads and signed zeros, intervals, json, arrays with bounds and NULLs, ...): key order equals SQL order, for single values and composite keys; keys decode to the canonical value and, with the fidelity suffix, to the exact one; values and rows round-trip through the row codec, text I/O and binary send/recv; prefix successors bound every extension; skipping a key column, a fidelity suffix or a codec value consumes exactly what decoding it does. Plus key order on a table of edge values per type (`types/encoding.rs`) |
 | storage model test (`storage/tests.rs`, proptest) | random operation sequences on several trees (counts, and numeric, float and integer summaries over values embedded in the keys) against a model of every key's (GSN, weight) history: weighted batches, retention frontier advances, tree creation and drops, checkpoints, GC, clean reopens and crashes (no final checkpoint; garbage after the durable end of the manifest or the active segment; stray segment files; a crash in the middle of a checkpoint). Node and segment sizes, retention and the buffer pool (down to a few KB) are part of the case. Checked: point lookups after every step; scans now and AS OF every retained GSN, range and prefix scans, range summaries and `nth`; the tree structure (key ranges, parent links, `min_seg`) and the segment accounting; after a crash, the state of the last checkpoint, and replaying the operations since then must reproduce the state before the crash. Also: entries retracted behind the frontier are consolidated away, and a full-history model test with AS OF reads across crashes, checkpoints and GC that ends with GC keeping the store within a small factor of its live data |
-| engine tests (`tests/engine.rs`) | through the public API, without PostgreSQL: temporal filters following the logged clock, across a restart, and with the clock never going backwards; rejection of invalid temporal filters; temporal views (joins, aggregates, outer joins, `date_trunc`) equal to a recomputation as random changes and ticks interleave; recovery after drops (checkpointed indexes are found again although node ids changed; a multiset table keeps its rows); jsonpath views; multi-dimensional arrays and lockstep set-returning functions; regression tests (DISTINCT ON over infinite intervals, ordered aggregates after a DISTINCT one, percentiles differing only in their fraction, `WITH ORDINALITY` after `LATERAL`, exact representations of values derived from presence changes, subscriptions to a view sharing its dataflow with a dropped or replaced view, subscriptions ending when a replacement changes the view's columns) and an ignored test of an open bug |
+| engine tests (`tests/engine.rs`) | through the public API, without PostgreSQL: temporal filters following the logged clock, across a restart, and with the clock never going backwards; rejection of invalid temporal filters; temporal views (joins, aggregates, outer joins, `date_trunc`) equal to a recomputation as random changes and ticks interleave; recovery after drops (checkpointed indexes are found again although node ids changed; a multiset table keeps its rows); jsonpath views; multi-dimensional arrays and lockstep set-returning functions; ad hoc reads through index key ranges, partial decoding and index joins equal to the same queries written so that they cannot use them (`id + 0`), also `AS OF` an earlier GSN and across an index and a view rebuilt after it; regression tests (DISTINCT ON over infinite intervals, ordered aggregates after a DISTINCT one, percentiles differing only in their fraction, `WITH ORDINALITY` after `LATERAL`, exact representations of values derived from presence changes, subscriptions to a view sharing its dataflow with a dropped or replaced view, subscriptions ending when a replacement changes the view's columns) and an ignored test of an open bug |
 | self-differential test (`tests/selfdiff.rs`, proptest) | random schemas of local tables and random views from `ivm-difftest`'s generator, then random actions: DML (also primary key changes and rows changed several times), checkpoints, clean restarts, crashes (sometimes with a torn record at the end of the log), views created, replaced and dropped, and reads AS OF earlier GSNs. After every action each view must equal its query run ad hoc (non-incrementally), reads AS OF a GSN must return what the views held then, and every view, and the queries of some, are subscribed to: the changes streamed must add up to their contents. A failure shrinks to a minimal case |
 | dataflow tests (`tests/dataflow.rs`) | operator regression tests: maintained views equal a recompute (an ad hoc query or a freshly hydrated copy) after every change; error records of shared nodes, across recovery and in recursive queries |
 | SQL and protocol tests (`tests/sql_semantics.rs`, `tests/server_protocol.rs`) | results checked against PostgreSQL 17 and inputs that must fail instead of crashing the engine; the wire protocol with raw messages against an in-process server |
@@ -317,3 +317,84 @@ To investigate a failure, re-run with the same `--seed` and
 pass or fail), and add `--keep` to inspect the cluster and the engine's
 data directory afterwards. Campaigns run many seeds in parallel, e.g.
 `seq 1 32 | xargs -P 4 -I{} sh -c 'target/release/ivm-difftest --seed {} --views 50 --schema-changes 3 > dt-{}.log 2>&1 || echo "seed {} failed"'`.
+
+## ivm-bench
+
+`ivm-bench` (`crates/ivm/src/bin/ivm-bench.rs`) is a reproducible
+performance benchmark. It generates a deterministic data set in PostgreSQL,
+replicates it into an in-process engine and drives the engine's pgwire
+server like a client, measuring one phase after another.
+
+```sh
+cargo build --release
+target/release/ivm-bench [--accounts N] [--txns N] [--small N] [--large N]
+    [--point-reads N] [--sub-txns N] [--upstream CONNINFO] [--data-dir DIR]
+    [--cache-mb N] [--no-sync] [--skip PHASE,...] [--json FILE] [--keep-data]
+    [--repeat N]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--accounts N`, `--txns N` | 100,000, 2,000,000 | rows of the upstream tables `accounts` and `txns` |
+| `--small N` | 20,000 | single-statement transactions per small-transaction phase |
+| `--large N` | 500,000 | rows of the large `INSERT` and `UPDATE` transactions |
+| `--point-reads N` | 2,000 | queries per point-read phase |
+| `--sub-txns N` | 5,000 | upstream transactions delivered to a `SUBSCRIBE` |
+| `--upstream CONNINFO` | private cluster | use an existing cluster (`wal_level = logical`) |
+| `--data-dir DIR` | `TMPDIR` | parent of the engine's data directory |
+| `--cache-mb N` | 1024 | buffer pool size |
+| `--no-sync` | off | run the engine without `fsync` |
+| `--skip PHASE,...` | none | skip `small`, `recovery`, `large`, `reads` or `subscribe` |
+| `--json FILE` | none | also write the results to `FILE` as a JSON array |
+| `--keep-data` | off | keep the engine's data directory |
+| `--repeat N` | 1 | run hydration, the small-transaction phases and the large transactions N times (every run is recorded) |
+
+Without `--upstream` a private cluster is started (`TempCluster`, with
+`PG_BIN`) and the data generated in it. With `--upstream`, the data set is
+generated once into a template database `ivmbench_v2_<accounts>_<txns>` and
+every run works on a copy of it (`ivmbench_run_<pid>`, with a replication
+slot of its own), so runs start from identical data; run databases and
+slots left behind by crashed runs are dropped.
+
+The data: `accounts (id, region, name, balance)` with 20 regions, and
+`txns (id, account_id, kind, amount, created)` whose account, kind and
+amount are hashes of the id. The phases:
+
+| Phase | What is measured |
+|---|---|
+| `load` | initial snapshot of both tables (source parsing, table updates) |
+| `checkpoint_tables`, `checkpoint_views` | an explicit checkpoint; store size |
+| `hydrate_by_region`, `hydrate_acct_totals` | `CREATE MATERIALIZED VIEW` of a join aggregate (`by_region`) and of a `LEFT JOIN` aggregate per account (`acct_totals`) over the loaded data |
+| `small_live` | small transactions (inserts, updates and deletes of `txns`, updates of `accounts`) applied while the engine runs |
+| `shutdown`, `recovery_start` | wall time of the engine's shutdown and restart in between |
+| `small_catchup` | as many committed while the engine was down, caught up after the restart (cold cache) |
+| `large_insert`, `large_update` | one transaction inserting, then one updating, `--large` rows, live |
+| `read_*`, `adhoc_*` | point, range and scan reads of the views and tables; ad hoc aggregates and joins over the tables |
+| `subscribe_snapshot`, `subscribe_live` | a `SUBSCRIBE`'s snapshot and its delivery of live changes |
+| `recovery_shutdown`, `recovery` | a final shutdown, then a restart from its checkpoint until the first read |
+
+Each phase prints a line and a `RESULT {...}` JSON record with its wall
+time; CPU time per thread group, from `/proc/self/task/*/schedstat`
+(`engine_cpu_s`: the thread that owns storage and the dataflow;
+`source_cpu_s`: snapshot and replication decoding; `sequencer_cpu_s`;
+`session_cpu_s`: pgwire), the engine thread's run-queue wait; the
+upstream cluster's CPU time (when it runs on the same machine); the peak
+RSS during the phase (`VmHWM`, reset per phase); and phase-specific rates
+and latencies. The binary's global allocator counts allocations per
+thread (`engine_allocs`, `source_allocs`): unlike CPU time on a busy
+machine these are deterministic, a noise-free measure of allocation churn.
+Each phase's time window is printed as `WINDOW <phase> <start> <end>`
+(nanoseconds since the process started), to select it in a profile, e.g.
+`gprofng display text -filters 'TSTAMP>=<start> && TSTAMP<=<end>' -functions x.er`
+for an experiment recorded with `gprofng collect app -o x.er target/release/ivm-bench ...`.
+
+`bench/compare.py` summarizes `--json` files (minimum and median of every
+metric per phase) and compares two sets of runs:
+
+```sh
+bench/compare.py base-1.json base-2.json -- new-1.json new-2.json
+```
+
+CPU times on a shared machine vary by tens of percent between runs:
+interleave the runs of the variants being compared (A B A B ...), compare
+medians and minimums, and check allocation counts.

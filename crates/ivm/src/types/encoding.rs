@@ -284,10 +284,67 @@ fn decode_bytes(buf: &[u8]) -> Result<(Vec<u8>, usize)> {
     }
 }
 
-/// Skip one encoded key column without decoding it.
+/// Length of one encoded key column, found without decoding (allocating)
+/// it for all but jsonb and array values.
 pub fn skip_key(buf: &[u8], ty: &SqlType, spec: SortSpec) -> Result<usize> {
-    // Decoding is cheap enough for all fixed types; variable types need a scan.
-    Ok(decode_key(buf, ty, spec)?.1)
+    let tag = *buf.first().ok_or_else(|| SqlError::corrupt("truncated key"))?;
+    match tag {
+        TAG_NULL_FIRST | TAG_NULL_LAST => return Ok(1),
+        TAG_VALUE => {}
+        _ => return Err(SqlError::corrupt(format!("bad key tag {tag}"))),
+    }
+    let fixed = |n: usize| if buf.len() > n { Ok(1 + n) } else { Err(SqlError::corrupt("truncated key value")) };
+    match ty {
+        SqlType::Bool => fixed(1),
+        SqlType::Int2 => fixed(2),
+        SqlType::Int4 | SqlType::Oid | SqlType::Float4 | SqlType::Date => fixed(4),
+        SqlType::Int8 | SqlType::Float8 | SqlType::Time | SqlType::Timestamp | SqlType::TimestampTz => fixed(8),
+        SqlType::Interval | SqlType::Uuid => fixed(16),
+        SqlType::Numeric => Ok(1 + pgnumeric::Numeric::key_len(&buf[1..], spec.desc)?),
+        SqlType::Text
+        | SqlType::Varchar
+        | SqlType::Bpchar
+        | SqlType::Name
+        | SqlType::Json
+        | SqlType::JsonPath
+        | SqlType::Bytea
+        | SqlType::Unknown => Ok(1 + skip_bytes(&buf[1..], if spec.desc { 0xFF } else { 0x00 })?),
+        SqlType::Jsonb | SqlType::Array(_) => Ok(decode_key(buf, ty, spec)?.1),
+    }
+}
+
+/// Length of an `encode_bytes` encoding whose bytes are XORed with `mask`.
+fn skip_bytes(buf: &[u8], mask: u8) -> Result<usize> {
+    let mut i = 0;
+    loop {
+        let off = buf[i..].iter().position(|b| *b == mask).ok_or_else(|| SqlError::corrupt("unterminated bytes in key"))?;
+        i += off;
+        match buf.get(i + 1).map(|b| b ^ mask) {
+            Some(0) => return Ok(i + 2),
+            Some(0xFF) => i += 2,
+            _ => return Err(SqlError::corrupt("bad escape in key")),
+        }
+    }
+}
+
+/// Length of the fidelity suffix of a non-null value of type `ty`. Arrays
+/// are not supported (their suffix depends on which elements are null).
+pub fn skip_fidelity(buf: &[u8], ty: &SqlType) -> Result<usize> {
+    let mut rd = buf;
+    match ty {
+        SqlType::Numeric => {
+            super::codec::get_uvarint(&mut rd)?;
+        }
+        SqlType::Float4 | SqlType::Float8 => rd = rd.get(1..).ok_or_else(|| SqlError::corrupt("truncated fidelity"))?,
+        SqlType::Interval => rd = rd.get(16..).ok_or_else(|| SqlError::corrupt("truncated fidelity"))?,
+        SqlType::Jsonb => {
+            let len = super::codec::get_uvarint(&mut rd)? as usize;
+            rd = rd.get(len..).ok_or_else(|| SqlError::corrupt("truncated fidelity"))?;
+        }
+        SqlType::Array(_) => return Err(SqlError::internal("skip_fidelity on an array")),
+        _ => {}
+    }
+    Ok(buf.len() - rd.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -446,5 +503,54 @@ mod order_tests {
         check(&SqlType::Array(Box::new(SqlType::Numeric)), &["{}", "{1.0}", "{1.00,2}", "{NaN}", "{-1}"]);
         check(&SqlType::Array(Box::new(SqlType::Text)), &["{}", "{\"\"}", "{a}", "{a,b}", "{ab}", "{b}", "{NULL}"]);
         check(&SqlType::Jsonb, &["null", "\"\"", "\"a\"", "\"b\"", "1", "1.0", "2", "false", "true", "[]", "[1]", "[1,2]", "[2]", "{}", "{\"a\": 1}", "{\"b\": 1}", "{\"a\": 1, \"b\": 2}", "{\"aa\": 1}"]);
+    }
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+
+    #[test]
+    fn skip_matches_decode() {
+        use crate::types::Datum as D;
+        use std::sync::Arc;
+        let vals: Vec<(D, SqlType)> = vec![
+            (D::Null, SqlType::Int4),
+            (D::Bool(true), SqlType::Bool),
+            (D::Int2(-3), SqlType::Int2),
+            (D::Int4(77), SqlType::Int4),
+            (D::Int8(-1 << 40), SqlType::Int8),
+            (D::Float4(-1.5), SqlType::Float4),
+            (D::Float8(f64::NAN), SqlType::Float8),
+            (D::Date(-9), SqlType::Date),
+            (D::Timestamp(123456789), SqlType::Timestamp),
+            (D::Interval(Interval { months: 1, days: -2, micros: 3 }), SqlType::Interval),
+            (D::Uuid([0xFF; 16]), SqlType::Uuid),
+            (D::text(""), SqlType::Text),
+            (D::text("a\0b\0\0"), SqlType::Text),
+            (D::text("\u{ff}\u{fe}x"), SqlType::Varchar),
+            (D::Bytea(Arc::from(vec![0u8, 0xFF, 0, 0xFE, 1].into_boxed_slice())), SqlType::Bytea),
+            (D::numeric("-123.4500".parse().unwrap()), SqlType::Numeric),
+            (D::numeric("0".parse().unwrap()), SqlType::Numeric),
+            (D::numeric("1e300".parse().unwrap()), SqlType::Numeric),
+            (D::array(ArrayValue::new_1d(SqlType::Int4, vec![D::Int4(1), D::Null])), SqlType::Array(Box::new(SqlType::Int4))),
+        ];
+        for spec in [SortSpec::ASC, SortSpec::DESC, SortSpec { desc: false, nulls_first: true }] {
+            for (d, ty) in &vals {
+                let mut b = Vec::new();
+                encode_key(d, spec, &mut b);
+                let n = b.len();
+                encode_key(&D::text("tail"), spec, &mut b);
+                assert_eq!(skip_key(&b, ty, spec).unwrap(), n, "{d:?} {spec:?}");
+                assert_eq!(decode_key(&b, ty, spec).unwrap().1, n, "{d:?} {spec:?}");
+                if !d.is_null() && has_fidelity(ty) && !matches!(ty, SqlType::Array(_)) {
+                    let mut f = Vec::new();
+                    encode_fidelity(d, &mut f);
+                    let n = f.len();
+                    f.extend_from_slice(&[9, 9, 9]);
+                    assert_eq!(skip_fidelity(&f, ty).unwrap(), n, "{d:?}");
+                }
+            }
+        }
     }
 }

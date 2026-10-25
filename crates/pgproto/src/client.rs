@@ -425,6 +425,38 @@ impl SimpleQueryResult {
     }
 }
 
+/// The callback of [`Client::simple_query_rows`]: called with the columns of
+/// the statement and each of its data rows; an error ends the calls.
+pub type OnRow<'f> = dyn FnMut(&[Column], RowRef<'_>) -> std::result::Result<(), String> + 'f;
+
+/// A data row borrowed from the connection's buffer (see
+/// [`Client::simple_query_rows`]).
+pub struct RowRef<'a> {
+    body: &'a [u8],
+    /// (offset, length) of each field; length -1 for NULL.
+    fields: &'a [(u32, i32)],
+}
+
+impl<'a> RowRef<'a> {
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// Raw value of field `i` (text format); `None` for SQL NULL or out of
+    /// range.
+    pub fn get(&self, i: usize) -> Option<&'a [u8]> {
+        let &(off, len) = self.fields.get(i)?;
+        if len < 0 {
+            return None;
+        }
+        Some(&self.body[off as usize..off as usize + len as usize])
+    }
+}
+
 fn tag_rows(tag: &str) -> u64 {
     tag.rsplit(' ')
         .next()
@@ -918,6 +950,87 @@ impl Conn {
             .get_or_insert_with(|| "connection closed".into());
     }
 
+    fn simple_query_rows(
+        &mut self,
+        sql: &str,
+        on_row: &mut OnRow<'_>,
+    ) -> Result<Vec<String>> {
+        self.check()?;
+        self.put_query(sql)?;
+        self.send()?;
+        let mut tags = Vec::new();
+        let mut columns: Vec<Column> = Vec::new();
+        let mut fields: Vec<(u32, i32)> = Vec::new();
+        let mut error: Option<Error> = None;
+        loop {
+            let m = self.recv()?;
+            match m.0 {
+                b'T' => match parse_row_description(self.body(&m)) {
+                    Ok(c) => columns = c,
+                    Err(e) => return Err(self.fail(e)),
+                },
+                b'D' => {
+                    let body = self.body(&m);
+                    fields.clear();
+                    let mut r = Reader::new(body);
+                    let parsed: Result<()> = (|| {
+                        let n = r.u16()? as usize;
+                        for _ in 0..n {
+                            let len = r.i32()?;
+                            let off = body.len() - r.remaining();
+                            if len > 0 {
+                                r.bytes(len as usize)?;
+                            }
+                            fields.push((off as u32, len));
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = parsed {
+                        return Err(self.fail(e));
+                    }
+                    if error.is_none()
+                        && let Err(msg) = on_row(&columns, RowRef { body, fields: &fields })
+                    {
+                        error = Some(Error::new(ErrorKind::Protocol, msg));
+                    }
+                }
+                b'C' => {
+                    tags.push(Reader::new(self.body(&m)).cstr().unwrap_or_default());
+                    columns.clear();
+                }
+                b'I' => columns.clear(),
+                b'E' => {
+                    let e = self.server_error(&m);
+                    if self.broken.is_some() {
+                        return Err(e);
+                    }
+                    error.get_or_insert(e);
+                }
+                b'Z' => {
+                    self.txn_status = self.body(&m).first().copied().unwrap_or(b'I');
+                    break;
+                }
+                b'G' | b'H' => {
+                    // COPY is not supported here: end it and report
+                    if m.0 == b'G' {
+                        let at = wire::begin(&mut self.wbuf, b'f');
+                        wire::put_cstr(&mut self.wbuf, "COPY is not supported by simple_query_rows");
+                        wire::finish(&mut self.wbuf, at);
+                        self.send()?;
+                    }
+                    error.get_or_insert(Error::new(ErrorKind::Protocol, "COPY is not supported by simple_query_rows"));
+                }
+                b'd' | b'c' => {}
+                _ if self.handle_async(&m) => {}
+                _ => return Err(self.unexpected(&m, "in simple query response")),
+            }
+        }
+        match error {
+            Some(e) => Err(e),
+            None => Ok(tags),
+        }
+    }
+
     fn simple_query(&mut self, sql: &str) -> Result<Vec<SimpleQueryResult>> {
         self.check()?;
         self.put_query(sql)?;
@@ -1294,6 +1407,19 @@ impl Client {
     /// connection stays usable, and the error is returned.
     pub fn simple_query(&mut self, sql: &str) -> Result<Vec<SimpleQueryResult>> {
         self.conn.simple_query(sql)
+    }
+
+    /// Like `simple_query`, but hands every data row to `on_row` with the
+    /// columns of its statement, borrowed from the receive buffer instead
+    /// of collected as owned strings; returns the command tags. An error
+    /// returned by `on_row` ends the calls to it and is returned (as a
+    /// protocol error) once the responses are drained.
+    pub fn simple_query_rows(
+        &mut self,
+        sql: &str,
+        on_row: &mut OnRow<'_>,
+    ) -> Result<Vec<String>> {
+        self.conn.simple_query_rows(sql, on_row)
     }
 
     /// Like `simple_query`, returning the last result that has a row

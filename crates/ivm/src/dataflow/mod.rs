@@ -564,15 +564,15 @@ impl Graph {
     /// Rows of an arrangement with weights as of `at` (decoded).
     pub fn scan_arr(&self, env: &mut Env, arr: ArrId, at: ReadAt) -> Result<Delta> {
         let a = self.arr(arr);
-        let layout = a.layout.clone();
-        let mut out = Vec::new();
-        let mut c = env.cursor(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-        while let Some((k, h)) = env.cursor_next(&mut c)? {
+        let layout = &a.layout;
+        let mut out = Vec::with_capacity(env.tree_count(a.tree).clamp(0, 1 << 24) as usize);
+        env.for_each(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
             let w = h.weight(at);
             if w != 0 {
-                out.push((layout.decode_row(&k)?, w));
+                out.push((layout.decode_row(k)?, w));
             }
-        }
+            Ok(true)
+        })?;
         Ok(out)
     }
 
@@ -580,20 +580,24 @@ impl Graph {
     pub fn lookup(&self, env: &mut Env, arr: ArrId, key: &[crate::types::Datum], at: ReadAt) -> Result<Delta> {
         let a = self.arr(arr);
         let prefix = a.layout.encode_prefix(key);
+        let layout = &a.layout;
         let mut out = Vec::new();
-        for (k, h) in env.scan_prefix(a.tree, &prefix)? {
+        env.for_each_prefix(a.tree, &prefix, &mut |k, h| {
             let w = h.weight(at);
             if w != 0 {
-                out.push((a.layout.decode_row(&k)?, w));
+                out.push((layout.decode_row(k)?, w));
             }
-        }
+            Ok(true)
+        })?;
         Ok(out)
     }
 
-    /// Full contents of a node as of the latest processed time.
+    /// Full contents of a node as of the latest processed time (consolidated).
     pub fn snapshot(&self, env: &mut Env, node: NodeId) -> Result<Output> {
         let mut cache = FxHashMap::default();
-        Ok(ops::owned(ops::snapshot_node(self, env, node, &mut cache)?))
+        let mut out = ops::owned(ops::snapshot_node(self, env, node, &mut cache)?);
+        consolidate(&mut out.data);
+        Ok(out)
     }
 
     /// The node's first hydrated arrangement, if any.
@@ -790,13 +794,17 @@ impl Graph {
                 };
                 for a in pending_arrs {
                     let arr = self.arr(a);
-                    // in batches, to bound the memory of encoded entries
-                    for batch in snap.data.chunks(100_000) {
-                        let mut ups = Vec::with_capacity(batch.len());
-                        for (row, w) in batch {
-                            ups.push((arr.layout.encode_row(row)?, *w));
-                        }
-                        env.apply(arr.tree, &mut ups, gsn)?;
+                    // Entries are applied in key order, in batches that each
+                    // cover a key range: unordered batches would each touch
+                    // (and rewrite) every leaf.
+                    let mut ups = Vec::with_capacity(snap.data.len());
+                    for (row, w) in &snap.data {
+                        ups.push((arr.layout.encode_row(row)?, *w));
+                    }
+                    ups.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+                    while !ups.is_empty() {
+                        let mut batch = ups.split_off(ups.len().saturating_sub(100_000));
+                        env.apply(arr.tree, &mut batch, gsn)?;
                     }
                     let a = self.arrs[a].as_mut().unwrap();
                     a.hydrated = true;
@@ -889,15 +897,16 @@ pub fn consolidate(delta: &mut Delta) {
         return;
     }
     delta.sort_unstable_by(|a, b| crate::types::datum::exact_row_cmp(&a.0, &b.0));
-    let mut out: Delta = Vec::with_capacity(delta.len());
-    for (r, w) in delta.drain(..) {
-        match out.last_mut() {
-            Some((lr, lw)) if crate::types::datum::exact_row_cmp(lr, &r) == std::cmp::Ordering::Equal => *lw += w,
-            _ => out.push((r, w)),
+    // merge runs of equal rows in place (the later ones are dropped)
+    delta.dedup_by(|cur, kept| {
+        if crate::types::datum::exact_row_cmp(&cur.0, &kept.0) == std::cmp::Ordering::Equal {
+            kept.1 += cur.1;
+            true
+        } else {
+            false
         }
-    }
-    out.retain(|(_, w)| *w != 0);
-    *delta = out;
+    });
+    delta.retain(|(_, w)| *w != 0);
 }
 
 pub fn consolidate_errs(errs: &mut ErrDelta) {

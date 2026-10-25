@@ -41,6 +41,13 @@ pub trait Summarizer: Send + Sync {
     fn spec(&self) -> &[AggKind];
     /// Fold one entry (its key bytes and current total weight) into `acc`.
     fn add_entry(&self, acc: &mut Summary, key: &[u8], weight: i64) -> Result<()>;
+    /// Fold several entries into `acc`.
+    fn add_entries(&self, acc: &mut Summary, entries: &mut dyn Iterator<Item = (&[u8], i64)>) -> Result<()> {
+        for (k, w) in entries {
+            self.add_entry(acc, k, w)?;
+        }
+        Ok(())
+    }
     /// Update `acc`, a summary covering the entry, for the entry's total
     /// weight changing from `before` to `after`. False when `acc` must be
     /// recomputed from the node's contents instead.
@@ -542,25 +549,35 @@ impl Env {
             return Ok(());
         }
         updates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut ups: Vec<(Box<[u8]>, i64)> = Vec::with_capacity(updates.len());
-        for (k, w) in updates.drain(..) {
-            match ups.last_mut() {
-                Some((lk, lw)) if **lk == *k => *lw += w,
-                _ => ups.push((k.into_boxed_slice(), w)),
+        // consolidate equal keys in place
+        updates.dedup_by(|cur, kept| {
+            if cur.0 == kept.0 {
+                kept.1 += cur.1;
+                true
+            } else {
+                false
             }
-        }
-        ups.retain(|(_, w)| *w != 0);
-        if ups.is_empty() {
+        });
+        updates.retain(|(_, w)| *w != 0);
+        if updates.is_empty() {
             return Ok(());
         }
-        let t = self.trees.get(&tree).ok_or_else(|| SqlError::internal(format!("no tree {tree}")))?;
-        let summ = t.summarizer.clone();
-        let old = t.summary.clone();
+        let summ = self.trees.get(&tree).ok_or_else(|| SqlError::internal(format!("no tree {tree}")))?.summarizer.clone();
         let root = match self.root_slot(tree)? {
             Some(id) => id,
             None => self.alloc_slot(Node::Leaf(Vec::new()), None, NONE, tree),
         };
-        let mut parts = self.apply_node(root, &ups, gsn, &summ, Some(&old))?;
+        // the tree's summary is replaced below
+        let old = std::mem::take(&mut self.trees.get_mut(&tree).unwrap().summary);
+        let parts = self.apply_node(root, updates, gsn, &summ, Some(&old));
+        updates.clear();
+        let mut parts = match parts {
+            Ok(p) => p,
+            Err(e) => {
+                self.trees.get_mut(&tree).unwrap().summary = old;
+                return Err(e);
+            }
+        };
         let top = match parts.len() {
             0 => None,
             1 => parts.pop(),
@@ -600,7 +617,7 @@ impl Env {
         }
     }
 
-    fn build_root(&mut self, mut parts: Vec<Part>, tree: TreeId, summ: &Arc<dyn Summarizer>) -> Result<Part> {
+    fn build_root(&mut self, mut parts: Parts, tree: TreeId, summ: &Arc<dyn Summarizer>) -> Result<Part> {
         loop {
             let root = self.alloc_slot(Node::Internal(Vec::new()), None, NONE, tree);
             for p in &parts {
@@ -624,11 +641,11 @@ impl Env {
     fn apply_node(
         &mut self,
         id: u32,
-        ups: &[(Box<[u8]>, i64)],
+        ups: &[(Vec<u8>, i64)],
         gsn: Gsn,
         summ: &Arc<dyn Summarizer>,
         old: Option<&Summary>,
-    ) -> Result<Vec<Part>> {
+    ) -> Result<Parts> {
         let was_dirty = self.slot(id).dirty;
         let edits = self.slot(id).edits;
         let old_bytes = self.slot(id).bytes;
@@ -637,8 +654,10 @@ impl Env {
         match node {
             Node::Leaf(entries) => {
                 let frontier = self.frontier;
-                // the leaf's summary, updated entry by entry while possible
-                let mut incr = old.cloned();
+                // weight changes as (index into ups, total weight before),
+                // folded into the leaf's old summary afterwards if the leaf
+                // does not split and that is cheaper than recomputing it
+                let mut changes: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::with_capacity(ups.len());
                 // Few updates: edit in place. Untouched entries are compacted
                 // (dropping versions retracted before the frontier) on the
                 // first edit after a checkpoint and then every few edits.
@@ -649,7 +668,7 @@ impl Env {
                 let out = if in_place {
                     let mut entries = entries;
                     let mut pos = 0usize;
-                    for (k, w) in ups {
+                    for (ui, (k, w)) in ups.iter().enumerate() {
                         pos += entries[pos..].partition_point(|e| *e.key < **k);
                         let before = if pos < entries.len() && *entries[pos].key == **k {
                             let e = &mut entries[pos];
@@ -667,24 +686,20 @@ impl Env {
                             let mut h = History::default();
                             h.add(gsn, *w, frontier);
                             if !h.is_empty() {
-                                let e = LeafEntry { key: k.clone(), hist: h };
+                                let e = LeafEntry { key: k.as_slice().into(), hist: h };
                                 size += entry_size(&e);
                                 entries.insert(pos, e);
                                 pos += 1;
                             }
                             0
                         };
-                        if let Some(s) = incr.as_mut()
-                            && !summ.update_entry(s, k, before, before + w)?
-                        {
-                            incr = None;
-                        }
+                        changes.push((ui, before));
                     }
                     entries
                 } else {
                     let mut out: Vec<LeafEntry> = Vec::with_capacity(entries.len() + ups.len());
                     let mut it = entries.into_iter().peekable();
-                    for (k, w) in ups {
+                    for (ui, (k, w)) in ups.iter().enumerate() {
                         while let Some(e) = it.peek() {
                             if *e.key < **k {
                                 let mut e = it.next().unwrap();
@@ -710,16 +725,12 @@ impl Env {
                                 let mut h = History::default();
                                 h.add(gsn, *w, frontier);
                                 if !h.is_empty() {
-                                    out.push(LeafEntry { key: k.clone(), hist: h });
+                                    out.push(LeafEntry { key: k.as_slice().into(), hist: h });
                                 }
                                 0
                             }
                         };
-                        if let Some(s) = incr.as_mut()
-                            && !summ.update_entry(s, k, before, before + w)?
-                        {
-                            incr = None;
-                        }
+                        changes.push((ui, before));
                     }
                     for mut e in it {
                         e.hist.compact(frontier);
@@ -732,35 +743,26 @@ impl Env {
                 if out.is_empty() {
                     self.put_node(id, Node::Leaf(Vec::new()));
                     self.free_slot(id);
-                    return Ok(vec![]);
+                    return Ok(Parts::new());
                 }
                 if in_place && size <= self.opts.leaf_bytes {
                     // common case: no split, size already known
-                    let summary = match incr.take() {
-                        Some(s) => s,
-                        None => leaf_summary(&out, summ)?,
-                    };
-                    let first = out[0].key.clone();
+                    let summary = summary_after(old, &out, ups, &changes, summ)?;
                     self.put_node_sized(id, Node::Leaf(out), size);
-                    return Ok(vec![Part { sep: first, id, summary, min_seg: u32::MAX }]);
+                    // the first part keeps the node's place (and separator) in the parent
+                    return Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary, min_seg: u32::MAX }]);
                 }
                 let chunks = split_by_bytes(out, self.opts.leaf_bytes, entry_size, 1);
                 let single = chunks.len() == 1;
                 let parent = self.slot(id).parent;
                 let tree = self.slot(id).tree;
-                let mut parts = Vec::with_capacity(chunks.len());
-                let mut prev_last: Option<Box<[u8]>> = None;
-                for (i, chunk) in chunks.into_iter().enumerate() {
-                    // suffix truncation: the shortest separator between chunks
-                    let first = match &prev_last {
-                        Some(a) => shortest_separator(a, &chunk[0].key),
-                        None => chunk[0].key.clone(),
-                    };
-                    prev_last = Some(chunk.last().unwrap().key.clone());
-                    let summary = match incr.take() {
-                        Some(s) if single => s,
-                        _ => leaf_summary(&chunk, summ)?,
-                    };
+                let mut parts = Parts::with_capacity(chunks.len());
+                // suffix truncation: the shortest separators between chunks
+                // (the first part keeps the node's separator in the parent)
+                let mut seps: Vec<Box<[u8]>> = vec![Box::default()];
+                seps.extend(chunks.windows(2).map(|w| shortest_separator(&w[0].last().unwrap().key, &w[1][0].key)));
+                for (i, (chunk, first)) in chunks.into_iter().zip(seps).enumerate() {
+                    let summary = if single { summary_after(old, &chunk, ups, &changes, summ)? } else { leaf_summary(&chunk, summ)? };
                     let pid = if i == 0 {
                         self.put_node(id, Node::Leaf(chunk));
                         id
@@ -785,15 +787,15 @@ impl Env {
                 let mut incr = old.cloned();
                 let n = children.len();
                 // (child, update range) for each child receiving updates
-                let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+                let mut runs: smallvec::SmallVec<[(usize, usize, usize); 4]> = smallvec::SmallVec::new();
                 let (mut pos, mut ci) = (0usize, 0usize);
                 while pos < ups.len() {
                     // the last child whose separator is <= the key (the first
                     // child also takes smaller keys)
-                    ci += children[ci + 1..].partition_point(|c| *c.sep <= *ups[pos].0);
+                    ci += children[ci + 1..].partition_point(|c| *c.sep <= *ups[pos].0.as_slice());
                     let end = if ci + 1 < n {
                         let next = &*children[ci + 1].sep;
-                        pos + ups[pos..].partition_point(|(k, _)| **k < *next)
+                        pos + ups[pos..].partition_point(|(k, _)| k.as_slice() < next)
                     } else {
                         ups.len()
                     };
@@ -807,7 +809,7 @@ impl Env {
                     let cid = self.load(children[ci].ptr, id, tree)?;
                     let parts = self.apply_node(cid, &ups[start..end], gsn, summ, Some(&children[ci].summary))?;
                     if let Some(s) = incr.as_mut() {
-                        let news: Vec<&Summary> = parts.iter().map(|p| &p.summary).collect();
+                        let news: smallvec::SmallVec<[&Summary; 2]> = parts.iter().map(|p| &p.summary).collect();
                         if !s.replace_child(&children[ci].summary, &news) {
                             incr = None;
                         }
@@ -830,7 +832,7 @@ impl Env {
                 if children.is_empty() {
                     self.slot_mut(id).loaded_children = 0;
                     self.free_slot(id);
-                    return Ok(vec![]);
+                    return Ok(Parts::new());
                 }
                 self.finish_internal_sized(id, children, incr, summ, size)
             }
@@ -847,7 +849,7 @@ impl Env {
         summary: Option<Summary>,
         summ: &Arc<dyn Summarizer>,
         size: usize,
-    ) -> Result<Vec<Part>> {
+    ) -> Result<Parts> {
         if size > self.opts.internal_bytes {
             return self.finish_internal(id, children, summary, summ);
         }
@@ -866,9 +868,9 @@ impl Env {
             None => children_summary(&children, summ),
         };
         let min_seg = children.iter().map(|c| c.min_seg).fold(u32::MAX, u32::min);
-        let first = children[0].sep.clone();
         self.put_node_sized(id, Node::Internal(children), size);
-        Ok(vec![Part { sep: first, id, summary: s, min_seg }])
+        // the first part keeps the node's place (and separator) in the parent
+        Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary: s, min_seg }])
     }
 
     /// Store `children` in internal node `id`, splitting by size. `summary`
@@ -879,7 +881,7 @@ impl Env {
         children: Vec<Child>,
         summary: Option<Summary>,
         summ: &Arc<dyn Summarizer>,
-    ) -> Result<Vec<Part>> {
+    ) -> Result<Parts> {
         let parent = self.slot(id).parent;
         let tree = self.slot(id).tree;
         // internal nodes keep at least two children per chunk so that a tree
@@ -887,9 +889,11 @@ impl Env {
         let chunks = split_by_bytes(children, self.opts.internal_bytes, node::child_size, 2);
         let single = chunks.len() == 1;
         let mut summary = summary;
-        let mut parts = Vec::with_capacity(chunks.len());
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let first = chunk[0].sep.clone();
+        let mut parts = Parts::with_capacity(chunks.len());
+        for (i, mut chunk) in chunks.into_iter().enumerate() {
+            // a new node's separator is its first child's, which the node
+            // itself ignores (the first part keeps the node's own separator)
+            let first = if i == 0 { Box::default() } else { std::mem::take(&mut chunk[0].sep) };
             let loaded = chunk.iter().filter(|c| matches!(c.ptr, NodePtr::Mem(_))).count() as u32;
             let target = if i == 0 {
                 id
@@ -1014,19 +1018,102 @@ impl Env {
 
     /// Collect all entries in a range (convenience for small ranges).
     pub fn scan(&mut self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Result<Vec<(Box<[u8]>, History)>> {
-        let mut c = self.cursor(tree, lo, hi);
         let mut out = Vec::new();
-        while let Some(x) = self.cursor_next(&mut c)? {
-            out.push(x);
-        }
+        self.for_each(tree, lo, hi, &mut |k, h| {
+            out.push((k.into(), h.clone()));
+            Ok(true)
+        })?;
         Ok(out)
     }
 
     /// Entries whose key starts with `prefix`.
     pub fn scan_prefix(&mut self, tree: TreeId, prefix: &[u8]) -> Result<Vec<(Box<[u8]>, History)>> {
-        match crate::types::encoding::prefix_successor(prefix) {
-            Some(succ) => self.scan(tree, Bound::Included(prefix), Bound::Excluded(&succ)),
-            None => self.scan(tree, Bound::Included(prefix), Bound::Unbounded),
+        let mut out = Vec::new();
+        self.for_each_prefix(tree, prefix, &mut |k, h| {
+            out.push((k.into(), h.clone()));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Call `f` with the entries in [lo, hi) in key order until it returns
+    /// false. Entries are visited where they are, without copying them.
+    pub fn for_each(
+        &mut self,
+        tree: TreeId,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        f: &mut dyn FnMut(&[u8], &History) -> Result<bool>,
+    ) -> Result<()> {
+        self.walk(tree, lo, &|k| below_hi(k, hi), f)
+    }
+
+    /// `for_each` over the entries whose key starts with `prefix`.
+    pub fn for_each_prefix(&mut self, tree: TreeId, prefix: &[u8], f: &mut dyn FnMut(&[u8], &History) -> Result<bool>) -> Result<()> {
+        self.walk(tree, Bound::Included(prefix), &|k| k.starts_with(prefix), f)
+    }
+
+    /// Visit entries from `lo` while `in_range` (true up to some key, false
+    /// after it) holds, one leaf at a time: each leaf is found from the root,
+    /// so nothing is pinned between leaves.
+    fn walk(
+        &mut self,
+        tree: TreeId,
+        lo: Bound<&[u8]>,
+        in_range: &dyn Fn(&[u8]) -> bool,
+        f: &mut dyn FnMut(&[u8], &History) -> Result<bool>,
+    ) -> Result<()> {
+        let mut resume: Option<Vec<u8>> = None;
+        loop {
+            let Some(mut id) = self.root_slot(tree)? else { return Ok(()) };
+            let lo = match &resume {
+                Some(v) => Bound::Included(v.as_slice()),
+                None => lo,
+            };
+            // the deepest internal node with a child after the path (slots
+            // stay put until maybe_evict runs at the end)
+            let mut next: Option<(u32, usize)> = None;
+            loop {
+                match self.node(id) {
+                    Node::Leaf(_) => break,
+                    Node::Internal(children) => {
+                        let idx = match lo {
+                            Bound::Unbounded => 0,
+                            Bound::Included(k) | Bound::Excluded(k) => route(children, k),
+                        };
+                        if idx + 1 < children.len() {
+                            next = Some((id, idx + 1));
+                        }
+                        id = self.load_child(id, idx)?;
+                    }
+                }
+            }
+            let Node::Leaf(entries) = self.node(id) else { unreachable!() };
+            let start = match lo {
+                Bound::Unbounded => 0,
+                Bound::Included(k) => entries.partition_point(|e| &*e.key < k),
+                Bound::Excluded(k) => entries.partition_point(|e| &*e.key <= k),
+            };
+            for e in &entries[start..] {
+                if !in_range(&e.key) || !f(&e.key, &e.hist)? {
+                    self.maybe_evict();
+                    return Ok(());
+                }
+            }
+            let sep = match next {
+                Some((pid, ci)) => match self.node(pid) {
+                    Node::Internal(ch) if in_range(&ch[ci].sep) => Some(ch[ci].sep.to_vec()),
+                    _ => None,
+                },
+                None => None,
+            };
+            match sep {
+                Some(s) => resume = Some(s),
+                None => {
+                    self.maybe_evict();
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -1085,15 +1172,12 @@ impl Env {
                     Bound::Included(k) => entries.partition_point(|e| &*e.key < k),
                     Bound::Excluded(k) => entries.partition_point(|e| &*e.key <= k),
                 };
-                for e in &entries[start..] {
-                    if !below_hi(&e.key, hi) {
-                        break;
-                    }
-                    if summ.spec().is_empty() {
-                        acc.count += e.hist.total();
-                    } else {
-                        summ.add_entry(acc, &e.key, e.hist.total())?;
-                    }
+                let end = start + entries[start..].partition_point(|e| below_hi(&e.key, hi));
+                let entries = &entries[start..end];
+                if summ.spec().is_empty() {
+                    acc.count += entries.iter().map(|e| e.hist.total()).sum::<i64>();
+                } else {
+                    summ.add_entries(acc, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
                 }
                 Ok(())
             }
@@ -1449,7 +1533,10 @@ fn split_by_bytes<T>(items: Vec<T>, target: usize, size: fn(&T) -> usize, min_it
     if total <= target || items.len() < 2 * min_items.max(1) {
         return vec![items];
     }
-    let nchunks = total.div_ceil(target).max(2).min(items.len() / min_items.max(1));
+    // A batch spread over many nodes (a bulk load) leaves room in each, so
+    // that the next inserts do not split full nodes right away.
+    let fill = if total > 2 * target { target - target / 10 } else { target };
+    let nchunks = total.div_ceil(fill).max(2).min(items.len() / min_items.max(1));
     let per = total.div_ceil(nchunks);
     let mut out = Vec::with_capacity(nchunks);
     let mut cur = Vec::new();
@@ -1478,6 +1565,9 @@ fn split_by_bytes<T>(items: Vec<T>, target: usize, size: fn(&T) -> usize, min_it
 }
 
 /// Shortest key `s` with `a < s <= b` (for `a < b`): B+tree suffix truncation.
+/// The nodes an update leaves in place of one (usually just that one).
+type Parts = smallvec::SmallVec<[Part; 1]>;
+
 /// A node produced by an update: its separator, slot, summary and min_seg.
 struct Part {
     sep: Box<[u8]>,
@@ -1497,11 +1587,39 @@ fn leaf_summary(entries: &[LeafEntry], summ: &Arc<dyn Summarizer>) -> Result<Sum
     if summ.spec().is_empty() {
         s.count = entries.iter().map(|e| e.hist.total()).sum();
     } else {
-        for e in entries {
-            summ.add_entry(&mut s, &e.key, e.hist.total())?;
-        }
+        summ.add_entries(&mut s, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
     }
     Ok(s)
+}
+
+/// Summary of a leaf whose entries are now `entries`, after the weight
+/// changes `changes` (index into `ups`, weight before) to a leaf whose
+/// summary was `old`: folded into `old` when that is cheaper than
+/// recomputing from `entries` and possible (a MIN/MAX may lose its extreme).
+fn summary_after(
+    old: Option<&Summary>,
+    entries: &[LeafEntry],
+    ups: &[(Vec<u8>, i64)],
+    changes: &[(usize, i64)],
+    summ: &Arc<dyn Summarizer>,
+) -> Result<Summary> {
+    if let Some(old) = old
+        && changes.len() < entries.len()
+    {
+        let mut s = old.clone();
+        let mut exact = true;
+        for &(i, before) in changes {
+            let (k, w) = &ups[i];
+            if !summ.update_entry(&mut s, k, before, before + w)? {
+                exact = false;
+                break;
+            }
+        }
+        if exact {
+            return Ok(s);
+        }
+    }
+    leaf_summary(entries, summ)
 }
 
 fn children_summary(children: &[Child], summ: &Arc<dyn Summarizer>) -> Summary {

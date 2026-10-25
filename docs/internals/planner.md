@@ -242,11 +242,20 @@ Ad hoc queries (and the evaluation of DML statements) do not build dataflow.
 `exec::ExecCtx` evaluates the optimised `Rel` directly against the
 arrangements at a given `ReadAt`:
 
-- `Get` scans the node's first hydrated arrangement (any table or
-  materialized view has one); `Filter(Get)` with `column = constant`
-  predicates uses the arrangement with the longest matching key prefix for a
-  prefix lookup;
-- joins are hash joins on the equality conditions (all join kinds);
+- `Get` scans the node's first arrangement whose history covers the read
+  (any table or materialized view has one);
+- a base relation read — a `Get` under filters and projections — reads one
+  arrangement: equalities with constants on a key prefix, optionally
+  followed by a range (`<`, `<=`, `>`, `>=`, `BETWEEN`) on the next key
+  column, select a key range of the arrangement they narrow most (ascending
+  keys only; constants of exactly the column's type). Only the columns the
+  projection and the predicates use are decoded, and every predicate is
+  still checked on every row;
+- joins are hash joins on the equality conditions (all join kinds), except
+  that an inner, left, semi or anti join whose right side is a base relation
+  read, and whose left side is small compared to an arrangement of that
+  relation keyed by equated columns (less than 1/64 of its entries), looks
+  each left row's key up in the arrangement instead;
 - aggregation is hash aggregation using the same aggregate definitions and
   summary arithmetic as `Reduce`, window functions the same partition
   computation as `Window`, `WITH RECURSIVE` semi-naive iteration;

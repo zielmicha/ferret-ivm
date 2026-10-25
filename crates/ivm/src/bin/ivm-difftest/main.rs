@@ -33,6 +33,9 @@
 //! self-differential test (tests/selfdiff.rs), which compares views with
 //! ad hoc queries without PostgreSQL.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod sqlgen;
 #[path = "../../testkit.rs"]
 mod testkit;

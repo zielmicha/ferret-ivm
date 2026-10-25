@@ -668,18 +668,14 @@ impl PgSource {
             last: true,
         };
         if t.pk.is_empty() {
-            let res = q.simple_query(&format!(
-                "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; SELECT {cols} FROM {tname}; COMMIT"
-            ))?;
-            let snap_text = res.iter().find(|r| !r.rows.is_empty() && r.columns.len() == 1 && r.columns[0].name == "pg_current_snapshot")
-                .and_then(|r| r.rows[0][0].clone())
-                .unwrap_or_default();
-            chunk.snap = parse_snapshot(&snap_text);
-            if let Some(data) = res.iter().rev().find(|r| r.columns.len() == t.columns.len() && r.columns.first().map(|c| c.name != "pg_current_snapshot").unwrap_or(true)) {
-                for r in &data.rows {
-                    chunk.multiset.push(parse_text_row(r, &t)?);
-                }
-            }
+            let (snap_text, rows) = chunk_query(
+                q,
+                &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; SELECT {cols} FROM {tname}; COMMIT"),
+                &t,
+                &mut Vec::new(),
+            )?;
+            chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
+            chunk.multiset = rows;
         } else {
             // Chunks must be ordered as the engine orders keys (memcmp of
             // the key encoding). For string columns that is the byte order
@@ -720,30 +716,25 @@ impl PgSource {
             };
             // the snapshot tells which commits before the low watermark the
             // chunk may have missed
-            let res = q.simple_query(&format!(
-                "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; \
-                 SELECT {cols} FROM {tname}{where_clause} ORDER BY {} LIMIT {CHUNK_ROWS}; COMMIT",
-                pk_cols.join(", ")
-            ))?;
-            let snap_text = res
-                .iter()
-                .find(|r| !r.rows.is_empty() && r.columns.len() == 1 && r.columns[0].name == "pg_current_snapshot")
-                .and_then(|r| r.rows[0][0].clone())
-                .unwrap_or_default();
-            chunk.snap = parse_snapshot(&snap_text);
-            let empty = Vec::new();
-            let rows = res
-                .iter()
-                .rev()
-                .find(|r| r.columns.len() == t.columns.len() && r.columns.first().map(|c| c.name != "pg_current_snapshot").unwrap_or(true))
-                .map(|r| &r.rows)
-                .unwrap_or(&empty);
+            let mut last_pk_text = Vec::new();
+            let (snap_text, rows) = chunk_query(
+                q,
+                &format!(
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; \
+                     SELECT {cols} FROM {tname}{where_clause} ORDER BY {} LIMIT {CHUNK_ROWS}; COMMIT",
+                    pk_cols.join(", ")
+                ),
+                &t,
+                &mut last_pk_text,
+            )?;
+            chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
             chunk.last = rows.len() < CHUNK_ROWS;
-            for r in rows {
-                let row = parse_text_row(r, &t)?;
+            if !rows.is_empty() {
+                chunk.max_key_text = Some(last_pk_text);
+            }
+            for row in rows {
                 let kb = pk_bytes(&row, &t.pk);
                 chunk.max_key = Some(kb.clone());
-                chunk.max_key_text = Some(t.pk.iter().map(|c| r[*c].clone().unwrap_or_default()).collect());
                 chunk.rows.insert(kb, row);
             }
         }
@@ -795,15 +786,49 @@ fn reshape_changes(changes: &mut Vec<(ObjectId, TableChange)>, old: &SourceTable
     });
 }
 
-fn parse_text_row(r: &[Option<String>], t: &SourceTable) -> Result<Row> {
-    let mut row = Vec::with_capacity(t.columns.len());
-    for (v, c) in r.iter().zip(&t.columns) {
-        row.push(match v {
-            None => Datum::Null,
-            Some(s) => parse_datum(s, &c.ty.ty, -1)?,
-        });
-    }
-    Ok(row)
+/// Run a snapshot chunk's statements: the text of pg_current_snapshot()
+/// and the table's rows, parsed from the text values as they arrive (no
+/// strings collected per value). `last_pk_text` receives the text of the
+/// last row's primary key.
+fn chunk_query(q: &mut Client, sql: &str, t: &SourceTable, last_pk_text: &mut Vec<String>) -> Result<(Option<String>, Vec<Row>)> {
+    let mut snap = None;
+    let mut rows = Vec::new();
+    let mut err = None;
+    q.simple_query_rows(sql, &mut |cols, r| {
+        if snap.is_none() && cols.len() == 1 && cols[0].name == "pg_current_snapshot" {
+            snap = r.get(0).map(|b| String::from_utf8_lossy(b).into_owned());
+            return Ok(());
+        }
+        if cols.len() != t.columns.len() {
+            return Ok(());
+        }
+        let mut row = Vec::with_capacity(t.columns.len());
+        for (i, c) in t.columns.iter().enumerate() {
+            row.push(match r.get(i) {
+                None => Datum::Null,
+                Some(b) => match parse_datum(&String::from_utf8_lossy(b), &c.ty.ty, -1) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let msg = e.message.clone();
+                        err = Some(e);
+                        return Err(msg);
+                    }
+                },
+            });
+        }
+        // the strings are reused from row to row
+        last_pk_text.resize(t.pk.len(), String::new());
+        for (s, c) in last_pk_text.iter_mut().zip(&t.pk) {
+            s.clear();
+            if let Some(b) = r.get(*c) {
+                s.push_str(&String::from_utf8_lossy(b));
+            }
+        }
+        rows.push(row);
+        Ok(())
+    })
+    .map_err(|e| err.take().unwrap_or_else(|| e.into()))?;
+    Ok((snap, rows))
 }
 
 /// Is the (32-bit) transaction id visible in a pg_current_snapshot()?

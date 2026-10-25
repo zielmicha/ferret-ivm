@@ -139,8 +139,8 @@ that error (the error's SQLSTATE and message), regardless of the read point.
 ### How reads are executed
 
 Ad hoc queries do not create dataflow: they are planned like views and then
-evaluated once by a batch executor over the indexes (hash joins, hash
-aggregation, sorting), at the chosen GSN. Reading a materialized view is a
+evaluated once by a batch executor over the indexes (key lookups and
+ranges, index or hash joins, hash aggregation, sorting), at the chosen GSN. Reading a materialized view is a
 scan of its index (or a key range of it, see
 [Indexes](tables-and-views.md#indexes)); reading a virtual view evaluates its
 query. Expression errors make the query fail, as in PostgreSQL.

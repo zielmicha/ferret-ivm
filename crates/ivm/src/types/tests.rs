@@ -9,12 +9,14 @@
 //!   suffix it restores the exact value; key plus suffix tell two values
 //!   apart exactly when `exact_cmp` does.
 //! - The row codec, text I/O and binary send/receive round trip exactly.
+//! - Skipping a key column, a fidelity suffix or a codec value consumes
+//!   exactly what decoding it does.
 //!
 //! Failures shrink to a minimal case and are recorded under
 //! `proptest-regressions/`. `PROPTEST_CASES=N` runs N cases per property
 //! instead of 4096; `PROPTEST_RNG_SEED=N` fixes the seed.
 
-use super::codec::{decode_datum, decode_row, encode_datum, encode_row};
+use super::codec::{decode_datum, decode_row, encode_datum, encode_row, skip_datum};
 use super::datum::{exact_cmp, ArrayValue, Datum};
 use super::encoding::*;
 use super::text::{format_datum, parse_datum, recv_datum, send_datum};
@@ -378,6 +380,9 @@ proptest! {
                 let mut exact = back.clone();
                 let used = apply_fidelity(&mut exact, &[&f[..], &[7, 7, 7]].concat()).unwrap();
                 prop_assert_eq!(used, f.len());
+                if !matches!(ty, SqlType::Array(_)) {
+                    prop_assert_eq!(skip_fidelity(&[&f[..], &[7, 7, 7]].concat(), &ty).unwrap(), f.len());
+                }
                 prop_assert!(identical(&exact, &canonical_nans(&d)), "fidelity restores {:?}", exact);
             } else if !d.is_null() {
                 prop_assert!(identical(&back, &canonical_nans(&d)), "decoded {:?}", back);
@@ -392,6 +397,10 @@ proptest! {
         let mut rd = &buf[..];
         let back = decode_datum(&mut rd).unwrap();
         prop_assert!(rd.is_empty() && identical(&back, &d), "codec gave {:?}", back);
+        let padded = [&buf[..], &[0x7F, 0x00]].concat();
+        let mut rd = &padded[..];
+        skip_datum(&mut rd).unwrap();
+        prop_assert_eq!(padded.len() - rd.len(), buf.len(), "skipped length");
         if !d.is_null() {
             let text = format_datum(&d);
             let parsed = parse_datum(&text, &ty, -1).map_err(|e| TestCaseError::fail(format!("parsing {text:?}: {e}")))?;
