@@ -144,8 +144,13 @@ in the stream and no chunk is in flight:
 
 1. Pick the table with the lowest id whose snapshot is not done.
 2. On a normal connection, emit the **low watermark**:
-   `SELECT pg_logical_emit_message(true, 'ivm', 'L:<source>:<table>:<seq>')`
+   `SELECT pg_logical_emit_message(true, 'ivm', 'L:<source>:<table>:<run>:<seq>')`
    (a transactional message: it appears in the stream at its commit).
+   `<run>` is a random id chosen each time the source thread starts and
+   `<seq>` counts its chunks, so the tag is unique: after a restart the
+   stream resumes before watermarks of the previous run, and logical
+   messages reach every slot of the database, including those of other
+   engines.
 3. Read the chunk in one transaction:
    ```sql
    BEGIN ISOLATION LEVEL REPEATABLE READ;
@@ -159,7 +164,7 @@ in the stream and no chunk is in flight:
    primary key; the chunk records its last key (`max_key`), whether it is the
    last chunk (fewer than 10,000 rows), and the snapshot's
    `(xmin, xmax, xip)`.
-4. Emit the **high watermark** `'H:<source>:<table>:<seq>'`.
+4. Emit the **high watermark** `'H:<source>:<table>:<run>:<seq>'`.
 
 The chunk starts in phase *before-low*. While the stream is processed:
 

@@ -199,6 +199,9 @@ struct PgSource {
     chunk: Option<Chunk>,
     query: Option<Client>,
     status: Arc<Mutex<String>>,
+    /// Random id of this run of the source and the number of chunks it
+    /// started: they make watermark tags unique (see `watermarks`).
+    run_id: u64,
     seq: u64,
     /// Commits sent to the log whose durability is not yet confirmed.
     inflight: std::collections::VecDeque<(u64, Receiver<u64>)>,
@@ -630,6 +633,17 @@ impl PgSource {
         }
     }
 
+    /// Low and high watermark tags for the next chunk of `table`. They must
+    /// be unique: watermarks written by an earlier run of this source (the
+    /// stream resumes before them after a restart), or by another engine
+    /// whose source and table have the same ids (logical messages reach
+    /// every slot of the database), must not be taken for this chunk's.
+    fn watermarks(&mut self, table: ObjectId) -> (String, String) {
+        self.seq += 1;
+        let tag = format!("{}:{table}:{:016x}:{}", self.id, self.run_id, self.seq);
+        (format!("L:{tag}"), format!("H:{tag}"))
+    }
+
     /// Start the next snapshot chunk if none is in flight.
     fn maybe_start_chunk(&mut self) -> Result<()> {
         if self.chunk.is_some() {
@@ -646,9 +660,7 @@ impl PgSource {
         if self.query.is_none() {
             self.query = Some(connect(&self.def.conninfo, false)?);
         }
-        self.seq += 1;
-        let low = format!("L:{}:{}:{}", self.id, table, self.seq);
-        let high = format!("H:{}:{}:{}", self.id, table, self.seq);
+        let (low, high) = self.watermarks(table);
         let q = self.query.as_mut().unwrap();
         let tname = format!("{}.{}", qident(&t.upstream.0), qident(&t.upstream.1));
         // values arrive in text format through the simple query protocol;
@@ -858,6 +870,7 @@ pub fn run(
         chunk: None,
         query: None,
         status: status.clone(),
+        run_id: crate::source::random_u64(),
         seq: 0,
         inflight: std::collections::VecDeque::new(),
         pending_wal_end: 0,
@@ -1044,6 +1057,7 @@ mod tests {
             chunk: None,
             query: None,
             status: Arc::new(Mutex::new(String::new())),
+            run_id: crate::source::random_u64(),
             seq: 0,
             inflight: std::collections::VecDeque::new(),
             pending_wal_end: 0,
@@ -1287,6 +1301,34 @@ mod tests {
             [(10, TableChange::Upsert { row, .. })] => assert_eq!(row, &vec![Datum::Int4(1), Datum::Null, Datum::Int4(2)]),
             other => panic!("unexpected changes {other:?}"),
         }
+    }
+
+    /// Watermarks of one run (process) of the source can still be in the
+    /// stream after a restart: the new run's watermarks must differ, or the
+    /// old ones would open the window of (or finish) a new chunk early.
+    /// Tags used to restart at sequence 1 in every process.
+    #[test]
+    fn watermarks_differ_between_runs() {
+        let (mut old_run, _) = source(vec![table(&["id", "a"], vec![0])], SourceState { slot_created: true, ..Default::default() });
+        let (mut src, log) = source(vec![table(&["id", "a"], vec![0])], SourceState { slot_created: true, ..Default::default() });
+        let (old_low, old_high) = old_run.watermarks(10);
+        let (low, high) = src.watermarks(10);
+        assert_ne!(old_low, low);
+        assert_ne!(old_high, high);
+        let mut ch = chunk_before_low(&[[1, 10]], true);
+        (ch.low, ch.high) = (low, high);
+        src.chunk = Some(ch);
+        src.handle_message(begin(80)).unwrap();
+        src.handle_message(relation(&["id", "a"], 1)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        for (xid, tag, end) in [(81, &old_low, 110), (82, &old_high, 120)] {
+            src.handle_message(begin(xid)).unwrap();
+            src.handle_message(message(tag)).unwrap();
+            src.handle_message(commit(end)).unwrap();
+        }
+        src.drain_acks(true).unwrap();
+        assert!(src.chunk.as_ref().is_some_and(|c| c.phase == Phase::BeforeLow), "the old run's watermarks were taken for the chunk's");
+        assert!(replay(&log.lock()).is_empty());
     }
 
     #[test]

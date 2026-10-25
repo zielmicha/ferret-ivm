@@ -105,6 +105,19 @@ pub fn start(
     Ok(SourceHandle { tx, status, thread: Some(thread) })
 }
 
+/// A random 64-bit value, different in every call and every process (not
+/// cryptographically strong; for identifiers that must not repeat).
+pub(crate) fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    // RandomState is seeded from the operating system's generator
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.write_u32(std::process::id());
+    h.write_u64(CALLS.fetch_add(1, Ordering::Relaxed));
+    h.finish()
+}
+
 /// Drop a replication slot in the background (best effort).
 pub fn drop_slot_async(conninfo: String, slot: String) {
     std::thread::spawn(move || {
