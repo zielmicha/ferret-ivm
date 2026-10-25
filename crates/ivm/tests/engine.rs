@@ -1,4 +1,8 @@
-//! Engine-level tests through the public API (no Postgres needed).
+//! Engine-level tests through the public API (no PostgreSQL needed): exact
+//! semantics of temporal filters, recovery, specific features, and
+//! regression tests for bugs (some `#[ignore]`d with the bug described, for
+//! bugs that are still open). Randomized comparisons of views with their
+//! queries are in selfdiff.rs.
 
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
@@ -128,63 +132,6 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0 % n
     }
-}
-
-/// Maintained aggregates must equal a recompute, including when equal group
-/// keys and arguments come in several representations (numeric scales).
-#[test]
-fn aggregates_match_recompute_with_mixed_representations() {
-    let dir = tmpdir("mixed-repr");
-    let running = start(&dir);
-    let h = running.handle.clone();
-    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, k numeric, g int, v numeric, b bool)");
-    let views = [
-        "SELECT k, count(*) AS n, sum(v) AS s, min(v) AS mn, max(v) AS mx, avg(v) AS a FROM t GROUP BY k",
-        "SELECT g, k, count(DISTINCT v) AS d, count(*) AS n FROM t GROUP BY g, k",
-        "SELECT (id % 3) AS m, k, max(g) AS mg, min(k) AS mk FROM t WHERE b GROUP BY (id % 3), k",
-        "SELECT sum(v) AS s, count(v) AS c, min(k) AS mk, max(k) AS xk FROM t",
-    ];
-    for (i, v) in views.iter().enumerate() {
-        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {v}"));
-    }
-    let reprs = ["1", "1.0", "1.00", "2", "2.0", "-0.5", "-0.50", "NULL", "3.000", "3"];
-    let mut rng = Rng(0x2545F4914F6CDD1D);
-    for step in 0..300 {
-        let id = rng.below(40);
-        let sql = match rng.below(4) {
-            0 => format!("DELETE FROM t WHERE id = {id}"),
-            1 => format!("UPDATE t SET v = {} WHERE id = {id}", reprs[rng.below(10) as usize]),
-            _ => format!(
-                "INSERT INTO t VALUES ({id}, {}, {}, {}, {}) ON CONFLICT DO NOTHING",
-                reprs[rng.below(10) as usize],
-                rng.below(3),
-                reprs[rng.below(10) as usize],
-                rng.below(2) == 0
-            ),
-        };
-        exec(&h, &sql);
-        for (i, v) in views.iter().enumerate() {
-            // values must agree; representations of keys may differ only where
-            // several are present, so compare by value with trailing zeros
-            let norm = |rows: Vec<String>| {
-                let mut r: Vec<String> = rows
-                    .into_iter()
-                    .map(|row| {
-                        row.split('|')
-                            .map(|f| if f.contains('.') { f.trim_end_matches('0').trim_end_matches('.').to_string() } else { f.to_string() })
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    })
-                    .collect();
-                r.sort();
-                r
-            };
-            let got = norm(rows(&h, &format!("SELECT * FROM v{i}")));
-            let want = norm(rows(&h, v));
-            assert_eq!(got, want, "step {step} after {sql}: view v{i} = {v}");
-        }
-    }
-    running.shutdown();
 }
 
 /// Temporal filters anywhere in a plan (joined, aggregated, mixed with
@@ -368,6 +315,83 @@ fn distinct_on_infinite_intervals() {
     assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), want);
     exec(&h, "DELETE FROM t WHERE id IN (1, 4)");
     assert_eq!(rows(&h, "SELECT * FROM v ORDER BY iv, id"), ["-infinity|3", "30 days|5", "infinity|2", "|6"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recovery re-plans every view, and delta join paths are ordered by the
+/// current sizes of their inputs. When the sizes changed since the view was
+/// created, the re-planned joins look up other indexes, the view's
+/// arrangements no longer match the checkpointed ones and are hydrated
+/// afresh: their history is gone, so reads AS OF a GSN before the restart
+/// return the hydrated state (nothing, here) instead of what the view held.
+#[test]
+#[ignore = "bug: recovery re-plans joins from current table sizes; changed plans re-hydrate views and lose their AS OF history"]
+fn as_of_history_survives_restart_after_table_sizes_change() {
+    let dir = tmpdir("replan-history");
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, retention_gsns: 100_000, ..Default::default() };
+    let running = coord::start(cfg.clone()).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE a (id int PRIMARY KEY, k1 int, k3 int)");
+    exec(&h, "CREATE TABLE b (id int PRIMARY KEY, k1 int, k2 int)");
+    exec(&h, "CREATE TABLE c (id int PRIMARY KEY, k2 int, k3 int)");
+    exec(&h, "INSERT INTO a SELECT g, g % 3, g % 5 FROM generate_series(1, 10) g");
+    exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(1, 5) g");
+    exec(&h, "INSERT INTO c SELECT g, g % 4, g % 5 FROM generate_series(1, 50) g");
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT count(*) AS n FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3");
+    let gsn = rows(&h, "SHOW GSN")[0].clone();
+    let then = rows(&h, "SELECT * FROM v");
+    // b grows, c shrinks: the join order flips
+    exec(&h, "DELETE FROM c WHERE id > 3");
+    exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(6, 200) g");
+    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then);
+    running.shutdown();
+    let running = coord::start(cfg).unwrap();
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT * FROM v"), rows(&h, "SELECT count(*) FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3"));
+    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then, "view v AS OF {gsn} after the restart");
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Errors are data: a view whose rows include an expression error fails to
+/// read until the offending rows are gone. Error records are kept per view
+/// and collected only from changes after the view was created, and
+/// arrangements hold no errors: a view hydrated from an existing node misses
+/// that node's current errors, and reading it succeeds with the failing
+/// rows missing. Both a view reusing an existing dataflow node (`e1`, `e2`:
+/// the same aggregate as `e0`) and a view over a failing view created after
+/// the failure (`late`; `early` existed before and fails as it should).
+#[test]
+#[ignore = "bug: views hydrated from an existing node (shared nodes, views over views) miss its current error records"]
+fn views_hydrated_from_failing_nodes_report_their_errors() {
+    let dir = tmpdir("shared-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    let code = |sql: &str| {
+        let stmt = ivm::sql::parse_statement(sql).unwrap();
+        h.execute(stmt, vec![], SessionVars::default(), String::new()).map(|_| ()).map_err(|e| e.code)
+    };
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, k int, a int[])");
+    let q = "SELECT (a || ARRAY[9]) AS x, count(*) FROM t GROUP BY 1";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW e0 AS {q}"));
+    exec(&h, "CREATE MATERIALIZED VIEW vin AS SELECT k AS x0, (a || ARRAY[9]) AS x1 FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW early AS SELECT x0, count(*) AS n FROM vin GROUP BY x0");
+    exec(&h, "INSERT INTO t VALUES (1, 1, '{1,2}'), (2, 1, '{{1,2},{3,4}}')");
+    exec(&h, &format!("CREATE MATERIALIZED VIEW e1 AS {q}"));
+    exec(&h, "CREATE MATERIALIZED VIEW e2 AS SELECT (a || ARRAY[9]) AS x, count(*) AS n FROM t GROUP BY 1");
+    exec(&h, "CREATE MATERIALIZED VIEW late AS SELECT x0, count(*) AS n FROM vin GROUP BY x0");
+    assert_eq!(code(q), Err("2202E".to_string()));
+    for v in ["e0", "vin", "early", "e1", "e2", "late"] {
+        assert_eq!(code(&format!("SELECT * FROM {v}")), Err("2202E".to_string()), "reading {v}");
+    }
+    exec(&h, "DELETE FROM t WHERE id = 2");
+    for v in ["e0", "e1", "e2"] {
+        assert_eq!(rows(&h, &format!("SELECT * FROM {v}")), ["{1,2,9}|1"]);
+    }
+    for v in ["early", "late"] {
+        assert_eq!(rows(&h, &format!("SELECT * FROM {v}")), ["1|1"]);
+    }
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
