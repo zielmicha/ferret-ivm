@@ -95,30 +95,34 @@ fn execute(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {
     h.execute(stmt, vec![], SessionVars::default(), String::new()).map_err(|e| format!("{} ({})", e.message, e.code))
 }
 
-/// A result row as text; floats rounded, and numerics trimmed where SQL may
-/// keep any representation of equal values.
+/// A value as text; floats rounded, and numerics trimmed where SQL may keep
+/// any representation of equal values.
+fn datum_text(d: &Datum, ty: &SqlType, trim_numeric: bool) -> String {
+    if d.is_null() {
+        return "∅".to_string();
+    }
+    let s = format_datum(d);
+    match ty {
+        SqlType::Float4 | SqlType::Float8 => match s.parse::<f64>() {
+            Ok(f) => if f == 0.0 { "0".into() } else { format!("{f:.9e}") },
+            Err(_) => s,
+        },
+        SqlType::Numeric if trim_numeric => trim_numeric_text(s),
+        _ => s,
+    }
+}
+
+fn trim_numeric_text(s: String) -> String {
+    if !s.contains('.') {
+        return s;
+    }
+    let t = s.trim_end_matches('0').trim_end_matches('.');
+    if t == "-0" || t.is_empty() { "0".into() } else { t.to_string() }
+}
+
+/// A result row as text (see `datum_text`).
 fn row_text(r: &[Datum], columns: &[ResultColumn], trim_numeric: bool) -> String {
-    r.iter()
-        .zip(columns)
-        .map(|(d, c)| {
-            if d.is_null() {
-                return "∅".to_string();
-            }
-            let s = format_datum(d);
-            match c.ty {
-                SqlType::Float4 | SqlType::Float8 => match s.parse::<f64>() {
-                    Ok(f) => if f == 0.0 { "0".into() } else { format!("{f:.9e}") },
-                    Err(_) => s,
-                },
-                SqlType::Numeric if trim_numeric && s.contains('.') => {
-                    let t = s.trim_end_matches('0').trim_end_matches('.');
-                    if t == "-0" || t.is_empty() { "0".into() } else { t.to_string() }
-                }
-                _ => s,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("|")
+    r.iter().zip(columns).map(|(d, c)| datum_text(d, &c.ty, trim_numeric)).collect::<Vec<_>>().join("|")
 }
 
 /// Result rows as sorted text (see `row_text`).
@@ -138,19 +142,21 @@ struct Sub {
     columns: Vec<ResultColumn>,
     rx: crossbeam_channel::Receiver<SubEvent>,
     cancel: Arc<AtomicBool>,
-    rows: BTreeMap<String, i64>,
+    /// The rows (each value as text, numerics untrimmed) the changes so far
+    /// add up to, with their multiplicities.
+    rows: BTreeMap<Vec<String>, i64>,
     failed: Option<String>,
 }
 
 impl Sub {
     /// Apply the changes delivered so far (every applied commit delivers
     /// before it returns).
-    fn drain(&mut self, trim: bool) {
+    fn drain(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 SubEvent::Data { rows, .. } => {
                     for (r, w) in rows {
-                        let k = row_text(&r, &self.columns, trim);
+                        let k: Vec<String> = r.iter().zip(&self.columns).map(|(d, c)| datum_text(d, &c.ty, false)).collect();
                         let e = self.rows.entry(k.clone()).or_default();
                         *e += w;
                         if *e == 0 {
@@ -164,8 +170,21 @@ impl Sub {
         }
     }
 
-    fn contents(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.rows.iter().flat_map(|(r, w)| std::iter::repeat_n(r.clone(), (*w).max(0) as usize)).collect();
+    /// The rows as `query` returns them. (Numerics are trimmed only here:
+    /// whether to trim depends on what the stream is compared with, which
+    /// a view's replacement changes.)
+    fn contents(&self, trim_numeric: bool) -> Vec<String> {
+        let mut acc: BTreeMap<String, i64> = BTreeMap::new();
+        for (r, w) in &self.rows {
+            let k = r
+                .iter()
+                .zip(&self.columns)
+                .map(|(v, c)| if trim_numeric && c.ty == SqlType::Numeric { trim_numeric_text(v.clone()) } else { v.clone() })
+                .collect::<Vec<_>>()
+                .join("|");
+            *acc.entry(k).or_default() += w;
+        }
+        let mut v: Vec<String> = acc.iter().flat_map(|(r, w)| std::iter::repeat_n(r.clone(), (*w).max(0) as usize)).collect();
         v.sort();
         v
     }
@@ -300,15 +319,15 @@ impl Case {
             }
             // what subscriptions to it (or to its query) add up to
             for sub in self.subs.iter_mut().filter(|s| s.view == v.name) {
-                sub.drain(v.trim);
-                let (expect, of) = match &sub.to_query {
-                    Some(q) if q == &v.query => (want.clone(), "its query"),
+                sub.drain();
+                let (expect, of, trim) = match &sub.to_query {
+                    Some(q) if q == &v.query => (want.clone(), "its query", v.trim),
                     // the view was replaced since: the query subscription goes on
-                    Some(q) => (query(&h, q, v.trim), "its former query"),
-                    None => (got.clone(), "the view"),
+                    Some(q) => (query(&h, q, sqlgen::dedups(q)), "its former query", sqlgen::dedups(q)),
+                    None => (got.clone(), "the view", v.trim),
                 };
                 if let (Ok(expect), None) = (&expect, &sub.failed) {
-                    let acc = sub.contents();
+                    let acc = sub.contents(trim);
                     if &acc != expect {
                         let msg = format!("after {what}: subscription to {} of {} = {}\n  stream adds up to: {acc:?}\n  {of} holds:       {expect:?}", if sub.to_query.is_some() { "the query" } else { "view" }, v.name, v.query);
                         panic!("{msg}\ncase:\n  {}", self.log.join("\n  "));
