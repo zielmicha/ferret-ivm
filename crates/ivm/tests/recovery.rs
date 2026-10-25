@@ -242,3 +242,28 @@ fn as_of_reads_use_arrangements_with_history() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A view whose dataflow is shared with an existing view (here: the same
+/// query) reports that view's errors; it used to start without them and
+/// read its partial rows as if valid (also after a restart).
+#[test]
+fn views_sharing_a_dataflow_share_its_errors() {
+    let dir = tmpdir("shared-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (a int PRIMARY KEY, b int)");
+    exec(&h, "INSERT INTO t VALUES (1, 0), (2, 1)");
+    exec(&h, "CREATE MATERIALIZED VIEW v1 AS SELECT a, 10 / b AS x FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW v2 AS SELECT a, 10 / b AS x FROM t");
+    for v in ["v1", "v2"] {
+        assert_eq!(try_exec(&h, &format!("SELECT * FROM {v}")).unwrap_err(), "division by zero", "{v}");
+    }
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(try_exec(&h, "SELECT * FROM v2").unwrap_err(), "division by zero");
+    exec(&h, "DELETE FROM t WHERE a = 1");
+    assert_eq!(rows(&h, "SELECT * FROM v2"), ["2|10"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -516,11 +516,7 @@ impl Engine {
         if cv.materialized {
             self.create_view_rt(id, &query_sql)?;
             let errs = self.graph.hydrate(&mut self.env, gsn)?;
-            if let Some(v) = self.rt.views.get_mut(&id)
-                && let Some(e) = errs.get(&v.node)
-            {
-                merge_errors(&mut v.errors, e);
-            }
+            self.init_view_errors(id, &errs);
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::MaterializedView(def), created_gsn: gsn, create_sql: sql.to_string() });
         } else {
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::View(def), created_gsn: gsn, create_sql: sql.to_string() });
@@ -530,6 +526,22 @@ impl Engine {
             self.replan_dependents(gsn, id)?;
         }
         Ok(ExecResult::Command { tag: tag.into() })
+    }
+
+    /// Error records of a new view runtime: those found hydrating its
+    /// dataflow or, when its root operator already existed (shared with
+    /// another view), that view's.
+    fn init_view_errors(&mut self, id: ObjectId, hydrated: &FxHashMap<NodeId, crate::dataflow::ErrDelta>) {
+        let node = self.rt.views[&id].node;
+        let errors = match hydrated.get(&node) {
+            Some(e) => {
+                let mut m = BTreeMap::new();
+                merge_errors(&mut m, e);
+                m
+            }
+            None => self.rt.views.iter().find(|(v, rt)| **v != id && rt.node == node).map(|(_, rt)| rt.errors.clone()).unwrap_or_default(),
+        };
+        self.rt.views.get_mut(&id).unwrap().errors = errors;
     }
 
     /// Would replacing view `old` by `new` leave everything that depends on
@@ -690,8 +702,8 @@ impl Engine {
         if new_node == old.node {
             // same dataflow: same errors
             self.rt.views.get_mut(&id).unwrap().errors = old.errors.clone();
-        } else if let Some(e) = errs.get(&new_node) {
-            merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, e);
+        } else {
+            self.init_view_errors(id, &errs);
         }
         let new_arr = self.rt.views[&id].arr;
         let new_rows = self.graph.scan_arr(&mut self.env, new_arr, crate::storage::ReadAt::Latest)?;
