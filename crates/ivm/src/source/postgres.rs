@@ -188,6 +188,10 @@ struct PgSource {
     inflight: std::collections::VecDeque<(u64, Receiver<u64>)>,
     /// wal_end of a keepalive received while commits were in flight.
     pending_wal_end: u64,
+    /// Relations announced in this session for tables the source does not
+    /// replicate (yet). pgoutput announces a relation once per session, so
+    /// a table added later (ALTER SOURCE REFRESH) is mapped from these.
+    unmapped_rels: HashMap<u32, Relation>,
 }
 
 fn pk_bytes(row: &[Datum], pk: &[usize]) -> Vec<u8> {
@@ -472,8 +476,25 @@ impl PgSource {
         }
     }
 
+    /// Start replicating more tables (their snapshots follow).
+    fn add_tables(&mut self, tables: Vec<SourceTable>) -> Result<()> {
+        for t in tables {
+            self.tables.insert(t.id, t);
+        }
+        let known: Vec<u32> = self.unmapped_rels.values().filter(|r| self.table_of(r).is_some()).map(|r| r.id).collect();
+        for id in known {
+            if let Some(rel) = self.unmapped_rels.remove(&id) {
+                self.handle_relation(rel)?;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_relation(&mut self, rel: Relation) -> Result<()> {
-        let Some(table) = self.table_of(&rel) else { return Ok(()) };
+        let Some(table) = self.table_of(&rel) else {
+            self.unmapped_rels.insert(rel.id, rel);
+            return Ok(());
+        };
         let t = self.tables[&table].clone();
         let cols: Vec<Option<usize>> = rel.columns.iter().map(|rc| t.columns.iter().position(|c| c.name == rc.name)).collect();
         // detect a changed shape: new/dropped columns or changed types
@@ -752,6 +773,7 @@ pub fn run(
         seq: 0,
         inflight: std::collections::VecDeque::new(),
         pending_wal_end: 0,
+        unmapped_rels: HashMap::new(),
     };
     let mut backoff = Duration::from_millis(200);
     loop {
@@ -768,12 +790,14 @@ pub fn run(
                 src.chunk = None;
                 src.query = None;
                 src.rels.clear();
+                src.unmapped_rels.clear();
             }
         }
         // stop requests during backoff
         match ctl.recv_timeout(backoff) {
             Ok(SourceCtl::Stop) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             Ok(SourceCtl::AddTables(t)) => {
+                // no session: relations are announced again by the next one
                 for x in t {
                     src.tables.insert(x.id, x);
                 }
@@ -812,11 +836,7 @@ fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
         while let Ok(m) = ctl.try_recv() {
             match m {
                 SourceCtl::Stop => return Ok(true),
-                SourceCtl::AddTables(t) => {
-                    for x in t {
-                        src.tables.insert(x.id, x);
-                    }
-                }
+                SourceCtl::AddTables(t) => src.add_tables(t)?,
             }
         }
         if src.txn.is_none() {

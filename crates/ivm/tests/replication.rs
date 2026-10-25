@@ -226,3 +226,27 @@ fn text_replicated_keys_snapshot_in_chunks() {
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM e"), ["25000|312512498"]);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM i"), ["11999|72005999"]);
 }
+
+/// Changes to a table added by ALTER SOURCE REFRESH are replicated even when
+/// PostgreSQL announced the table (a Relation message, sent once per
+/// session) before the source knew it; they used to be ignored for good.
+#[test]
+fn refreshed_tables_announced_earlier_are_replicated() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE a (id int PRIMARY KEY)");
+    up.exec("CREATE TABLE b (id int PRIMARY KEY, v int)");
+    up.exec("CREATE PUBLICATION p FOR TABLE a");
+    let dir = tmpdir("refresh");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM a");
+    up.exec("ALTER PUBLICATION p ADD TABLE b");
+    up.exec("INSERT INTO b VALUES (1, 1)"); // announces b to the running session
+    up.exec("INSERT INTO a VALUES (1)");
+    let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM a");
+    ivm.exec("ALTER SOURCE s REFRESH");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM b ORDER BY id"), ["1|1"]);
+    up.exec("INSERT INTO b VALUES (2, 2)");
+    up.exec("UPDATE b SET v = 10 WHERE id = 1");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM b ORDER BY id"), ["1|10", "2|2"]);
+}
