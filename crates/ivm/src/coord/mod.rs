@@ -559,14 +559,12 @@ impl Engine {
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
-        for (_, s) in self.source_handles.drain() {
-            s.stop();
-        }
-        let threads: Vec<JoinHandle<()>> = self.sink_handles.drain().filter_map(|(_, s)| s.stop()).collect();
+        let mut threads: Vec<JoinHandle<()>> = self.source_handles.drain().filter_map(|(_, s)| s.stop()).collect();
+        threads.extend(self.sink_handles.drain().filter_map(|(_, s)| s.stop()));
         let _ = self.seq.send(SeqMsg::Shutdown);
         self.checkpoint()?;
-        // give sinks a moment to finish; one stuck in a connection attempt
-        // is left behind
+        // give sources and sinks a moment to finish; one stuck in a
+        // connection attempt is left behind
         let deadline = Instant::now() + Duration::from_secs(5);
         for t in threads {
             while !t.is_finished() && Instant::now() < deadline {
@@ -677,7 +675,9 @@ impl Engine {
                     };
                     self.reply_pending(lsn, res);
                     self.drain_dml_queue();
-                } else {
+                } else if self.catalog.get(source).is_some() {
+                    // (a dropped source's thread may still log a record
+                    // before it notices that it was stopped)
                     let e = self.source_lsns.entry(source).or_insert(0);
                     *e = (*e).max(lsn);
                 }
@@ -699,7 +699,9 @@ impl Engine {
             }
             LogRecord::Progress { source, lsn: _, state } => {
                 self.processed = gsn;
-                self.source_states.insert(source, state);
+                if self.catalog.get(source).is_some() {
+                    self.source_states.insert(source, state);
+                }
                 self.snap_epoch += 1;
             }
             LogRecord::Schema { source: _, table, columns, pk } => {

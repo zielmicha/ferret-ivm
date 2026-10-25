@@ -58,7 +58,7 @@ Where the implementation differs from the design:
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
 | stop-file watcher | | polls for `.ivm-stop` every 500 ms; when it appears, requests a shutdown and exits the process at once, without waiting for the final checkpoint |
-| slot-drop helpers | | short-lived; drop a replication slot after `DROP SOURCE` |
+| slot-drop helpers | | short-lived; drop a replication slot after `DROP SOURCE`, once the source thread has stopped |
 
 There is exactly one engine thread: all dataflow maintenance, all index
 reads and writes, and all query execution happen on it. Everything that

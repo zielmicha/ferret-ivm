@@ -177,16 +177,19 @@ fn silent_server() -> u16 {
     port
 }
 
-/// DROP SINK returns while the sink thread is stuck connecting (the engine
-/// thread used to wait for it, and froze), and so does a shutdown.
+/// DROP SINK and DROP SOURCE return while the sink or source thread is
+/// stuck connecting (the engine thread used to wait for it, and froze),
+/// and so does a shutdown.
 #[test]
 fn stuck_sinks_and_sources_do_not_block_the_engine() {
     let port = silent_server();
     let e = Engine::start("stuck-threads");
     e.exec("CREATE TABLE t (id int PRIMARY KEY)");
     e.exec(&format!("CREATE SINK s FROM t INTO POSTGRES CONNECTION 'host=127.0.0.1 port={port}' TABLE 'target'"));
+    e.create_source("src", &format!("host=127.0.0.1 port={port}"));
     std::thread::sleep(Duration::from_millis(300));
     e.within("DROP SINK s", 5).unwrap();
+    e.within("DROP SOURCE src", 5).unwrap();
     e.within("INSERT INTO t VALUES (1)", 5).unwrap();
     // one left running at shutdown
     e.exec(&format!("CREATE SINK s2 FROM t INTO POSTGRES CONNECTION 'host=127.0.0.1 port={port}' TABLE 'target'"));

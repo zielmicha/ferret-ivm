@@ -71,11 +71,12 @@ pub struct SourceHandle {
 }
 
 impl SourceHandle {
-    pub fn stop(mut self) {
+    /// Ask the source thread to stop, without waiting for it: it may be in
+    /// a connection attempt or a snapshot query, which the engine thread
+    /// must not wait for. Returns the thread, to join where waiting is fine.
+    pub fn stop(mut self) -> Option<std::thread::JoinHandle<()>> {
         let _ = self.tx.send(SourceCtl::Stop);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.thread.take()
     }
     pub fn status(&self) -> String {
         self.status.lock().clone()
@@ -105,9 +106,20 @@ pub fn start(
     Ok(SourceHandle { tx, status, thread: Some(thread) })
 }
 
-/// Drop a replication slot in the background (best effort).
-pub fn drop_slot_async(conninfo: String, slot: String) {
+/// Drop a replication slot in the background (best effort), once the thread
+/// of the source that used it has stopped (for at most a minute: a source
+/// holding the slot keeps it active).
+pub fn drop_slot_async(conninfo: String, slot: String, source_thread: Option<std::thread::JoinHandle<()>>) {
     std::thread::spawn(move || {
+        if let Some(t) = source_thread {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !t.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
         for _ in 0..20 {
             match pgproto::Config::parse(&conninfo).and_then(|c| pgproto::Client::connect_replication(&c)) {
                 Ok(mut c) => match c.drop_slot(&slot, false) {

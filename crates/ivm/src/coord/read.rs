@@ -632,8 +632,9 @@ impl Engine {
                     vec!["segments".into(), st.segments.len().to_string()],
                 ];
                 for (src, lsn) in self.shared.source_lsn.lock().iter() {
-                    let name = self.catalog.get(*src).map(|o| o.name.clone()).unwrap_or_default();
-                    rows.push(vec![format!("source {name} lsn"), format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)]);
+                    // (a dropped source's thread may report once more)
+                    let Some(o) = self.catalog.get(*src) else { continue };
+                    rows.push(vec![format!("source {} lsn", o.name), format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)]);
                 }
                 text_rows(&["frontier", "value"], rows)
             }

@@ -402,12 +402,14 @@ Dropping a source **always cascades**: the source's tables and every object
 that depends on them — views, materialized views, indexes and sinks,
 transitively — are dropped with it. `CASCADE` is accepted and has no effect.
 
-The source thread is stopped and the replication slot is dropped in the
-background (`DROP_REPLICATION_SLOT`, up to 20 attempts 250 ms apart; a slot
-that no longer exists counts as dropped). If the upstream is unreachable
-during those five seconds, or the engine stops before the drop succeeds, the
-slot remains and must be dropped by hand (see below). Replaying a
-`DROP SOURCE` from the log does not try to drop the slot again.
+The source thread is asked to stop (the engine does not wait for it: it may
+be in a connection attempt or a snapshot query), and the replication slot
+is dropped in the background once the thread has stopped (or after a
+minute), with up to 20 `DROP_REPLICATION_SLOT` attempts 250 ms apart; a
+slot that no longer exists counts as dropped. If the upstream is
+unreachable during those five seconds, or the engine stops before the drop
+succeeds, the slot remains and must be dropped by hand (see below).
+Replaying a `DROP SOURCE` from the log does not try to drop the slot again.
 
 ## Monitoring
 

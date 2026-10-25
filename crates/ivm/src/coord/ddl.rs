@@ -1003,11 +1003,10 @@ impl Engine {
                 }
             }
             ObjectKind::Source(def) => {
-                if let Some(h) = self.source_handles.remove(&id) {
-                    h.stop();
-                }
+                // (the engine thread does not wait for the source thread)
+                let thread = self.source_handles.remove(&id).and_then(|h| h.stop());
                 if !self.replaying {
-                    crate::source::drop_slot_async(def.conninfo.clone(), def.slot.clone());
+                    crate::source::drop_slot_async(def.conninfo.clone(), def.slot.clone(), thread);
                 }
                 self.source_states.remove(&id);
                 // a dropped source no longer holds back reads waiting for an LSN
