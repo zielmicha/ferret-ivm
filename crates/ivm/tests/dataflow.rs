@@ -424,3 +424,37 @@ fn computed_join_keys() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Expression errors in the per-input maps of a join count once per input
+/// row, whether the view was hydrated over the row or saw it arrive: the
+/// hydration of a join used to count them only for the input it scanned
+/// (the smallest), so views created later disagreed with older ones.
+#[test]
+fn join_input_errors_hydrate_like_steps() {
+    let dir = tmpdir("join-input-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE small (id int PRIMARY KEY, v int)");
+    exec(&h, "CREATE TABLE big (id int PRIMARY KEY, x int)");
+    exec(&h, "INSERT INTO small VALUES (1, 1)");
+    exec(&h, "INSERT INTO big SELECT g, g FROM generate_series(1, 20) g");
+    let q = "SELECT small.id, s.q FROM small JOIN (SELECT id, 10 / x AS q FROM big) s ON small.v = s.id";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW before_ AS {q}"));
+    exec(&h, "UPDATE big SET x = 0 WHERE id = 7"); // joins nothing
+    // the same join under another root (hydrated, not shared)
+    exec(&h, &format!("CREATE MATERIALIZED VIEW after_ AS SELECT * FROM ({q}) j WHERE id > 0"));
+    let div0 = Some("22012 division by zero".to_string());
+    for v in ["before_", "after_"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), div0, "{v}");
+    }
+    exec(&h, "UPDATE big SET x = 7 WHERE id = 7");
+    for v in ["before_", "after_"] {
+        assert_eq!(rows(&h, &format!("SELECT * FROM {v}")), ["1|10"], "{v}");
+    }
+    exec(&h, "UPDATE big SET x = 0 WHERE id = 8");
+    for v in ["before_", "after_"] {
+        assert_eq!(read_error(&h, &format!("SELECT * FROM {v}")), div0, "{v}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

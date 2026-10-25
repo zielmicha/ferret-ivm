@@ -320,6 +320,19 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Res
     let path = p.paths.iter().find(|pa| pa.source == src).expect("path for every input");
     let inp = &p.inputs[src];
     let mut cache = FxHashMap::default();
+    // expression errors in the other regular inputs' maps count once per
+    // input row, as on their delta paths (lookups skip the failing rows)
+    for (i, other) in p.inputs.iter().enumerate() {
+        if i == src || other.presence.is_some() || other.mfp.steps.is_empty() {
+            continue;
+        }
+        let snap = super::ops::snapshot_node(g, env, other.node, &mut cache)?;
+        for (raw, w) in &snap.data {
+            if let Err(e) = other.mfp.eval(raw) {
+                out.errs.push((err_record(&e), *w));
+            }
+        }
+    }
     let snap = super::ops::owned(super::ops::snapshot_node(g, env, inp.node, &mut cache)?);
     let mut start = Vec::with_capacity(snap.data.len());
     for (raw, w) in snap.data {
