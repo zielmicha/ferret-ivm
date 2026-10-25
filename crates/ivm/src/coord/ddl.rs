@@ -153,6 +153,9 @@ impl Engine {
                 };
                 self.check_source_tables(name, &self.new_source_tables(src.id, parse_discovered(&extra)?))?;
             }
+            Statement::CreateSink { name, from, key, .. } => {
+                self.check_sink(name, from, key.as_deref())?;
+            }
             _ => {}
         }
         let req = self.alloc_req();
@@ -282,15 +285,7 @@ impl Engine {
                 Ok(ExecResult::Command { tag: "DROP SOURCE".into() })
             }
             Statement::CreateSink { name, from, conninfo, table, key } => {
-                if self.catalog.by_name(&name).is_some() {
-                    sql_bail!(codes::DUPLICATE_OBJECT, "sink \"{name}\" already exists");
-                }
-                let Some(v) = self.catalog.by_name(&from).cloned() else {
-                    sql_bail!(codes::UNDEFINED_TABLE, "relation \"{from}\" does not exist");
-                };
-                if !matches!(v.kind, ObjectKind::MaterializedView(_) | ObjectKind::Table(_)) {
-                    sql_bail!(codes::WRONG_OBJECT_TYPE, "sink source \"{from}\" must be a table or materialized view");
-                }
+                let v = self.check_sink(&name, &from, key.as_deref())?;
                 let id = self.catalog.alloc_id();
                 let def = SinkDef { from: v.id, conninfo, table, key };
                 self.catalog.insert(CatalogObject {
@@ -346,6 +341,49 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Can sink `name` read relation `from` with this key? Returns the
+    /// relation. Checked before logging and again on apply: the sink thread
+    /// creates its target table with the key as primary key, and would
+    /// otherwise retry an impossible definition forever.
+    fn check_sink(&self, name: &str, from: &str, key: Option<&[String]>) -> Result<CatalogObject> {
+        if self.catalog.by_name(name).is_some() {
+            sql_bail!(codes::DUPLICATE_OBJECT, "sink \"{name}\" already exists");
+        }
+        let Some(v) = self.catalog.by_name(from).cloned() else {
+            sql_bail!(codes::UNDEFINED_TABLE, "relation \"{from}\" does not exist");
+        };
+        let columns = match &v.kind {
+            ObjectKind::MaterializedView(d) => &d.columns,
+            ObjectKind::Table(t) => &t.columns,
+            _ => sql_bail!(codes::WRONG_OBJECT_TYPE, "sink source \"{from}\" must be a table or materialized view"),
+        };
+        let key = key.unwrap_or_default();
+        for (i, k) in key.iter().enumerate() {
+            let Some(c) = columns.iter().find(|c| &c.name == k) else {
+                sql_bail!(codes::UNDEFINED_COLUMN, "sink key column \"{k}\" does not exist in \"{from}\"");
+            };
+            if key[..i].contains(k) {
+                sql_bail!(codes::DUPLICATE_COLUMN, "column \"{k}\" appears twice in the sink key");
+            }
+            fn has_equality(t: &crate::types::SqlType) -> bool {
+                use crate::types::SqlType as T;
+                match t {
+                    T::Json | T::JsonPath => false,
+                    T::Array(e) => has_equality(e),
+                    _ => true,
+                }
+            }
+            if !has_equality(&c.ty.ty) {
+                sql_bail!(
+                    codes::FEATURE_NOT_SUPPORTED,
+                    "sink key column \"{k}\" has type {}, which cannot be part of a primary key",
+                    crate::types::format_type(&c.ty.ty, c.ty.typmod)
+                );
+            }
+        }
+        Ok(v)
     }
 
     /// Discovered tables a source does not replicate yet.

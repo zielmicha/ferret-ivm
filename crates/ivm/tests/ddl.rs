@@ -138,3 +138,23 @@ fn view_column_lists() {
     check(&e);
     e.shutdown();
 }
+
+/// CREATE SINK checks its KEY against the relation's columns: the sink
+/// thread creates the target table with the key as primary key, and used
+/// to retry an impossible definition forever.
+#[test]
+fn sink_keys_are_validated() {
+    let e = Engine::start("sink-keys");
+    e.exec("CREATE TABLE t (a int PRIMARY KEY, b text, j json)");
+    e.exec("CREATE VIEW v AS SELECT a FROM t");
+    let sink = |from: &str, key: &str| format!("CREATE SINK s FROM {from} INTO POSTGRES CONNECTION 'host=127.0.0.1 port=1' TABLE 'target' KEY ({key})");
+    assert_eq!(e.err(&sink("t", "a, nope")), err("42703", "sink key column \"nope\" does not exist in \"t\""));
+    assert_eq!(e.err(&sink("t", "b, a, b")), err("42701", "column \"b\" appears twice in the sink key"));
+    assert_eq!(e.err(&sink("t", "j")), err("0A000", "sink key column \"j\" has type json, which cannot be part of a primary key"));
+    assert_eq!(e.err(&sink("v", "a")), err("42809", "sink source \"v\" must be a table or materialized view"));
+    assert_eq!(e.err(&sink("nope", "a")), err("42P01", "relation \"nope\" does not exist"));
+    // rejected before anything was logged
+    assert_eq!(e.rows("SHOW SINKS"), Vec::<String>::new());
+    assert_eq!(e.rows("SELECT count(*) FROM ivm.catalog_history"), ["2"]);
+    e.shutdown();
+}
