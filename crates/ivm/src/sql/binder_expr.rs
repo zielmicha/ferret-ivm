@@ -550,10 +550,10 @@ impl<'a> Binder<'a> {
                 let ts = self.bind_expr(timestamp, ctx)?;
                 let tz = self.bind_expr(time_zone, ctx)?;
                 let (tst, tzt) = (self.ty_of(&ts, ctx), self.ty_of(&tz, ctx));
+                // a date resolves to the timestamptz variant (preferred type)
                 let ts_target = match tst {
                     SqlType::Timestamp | SqlType::TimestampTz => tst.clone(),
-                    SqlType::Date => SqlType::Timestamp,
-                    SqlType::Unknown => SqlType::TimestampTz,
+                    SqlType::Date | SqlType::Unknown => SqlType::TimestampTz,
                     other => sql_bail!(codes::DATATYPE_MISMATCH, "AT TIME ZONE requires a timestamp, got {other}"),
                 };
                 let ts = self.coerce(ts, &tst, &ts_target, CastContext::Implicit, "AT TIME ZONE")?;
@@ -1738,12 +1738,33 @@ impl<'a> Binder<'a> {
     ) -> Result<(TableFunc, Vec<Expr>, Vec<ColumnType>, Vec<String>)> {
         let (func, out, names): (TableFunc, Vec<ColumnType>, Vec<String>) = match (name, bound.len()) {
             ("generate_series", 2 | 3) => {
-                // the step's type follows from the bounds' (interval for timestamps)
-                let t = match common_type(&types[..2], "generate_series")? {
+                // the step's type follows from the bounds' (interval for
+                // timestamps); untyped bounds take the step's
+                let bounds = if types[0] == SqlType::Unknown && types[1] == SqlType::Unknown {
+                    match types.get(2) {
+                        Some(SqlType::Interval) => SqlType::TimestampTz,
+                        Some(t) if t.is_numeric_family() => t.clone(),
+                        _ => sql_bail!(
+                            codes::AMBIGUOUS_FUNCTION,
+                            "function generate_series({}) is not unique",
+                            types.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
+                        ),
+                    }
+                } else {
+                    common_type(&types[..2], "generate_series")?
+                };
+                // numeric bounds and step share one type
+                let bounds = match (&bounds, types.get(2)) {
+                    (b, Some(st)) if b.is_numeric_family() && st.is_numeric_family() => {
+                        common_type(&[bounds.clone(), st.clone()], "generate_series")?
+                    }
+                    _ => bounds,
+                };
+                let t = match bounds {
                     SqlType::Int2 | SqlType::Int4 => SqlType::Int4,
                     SqlType::Int8 => SqlType::Int8,
                     SqlType::Numeric => SqlType::Numeric,
-                    SqlType::Timestamp | SqlType::Unknown => SqlType::Timestamp,
+                    SqlType::Timestamp => SqlType::Timestamp,
                     // dates resolve to the timestamptz variant (preferred type)
                     SqlType::TimestampTz | SqlType::Date => SqlType::TimestampTz,
                     other => sql_bail!(codes::UNDEFINED_FUNCTION, "function generate_series({other}) does not exist"),

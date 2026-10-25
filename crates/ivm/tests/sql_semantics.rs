@@ -144,3 +144,27 @@ fn untyped_literals_in_query_outputs_resolve_to_text() {
     assert_eq!(rows(&h, "SELECT day FROM d"), vec!["2024-01-01"]);
     running.shutdown();
 }
+
+#[test]
+fn at_time_zone_and_generate_series_resolve_like_postgresql() {
+    let running = start("tz-series");
+    let h = running.handle.clone();
+    // a date converts to timestamptz (the preferred type), so the result is a
+    // timestamp in the given zone (it used to be treated as a timestamp)
+    let q = "SELECT date '2024-06-01' AT TIME ZONE 'Asia/Tokyo'";
+    assert_eq!(rows(&h, q), vec!["2024-06-01 09:00:00"]);
+    assert_eq!(column_types(&h, q), vec!["timestamp without time zone"]);
+    // untyped bounds take the step's type (used to fail: generate_series(text))
+    let q = "SELECT g FROM generate_series('2024-01-01', '2024-01-02', '1 day'::interval) g";
+    assert_eq!(rows(&h, q), vec!["2024-01-01 00:00:00+00", "2024-01-02 00:00:00+00"]);
+    assert_eq!(column_types(&h, q), vec!["timestamp with time zone"]);
+    assert_eq!(rows(&h, "SELECT g FROM generate_series('1', '2', 1) g"), vec!["1", "2"]);
+    let err = try_rows(&h, "SELECT g FROM generate_series('1', '2') g").unwrap_err();
+    assert!(err.contains("is not unique"), "{err}");
+    // numeric bounds and step share one type
+    let q = "SELECT g FROM generate_series(1, 2, 0.5) g";
+    assert_eq!(rows(&h, q), vec!["1", "1.5", "2.0"]);
+    assert_eq!(column_types(&h, q), vec!["numeric"]);
+    assert_eq!(column_types(&h, "SELECT * FROM generate_series(1, 3, 2::bigint)"), vec!["bigint"]);
+    running.shutdown();
+}
