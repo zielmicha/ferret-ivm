@@ -39,6 +39,13 @@ pub trait Summarizer: Send + Sync {
     fn spec(&self) -> &[AggKind];
     /// Fold one entry (its key bytes and current total weight) into `acc`.
     fn add_entry(&self, acc: &mut Summary, key: &[u8], weight: i64) -> Result<()>;
+    /// Fold several entries into `acc`.
+    fn add_entries(&self, acc: &mut Summary, entries: &mut dyn Iterator<Item = (&[u8], i64)>) -> Result<()> {
+        for (k, w) in entries {
+            self.add_entry(acc, k, w)?;
+        }
+        Ok(())
+    }
     /// Update `acc`, a summary covering the entry, for the entry's total
     /// weight changing from `before` to `after`. False when `acc` must be
     /// recomputed from the node's contents instead.
@@ -1083,15 +1090,12 @@ impl Env {
                     Bound::Included(k) => entries.partition_point(|e| &*e.key < k),
                     Bound::Excluded(k) => entries.partition_point(|e| &*e.key <= k),
                 };
-                for e in &entries[start..] {
-                    if !below_hi(&e.key, hi) {
-                        break;
-                    }
-                    if summ.spec().is_empty() {
-                        acc.count += e.hist.total();
-                    } else {
-                        summ.add_entry(acc, &e.key, e.hist.total())?;
-                    }
+                let end = start + entries[start..].partition_point(|e| below_hi(&e.key, hi));
+                let entries = &entries[start..end];
+                if summ.spec().is_empty() {
+                    acc.count += entries.iter().map(|e| e.hist.total()).sum::<i64>();
+                } else {
+                    summ.add_entries(acc, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
                 }
                 Ok(())
             }
@@ -1495,9 +1499,7 @@ fn leaf_summary(entries: &[LeafEntry], summ: &Arc<dyn Summarizer>) -> Result<Sum
     if summ.spec().is_empty() {
         s.count = entries.iter().map(|e| e.hist.total()).sum();
     } else {
-        for e in entries {
-            summ.add_entry(&mut s, &e.key, e.hist.total())?;
-        }
+        summ.add_entries(&mut s, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
     }
     Ok(s)
 }

@@ -191,6 +191,36 @@ pub(crate) fn decode_key(buf: &[u8]) -> Result<(Numeric, usize)> {
     Ok((v, pos))
 }
 
+/// Length of the key encoding at the start of `buf`, without decoding it.
+/// With `complemented`, every byte of the encoding is inverted (as for a
+/// descending key column).
+pub(crate) fn key_len(buf: &[u8], complemented: bool) -> Result<usize> {
+    let outer: u8 = if complemented { 0xFF } else { 0x00 };
+    let byte = |pos: usize| -> Result<u8> { Ok(*buf.get(pos).ok_or_else(|| key_error("truncated input"))? ^ outer) };
+    let mask: u8 = match byte(0)? {
+        TAG_NAN | TAG_PINF | TAG_NINF | TAG_ZERO => return Ok(1),
+        TAG_POS => 0x00,
+        TAG_NEG => 0xFF,
+        _ => return Err(key_error("bad tag")),
+    };
+    let b0 = byte(1)? ^ mask;
+    let mut pos = if b0 == 0xC0 || b0 == 0x3F {
+        5
+    } else if (0x40..=0xBF).contains(&b0) {
+        2
+    } else {
+        return Err(key_error("bad exponent"));
+    };
+    // digits end with the first even byte
+    loop {
+        let b = byte(pos)? ^ mask;
+        pos += 1;
+        if b & 1 == 0 {
+            return Ok(pos);
+        }
+    }
+}
+
 fn min_scale_of(v: &Numeric) -> i32 {
     // digits are stripped, so the last digit is nonzero
     let last = v.nd() - 1;
@@ -347,6 +377,32 @@ pub(crate) fn decode_binary(buf: &[u8]) -> Result<(Numeric, usize)> {
         return Err(bin_error("scale hides digits"));
     }
     Ok((v, pos))
+}
+
+/// Length of the compact value encoding at the start of `buf`, without
+/// decoding it.
+pub(crate) fn binary_len(buf: &[u8]) -> Result<usize> {
+    let h = *buf.first().ok_or_else(|| bin_error("empty input"))?;
+    if matches!(h, BIN_NAN | BIN_PINF | BIN_NINF) {
+        return Ok(1);
+    }
+    if h & 0x80 != 0 {
+        return Err(bin_error("bad header"));
+    }
+    let mut pos = 1;
+    let mut nd = (h & 0x3F) as u64;
+    if nd == 63 {
+        nd = get_varint(buf, &mut pos)?;
+    }
+    get_varint(buf, &mut pos)?; // dscale
+    if nd > 0 {
+        get_varint(buf, &mut pos)?; // weight
+    }
+    let end = (nd as usize).checked_mul(2).and_then(|n| n.checked_add(pos)).ok_or_else(|| bin_error("truncated input"))?;
+    if end > buf.len() {
+        return Err(bin_error("truncated input"));
+    }
+    Ok(end)
 }
 
 // ----------------------------------------------------------------------

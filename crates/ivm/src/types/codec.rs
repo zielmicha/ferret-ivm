@@ -241,6 +241,52 @@ pub fn decode_datum(buf: &mut &[u8]) -> Result<Datum> {
     })
 }
 
+fn skip_varint(buf: &mut &[u8]) -> Result<()> {
+    let n = buf.iter().position(|b| *b < 0x80).ok_or_else(|| SqlError::corrupt("truncated varint"))?;
+    *buf = &buf[n + 1..];
+    Ok(())
+}
+
+fn skip_n(buf: &mut &[u8], n: usize) -> Result<()> {
+    *buf = buf.get(n..).ok_or_else(|| SqlError::corrupt("truncated"))?;
+    Ok(())
+}
+
+/// Skip one value encoded by [`encode_datum`] without decoding it.
+pub fn skip_datum(buf: &mut &[u8]) -> Result<()> {
+    let tag = get_u8(buf)?;
+    match tag {
+        T_NULL | T_FALSE | T_TRUE => Ok(()),
+        T_INT2 | T_INT4 | T_INT8 | T_OID | T_DATE | T_TIME | T_TIMESTAMP | T_TIMESTAMPTZ => skip_varint(buf),
+        T_FLOAT4 => skip_n(buf, 4),
+        T_FLOAT8 => skip_n(buf, 8),
+        T_UUID => skip_n(buf, 16),
+        T_NUMERIC => {
+            let n = pgnumeric::Numeric::binary_len(buf)?;
+            skip_n(buf, n)
+        }
+        T_TEXT | T_JSON | T_BYTEA | T_JSONB => get_bytes(buf).map(|_| ()),
+        T_INTERVAL => {
+            skip_varint(buf)?;
+            skip_varint(buf)?;
+            skip_varint(buf)
+        }
+        T_ARRAY => {
+            decode_type(buf)?;
+            let ndims = get_uvarint(buf)?;
+            for _ in 0..2 * ndims {
+                skip_varint(buf)?;
+            }
+            let n = get_uvarint(buf)?;
+            for _ in 0..n {
+                skip_datum(buf)?;
+            }
+            Ok(())
+        }
+        _ => Err(SqlError::corrupt(format!("bad datum tag {tag}"))),
+    }
+}
+
 pub fn encode_row(row: &[Datum], out: &mut Vec<u8>) {
     put_uvarint(out, row.len() as u64);
     for d in row {
@@ -308,5 +354,20 @@ mod tests {
         let mut s = &b[..];
         let back = decode_row(&mut s).unwrap();
         assert_eq!(format!("{row:?}"), format!("{back:?}"));
+        // skipping consumes exactly what decoding does
+        let mut extra = row.clone();
+        extra.push(Datum::numeric("-12.340".parse().unwrap()));
+        extra.push(Datum::array(ArrayValue::new_1d(SqlType::Text, vec![Datum::text("x"), Datum::Null])));
+        extra.push(Datum::Oid(7));
+        extra.push(Datum::bytea(vec![1, 2, 3]));
+        for d in &extra {
+            let mut b = Vec::new();
+            encode_datum(d, &mut b);
+            let n = b.len();
+            b.push(0x7F);
+            let mut s = &b[..];
+            skip_datum(&mut s).unwrap();
+            assert_eq!(b.len() - s.len(), n, "{d:?}");
+        }
     }
 }
