@@ -16,8 +16,11 @@ EXPLAIN MAINTENANCE [ FOR ] [ MATERIALIZED ] [ VIEW ] name
 `query` is anything starting with `SELECT`, `WITH`, `VALUES` or `(`.
 `DATAFLOW` and `MAINTENANCE` need the name of a materialized view; for a
 [broken](operations.md#recovery) one they fail with SQLSTATE `55000`
-(`materialized view "v" is broken: <reason>`). `EXPLAIN` of DML or DDL is
-not supported (anything else after `EXPLAIN` is taken as a view name).
+(`materialized view "v" is broken: <reason>`). `EXPLAIN` of DML or DDL,
+and `EXPLAIN` options (`ANALYZE`, `VERBOSE`, ...), are not supported:
+`EXPLAIN INSERT is not supported: EXPLAIN takes a query (SELECT, WITH,
+VALUES) or the name of a view` (SQLSTATE `0A000`). A single name after
+`EXPLAIN` is a view name.
 
 ### EXPLAIN [PLAN]: the logical plan
 

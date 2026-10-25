@@ -602,6 +602,14 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
             t2.eat("materialized");
             t2.eat("view");
             let name = t2.ident()?;
+            if !t2.at_end() {
+                // not a name: EXPLAIN of DML or DDL, or with options
+                let word = rl.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or_default().to_uppercase();
+                sql_bail!(
+                    codes::FEATURE_NOT_SUPPORTED,
+                    "EXPLAIN {word} is not supported: EXPLAIN takes a query (SELECT, WITH, VALUES) or the name of a view"
+                );
+            }
             return Ok(Statement::Explain { kind, target: ExplainTarget::Name(name) });
         }
         "checkpoint" => return Ok(Statement::Checkpoint),
@@ -862,6 +870,26 @@ fn parse_show(t: &mut Toks) -> Result<Option<ShowKind>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EXPLAIN of anything but a query or a view name fails as such: the
+    /// first word used to be taken as a view name (`EXPLAIN INSERT ...`:
+    /// relation "insert" does not exist).
+    #[test]
+    fn explain_targets() {
+        for sql in ["EXPLAIN INSERT INTO t VALUES (1)", "EXPLAIN ANALYZE SELECT 1", "EXPLAIN DATAFLOW DELETE FROM t", "explain update t set a = 1"] {
+            let e = parse_statement(sql).map(|_| ()).unwrap_err();
+            assert_eq!(e.code, codes::FEATURE_NOT_SUPPORTED, "{sql}: {}", e.message);
+            let word = sql.split_whitespace().find(|w| !["explain", "dataflow"].contains(&w.to_lowercase().as_str())).unwrap().to_uppercase();
+            assert!(e.message.starts_with(&format!("EXPLAIN {word} is not supported")), "{sql}: {}", e.message);
+        }
+        for (sql, name) in [("EXPLAIN v", "v"), ("EXPLAIN MATERIALIZED VIEW \"V w\"", "V w"), ("EXPLAIN MAINTENANCE FOR m", "m")] {
+            match parse_statement(sql).unwrap() {
+                Statement::Explain { target: ExplainTarget::Name(n), .. } => assert_eq!(n, name, "{sql}"),
+                other => panic!("{sql}: {other:?}"),
+            }
+        }
+        assert!(matches!(parse_statement("EXPLAIN SELECT 1").unwrap(), Statement::Explain { target: ExplainTarget::Query(_), .. }));
+    }
 
     #[test]
     fn split() {
