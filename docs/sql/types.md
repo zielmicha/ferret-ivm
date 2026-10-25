@@ -35,7 +35,8 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 | arrays | `type[]`, `type[n]` | | of every type above; multi-dimensional (up to 6), with lower bounds |
 
 Type modifiers (`numeric(10,2)`, `varchar(20)`, `timestamp(3)`,
-`interval(2)`, `interval day to second`) are kept on columns and applied on
+`interval(2)`, `interval day to second`) are kept on columns (and shown by
+`format_type`, `SHOW COLUMNS` and psql's `\d` as in PostgreSQL) and applied on
 input and on casts, including interval field restrictions (`INTERVAL '1 day
 2 hours' DAY` and `'1 day 2 hours'::interval day` are `1 day`). The modifier
 of an array type applies to every element (`'{abc}'::varchar(2)[]` is

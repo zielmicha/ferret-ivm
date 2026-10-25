@@ -587,6 +587,39 @@ fn object_aggregates_reject_null_keys_as_postgresql() {
     running.shutdown();
 }
 
+/// Interval type modifiers show as in PostgreSQL: format_type (psql's \d,
+/// SHOW COLUMNS) used to print every interval column as `interval`, and
+/// information_schema reported the raw modifier as its precision.
+#[test]
+fn interval_type_modifiers_are_shown() {
+    let running = start("interval-typmods");
+    let h = running.handle.clone();
+    exec(
+        &h,
+        "CREATE TABLE it (a interval(3), b interval day, c interval day to second(2), d interval, \
+         e interval year to month, f interval second(1), g interval minute to second)",
+    );
+    // (checked against PostgreSQL 17)
+    assert_eq!(
+        rows(&h, "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'it'::regclass AND attnum > 0 ORDER BY attnum"),
+        vec![
+            "a|2147418115|interval(3)",
+            "b|589823|interval day",
+            "c|470286338|interval day to second(2)",
+            "d|-1|interval",
+            "e|458751|interval year to month",
+            "f|268435457|interval second(1)",
+            "g|402718719|interval minute to second",
+        ]
+    );
+    assert_eq!(
+        rows(&h, "SELECT column_name, datetime_precision, interval_type, interval_precision FROM information_schema.columns WHERE table_name = 'it' ORDER BY ordinal_position"),
+        vec!["a|3||", "b|6|DAY|", "c|2|DAY TO SECOND(2)|", "d|6||", "e|6|YEAR TO MONTH|", "f|1|SECOND(1)|", "g|6|MINUTE TO SECOND|"]
+    );
+    assert_eq!(rows(&h, "SHOW COLUMNS FROM it")[2], "c|interval day to second(2)|true|false");
+    running.shutdown();
+}
+
 #[test]
 fn current_setting_reports_server_settings() {
     let running = start("current-setting");

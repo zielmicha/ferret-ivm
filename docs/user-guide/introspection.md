@@ -199,7 +199,7 @@ object appears in schema `public`, owned by role `ivm`, in database `ivm`.
 | `information_schema.schemata` | `pg_catalog`, `public`, `information_schema` |
 | `information_schema.tables` | tables (`BASE TABLE`), views and materialized views (`VIEW`) |
 | `information_schema.views` | views and materialized views |
-| `information_schema.columns` | columns with types, precision, nullability |
+| `information_schema.columns` | columns with types, precision (also `interval_type` and the precision of `interval` columns), nullability |
 
 Only the listed columns exist; a query that selects another column of these
 relations fails with `column ... does not exist`. Other catalog relations

@@ -330,6 +330,41 @@ pub mod typmod {
     pub fn varchar_len(typmod: i32) -> Option<i32> {
         if typmod < VARHDRSZ { None } else { Some(typmod - VARHDRSZ) }
     }
+    /// The fields of an interval typmod as PostgreSQL's intervaltypmodout
+    /// writes them ("day to second"; None for all fields or no typmod).
+    pub fn interval_fields(typmod: i32) -> Option<&'static str> {
+        if typmod < 0 {
+            return None;
+        }
+        // field bits as in PostgreSQL's datetime.h
+        const MONTH: i32 = 1 << 1;
+        const YEAR: i32 = 1 << 2;
+        const DAY: i32 = 1 << 3;
+        const HOUR: i32 = 1 << 10;
+        const MINUTE: i32 = 1 << 11;
+        const SECOND: i32 = 1 << 12;
+        Some(match (typmod >> 16) & 0x7FFF {
+            YEAR => "year",
+            MONTH => "month",
+            DAY => "day",
+            HOUR => "hour",
+            MINUTE => "minute",
+            SECOND => "second",
+            r if r == YEAR | MONTH => "year to month",
+            r if r == DAY | HOUR => "day to hour",
+            r if r == DAY | HOUR | MINUTE => "day to minute",
+            r if r == DAY | HOUR | MINUTE | SECOND => "day to second",
+            r if r == HOUR | MINUTE => "hour to minute",
+            r if r == HOUR | MINUTE | SECOND => "hour to second",
+            r if r == MINUTE | SECOND => "minute to second",
+            _ => return None,
+        })
+    }
+    /// The fractional-second precision of an interval typmod (None: the
+    /// default).
+    pub fn interval_precision(typmod: i32) -> Option<i32> {
+        (typmod >= 0 && typmod & 0xFFFF != 0xFFFF).then_some(typmod & 0xFFFF)
+    }
 }
 
 /// Render a type with its modifier the way format_type() does.
@@ -358,6 +393,17 @@ pub fn format_type(ty: &SqlType, typmod: i32) -> String {
                 _ => " without time zone",
             };
             format!("{base}({typmod}){suffix}")
+        }
+        SqlType::Interval if typmod >= 0 => {
+            let mut s = String::from("interval");
+            if let Some(f) = typmod::interval_fields(typmod) {
+                s.push(' ');
+                s.push_str(f);
+            }
+            if let Some(p) = typmod::interval_precision(typmod) {
+                s.push_str(&format!("({p})"));
+            }
+            s
         }
         SqlType::Array(e) if typmod >= 0 => format!("{}[]", format_type(e, typmod)),
         _ => ty.name(),
