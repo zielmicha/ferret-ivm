@@ -27,25 +27,21 @@ impl Expr {
                         }
                         f(&a)
                     }
+                    // all arguments are evaluated before the strictness
+                    // check, as in PostgreSQL: their errors are raised even
+                    // when another argument is NULL
                     Imp::F2(f) => {
                         let a = c.args[0].eval(row)?;
-                        if def.strict && a.is_null() {
-                            return Ok(Datum::Null);
-                        }
                         let b = c.args[1].eval(row)?;
-                        if def.strict && b.is_null() {
+                        if def.strict && (a.is_null() || b.is_null()) {
                             return Ok(Datum::Null);
                         }
                         f(&a, &b)
                     }
                     Imp::FN(f) => {
-                        let mut args = Vec::with_capacity(c.args.len());
-                        for a in &c.args {
-                            let v = a.eval(row)?;
-                            if def.strict && v.is_null() {
-                                return Ok(Datum::Null);
-                            }
-                            args.push(v);
+                        let args = c.args.iter().map(|a| a.eval(row)).collect::<Result<Vec<_>>>()?;
+                        if def.strict && args.iter().any(|v| v.is_null()) {
+                            return Ok(Datum::Null);
                         }
                         f(&args)
                     }

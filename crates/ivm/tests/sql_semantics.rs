@@ -847,3 +847,22 @@ fn strict_calls_with_null_constants_fold_to_null() {
     assert!(try_rows(&h, "SELECT count(*) FROM t1 WHERE a + NULL::int > 1/0").unwrap_err().contains("division by zero"));
     running.shutdown();
 }
+
+#[test]
+fn strict_calls_evaluate_every_argument() {
+    let running = start("strict-args");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // PostgreSQL evaluates all arguments before the strictness check, so an
+    // argument's error is raised even when an earlier argument is NULL
+    for (q, msg) in [
+        ("SELECT a + 1/(id - id) FROM t1 WHERE a IS NULL", "division by zero"),
+        ("SELECT s < format('%I', s) FROM t1 WHERE s IS NULL", "null values cannot be formatted as an SQL identifier"),
+        ("SELECT lpad(s, 1/(id - id), 'x') FROM t1 WHERE s IS NULL", "division by zero"),
+    ] {
+        let err = try_rows(&h, q).unwrap_err();
+        assert!(err.contains(msg), "{q}: {err}");
+    }
+    assert_eq!(rows(&h, "SELECT a + b, lpad(s, a, '*') FROM t1 WHERE id IN (2, 3) ORDER BY id"), vec!["|*b", "|"]);
+    running.shutdown();
+}
