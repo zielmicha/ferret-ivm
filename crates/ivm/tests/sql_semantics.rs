@@ -14,9 +14,25 @@ fn tmpdir(name: &str) -> PathBuf {
     d
 }
 
-fn start(name: &str) -> coord::Running {
-    let cfg = coord::Config { data_dir: tmpdir(name), sync: false, tick: None, ..Default::default() };
-    coord::start(cfg).expect("engine starts")
+/// A running engine whose data directory is removed at shutdown.
+struct Running {
+    handle: EngineHandle,
+    engine: coord::Running,
+    dir: PathBuf,
+}
+
+impl Running {
+    fn shutdown(self) {
+        self.engine.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn start(name: &str) -> Running {
+    let dir = tmpdir(name);
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    let engine = coord::start(cfg).expect("engine starts");
+    Running { handle: engine.handle.clone(), engine, dir }
 }
 
 fn try_exec(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {

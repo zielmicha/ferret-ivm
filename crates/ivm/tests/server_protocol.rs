@@ -14,17 +14,31 @@ fn tmpdir(name: &str) -> PathBuf {
     d
 }
 
+/// A running engine whose data directory is removed at shutdown.
+struct Running {
+    engine: coord::Running,
+    dir: PathBuf,
+}
+
+impl Running {
+    fn shutdown(self) {
+        self.engine.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Start an engine and a server on an ephemeral port.
-fn start(name: &str) -> (coord::Running, u16) {
-    let cfg = coord::Config { data_dir: tmpdir(name), sync: false, tick: None, ..Default::default() };
-    let running = coord::start(cfg).expect("engine starts");
+fn start(name: &str) -> (Running, u16) {
+    let dir = tmpdir(name);
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    let engine = coord::start(cfg).expect("engine starts");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let h = running.handle.clone();
+    let h = engine.handle.clone();
     std::thread::spawn(move || {
         let _ = server::serve_listener(listener, ServerConfig { listen: String::new(), password: None }, h);
     });
-    (running, port)
+    (Running { engine, dir }, port)
 }
 
 struct Conn {
