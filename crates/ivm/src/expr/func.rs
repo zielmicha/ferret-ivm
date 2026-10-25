@@ -279,6 +279,9 @@ fn try_match(def: &FuncDef, args: &[SqlType]) -> Option<(i32, Vec<SqlType>, SqlT
     Some((cost, types, ret))
 }
 
+/// A matching overload: (cost, tie-breakers, function, argument types, result type).
+type Candidate = (i32, (i32, i32), FuncId, Vec<SqlType>, SqlType);
+
 /// Resolve a function or operator call by name and argument types.
 pub fn resolve(name: &str, args: &[SqlType]) -> Result<Resolved> {
     let reg = registry();
@@ -303,7 +306,7 @@ pub fn resolve(name: &str, args: &[SqlType]) -> Result<Resolved> {
             }
         }
     }
-    let mut best: Option<(i32, (i32, i32), FuncId, Vec<SqlType>, SqlType)> = None;
+    let mut best: Option<Candidate> = None;
     for c in cands {
         let def = &reg.funcs[c.0 as usize];
         if let Some((cost, types, ret)) = try_match(def, args) {
