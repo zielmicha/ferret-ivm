@@ -465,6 +465,13 @@ fn quote_literal(a: &Datum) -> Result<Datum> {
 fn quote_nullable(args: &[Datum]) -> Result<Datum> {
     Ok(if args[0].is_null() { txt("NULL".into()) } else { txt(pgfuncs::text::quote_literal(&as_text(&args[0]))) })
 }
+/// quote_literal(character(n)) quotes $1::text, which drops the padding.
+fn quote_literal_bpchar(a: &Datum) -> Result<Datum> {
+    Ok(txt(pgfuncs::text::quote_literal(s(a).trim_end_matches(' '))))
+}
+fn quote_nullable_bpchar(args: &[Datum]) -> Result<Datum> {
+    if args[0].is_null() { Ok(txt("NULL".into())) } else { quote_literal_bpchar(&args[0]) }
+}
 fn to_hex(a: &Datum) -> Result<Datum> {
     Ok(txt(match a {
         Datum::Int4(v) => pgfuncs::text::to_hex32(*v),
@@ -1476,6 +1483,8 @@ pub fn register(b: &mut Builder) {
     b.f1("quote_literal", T::Text, T::Text, quote_literal);
     b.poly("quote_literal", vec![P::AnyElement], Ret::T(T::Text), Imp::F1(quote_literal));
     b.poly("quote_nullable", vec![P::AnyElement], Ret::T(T::Text), Imp::FN(quote_nullable)).strict = false;
+    b.f1("quote_literal", T::Bpchar, T::Text, quote_literal_bpchar);
+    b.poly("quote_nullable", vec![P::T(T::Bpchar)], Ret::T(T::Text), Imp::FN(quote_nullable_bpchar)).strict = false;
     b.f1("to_hex", T::Int4, T::Text, to_hex);
     b.f1("to_hex", T::Int8, T::Text, to_hex);
     {

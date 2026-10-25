@@ -783,3 +783,16 @@ fn unknown_literal_arguments_prefer_preferred_types() {
     assert_eq!(rows(&h, "SELECT round('2.5'), pg_typeof(sign('-2')), pg_typeof(abs(1::int2))"), vec!["2|double precision|smallint"]);
     running.shutdown();
 }
+
+#[test]
+fn quote_literal_of_character_drops_padding() {
+    let running = start("quote-bpchar");
+    let h = running.handle.clone();
+    // PostgreSQL quotes $1::text, which strips character(n) padding
+    assert_eq!(
+        rows(&h, "SELECT quote_literal('ab'::char(4)), quote_nullable('ab'::char(4)), quote_nullable(NULL::char(2)), \
+                  quote_literal('  '::char(3)), quote_literal(d) FROM (VALUES ('x'::char(3))) v(d)"),
+        vec!["'ab'|'ab'|NULL|''|'x'"]
+    );
+    running.shutdown();
+}
