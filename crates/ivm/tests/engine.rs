@@ -397,6 +397,31 @@ fn lateral_functions_with_ordinality() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A predicate on a derived table's columns stayed above the projection
+/// computing them, so every column was computed for rows the predicate
+/// then dropped: an expression failing on such a row failed the query (and
+/// the view), where PostgreSQL pushes the predicate into the subquery and
+/// never evaluates the column for it.
+#[test]
+fn predicates_on_derived_columns_filter_before_other_columns() {
+    let dir = tmpdir("pushdown");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, c0 int[], c1 float8, c2 int)");
+    // || fails for the two-dimensional arrays, which the predicates drop
+    exec(&h, "INSERT INTO t VALUES (1, '{{1,2},{3,4}}', 0, NULL), (2, '{5}', 0, 7), (3, '{{6}}', 100, 9), (4, '{8}', 1, 3)");
+    let q1 = "SELECT d.*, 1 AS one FROM (SELECT a0.c2 AS x0, array_ndims(a0.c0) AS x1, (a0.c0 || ARRAY[9]) AS x2 FROM t a0 \
+              WHERE a0.c1 IN (0::float8, 100::float8)) d WHERE d.x0 IS NOT NULL AND d.x1 = 1";
+    let q2 = "SELECT * FROM (SELECT id + 1 AS x, c0 || ARRAY[9] AS y FROM t) d WHERE d.x IN (3, 5)";
+    for (i, (q, want)) in [(q1, vec!["7|1|{5,9}|1"]), (q2, vec!["3|{5,9}", "5|{8,9}"])].into_iter().enumerate() {
+        assert_eq!(rows(&h, &format!("{q} ORDER BY 1")), want, "{q}");
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+        assert_eq!(rows(&h, &format!("SELECT * FROM v{i} ORDER BY 1")), want, "view {q}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Ad hoc execution deduplicated a group's rows for a DISTINCT ordered
 /// aggregate in place, so ordered aggregates after it saw only the distinct
 /// rows (here mode() saw x = 17 alone). Expected values are PostgreSQL's.
