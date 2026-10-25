@@ -59,7 +59,7 @@ Where the implementation differs from the design:
 | `ivm-session-<n>` (one per client) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
-| stop-file watcher | | polls for `.ivm-stop` every 500 ms |
+| stop-file watcher | | polls for `.ivm-stop` every 500 ms; when it appears, requests a shutdown and exits the process at once, without waiting for the final checkpoint |
 | slot-drop helpers | | short-lived; drop a replication slot after `DROP SOURCE` |
 
 There is exactly one engine thread: all dataflow maintenance, all index
@@ -137,12 +137,16 @@ a time; others queue in the engine (`dml_queue`) and run in order.
 
 The session first does whatever needs the network (for `CREATE SOURCE` and
 `ALTER SOURCE ... REFRESH`, discovering the upstream tables) and sends the
-statement with the result (`extra`, JSON) to the engine. The engine
-validates the statement against the current catalog (planning views as a dry
-run, so errors are reported before anything is logged), submits a
-`Ddl { req, sql, extra }` record, and applies it when it comes back durable;
-the reply is sent then. Replay applies the same record with the same `extra`,
-never contacting the upstream.
+statement with the result (`extra`, JSON) to the engine. For `CREATE TABLE`,
+`CREATE [MATERIALIZED] VIEW`, `CREATE SOURCE` and `ALTER SOURCE` the engine
+first validates the statement against the current catalog (for views: binding,
+planning and the determinism check, as a dry run — not lowering or
+hydration). It then submits a `Ddl { req, sql, extra }` record and applies it
+when it comes back durable; the reply is sent then. Errors found only while
+applying (in lowering, hydration, or for statements without a dry run) leave
+the failed record in the log; it fails again on replay, where the failure is
+only logged. Replay applies the same record with the same `extra`, never
+contacting the upstream.
 
 ### Clock ticks
 
@@ -175,12 +179,12 @@ handles:
 
 | Message | Action |
 |---|---|
-| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads |
+| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread, any other error leaves the record half-applied without advancing `processed` or replying to the client |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
 | `Wake` | a source frontier moved: re-check reads waiting for an LSN |
-| `Shutdown` | stop sources and sinks, stop the sequencer, take a final checkpoint, exit |
+| `Shutdown` | stop sources and sinks, stop the sequencer, take a final checkpoint, exit (the stop-file path exits the process before this completes) |
 
 After every message it runs deferred requests (queued DML, woken reads),
 takes a checkpoint if one is due, and removes cancelled subscriptions.
@@ -197,7 +201,7 @@ takes a checkpoint if one is due, and removes cancelled subscriptions.
 
 Records at or below the last applied GSN are ignored, which makes replay
 idempotent. After each record the retention frontier is moved to
-`processed − retention`.
+`processed − max(retention, 1)` (recovery sets it to `processed − retention`).
 
 ## The GSN clock and frontiers
 

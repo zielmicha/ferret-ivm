@@ -42,7 +42,10 @@ implementation checkpoints everything together).
    tables (`table_rt`), materialized views (planned and lowered again from
    their SQL text), indexes. Every arrangement the planner asks for looks up
    its fingerprint in the recovered map (see below); found trees are attached
-   and count as hydrated.
+   and count as hydrated. Because `CREATE OR REPLACE` keeps the object's id,
+   a view replaced to read a relation created after it is rebuilt before
+   that relation exists, and recovery fails (`relation "b" has no dataflow`;
+   a known problem).
 6. **Hydrate** everything that was not matched, from the recovered state at
    the checkpoint GSN (`Graph::hydrate`), then **drop** recovered trees that
    nothing attached (arrangements that no longer exist) and set the retention
@@ -50,7 +53,8 @@ implementation checkpoints everything together).
 7. **Replay** every log record after the checkpoint GSN through
    `apply_record`, with `replaying = true`: DDL is re-applied from its logged
    text and `extra`, no source or sink is started, no slot is dropped, and
-   nobody is waiting for replies.
+   nobody is waiting for replies. A DDL record that fails is only logged, but
+   any other record that fails to apply stops the start-up with its error.
 8. **Start** the sources (with their logged state and resume LSN), the sinks
    (each takes a snapshot and resynchronises, see
    [Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)), the
@@ -180,7 +184,7 @@ For every streamed change of key `k` in table `T` (`snapshot_filter`):
 | otherwise (`k` beyond everything copied so far) | skip: a later chunk will read the row's current value |
 | `TRUNCATE` | apply always, and clear the chunk's rows of that table |
 
-Why this yields a consistent copy: the chunk's snapshot is taken after the
+Why this yields a consistent copy (with one exception, below): the chunk's snapshot is taken after the
 low watermark committed, so every transaction that commits after the high
 watermark is newer than the chunk and is applied by the stream (its key is
 now at or below the boundary). Transactions between the watermarks are
@@ -193,6 +197,13 @@ touched until a later chunk copies them, with a later snapshot. Each chunk's
 rows and the boundary move are logged in the same commit, so the engine's
 copy is always a prefix of the key space that agrees with the upstream as of
 the GSN.
+
+The exception, found by reading the code (not reproduced): a `TRUNCATE` that
+committed before the low watermark but is processed while the chunk is in
+flight clears the chunk's rows, although the chunk's snapshot already
+reflects the truncation. Rows inserted after the `TRUNCATE` and visible in
+the snapshot are then skipped by the stream (phase *before-low*, visible)
+and missing from the chunk, so they are never copied.
 
 The 32-bit transaction ids of the stream are compared with the 64-bit
 snapshot by choosing the epoch closest to the snapshot (`xid_visible`).

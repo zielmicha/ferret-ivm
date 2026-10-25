@@ -239,7 +239,9 @@ Joins that the lowering produces from other constructs:
 - **Semijoin** (`EXISTS`, `IN`): `l` delta-joined with a presence input over
   the distinct key values of `r`. If the condition is not a conjunction of
   equalities between the two sides, the matching left rows are computed by
-  a full inner join, projected to the left columns, and made distinct.
+  a full inner join, projected to the left columns, and made distinct; `l`
+  is then joined back to them on all its columns (`IS NOT DISTINCT FROM`),
+  which keeps `l`'s duplicate rows.
 - **Antijoin** (`NOT EXISTS`, `NOT IN`): `Union(l, −semijoin(l, r))`.
 - **Outer joins**: `Union(inner join, antijoin padded with NULLs)` (one or
   two antijoins for `FULL`).
@@ -306,11 +308,12 @@ order.
 
 ### SetOp
 
-`UNION`, `INTERSECT` and `EXCEPT` (with or without `ALL`) arrange both
-inputs by all columns. For each changed value, the weights on both sides
-before and after the GSN give the output multiplicities (for example
-`EXCEPT ALL`: `max(a − max(b, 0), 0)`), and the difference is emitted with a
-representative row. (`UNION` without `ALL` is lowered as `Distinct(Union)`.)
+`INTERSECT` and `EXCEPT` (with or without `ALL`) arrange both inputs by all
+columns. For each changed value, the weights on both sides before and after
+the GSN give the output multiplicities (for example `EXCEPT ALL`:
+`max(a − max(b, 0), 0)`), and the difference is emitted with a
+representative row. (`UNION ALL` is a plain `Union`, and `UNION` is lowered
+as `Distinct(Union)`.)
 
 ### TopK
 
@@ -367,8 +370,11 @@ state, never from the sources**:
    computed from the inputs' snapshots: a table from its primary index, an
    `Mfp` by evaluating its input's snapshot, a join by driving one path, a
    `Reduce` group by group from its input index, and so on.
-3. Error records found in snapshots are returned to the caller (the new
-   view's initial error counts).
+3. Error records found in snapshots are returned to the caller; the root
+   node's become the new view's initial error counts. A snapshot read from an
+   existing arrangement carries no error records, so errors of rows below any
+   arrangement inside the plan (or of a shared node that already existed)
+   are not counted at creation (a known problem).
 4. Snapshots are cached only while a node still to be hydrated will read
    them, so large intermediate results are freed early.
 
@@ -388,3 +394,10 @@ keeps, for each materialized view, a map from (SQLSTATE, message) to count,
 updated from the root node's output at every step and saved in checkpoints;
 reads fail while any count is positive
 ([Errors as data](../user-guide/temporal-filters-and-errors.md#errors-as-data)).
+Counts can become negative (a retraction of an error that was never counted)
+and then mask later errors.
+
+Errors raised inside `WITH RECURSIVE` evaluation, and errors computing an
+arrangement's key expression (`Layout` key expressions such as `a.x + 1`),
+do not become error records: they abort `Graph::step`, and the record is left
+half-applied.

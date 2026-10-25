@@ -165,7 +165,10 @@ only.
 
 ### Exact sums
 
-- `SumInt` accumulates in `i128`.
+- `SumInt` accumulates in `i128`, without overflow checks: sums of squares
+  of large `bigint` values (each square can approach 2^126) overflow — a
+  panic in debug builds, a wrapped, wrong result in release builds (a known
+  problem).
 - `NumSum` (numeric) keeps the finite sum as a `Numeric`, the weighted
   counts of NaN, +Infinity and -Infinity terms apart (as PostgreSQL's
   aggregate state does), and a multiset of the finite terms' display scales.
@@ -229,5 +232,6 @@ dirty, so that the next checkpoint rewrites them into the active segment.
 Once a segment has no live bytes it is deleted at the end of a checkpoint.
 The active segment itself is never a victim.
 
-Dropping a tree (`drop_tree`) releases all of its nodes, reading internal
-nodes from disk where necessary to find their children.
+Dropping a tree (`drop_tree`) releases all of its nodes; it reads and
+decodes every node that is not in memory, leaves included, so dropping a
+large tree that is mostly on disk reads all of it.

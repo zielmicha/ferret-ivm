@@ -141,7 +141,10 @@ If an outer reference survives, the query fails with
 1. **Constant folding** of every expression.
 2. **Predicate push-down** (`push`): filter conjuncts move below `Map`,
    `Project`, `Distinct`, `UnionAll`, `SetOp`, `Negate`, below `Aggregate` if
-   they only use group columns, below `TopK` if they only use the group
+   they only use group columns (a conjunct that uses no columns at all also
+   qualifies, which is wrong for an aggregate without `GROUP BY`:
+   `SELECT count(*) FROM t HAVING false` returns one row with 0 instead of
+   none — a known problem), below `TopK` if they only use the group
    columns, below `Window` if they only use columns that partition every
    window function, and into join inputs. For joins, a predicate over one
    side moves into that side (respecting outer-join semantics), and outer
