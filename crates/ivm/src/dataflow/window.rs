@@ -170,10 +170,11 @@ fn frame_bounds(rs: &[&Row], f: &WinSpec, p: &Peers, i: usize) -> (usize, usize)
         (_, FrameBound::UnboundedPreceding) => 0,
         (FrameUnits::Rows, FrameBound::Preceding(k)) => i.saturating_sub(k as usize),
         (FrameUnits::Rows, FrameBound::CurrentRow) => i,
-        (FrameUnits::Rows, FrameBound::Following(k)) => i + k as usize,
-        (FrameUnits::Groups, FrameBound::Preceding(k)) => gstart[(g as i64 - k).max(0) as usize],
+        // a start past the partition is an empty frame at its end
+        (FrameUnits::Rows, FrameBound::Following(k)) => (i as i64).saturating_add(k).min(n as i64) as usize,
+        (FrameUnits::Groups, FrameBound::Preceding(k)) => gstart[(g as i64).saturating_sub(k).max(0) as usize],
         (FrameUnits::Groups, FrameBound::Following(k)) => {
-            let gg = g as i64 + k;
+            let gg = (g as i64).saturating_add(k);
             if gg >= ng { n } else { gstart[gg as usize] }
         }
         (_, FrameBound::CurrentRow) => gstart[g],
@@ -186,12 +187,12 @@ fn frame_bounds(rs: &[&Row], f: &WinSpec, p: &Peers, i: usize) -> (usize, usize)
             range_bound(rs, ro, p, i, ro.end.as_ref().unwrap(), matches!(f.end, FrameBound::Preceding(_)), false)
         }
         (_, FrameBound::UnboundedFollowing) => n as i64 - 1,
-        (FrameUnits::Rows, FrameBound::Following(k)) => (i as i64 + k).min(n as i64 - 1),
+        (FrameUnits::Rows, FrameBound::Following(k)) => (i as i64).saturating_add(k).min(n as i64 - 1),
         (FrameUnits::Rows, FrameBound::CurrentRow) => i as i64,
-        (FrameUnits::Rows, FrameBound::Preceding(k)) => i as i64 - k,
-        (FrameUnits::Groups, FrameBound::Following(k)) => gend[((g as i64 + k).min(ng - 1)) as usize] as i64,
+        (FrameUnits::Rows, FrameBound::Preceding(k)) => (i as i64).saturating_sub(k),
+        (FrameUnits::Groups, FrameBound::Following(k)) => gend[((g as i64).saturating_add(k).min(ng - 1)) as usize] as i64,
         (FrameUnits::Groups, FrameBound::Preceding(k)) => {
-            let gg = g as i64 - k;
+            let gg = (g as i64).saturating_sub(k);
             if gg < 0 { -1 } else { gend[gg as usize] as i64 }
         }
         (_, FrameBound::CurrentRow) => gend[g] as i64,
