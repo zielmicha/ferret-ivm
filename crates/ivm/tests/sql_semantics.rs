@@ -589,3 +589,15 @@ fn long_operator_chains_do_not_crash_the_engine() {
     assert_eq!(rows(&h, "SELECT 1"), vec!["1"]);
     running.shutdown();
 }
+
+#[test]
+fn offset_with_fetch() {
+    let running = start("offset-fetch");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // the SQL standard form used to fail: cannot use both LIMIT and FETCH
+    assert_eq!(rows(&h, "SELECT id FROM t1 ORDER BY id OFFSET 1 ROW FETCH NEXT 2 ROWS ONLY"), vec!["2", "3"]);
+    assert_eq!(rows(&h, "SELECT id FROM t1 ORDER BY a OFFSET 1 ROWS FETCH FIRST 1 ROW WITH TIES"), vec!["2", "4"]);
+    assert!(try_rows(&h, "SELECT id FROM t1 LIMIT 1 FETCH FIRST 1 ROW ONLY").is_err());
+    running.shutdown();
+}

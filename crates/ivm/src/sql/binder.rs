@@ -208,7 +208,12 @@ impl<'a> Binder<'a> {
     // ------------------------------------------------------------------ queries
 
     pub fn bind_query(&mut self, q: &ast::Query) -> Result<BoundQuery> {
-        if q.fetch.is_some() && q.limit_clause.is_some() {
+        // (OFFSET alone is kept in the limit clause too: OFFSET n FETCH ...)
+        let has_limit = matches!(
+            &q.limit_clause,
+            Some(ast::LimitClause::LimitOffset { limit: Some(_), .. } | ast::LimitClause::OffsetCommaLimit { .. })
+        );
+        if q.fetch.is_some() && has_limit {
             sql_bail!(codes::SYNTAX_ERROR, "cannot use both LIMIT and FETCH");
         }
         if !q.locks.is_empty() {
