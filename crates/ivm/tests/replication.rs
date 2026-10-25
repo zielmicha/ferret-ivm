@@ -325,3 +325,34 @@ fn keyless_tables_truncate_and_resnapshot() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A TRUNCATE committed before a snapshot chunk was read, but replicated
+/// after the chunk started, cleared the chunk: its rows were those added
+/// after the truncate, whose own changes the source skips as the chunk has
+/// them, so they were lost. (Here the chunk is a re-snapshot after a schema
+/// change; it reads the table after both transactions, which the engine,
+/// stopped, replicates only afterwards.)
+#[test]
+fn snapshots_keep_rows_added_after_a_truncate() {
+    let pg = TempCluster::start(ClusterOptions::default()).expect("start postgres");
+    let conninfo = pg.conninfo("postgres");
+    let mut up = connect(&conninfo);
+    up.simple_query(
+        "CREATE TABLE t (id int PRIMARY KEY, n int);
+         INSERT INTO t SELECT g, g FROM generate_series(1, 6) g;
+         CREATE PUBLICATION p FOR TABLE t;",
+    )
+    .unwrap();
+    let dir = scratch("snapshot-truncate");
+    let running = coord::start(config(&dir)).unwrap();
+    create_source(&running.handle, &conninfo);
+    assert_caught_up(&running.handle, &mut up, &["SELECT count(*) FROM t"]);
+    running.shutdown();
+    up.simple_query("ALTER TABLE t ADD COLUMN x int DEFAULT 7; UPDATE t SET n = -1 WHERE id = 1;").unwrap();
+    up.simple_query("BEGIN; TRUNCATE t; INSERT INTO t VALUES (10, 10), (11, 11); COMMIT;").unwrap();
+    up.simple_query("INSERT INTO t VALUES (12, 12)").unwrap();
+    let running = coord::start(config(&dir)).unwrap();
+    assert_caught_up(&running.handle, &mut up, &["SELECT id, n, x FROM t ORDER BY id"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

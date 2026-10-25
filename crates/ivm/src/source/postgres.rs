@@ -348,12 +348,19 @@ impl PgSource {
                 self.push_delete(table, &row, key);
             }
             LogicalMessage::Truncate { relation_ids, .. } => {
+                let xid = self.txn.as_ref().map(|t| t.xid);
                 for r in relation_ids {
                     if let Some(rm) = self.rels.get(&r) {
                         let t = rm.table;
                         self.push_change(t, TableChange::Truncate);
+                        // The chunk's rows go too, unless they were read
+                        // after the truncate: then they are rows added
+                        // since, whose changes the stream skips as the
+                        // chunk's snapshot has them.
                         if let Some(ch) = &mut self.chunk
                             && ch.table == t
+                            && !(ch.phase == Phase::BeforeLow
+                                && matches!((&ch.snap, xid), (Some(snap), Some(x)) if xid_visible(snap, x)))
                         {
                             ch.rows.clear();
                             ch.multiset.clear();
