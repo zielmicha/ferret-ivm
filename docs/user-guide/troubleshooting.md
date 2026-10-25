@@ -251,9 +251,7 @@ Problems found while writing and checking this documentation (at commit
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| Upstream primary-key or replica-identity changes are not detected | afterwards upstream deletes are silently lost | re-create the source |
-| Deletes during a re-snapshot after a schema change are skipped | rows deleted upstream right after a schema change stay in the replica | re-create the source after the change if it matters |
-| The decision to re-snapshot after a schema change is not logged until the first chunk completes | until then fresh reads do not wait and show NULL in new columns; a restart in that window forgets the re-snapshot for good | check new columns after such changes; re-create the source |
+| Primary-key changes of a `REPLICA IDENTITY FULL` or `NOTHING` table are not detected | the table stays keyed by the old key; if those columns stop being unique, rows with the same old key are merged | re-create the source after such a change |
 | A sink drops queued changes while reconnecting | the target misses changes after an outage, or after concurrent `CREATE SINK`s race on creating `ivm_sink_progress` | create `ivm_sink_progress` in advance; create sinks one at a time; resynchronise after outages |
 | Time-travel reads use indexes built after the read GSN | `AS OF` reads of a replaced (or re-indexed) materialized view, and point lookups through a newer index, return too few rows or none | read without the `WHERE column = constant` condition, or within the index's lifetime |
 | Error records: not retracted after a restart (aggregate groups) or when they existed at creation (aggregates without `GROUP BY`); errors below an index or of shared operators not counted at creation; not versioned for `AS OF`; errors in join conditions treated as no match | views fail although the data is fixed, or succeed although PostgreSQL would fail ([details](temporal-filters-and-errors.md#errors-as-data)) | drop and re-create the view |

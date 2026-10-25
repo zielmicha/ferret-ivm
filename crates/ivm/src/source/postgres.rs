@@ -165,6 +165,11 @@ pub struct SnapState {
     pub done: bool,
     /// Text values of the last snapshotted primary key.
     pub boundary: Option<Vec<String>>,
+    /// The stored rows cannot be trusted (changes may have been lost, or
+    /// were decoded with a key that no longer applies): the snapshot starts
+    /// by truncating the table, so that rows deleted upstream go away too.
+    #[serde(default)]
+    pub truncate: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -576,50 +581,74 @@ impl PgSource {
             return Ok(());
         };
         let t = self.tables[&table].clone();
-        let cols: Vec<Option<usize>> = rel.columns.iter().map(|rc| t.columns.iter().position(|c| c.name == rc.name)).collect();
-        // detect a changed shape: new/dropped columns or changed types
-        let same = rel.columns.len() == t.columns.len()
+        // the relation's columns (nullability kept by name, new columns
+        // nullable) and the key it implies
+        let mut columns: Vec<Column> = rel
+            .columns
+            .iter()
+            .map(|rc| {
+                let (ty, typmod) = map_type(rc.type_oid, rc.type_modifier);
+                let nullable = t.columns.iter().find(|c| c.name == rc.name).map(|c| c.ty.nullable).unwrap_or(true);
+                Column::new(rc.name.clone(), ColumnType { ty, typmod, nullable })
+            })
+            .collect();
+        let mut pk = relation_key(&rel, &t, &columns);
+        // detect a changed shape (new/dropped columns or changed types) and
+        // a changed key (another replica identity or primary key)
+        let same_shape = rel.columns.len() == t.columns.len()
             && rel.columns.iter().zip(&t.columns).all(|(rc, c)| {
                 let (ty, _) = map_type(rc.type_oid, rc.type_modifier);
                 rc.name == c.name && ty == c.ty.ty
             });
-        if !same {
-            let columns: Vec<Column> = rel
-                .columns
-                .iter()
-                .map(|rc| {
-                    let (ty, typmod) = map_type(rc.type_oid, rc.type_modifier);
-                    let nullable = t.columns.iter().find(|c| c.name == rc.name).map(|c| c.ty.nullable).unwrap_or(true);
-                    Column::new(rc.name.clone(), ColumnType { ty, typmod, nullable })
-                })
-                .collect();
-            let pk: Vec<usize> = if rel.replica_identity == b'f' {
-                // FULL marks every column as key; keep the known PK by name
-                t.pk.iter().filter_map(|p| columns.iter().position(|c| c.name == t.columns[*p].name)).collect()
-            } else {
-                rel.columns.iter().enumerate().filter(|(_, c)| c.is_key).map(|(i, _)| i).collect()
-            };
-            log::info!("source table {}.{} changed shape; re-snapshotting", t.upstream.0, t.upstream.1);
-            // The schema change is logged now, before the commit of the
-            // transaction announcing it: its changes to the table so far
-            // were decoded in the old shape and must take the new one.
-            if let Some(txn) = &mut self.txn {
-                reshape_changes(&mut txn.changes, &t, table, &columns, &pk);
-            }
-            self.engine.log(LogRecord::Schema { source: self.id, table, columns: columns.clone(), pk: pk.clone() })?;
-            let nt = SourceTable { id: table, upstream: t.upstream.clone(), columns: columns.clone(), pk };
-            self.tables.insert(table, nt);
-            // re-snapshot to fill new columns of existing rows; logged at
-            // once so that a restart does not forget it
-            self.state.tables.insert(table, SnapState::default());
-            if self.chunk.as_ref().is_some_and(|c| c.table == table) {
-                self.chunk = None;
-            }
-            self.log_progress(self.durable_lsn)?;
-            let cols2: Vec<Option<usize>> = rel.columns.iter().enumerate().map(|(i, _)| Some(i)).collect();
-            self.rels.insert(rel.id, RelMap { table, cols: cols2 });
+        let names = |key: &[usize], cols: &[Column]| -> std::collections::BTreeSet<String> {
+            key.iter().map(|k| cols[*k].name.clone()).collect()
+        };
+        let same_key = names(&t.pk, &t.columns) == names(&pk, &columns);
+        if same_key {
+            // the same columns: keep their order
+            pk = t.pk.iter().filter_map(|p| columns.iter().position(|c| c.name == t.columns[*p].name)).collect();
+        }
+        if same_shape && same_key {
+            let cols: Vec<Option<usize>> = rel.columns.iter().map(|rc| t.columns.iter().position(|c| c.name == rc.name)).collect();
+            self.rels.insert(rel.id, RelMap { table, cols });
             return Ok(());
         }
+        for k in &pk {
+            columns[*k].ty.nullable = false;
+        }
+        if same_key {
+            log::info!("source table {}.{} changed shape; re-snapshotting", t.upstream.0, t.upstream.1);
+        } else {
+            let show = |key: &[usize], cols: &[Column]| key.iter().map(|k| cols[*k].name.as_str()).collect::<Vec<_>>().join(", ");
+            log::warn!(
+                "source table {}.{}: its key changed upstream from ({}) to ({}) (replica identity {:?}); re-keying it and copying it again",
+                t.upstream.0,
+                t.upstream.1,
+                show(&t.pk, &t.columns),
+                show(&pk, &columns),
+                rel.replica_identity as char
+            );
+        }
+        // The schema change is logged now, before the commit of the
+        // transaction announcing it: its changes to the table so far were
+        // decoded in the old shape and must take the new one.
+        if let Some(txn) = &mut self.txn {
+            reshape_changes(&mut txn.changes, &t, table, &columns, &pk);
+        }
+        // Re-snapshot: to fill new columns of existing rows, and after a key
+        // change from an empty table, as deletes by the old key were lost
+        // (and those decoded above with it are dropped by reshape_changes).
+        // The reset is logged before the schema change: a restart in
+        // between then copies the table in its old shape and detects the
+        // change again, while the other order would forget the re-snapshot.
+        self.state.tables.insert(table, SnapState { truncate: !same_key && !pk.is_empty(), ..Default::default() });
+        if self.chunk.as_ref().is_some_and(|c| c.table == table) {
+            self.chunk = None;
+        }
+        self.log_progress(self.durable_lsn)?;
+        self.engine.log(LogRecord::Schema { source: self.id, table, columns: columns.clone(), pk: pk.clone() })?;
+        self.tables.insert(table, SourceTable { id: table, upstream: t.upstream.clone(), columns, pk });
+        let cols: Vec<Option<usize>> = rel.columns.iter().enumerate().map(|(i, _)| Some(i)).collect();
         self.rels.insert(rel.id, RelMap { table, cols });
         Ok(())
     }
@@ -699,6 +728,16 @@ impl PgSource {
         let t = self.tables[&table].clone();
         if self.query.is_none() {
             self.query = Some(connect(&self.def.conninfo, false)?);
+        }
+        if self.state.tables.get(&table).is_some_and(|s| s.truncate) {
+            // Start from an empty table, here between upstream transactions
+            // and before the chunk's low watermark: from now on the table
+            // fills exactly as in an initial snapshot.
+            let lsn = self.inflight.back().map(|(l, _)| *l).unwrap_or(self.durable_lsn);
+            let rx = self.engine.log_async(LogRecord::Commit { source: self.id, lsn, changes: vec![(table, TableChange::Truncate)] })?;
+            self.inflight.push_back((lsn, rx));
+            self.state.tables.entry(table).or_default().truncate = false;
+            self.log_progress(self.durable_lsn)?;
         }
         let (low, high) = self.watermarks(table);
         let q = self.query.as_mut().unwrap();
@@ -804,6 +843,26 @@ impl PgSource {
         self.chunk = Some(chunk);
         *self.status.lock() = format!("snapshotting {}.{}", t.upstream.0, t.upstream.1);
         Ok(())
+    }
+}
+
+/// The key a Relation message implies for a table known as `t`, as
+/// positions in the relation's `columns`: the replica identity columns it
+/// flags, i.e. the primary key with REPLICA IDENTITY DEFAULT (none if the
+/// table has no primary key any more: it is then a multiset, as PostgreSQL
+/// refuses to publish its updates and deletes) or the index's columns with
+/// USING INDEX. FULL flags every column, and NOTHING (also an identity index
+/// that was dropped) none: they keep the known key as long as its columns
+/// exist.
+fn relation_key(rel: &Relation, t: &SourceTable, columns: &[Column]) -> Vec<usize> {
+    let flagged: Vec<usize> = rel.columns.iter().enumerate().filter(|(_, c)| c.is_key).map(|(i, _)| i).collect();
+    match rel.replica_identity {
+        b'd' => flagged,
+        b'i' if !flagged.is_empty() => flagged,
+        _ => {
+            let known: Vec<usize> = t.pk.iter().filter_map(|p| columns.iter().position(|c| c.name == t.columns[*p].name)).collect();
+            if known.len() == t.pk.len() { known } else { vec![] }
+        }
     }
 }
 
@@ -1109,7 +1168,7 @@ mod tests {
 
     fn done_state(table: ObjectId) -> SourceState {
         let mut st = SourceState { slot_created: true, ..Default::default() };
-        st.tables.insert(table, SnapState { done: true, boundary: None });
+        st.tables.insert(table, SnapState { done: true, ..Default::default() });
         st
     }
 
@@ -1298,7 +1357,8 @@ mod tests {
 
     /// A schema change resets the table's snapshot state and logs it at once:
     /// the re-snapshot used to be recorded only with the next chunk, so a
-    /// restart in between left new columns NULL for good.
+    /// restart in between left new columns NULL for good. The reset comes
+    /// first: a restart right after the schema record would forget it.
     #[test]
     fn schema_change_logs_the_resnapshot() {
         let (mut src, log) = source(vec![table(&["id", "a"], vec![0])], done_state(10));
@@ -1307,14 +1367,68 @@ mod tests {
         src.handle_message(commit(100)).unwrap();
         src.drain_acks(true).unwrap();
         let recs = log.lock();
-        assert!(matches!(&recs[0], LogRecord::Schema { table: 10, columns, .. } if columns.len() == 3), "{recs:?}");
-        match &recs[1] {
+        match &recs[0] {
             LogRecord::Progress { state, .. } => {
                 let st: SourceState = serde_json::from_str(state).unwrap();
                 assert!(!st.tables[&10].done);
+                // the key did not change: existing rows are kept
+                assert!(!st.tables[&10].truncate);
             }
             other => panic!("expected the reset snapshot state, got {other:?}"),
         }
+        assert!(matches!(&recs[1], LogRecord::Schema { table: 10, columns, .. } if columns.len() == 3), "{recs:?}");
+    }
+
+    /// The key a Relation message implies: the flagged identity columns,
+    /// except with FULL and NOTHING, which keep the known key.
+    #[test]
+    fn keys_implied_by_relation_messages() {
+        let t = table(&["id", "a", "b"], vec![0]);
+        let key = |ident: u8, flags: &[bool], names: &[&str]| {
+            let LogicalMessage::Relation(mut rel) = relation(names, 0) else { unreachable!() };
+            rel.replica_identity = ident;
+            for (c, f) in rel.columns.iter_mut().zip(flags) {
+                c.is_key = *f;
+            }
+            let cols = int_cols(names);
+            relation_key(&rel, &t, &cols)
+        };
+        let abc = ["id", "a", "b"];
+        assert_eq!(key(b'd', &[true, false, false], &abc), [0]);
+        assert_eq!(key(b'd', &[false, true, true], &abc), [1, 2], "another primary key");
+        assert_eq!(key(b'd', &[false, false, false], &abc), Vec::<usize>::new(), "no primary key any more");
+        assert_eq!(key(b'i', &[false, false, true], &abc), [2], "an identity index");
+        assert_eq!(key(b'i', &[false, false, false], &abc), [0], "the identity index was dropped");
+        assert_eq!(key(b'n', &[false, false, false], &abc), [0]);
+        assert_eq!(key(b'f', &[true, true, true], &abc), [0]);
+        assert_eq!(key(b'f', &[true, true, true], &["b", "id"]), [1], "by name");
+        assert_eq!(key(b'f', &[true, true], &["a", "b"]), Vec::<usize>::new(), "the key column was dropped");
+    }
+
+    /// A changed key resets the table's snapshot state, which is logged
+    /// before the schema record, and the re-snapshot starts from an empty
+    /// table: deletes by the old key were lost.
+    #[test]
+    fn key_changes_resnapshot_from_an_empty_table() {
+        let (mut src, log) = source(vec![table(&["id", "a"], vec![0])], done_state(10));
+        src.handle_message(begin(5)).unwrap();
+        let LogicalMessage::Relation(mut rel) = relation(&["id", "a"], 0) else { unreachable!() };
+        rel.replica_identity = b'i';
+        rel.columns[1].is_key = true;
+        src.handle_message(LogicalMessage::Relation(rel)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.drain_acks(true).unwrap();
+        let recs = log.lock();
+        match &recs[..] {
+            [LogRecord::Progress { state, .. }, LogRecord::Schema { table: 10, columns, pk, .. }] => {
+                let st: SourceState = serde_json::from_str(state).unwrap();
+                assert!(!st.tables[&10].done && st.tables[&10].truncate);
+                assert_eq!(pk, &[1]);
+                assert!(!columns[1].ty.nullable, "key columns are not null");
+            }
+            other => panic!("unexpected records {other:?}"),
+        }
+        assert_eq!(src.tables[&10].pk, [1]);
     }
 
     /// Changes decoded before a schema change in the same transaction are

@@ -340,6 +340,59 @@ fn replica_identity_index_is_the_key() {
     assert_eq!(up.rows(qn), ["2|20|2", "3|-3|0", "4|-4|4", "5|-5|5"]);
 }
 
+/// Upstream changes of a table's replica identity or primary key are
+/// detected (in the Relation message that precedes the table's next change):
+/// the table is re-keyed and copied again. Deletes after such a change used
+/// to be silently lost, and a table whose primary key was dropped merged
+/// rows that were no longer unique.
+#[test]
+fn replica_identity_and_key_changes_are_detected() {
+    let (mut up, mut ivm, dir) = setup(
+        "ri-change",
+        &[
+            "CREATE TABLE t (id int PRIMARY KEY, u int NOT NULL, a int)",
+            "CREATE UNIQUE INDEX t_u ON t (u)",
+            "INSERT INTO t SELECT g, -g, g FROM generate_series(1, 20) g",
+            "CREATE TABLE k (id int PRIMARY KEY, a int NOT NULL)",
+            "INSERT INTO k SELECT g, 100 + g FROM generate_series(1, 20) g",
+            "CREATE TABLE m (a int, b int)",
+            "ALTER TABLE m REPLICA IDENTITY FULL",
+            "INSERT INTO m SELECT g, g FROM generate_series(1, 20) g",
+            "CREATE TABLE x (id int PRIMARY KEY, a int)",
+            "INSERT INTO x SELECT g, g FROM generate_series(1, 5) g",
+        ],
+    );
+    let all = |ivm: &mut Ivm, up: &mut Upstream| {
+        for t in ["t", "k", "m", "x"] {
+            let q = format!("SELECT * FROM {t} ORDER BY 1, 2");
+            assert_eq!(caught_up(ivm, up, &q), up.rows(&q), "table {t}");
+        }
+    };
+    all(&mut ivm, &mut up);
+    // the identity becomes a unique index instead of the primary key
+    up.exec("ALTER TABLE t REPLICA IDENTITY USING INDEX t_u");
+    up.exec("DELETE FROM t WHERE id <= 3");
+    up.exec("UPDATE t SET id = 100 WHERE id = 4");
+    // another primary key
+    up.exec("ALTER TABLE k DROP CONSTRAINT k_pkey, ADD PRIMARY KEY (a)");
+    up.exec("DELETE FROM k WHERE id <= 3");
+    // a keyless table gets a primary key (and the default identity)
+    up.exec("ALTER TABLE m ADD PRIMARY KEY (a), REPLICA IDENTITY DEFAULT");
+    up.exec("DELETE FROM m WHERE a <= 3");
+    up.exec("UPDATE m SET a = 100 WHERE a = 4");
+    // no primary key any more: rows need not be unique
+    up.exec("ALTER TABLE x DROP CONSTRAINT x_pkey");
+    up.exec("INSERT INTO x VALUES (1, 1), (6, 6)");
+    all(&mut ivm, &mut up);
+    ivm.shutdown();
+    let mut ivm = Ivm::start(&dir);
+    up.exec("DELETE FROM t WHERE id = 5");
+    up.exec("DELETE FROM k WHERE id = 5");
+    up.exec("DELETE FROM m WHERE a = 5");
+    up.exec("INSERT INTO x VALUES (6, 6)");
+    all(&mut ivm, &mut up);
+}
+
 /// Text in a SQL_ASCII database is not checked for any encoding, so values
 /// that are not UTF-8 could reach the source (where they used to become '',
 /// or U+FFFD in snapshots). Such upstreams are rejected.

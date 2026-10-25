@@ -233,6 +233,11 @@ in the snapshot is not caught.
   boundary.
 - `ALTER SOURCE ... REFRESH` adds tables that are snapshotted the same way.
 - After an upstream schema change the table's state is reset and the whole
-  table is copied again; because a re-snapshot only upserts, rows deleted
-  upstream while their key is beyond the boundary are not removed (see
+  table is copied again. A re-snapshot only upserts the rows it reads, so
+  stream deletes of keys beyond the boundary are applied rather than
+  skipped (the row may still be stored). When the stored rows cannot be
+  trusted — after a key change, whose deletes by the old key were lost —
+  the state also says `truncate`: before the first chunk's low watermark,
+  between upstream transactions, the source logs a commit truncating the
+  table, which then fills exactly as in an initial snapshot (see
   [Sources](../user-guide/sources.md#upstream-schema-changes)).

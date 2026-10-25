@@ -322,48 +322,48 @@ its rows are discarded.
 ### Upstream schema changes
 
 `pgoutput` describes a table with a Relation message before the first change
-that follows a schema change. When a Relation message differs from the known
-table — a different number of columns, or a different column name or mapped
-type at some position — the source:
+that follows a schema change (and at the start of every replication session).
+When a Relation message differs from the known table — a different number of
+columns, a different column name or mapped type at some position, or a
+different key — the source:
 
-1. logs a *schema* record with the new column list (names, types, typmods;
+1. resets the table's snapshot state and logs it (logged first, so that a
+   restart in between copies the table in its old shape and detects the
+   change again);
+2. logs a *schema* record with the new column list (names, types, typmods;
    nullability is kept for columns that existed before, new columns are
-   nullable) and the new key (the Relation message's key columns, or the
-   previous primary key matched by name when the table has
-   `REPLICA IDENTITY FULL`);
-2. the engine rebuilds the table's primary index in the new shape: columns
+   nullable, key columns are `NOT NULL`) and the new key (see below);
+3. the engine rebuilds the table's primary index in the new shape: columns
    are matched **by name**; existing values are cast to the new type (a
    failing cast gives NULL); new columns are NULL. The table's version is
    incremented;
-3. dependent materialized views are re-planned against the new definition
+4. dependent materialized views are re-planned against the new definition
    and swapped at that GSN;
-4. the source re-snapshots the table from the beginning, which fills the new
-   columns of existing rows. Fresh reads wait for this snapshot only once its
-   first chunk has been logged; until then they return the table at once,
-   with NULL in the new columns (see the known problems below).
+5. the source re-snapshots the table from the beginning, which fills the new
+   columns of existing rows. Fresh reads of the table wait for it.
 
-Schema changes that do not change the column names or mapped types are
-invisible to the engine: new indexes, defaults, constraints, typmod-only
-changes such as `varchar(10)` to `varchar(20)`, and also changes of the
-primary key or the replica identity. After a primary-key or replica-identity
-change the engine keeps matching rows by the old key, so upstream deletes are
-**silently lost**; re-create the source after such a change. A renamed column is a
-dropped column plus a new one: its values are NULL until the re-snapshot
-fills them, and materialized views that use the old name cannot be
-re-planned (see below).
+The key comes from the replica identity the Relation message describes: with
+`DEFAULT` the primary key's columns (the table becomes a keyless multiset if
+it no longer has a primary key: PostgreSQL then refuses to publish its
+updates and deletes), with `USING INDEX` the index's columns. `FULL` (which
+marks every column) and `NOTHING` keep the known key, as long as its columns
+still exist. So `ALTER TABLE ... REPLICA IDENTITY ...`, and adding, dropping
+or replacing the primary key under `DEFAULT`, re-key the table. After a key
+change the re-snapshot starts by truncating the table: deletes decoded with
+the old key could not be applied. Not detected: primary-key changes of a
+`FULL` or `NOTHING` table, whose Relation messages do not show the key (with
+`FULL`, old rows are complete, so this only matters if the old key columns
+stop being unique).
+
+Schema changes that change neither the column names, the mapped types nor
+the key are invisible to the engine: new indexes, defaults, constraints, and
+typmod-only changes such as `varchar(10)` to `varchar(20)`. A renamed column
+is a dropped column plus a new one: its values are NULL until the
+re-snapshot fills them, and materialized views that use the old name cannot
+be re-planned (see below).
 
 Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
 
-- Rows deleted upstream between the schema change and the moment the
-  re-snapshot reaches them stay in the replica: the re-snapshot only
-  upserts the rows it reads.
-- The decision to re-snapshot is not logged until the re-snapshot's first
-  chunk completes. If the engine restarts in between (for example because
-  the chunk's `SELECT` fails or waits for a lock), the re-snapshot is
-  forgotten: the table counts as complete, and existing rows keep NULL in
-  the new columns (and the values cast from the old types) until they change
-  upstream. Check new columns after a restart that followed a schema change,
-  and re-create the source if they are incomplete.
 - A materialized view that cannot be re-planned (for example it uses a
   dropped column) keeps its old dataflow and **stops being updated**; the
   failure is only logged (`view ... could not be re-planned after a schema
