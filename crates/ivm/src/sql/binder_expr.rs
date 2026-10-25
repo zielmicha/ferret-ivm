@@ -1914,10 +1914,14 @@ impl<'a> Binder<'a> {
                             };
                             let negative = match &d {
                                 Datum::Interval(_) => d.sql_cmp(&Datum::Interval(Default::default())) == std::cmp::Ordering::Less,
-                                other => other.as_f64().is_some_and(|f| f < 0.0),
+                                Datum::Numeric(n) => n.is_negative(),
+                                other => other.as_i64().map(|v| v < 0).or_else(|| other.as_f64().map(|f| f < 0.0)).unwrap_or(false),
                             };
-                            if negative {
+                            if negative && range_types.is_some() {
                                 sql_bail!("22013", "invalid preceding or following size in window function");
+                            }
+                            if negative {
+                                sql_bail!("22013", "frame {} offset must not be negative", if slot == 0 { "starting" } else { "ending" });
                             }
                             let n = if range_types.is_some() { 0 } else { d.as_i64().unwrap_or(0) };
                             offsets[slot] = Some(d);
@@ -1929,11 +1933,29 @@ impl<'a> Binder<'a> {
                         }
                     })
                 };
+                if units == FrameUnits::Groups && order.is_empty() {
+                    sql_bail!(codes::WINDOWING_ERROR, "GROUPS mode requires an ORDER BY clause");
+                }
                 let start = bound_of(self, &wf.start_bound, 0)?;
                 let end = match &wf.end_bound {
                     Some(e) => bound_of(self, e, 1)?,
                     None => FrameBound::CurrentRow,
                 };
+                // the frame shapes PostgreSQL's grammar rejects
+                use FrameBound as FB;
+                let invalid = match (&start, &end) {
+                    (FB::UnboundedFollowing, _) => Some("frame start cannot be UNBOUNDED FOLLOWING"),
+                    (_, FB::UnboundedPreceding) => Some("frame end cannot be UNBOUNDED PRECEDING"),
+                    (FB::CurrentRow, FB::Preceding(_)) => Some("frame starting from current row cannot have preceding rows"),
+                    (FB::Following(_), FB::CurrentRow) if wf.end_bound.is_none() => {
+                        Some("frame starting from following row cannot end with current row")
+                    }
+                    (FB::Following(_), FB::Preceding(_) | FB::CurrentRow) => Some("frame starting from following row cannot have preceding rows"),
+                    _ => None,
+                };
+                if let Some(msg) = invalid {
+                    sql_bail!(codes::WINDOWING_ERROR, "{msg}");
+                }
                 if let Some((_, minus, plus, cmp_type)) = range_types {
                     let [s, e] = offsets;
                     range = Some(crate::sql::plan::RangeOffsets { start: s, end: e, minus, plus, cmp_type });

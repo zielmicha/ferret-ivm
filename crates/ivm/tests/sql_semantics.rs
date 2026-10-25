@@ -619,3 +619,34 @@ fn like_any_multi_unnest_and_row_any() {
     assert_eq!(rows(&h, "SELECT 'a_c' ~~ 'a\\_c', 'abc' ~~* 'A%', 'abc' !~~ 'b%'"), vec!["t|t|t"]);
     running.shutdown();
 }
+
+#[test]
+fn invalid_window_frames_are_rejected() {
+    let running = start("frames");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // these used to run and return NULLs (or a wrong frame, for -1)
+    for (frame, msg) in [
+        ("ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING", "frame starting from following row cannot have preceding rows"),
+        ("ROWS BETWEEN CURRENT ROW AND 1 PRECEDING", "frame starting from current row cannot have preceding rows"),
+        ("ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW", "frame starting from following row cannot have preceding rows"),
+        ("ROWS 1 FOLLOWING", "frame starting from following row cannot end with current row"),
+        ("ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW", "frame start cannot be UNBOUNDED FOLLOWING"),
+        ("ROWS BETWEEN 1 PRECEDING AND UNBOUNDED PRECEDING", "frame end cannot be UNBOUNDED PRECEDING"),
+        ("ROWS BETWEEN -1 PRECEDING AND CURRENT ROW", "frame starting offset must not be negative"),
+        ("ROWS BETWEEN CURRENT ROW AND -2 FOLLOWING", "frame ending offset must not be negative"),
+        ("RANGE BETWEEN -1 PRECEDING AND CURRENT ROW", "invalid preceding or following size in window function"),
+    ] {
+        let q = format!("SELECT sum(id) OVER (ORDER BY id {frame}) FROM t1");
+        let err = try_rows(&h, &q).unwrap_err();
+        assert!(err.contains(msg), "{frame}: {err}");
+    }
+    let err = try_rows(&h, "SELECT count(*) OVER (GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t1").unwrap_err();
+    assert!(err.contains("GROUPS mode requires an ORDER BY clause"), "{err}");
+    // valid (if empty) frames still work
+    assert_eq!(
+        rows(&h, "SELECT id, sum(id) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) FROM t1 ORDER BY 1 LIMIT 2"),
+        vec!["1|", "2|"]
+    );
+    running.shutdown();
+}
