@@ -710,16 +710,16 @@ fn reconnect_backoff_resets_after_a_working_session() {
     let (mut up, mut ivm, _dir) = setup("backoff", &["CREATE TABLE t (id int PRIMARY KEY)"]);
     let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t");
     // sessions that end at once, without doing anything: the delay grows
-    // (0.2 s, 0.4 s, 0.8 s, 1.6 s)
-    for _ in 0..4 {
+    // (0.2 s, 0.4 s, 0.8 s, 1.6 s, 3.2 s)
+    for _ in 0..5 {
         kill_walsender(&mut up);
     }
     // a session that replicates something works: the next delay is short
-    // again (it would be 3.2 s otherwise)
+    // again (it would be 6.4 s otherwise)
     up.exec("INSERT INTO t VALUES (1)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t"), ["1"]);
     let took = kill_walsender(&mut up);
-    assert!(took < Duration::from_millis(1500), "reconnecting took {took:?}");
+    assert!(took < Duration::from_secs(3), "reconnecting took {took:?}");
     up.exec("INSERT INTO t VALUES (2)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t"), ["2"]);
 }
