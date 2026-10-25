@@ -700,12 +700,23 @@ impl Engine {
         diff.extend(old_rows.into_iter().map(|(r, w)| (r, -w)));
         crate::dataflow::consolidate(&mut diff);
         // (by view: other views and ad hoc subscriptions may share the old node)
+        let same = same_columns(&def.columns, &old_cols);
         for s in self.subs.iter_mut() {
-            if s.view == Some(id) {
+            if s.view != Some(id) {
+                continue;
+            }
+            if same {
                 s.node = new_node;
                 if !diff.is_empty() {
                     let _ = s.tx.send(SubEvent::Data { gsn, rows: diff.clone() });
                 }
+            } else {
+                // they were promised the old columns
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                    codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{name}\" changed its columns"),
+                )));
+                s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
         // the view's sinks (not those of other views sharing the old node)
@@ -715,7 +726,7 @@ impl Engine {
             .copied()
             .filter(|sid| matches!(self.catalog.get(*sid).map(|o| &o.kind), Some(ObjectKind::Sink(sd)) if sd.from == id))
             .collect();
-        if same_columns(&def.columns, &old_cols) {
+        if same {
             for sid in &sinks {
                 if let Some(sink) = self.sink_handles.get_mut(sid) {
                     sink.node = new_node;

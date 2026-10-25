@@ -461,6 +461,46 @@ fn dropping_a_view_leaves_subscriptions_to_its_twin_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Subscriptions to a view go on across a replacement that keeps its
+/// columns, with the change to the new contents. One changing them went on
+/// too, streaming rows of the new shape under the old column list (wider
+/// rows, text where an int was announced); it now ends with an error, as
+/// subscriptions to a table that changes its columns upstream do.
+#[test]
+fn replacing_a_view_with_other_columns_ends_its_subscriptions() {
+    let dir = tmpdir("replace-columns");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int, b text)");
+    exec(&h, "INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')");
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO v") else { panic!("not a subscription") };
+    // same columns: the subscription follows
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT id, a * 2 AS a FROM t");
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT b, id, a FROM t");
+    exec(&h, "INSERT INTO t VALUES (3, 30, 'z')");
+    let mut acc = std::collections::BTreeMap::new();
+    let mut error = None;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            SubEvent::Data { rows, .. } => {
+                assert!(error.is_none(), "rows after the error");
+                for (r, w) in rows {
+                    assert_eq!(r.len(), 2, "a row of another shape: {r:?}");
+                    *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
+                }
+            }
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => error = Some(e.code),
+        }
+    }
+    acc.retain(|_, w| *w != 0);
+    assert_eq!(acc.keys().cloned().collect::<Vec<_>>(), ["1|20", "2|40"], "the stream before the second replacement");
+    assert_eq!(error.as_deref(), Some("55000"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Replacing a view moved every subscription on its dataflow node to the
 /// new definition, also those to another view sharing the node (here an
 /// identical view b): they then streamed the replacement's changes.
