@@ -303,22 +303,22 @@ pub fn resolve(name: &str, args: &[SqlType]) -> Result<Resolved> {
             }
         }
     }
-    let mut best: Option<(i32, i32, FuncId, Vec<SqlType>, SqlType)> = None;
+    let mut best: Option<(i32, (i32, i32), FuncId, Vec<SqlType>, SqlType)> = None;
     for c in cands {
         let def = &reg.funcs[c.0 as usize];
         if let Some((cost, types, ret)) = try_match(def, args) {
-            // tie-breaker: prefer text where unknown literals were given
-            let unknown_text = args
-                .iter()
-                .zip(&types)
-                .filter(|(a, t)| **a == SqlType::Unknown && **t == SqlType::Text)
-                .count() as i32;
+            // tie-breakers: prefer text where unknown literals were given, then
+            // the preferred type of the category (abs(unknown) is abs(float8))
+            let unknown_as = |pred: &dyn Fn(&SqlType) -> bool| {
+                args.iter().zip(&types).filter(|(a, t)| **a == SqlType::Unknown && pred(t)).count() as i32
+            };
+            let tie = (unknown_as(&|t| *t == SqlType::Text), unknown_as(&|t| t.is_preferred()));
             let better = match &best {
                 None => true,
-                Some((bc, bu, ..)) => cost < *bc || (cost == *bc && unknown_text > *bu),
+                Some((bc, bt, ..)) => cost < *bc || (cost == *bc && tie > *bt),
             };
             if better {
-                best = Some((cost, unknown_text, *c, types, ret));
+                best = Some((cost, tie, *c, types, ret));
             }
         }
     }

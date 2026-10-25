@@ -772,3 +772,14 @@ fn relhasindex_counts_secondary_indexes() {
     assert_eq!(rows(&h, "SELECT hasindexes FROM pg_matviews WHERE matviewname = 'rm'"), vec!["t"]);
     running.shutdown();
 }
+
+#[test]
+fn unknown_literal_arguments_prefer_preferred_types() {
+    let running = start("unknown-preferred");
+    let h = running.handle.clone();
+    // abs(unknown) resolved to abs(smallint), the first overload registered,
+    // where PostgreSQL picks the preferred type of the category (float8)
+    assert_eq!(rows(&h, "SELECT abs('-1.5'), abs('100000'), pg_typeof(abs(NULL))"), vec!["1.5|100000|double precision"]);
+    assert_eq!(rows(&h, "SELECT round('2.5'), pg_typeof(sign('-2')), pg_typeof(abs(1::int2))"), vec!["2|double precision|smallint"]);
+    running.shutdown();
+}
