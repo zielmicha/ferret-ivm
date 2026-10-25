@@ -496,3 +496,36 @@ fn int8_variance_does_not_overflow() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Aggregate summaries are kept exactly beyond the range of numeric (as
+/// PostgreSQL's aggregate states are); only a result out of range is an
+/// error, as a record of its group. The square of a value above 1e65536
+/// used to fail the index update in the middle of a dataflow step: the
+/// statement was never acknowledged, the dataflow was left half-updated,
+/// and the engine thread panicked at the next checkpoint.
+#[test]
+fn numeric_aggregates_beyond_the_numeric_range() {
+    let dir = tmpdir("numeric-range");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, n numeric)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 1), (2, 1, 2)");
+    exec(&h, "CREATE MATERIALIZED VIEW s AS SELECT g, sum(n) AS s, var_pop(n) AS v, avg(n) AS a FROM t GROUP BY g");
+    exec_within(&h, "INSERT INTO t VALUES (3, 2, '1e100000'), (4, 2, '1e100000')", 10);
+    let check = "SELECT g, s = 3 OR s = 2e100000 OR s = 9e131071, v = 0.25 OR v = 0, a = 1.5 OR a = 1e100000 OR a = 9e131071 FROM s ORDER BY g";
+    assert_eq!(rows(&h, check), ["1|t|t|t", "2|t|t|t"]);
+    // a sum beyond the range is the group's error, until it is back in range
+    exec_within(&h, "INSERT INTO t VALUES (5, 3, '9e131071'), (6, 3, '9e131071')", 10);
+    assert_eq!(rows_of(&h, "SELECT * FROM s"), Err("22003 value overflows numeric format".to_string()));
+    exec(&h, "CHECKPOINT");
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows_of(&h, "SELECT * FROM s"), Err("22003 value overflows numeric format".to_string()));
+    exec_within(&h, "DELETE FROM t WHERE id = 6", 10);
+    assert_eq!(rows(&h, check), ["1|t|t|t", "2|t|t|t", "3|t|t|t"]);
+    exec(&h, "DELETE FROM t WHERE id IN (3, 4)");
+    assert_eq!(rows(&h, "SELECT g, s FROM s WHERE g < 3 ORDER BY g"), ["1|3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

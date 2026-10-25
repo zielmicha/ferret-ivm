@@ -606,6 +606,50 @@ impl Numeric {
         make_result(result)
     }
 
+    /// `self + o`, exact, without the storage format's range check. For
+    /// accumulators (PostgreSQL's aggregate transition states use unbounded
+    /// `NumericVar`s): an intermediate sum may leave the range that
+    /// [`Numeric::checked`] enforces when the result is read. Special values
+    /// as in [`Numeric::add`].
+    pub fn add_unbounded(&self, o: &Self) -> Self {
+        if self.is_special() || o.is_special() {
+            return self.add(o).unwrap_or_else(|_| Self::nan());
+        }
+        let mut v = add_var(self, o);
+        strip_var(&mut v);
+        v
+    }
+
+    /// `self - o`, as [`Numeric::add_unbounded`].
+    pub fn sub_unbounded(&self, o: &Self) -> Self {
+        if self.is_special() || o.is_special() {
+            return self.sub(o).unwrap_or_else(|_| Self::nan());
+        }
+        let mut v = sub_var(self, o);
+        strip_var(&mut v);
+        v
+    }
+
+    /// `self * o` as [`Numeric::mul`] (with its display scale limit), but
+    /// without the range check, as [`Numeric::add_unbounded`].
+    pub fn mul_unbounded(&self, o: &Self) -> Self {
+        if self.is_special() || o.is_special() {
+            return self.mul(o).unwrap_or_else(|_| Self::nan());
+        }
+        let mut result = mul_var(self, o, self.dscale + o.dscale);
+        if result.dscale > NUMERIC_DSCALE_MAX {
+            round_var(&mut result, NUMERIC_DSCALE_MAX);
+        }
+        strip_var(&mut result);
+        result
+    }
+
+    /// The value, if it fits the storage format (the result of unbounded
+    /// arithmetic may not): "value overflows numeric format" otherwise.
+    pub fn checked(&self) -> Result<Self> {
+        make_result(self.clone())
+    }
+
     /// numeric_div: result scale from select_div_scale; infinity rules.
     pub fn div(&self, o: &Self) -> Result<Self> {
         if self.is_special() || o.is_special() {
@@ -1086,6 +1130,13 @@ impl Numeric {
     /// consumed.
     pub fn decode_binary(buf: &[u8]) -> Result<(Self, usize)> {
         encoding::decode_binary(buf)
+    }
+
+    /// [`Numeric::decode_binary`], also accepting the finite values beyond
+    /// numeric's range that unbounded arithmetic produces (the encoding
+    /// represents them; see [`Numeric::add_unbounded`]).
+    pub fn decode_binary_unbounded(buf: &[u8]) -> Result<(Self, usize)> {
+        encoding::decode_binary_unbounded(buf)
     }
 
     /// PostgreSQL binary wire format (`numeric_send`).

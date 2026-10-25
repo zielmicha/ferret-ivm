@@ -483,10 +483,25 @@ impl Engine {
             match msg {
                 Some(EngineMsg::Durable(batch)) => {
                     for (gsn, rec) in batch {
+                        let dml = match &rec {
+                            LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
+                            _ => None,
+                        };
                         if let Err(e) = self.apply_record(gsn, rec) {
                             log::error!("failed to apply gsn {gsn}: {e}");
                             if e.code.starts_with("XX") || e.code.starts_with("58") {
                                 return Err(e);
+                            }
+                            // (data errors are error records, so this is a
+                            // bug) The record is not applied again: its
+                            // statement fails instead of leaving the client,
+                            // the DML queued behind it and fresh reads
+                            // waiting forever.
+                            self.processed = self.processed.max(gsn);
+                            if let Some(req) = dml {
+                                self.dml_counts.remove(&req);
+                                self.reply_pending(req, Err(e));
+                                self.drain_dml_queue();
                             }
                         }
                     }

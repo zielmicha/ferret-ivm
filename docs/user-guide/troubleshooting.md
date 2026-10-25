@@ -15,11 +15,6 @@
 - **`AS OF <gsn>` in the future** waits until the engine reaches that GSN.
 - **`SUBSCRIBE` in psql** never prints anything: psql waits for the end of
   the result. Use `COPY (SUBSCRIBE ...) TO STDOUT`.
-- **Every DML statement hangs**, and the server log shows
-  `failed to apply gsn ...`: a log record could not be processed (an error
-  inside `WITH RECURSIVE` maintenance or in an index key expression), and
-  the engine waits forever for its reply; see the last deviation in
-  [Errors as data](temporal-filters-and-errors.md#errors-as-data).
 - **`DROP SINK`, or a `DROP` that drops a sink, hangs**: the sink is
   retrying its connection ([Sinks](sinks.md#monitoring-and-drop-sink)).
 
@@ -236,7 +231,6 @@ Problems found while writing and checking this documentation (at commit
 | `CREATE OR REPLACE MATERIALIZED VIEW` does not switch dependents | materialized views over it read the old version until the next restart; its indexes keep the old version and make start-up panic if the new version has fewer columns | drop dependent views and indexes first |
 | `CREATE OR REPLACE` of a materialized view that has an index or a sink by a virtual view | the sink stops receiving changes; the next start fails (`index target without dataflow`, `sink source without dataflow`) | drop indexes and sinks first |
 | `CREATE OR REPLACE` that makes a view read a relation created after the view | the next start fails (`relation "b" has no dataflow`), because recovery rebuilds objects in creation order | drop and re-create the view instead of replacing it |
-| An error that escapes the dataflow (inside `WITH RECURSIVE` maintenance, or computing an index key such as a join on `a.x + 1`) | the change is half-applied, the statement never returns, every later DML statement hangs, and replaying the record fails at the next start unless a checkpoint followed it | avoid expressions that can fail in join keys and recursive queries |
 | `var_pop`/`var_samp`/`stddev*` over very large `bigint` values | the sum of squares overflows: the debug build panics the engine thread, a release build returns a wrong result | cast to `numeric` |
 
 ### Lost or wrong data

@@ -178,8 +178,8 @@ internal errors (`XX...` SQLSTATEs) and I/O errors (`58...`) — are not turned
 into records. Such an error while applying a log record stops the engine
 thread; the server then answers every statement with
 `engine is shutting down` until it is restarted. Any other error that
-escapes the dataflow is logged, and the record stays half-applied (see the
-last deviation below).
+escapes the dataflow (a bug) is logged, the record is not applied again (it
+may be half-applied), and the statement that wrote it fails.
 
 Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
 
@@ -204,11 +204,3 @@ Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
   the same error.
 - Error records are **not versioned**: an `AS OF` read checks the view's
   current error records, whatever they were at the read's GSN.
-- Errors inside **`WITH RECURSIVE`** maintenance and errors computing an
-  **index key** (for example a join on `a.x + 1 = b.y` when `a.x + 1`
-  overflows) do not become error records; they abort the processing of the
-  log record. The change is then half-applied (the base table is updated,
-  downstream views are not), the DML statement never gets a reply, and every
-  later DML statement waits forever; restarting replays the record and fails
-  again (`ivm: failed to start: ...`) unless a checkpoint was taken after
-  it.

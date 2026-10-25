@@ -187,3 +187,32 @@ fn encoding_lengths_without_decoding() {
         assert!(Numeric::binary_len(&b[..n - 1]).is_err() || n == 1);
     }
 }
+
+/// Unbounded arithmetic (for aggregate states) is exact beyond the storage
+/// format's range; `checked` and the checked decoder enforce the range,
+/// the unbounded decoder round-trips such values.
+#[test]
+fn unbounded_arithmetic_beyond_the_range() {
+    let big = Numeric::parse("9e131071").unwrap();
+    assert!(big.add(&big).is_err());
+    let sum = big.add_unbounded(&big);
+    assert_eq!(sum.checked().unwrap_err().message, "value overflows numeric format");
+    // exact: back in range when the term is removed again
+    assert_eq!(sum.sub_unbounded(&big).checked().unwrap(), big);
+    let sq = Numeric::parse("1e100000").unwrap();
+    let sq = sq.mul_unbounded(&sq);
+    assert!(sq.checked().is_err());
+    let mut buf = Vec::new();
+    sq.encode_binary(&mut buf);
+    assert!(Numeric::decode_binary(&buf).is_err());
+    let (back, len) = Numeric::decode_binary_unbounded(&buf).unwrap();
+    assert_eq!((back.cmp(&sq), len), (std::cmp::Ordering::Equal, buf.len()));
+    // in range, the same as the checked operations
+    let (a, b) = (Numeric::parse("1.50").unwrap(), Numeric::parse("-2.125").unwrap());
+    assert_eq!(a.add_unbounded(&b).to_string(), a.add(&b).unwrap().to_string());
+    assert_eq!(a.sub_unbounded(&b).to_string(), a.sub(&b).unwrap().to_string());
+    assert_eq!(a.mul_unbounded(&b).to_string(), a.mul(&b).unwrap().to_string());
+    assert_eq!(a.add_unbounded(&a.neg()).to_string(), "0.00");
+    assert_eq!(Numeric::nan().add_unbounded(&a).to_string(), "NaN");
+    assert_eq!(Numeric::infinity().sub_unbounded(&Numeric::infinity()).to_string(), "NaN");
+}

@@ -178,7 +178,7 @@ impl AggKind {
             }
             (AggKind::SumSqNumeric, AggState::SumNumeric(s)) => {
                 let x = v.as_numeric().ok_or_else(|| SqlError::internal("SumSqNumeric on non-numeric"))?;
-                s.add_term(&x.mul(x)?, w)?;
+                s.add_term(&x.mul_unbounded(x), w)?;
             }
             (AggKind::SumFloat, AggState::SumFloat(s)) => {
                 let x = v.as_f64().ok_or_else(|| SqlError::internal("SumFloat on non-float"))?;
@@ -381,6 +381,11 @@ impl AggState {
 /// counted apart from the finite sum. The finite terms' display scales are
 /// counted too: the result's scale is the largest scale present, which
 /// therefore does not depend on terms that were added and later removed.
+///
+/// Also like PostgreSQL's state, the finite sum is not limited to numeric's
+/// range (a sum over a subtree, or a sum of squares, may exceed it while
+/// every value read from it fits): maintaining it never fails, and readers
+/// check the range of the result (`Numeric::checked`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct NumSum {
     pub finite: Numeric,
@@ -412,9 +417,9 @@ impl NumSum {
             }
         } else {
             self.finite = match w {
-                1 => self.finite.add(x)?,
-                -1 => self.finite.sub(x)?,
-                _ => self.finite.add(&x.mul(&Numeric::from_i64(w))?)?,
+                1 => self.finite.add_unbounded(x),
+                -1 => self.finite.sub_unbounded(x),
+                _ => self.finite.add_unbounded(&x.mul_unbounded(&Numeric::from_i64(w))),
             };
             self.add_scale(x.dscale(), w);
         }
@@ -435,9 +440,7 @@ impl NumSum {
 
     /// Add `sign` (1 or -1) times `o`.
     pub fn combine(&mut self, o: &NumSum, sign: i64) {
-        // addition of finite numerics cannot fail
-        self.finite = if sign > 0 { self.finite.add(&o.finite) } else { self.finite.sub(&o.finite) }
-            .unwrap_or_else(|_| Numeric::nan());
+        self.finite = if sign > 0 { self.finite.add_unbounded(&o.finite) } else { self.finite.sub_unbounded(&o.finite) };
         for (s, c) in &o.scales {
             self.add_scale(*s, sign * c);
         }
@@ -447,7 +450,7 @@ impl NumSum {
     }
 
     /// The sum (PostgreSQL semantics for special values), at the largest
-    /// display scale among the terms.
+    /// display scale among the terms; possibly beyond numeric's range.
     pub fn value(&self) -> Numeric {
         if self.nan > 0 || (self.pos_inf > 0 && self.neg_inf > 0) {
             return Numeric::nan();
@@ -479,7 +482,8 @@ impl NumSum {
     }
 
     fn decode(buf: &mut &[u8]) -> Result<NumSum> {
-        let (finite, len) = Numeric::decode_binary(buf)?;
+        // (the exact sum may be beyond numeric's range)
+        let (finite, len) = Numeric::decode_binary_unbounded(buf)?;
         *buf = &buf[len..];
         let n = get_uvarint(buf)? as usize;
         let mut scales = SmallVec::with_capacity(n);

@@ -177,7 +177,7 @@ handles:
 
 | Message | Action |
 |---|---|
-| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread, any other error leaves the record half-applied without advancing `processed` or replying to the client |
+| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread; any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
