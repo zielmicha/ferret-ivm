@@ -7,6 +7,9 @@
 //!
 //! usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--keep]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use ivm::coord::{self, Config};
 use ivm::server::{self, ServerConfig};
 use pgproto::testutil::{ClusterOptions, TempCluster};
