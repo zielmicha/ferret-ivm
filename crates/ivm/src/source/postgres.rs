@@ -156,6 +156,8 @@ struct Chunk {
     rows: BTreeMap<Vec<u8>, Row>,
     /// rows of a multiset table (single chunk)
     multiset: Vec<Row>,
+    /// changes to a multiset table to apply after its rows (see push_multiset)
+    pending: Vec<TableChange>,
     /// snapshot visibility (multiset tables): xmin, xmax, in-progress xids
     snap: Option<(u64, u64, Vec<u64>)>,
     max_key: Option<Vec<u8>>,
@@ -299,17 +301,14 @@ impl PgSource {
                 let pk = self.tables[&table].pk.clone();
                 if pk.is_empty() {
                     // REPLICA IDENTITY FULL multiset table
-                    if self.multiset_visible(table) {
-                        return Ok(());
-                    }
                     let mut new_row = row;
                     if let Some(o) = &old_row {
                         for c in &unchanged {
                             new_row[*c] = o[*c].clone();
                         }
-                        self.push_change(table, TableChange::Remove { row: o.clone() });
+                        self.push_multiset(table, TableChange::Remove { row: o.clone() });
                     }
-                    self.push_change(table, TableChange::Insert { row: new_row });
+                    self.push_multiset(table, TableChange::Insert { row: new_row });
                     return Ok(());
                 }
                 // key change: delete the old key first
@@ -334,9 +333,7 @@ impl PgSource {
                 let (row, _) = self.convert(rm, &old)?;
                 let pk = self.tables[&table].pk.clone();
                 if pk.is_empty() {
-                    if !self.multiset_visible(table) {
-                        self.push_change(table, TableChange::Remove { row });
-                    }
+                    self.push_multiset(table, TableChange::Remove { row });
                     return Ok(());
                 }
                 // A delete always applies, whatever the snapshot filter says
@@ -360,8 +357,9 @@ impl PgSource {
                             && ch.phase == Phase::BeforeLow
                             && matches!((&ch.snap, xid), (Some(snap), Some(x)) if xid_visible(snap, x))
                     });
-                    if !self.tables[&t].pk.is_empty() || !self.multiset_visible(t) {
-                        // (a keyless table's chunk replaces its contents anyway)
+                    if self.tables[&t].pk.is_empty() {
+                        self.push_multiset(t, TableChange::Truncate);
+                    } else {
                         self.push_change(t, TableChange::Truncate);
                     }
                     if !in_chunk
@@ -384,10 +382,14 @@ impl PgSource {
                                 // it is the whole table, replacing what is stored
                                 // (rows kept from before a schema change)
                                 let rows = std::mem::take(&mut ch.multiset);
+                                let pending = std::mem::take(&mut ch.pending);
                                 let t = ch.table;
                                 self.push_change(t, TableChange::Truncate);
                                 for r in rows {
                                     self.push_change(t, TableChange::Insert { row: r });
+                                }
+                                for c in pending {
+                                    self.push_change(t, c);
                                 }
                             }
                         } else if tag == ch.high {
@@ -439,23 +441,25 @@ impl PgSource {
         Ok(())
     }
 
-    /// For multiset tables during the snapshot window: skip changes from
-    /// transactions visible in the chunk's snapshot.
-    fn multiset_visible(&self, table: ObjectId) -> bool {
-        let st = self.state.tables.get(&table).cloned().unwrap_or_default();
-        if st.done {
-            return false;
+    /// A change to a keyless table (REPLICA IDENTITY FULL). Until its
+    /// snapshot is done the table is replaced by its single chunk at the low
+    /// watermark: a change the chunk's snapshot saw is dropped, as is one
+    /// before any chunk (a later chunk reads it). A change it did not see
+    /// applies; one decoded before the low watermark (its commit preceded the
+    /// watermark but was not visible yet when the chunk was read) is applied
+    /// after the chunk's rows.
+    fn push_multiset(&mut self, table: ObjectId, change: TableChange) {
+        if self.state.tables.get(&table).is_some_and(|s| s.done) {
+            return self.push_change(table, change);
         }
-        let Some(ch) = &self.chunk else { return true };
-        if ch.table != table {
-            return true;
+        let xid = self.txn.as_ref().map(|t| t.xid);
+        let Some(ch) = self.chunk.as_mut().filter(|ch| ch.table == table) else { return };
+        let seen = matches!((&ch.snap, xid), (Some(s), Some(x)) if xid_visible(s, x));
+        match ch.phase {
+            Phase::InWindow if !seen => self.push_change(table, change),
+            Phase::BeforeLow if !seen && ch.snap.is_some() && xid.is_some() => ch.pending.push(change),
+            _ => {}
         }
-        if ch.phase == Phase::BeforeLow {
-            return true;
-        }
-        let Some(snap) = &ch.snap else { return false };
-        let Some(t) = &self.txn else { return false };
-        xid_visible(snap, t.xid)
     }
 
     fn push_change(&mut self, table: ObjectId, ch: TableChange) {
@@ -468,9 +472,7 @@ impl PgSource {
     fn push_upsert(&mut self, table: ObjectId, mut row: Row, unchanged: Vec<usize>, old: Option<Row>) -> Result<()> {
         let pk = self.tables[&table].pk.clone();
         if pk.is_empty() {
-            if !self.multiset_visible(table) {
-                self.push_change(table, TableChange::Insert { row });
-            }
+            self.push_multiset(table, TableChange::Insert { row });
             return Ok(());
         }
         let kb = pk_bytes(&row, &pk);
@@ -642,6 +644,7 @@ impl PgSource {
             phase: Phase::BeforeLow,
             rows: BTreeMap::new(),
             multiset: Vec::new(),
+            pending: Vec::new(),
             snap: None,
             max_key: None,
             max_key_text: None,
@@ -1093,6 +1096,7 @@ mod tests {
             phase: Phase::BeforeLow,
             rows: BTreeMap::new(),
             multiset: Vec::new(),
+            pending: Vec::new(),
             snap: Some((100, 100, vec![])),
             max_key: None,
             max_key_text: None,
@@ -1164,6 +1168,41 @@ mod tests {
         src.drain_acks(true).unwrap();
         let row = |a: i32, b: i32| vec![Datum::Int4(a), Datum::Int4(b)];
         assert_eq!(replay(&log.lock()), vec![row(7, 70), row(7, 70), row(8, 80)]);
+    }
+
+    /// A keyless table's change decoded before the chunk's low watermark from
+    /// a transaction its snapshot did not see (the commit preceded the
+    /// watermark but was not visible yet) applies after the chunk's rows;
+    /// it used to be dropped.
+    #[test]
+    fn keyless_changes_the_chunk_missed_apply() {
+        let (mut src, log) = source(vec![table(&["id", "a"], vec![])], SourceState { slot_created: true, ..Default::default() });
+        src.handle_message(begin(80)).unwrap();
+        src.handle_message(relation(&["id", "a"], 0)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.chunk = Some(chunk_before_low(&[[1, 10], [2, 20]], false));
+        // seen by the snapshot: already in the chunk
+        src.handle_message(begin(90)).unwrap();
+        src.handle_message(insert(&[2, 20])).unwrap();
+        src.handle_message(commit(200)).unwrap();
+        // not seen: must be applied
+        src.handle_message(begin(150)).unwrap();
+        src.handle_message(insert(&[3, 30])).unwrap();
+        src.handle_message(LogicalMessage::Delete {
+            relation_id: REL,
+            old: [1, 10].iter().map(|v: &i32| TupleValue::Text(v.to_string().into_bytes())).collect(),
+            old_is_key: false,
+        })
+        .unwrap();
+        src.handle_message(commit(210)).unwrap();
+        for (xid, tag, end) in [(151, "L:1:10:1", 220), (152, "H:1:10:1", 230)] {
+            src.handle_message(begin(xid)).unwrap();
+            src.handle_message(message(tag)).unwrap();
+            src.handle_message(commit(end)).unwrap();
+        }
+        src.drain_acks(true).unwrap();
+        let row = |a: i32, b: i32| vec![Datum::Int4(a), Datum::Int4(b)];
+        assert_eq!(replay(&log.lock()), vec![row(2, 20), row(3, 30)]);
     }
 
     /// A schema change resets the table's snapshot state and logs it at once:
