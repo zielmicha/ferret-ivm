@@ -242,6 +242,14 @@ impl Running {
             let _ = t.join();
         }
     }
+
+    /// Stop without the final checkpoint, as if the process had died right
+    /// after its last log write: the next start recovers the last
+    /// checkpoint and replays the log after it (for tests).
+    pub fn crash(self) {
+        self.handle.shared.crash.store(true, Ordering::Release);
+        self.shutdown();
+    }
 }
 
 /// Open (recovering if needed) and start the engine threads.
@@ -406,7 +414,9 @@ impl Engine {
             s.stop();
         }
         let _ = self.seq.send(SeqMsg::Shutdown);
-        self.checkpoint()?;
+        if !self.shared.crash.load(Ordering::Acquire) {
+            self.checkpoint()?;
+        }
         Ok(())
     }
 

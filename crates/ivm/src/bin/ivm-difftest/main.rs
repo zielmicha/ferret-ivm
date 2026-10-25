@@ -1,635 +1,42 @@
 //! Differential testing against a real PostgreSQL.
 //!
-//! Starts a private PostgreSQL cluster and an in-process engine, replicates
-//! randomly generated tables through logical replication, creates random
-//! materialized views, applies random update streams upstream, and after each
-//! batch compares every view with PostgreSQL recomputing the same query.
+//! Starts a private PostgreSQL cluster and an engine, replicates randomly
+//! generated tables through logical replication, creates random
+//! materialized views, applies random transactions upstream, and after each
+//! round compares every view with PostgreSQL recomputing the same query.
 //!
-//! usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--keep]
+//! usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--keep]
+//!
+//! - `--restarts N`: restart the engine N times at random points of the run
+//!   (a clean shutdown, or a crash that skips the final checkpoint so that
+//!   recovery replays the log) while replication continues upstream.
+//! - `--kill`: run the engine as a child process (the `ivm` binary next to
+//!   this one) and SIGKILL it for the restarts, at random moments: while it
+//!   applies changes, during a checkpoint, or during the initial snapshot.
+//! - `DIFFTEST_VERBOSE=1` prints the views and details of every mismatch.
+//! - `DIFFTEST_DUMP_DIR=dir` writes the upstream tables as INSERT statements
+//!   before every round (`dir/round-N.sql`), to replay a failing round.
+//! - `DIFFTEST_EXTRA_VIEWS='q1;;q2'` adds views (e0, e1, ...) that are
+//!   compared like the generated ones, without changing the seed's random
+//!   choices: to narrow down a mismatch with simplified variants of a query.
+//!
+//! The schema, query and change generators (sqlgen.rs) are shared with the
+//! engine tests (tests/engine.rs), which compare views with ad hoc queries
+//! without PostgreSQL.
 
+mod sqlgen;
+#[path = "../../testkit.rs"]
+mod testkit;
+
+use sqlgen::Gen;
 use ivm::coord::{self, Config};
 use ivm::server::{self, ServerConfig};
 use pgproto::testutil::{ClusterOptions, TempCluster};
 use pgproto::{Client, Config as PgConfig};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next() % n }
-    }
-    fn chance(&mut self, pct: u64) -> bool {
-        self.below(100) < pct
-    }
-    fn pick<'a, T>(&mut self, v: &'a [T]) -> &'a T {
-        &v[self.below(v.len() as u64) as usize]
-    }
-    fn range(&mut self, lo: i64, hi: i64) -> i64 {
-        lo + self.below((hi - lo + 1) as u64) as i64
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Ty {
-    Int,
-    BigInt,
-    Numeric,
-    /// unconstrained numeric: values of varying scale
-    Decimal,
-    Text,
-    Bool,
-    Date,
-    Timestamp,
-    Float,
-    Jsonb,
-    /// int[] with one- and two-dimensional values
-    IntArr,
-}
-
-impl Ty {
-    fn sql(&self) -> &'static str {
-        match self {
-            Ty::Int => "int",
-            Ty::BigInt => "bigint",
-            Ty::Numeric => "numeric(10,2)",
-            Ty::Decimal => "numeric",
-            Ty::Text => "text",
-            Ty::Bool => "boolean",
-            Ty::Date => "date",
-            Ty::Timestamp => "timestamp",
-            Ty::Float => "float8",
-            Ty::Jsonb => "jsonb",
-            Ty::IntArr => "int[]",
-        }
-    }
-    fn is_num(&self) -> bool {
-        matches!(self, Ty::Int | Ty::BigInt | Ty::Numeric | Ty::Decimal | Ty::Float)
-    }
-    fn orderable(&self) -> bool {
-        true
-    }
-    /// min() / max() exist
-    fn minmax(&self) -> bool {
-        *self != Ty::Jsonb
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Col {
-    name: String,
-    ty: Ty,
-    nullable: bool,
-    /// int column referencing another table's id
-    refs: Option<usize>,
-}
-
-#[derive(Clone, Debug)]
-struct Table {
-    name: String,
-    cols: Vec<Col>,
-    next_id: i64,
-}
-
-fn literal(rng: &mut Rng, ty: Ty) -> String {
-    match ty {
-        Ty::Int => rng.range(-5, 40).to_string(),
-        Ty::BigInt => rng.range(-1000, 1000).to_string(),
-        Ty::Numeric => format!("{}.{:02}", rng.range(-100, 100), rng.below(100)),
-        Ty::Decimal => {
-            let choices = ["1", "1.0", "1.50", "-2.125", "0.000", "3", "10.5", "-0.25", "2.00", "7.0001", "-4"];
-            rng.pick(&choices).to_string()
-        }
-        Ty::Text => {
-            let words = ["a", "b", "foo", "bar", "Baz", "", "ü", "a b", "zz", "A"];
-            let w = rng.pick(&words);
-            if rng.chance(30) { format!("'{}{}'", w, rng.below(5)) } else { format!("'{w}'") }
-        }
-        Ty::Bool => (if rng.chance(50) { "true" } else { "false" }).into(),
-        Ty::Date => format!("date '2024-01-01' + {}", rng.below(60)),
-        Ty::Timestamp => format!("timestamp '2024-01-01 00:00:00' + interval '{} minutes'", rng.below(100000)),
-        Ty::Float => {
-            let choices = ["0", "1.5", "-2.25", "3.75", "100", "0.1", "-0.5", "7"];
-            format!("{}::float8", rng.pick(&choices))
-        }
-        Ty::Jsonb => {
-            // integers only: equal jsonb numbers of different scale would make
-            // PostgreSQL's choice of representation nondeterministic
-            let (n, m) = (rng.range(0, 6), rng.range(0, 6));
-            let tags = *rng.pick(&[r#"["x", "y"]"#, r#"["y"]"#, "[]", r#"["x", "z", "x"]"#]);
-            let docs = [
-                format!(r#"'{{"a": {n}, "t": {tags}, "items": [{{"p": {m}}}, {{"p": {n}, "q": "s{m}"}}]}}'"#),
-                format!(r#"'{{"a": {n}, "items": []}}'"#),
-                format!(r#"'{{"t": {tags}}}'"#),
-                format!("'[{n}, {m}]'"),
-                format!(r#"'{{"a": {{"b": [{n}, {{"c": {m}}}]}}}}'"#),
-                "'null'".to_string(),
-            ];
-            rng.pick(&docs).clone()
-        }
-        Ty::IntArr => {
-            let (a, b, c, d) = (rng.range(0, 5), rng.range(0, 5), rng.range(0, 5), rng.range(0, 5));
-            let arrs = [
-                format!("'{{{a},{b}}}'"),
-                format!("'{{{a},{b},{c}}}'"),
-                format!("'{{{{{a},{b}}},{{{c},{d}}}}}'"),
-                "'{}'".to_string(),
-                format!("'{{{a},NULL}}'"),
-                format!("'[0:1]={{{a},{b}}}'"),
-                format!("'{{{{{a}}},{{{b}}}}}'"),
-                format!("'{{{a}}}'"),
-            ];
-            rng.pick(&arrs).clone()
-        }
-    }
-}
-
-fn value(rng: &mut Rng, c: &Col, tables: &[Table]) -> String {
-    if c.nullable && rng.chance(12) {
-        return "NULL".into();
-    }
-    if let Some(t) = c.refs {
-        let max = tables[t].next_id.max(2);
-        return rng.range(1, max + 2).to_string();
-    }
-    literal(rng, c.ty)
-}
-
-fn gen_schema(rng: &mut Rng) -> Vec<Table> {
-    let n = 3 + rng.below(2) as usize;
-    let mut tables: Vec<Table> = Vec::new();
-    for i in 0..n {
-        let mut cols = vec![Col { name: "id".into(), ty: Ty::Int, nullable: false, refs: None }];
-        let ncols = 2 + rng.below(4) as usize;
-        for j in 0..ncols {
-            let tys = [
-                Ty::Int,
-                Ty::BigInt,
-                Ty::Numeric,
-                Ty::Decimal,
-                Ty::Text,
-                Ty::Text,
-                Ty::Bool,
-                Ty::Date,
-                Ty::Timestamp,
-                Ty::Float,
-                Ty::Int,
-                Ty::Jsonb,
-                Ty::IntArr,
-            ];
-            let ty = *rng.pick(&tys);
-            cols.push(Col { name: format!("c{j}"), ty, nullable: rng.chance(60), refs: None });
-        }
-        // foreign-key-like columns to earlier tables
-        if i > 0 {
-            for k in 0..(1 + rng.below(2) as usize) {
-                let target = rng.below(i as u64) as usize;
-                cols.push(Col { name: format!("r{k}"), ty: Ty::Int, nullable: rng.chance(30), refs: Some(target) });
-            }
-        }
-        tables.push(Table { name: format!("t{i}"), cols, next_id: 1 });
-    }
-    tables
-}
-
-/// A table in scope for query generation.
-#[derive(Clone)]
-struct Src {
-    alias: String,
-    table: usize,
-}
-
-struct Gen<'a> {
-    rng: &'a mut Rng,
-    tables: &'a [Table],
-}
-
-impl Gen<'_> {
-    fn col_of(&mut self, srcs: &[Src], pred: impl Fn(&Col) -> bool) -> Option<(String, Ty)> {
-        let mut cands = Vec::new();
-        for s in srcs {
-            for c in &self.tables[s.table].cols {
-                if pred(c) {
-                    cands.push((format!("{}.{}", s.alias, c.name), c.ty));
-                }
-            }
-        }
-        if cands.is_empty() {
-            None
-        } else {
-            Some(self.rng.pick(&cands).clone())
-        }
-    }
-
-    fn expr(&mut self, srcs: &[Src], depth: u32) -> (String, Ty) {
-        let (c, ty) = self.col_of(srcs, |_| true).unwrap();
-        if depth > 1 || self.rng.chance(50) {
-            return (c, ty);
-        }
-        if self.rng.chance(15) {
-            // conditional expressions
-            let p = self.pred(srcs, 1);
-            return match self.rng.below(4) {
-                0 => (format!("CASE WHEN {p} THEN {c} ELSE NULL END"), ty),
-                1 if ty.is_num() => {
-                    let (d, dty) = self.col_of(srcs, |x| x.ty == ty).unwrap();
-                    let _ = dty;
-                    (format!("GREATEST({c}, {d})"), ty)
-                }
-                2 if ty.is_num() => (format!("NULLIF({c}, {})", literal(self.rng, ty)), ty),
-                _ => (format!("CASE WHEN {p} THEN 'yes' WHEN {c} IS NULL THEN 'null' ELSE 'no' END"), Ty::Text),
-            };
-        }
-        match ty {
-            Ty::Int | Ty::BigInt => match self.rng.below(5) {
-                0 => (format!("({c} + {})", self.rng.range(1, 9)), ty),
-                1 => (format!("({c} * 2)"), ty),
-                2 => (format!("abs({c})"), ty),
-                3 => (format!("coalesce({c}, 0)"), ty),
-                _ => (format!("({c} % 7)"), ty),
-            },
-            Ty::Numeric | Ty::Decimal => match self.rng.below(5) {
-                0 => (format!("round({c}, 1)"), ty),
-                1 => (format!("({c} * 3)"), ty),
-                2 => (format!("({c} - 1.5)"), ty),
-                3 => (format!("({c} / 7)"), ty),
-                _ => (format!("coalesce({c}, 0)"), ty),
-            },
-            Ty::Float => match self.rng.below(3) {
-                0 => (format!("({c} * 2)"), ty),
-                1 => (format!("({c} / 4)"), ty),
-                _ => (format!("floor({c})"), ty),
-            },
-            Ty::Text => match self.rng.below(5) {
-                0 => (format!("lower({c})"), ty),
-                1 => (format!("upper({c})"), ty),
-                2 => (format!("({c} || 'x')"), ty),
-                3 => (format!("length({c})"), Ty::Int),
-                _ => (format!("substr({c}, 1, 2)"), ty),
-            },
-            Ty::Bool => (format!("(NOT {c})"), ty),
-            Ty::Date => match self.rng.below(3) {
-                0 => (format!("({c} + 3)"), ty),
-                1 => (format!("extract(day from {c})"), Ty::Numeric),
-                _ => (format!("date_trunc('month', {c})"), Ty::Timestamp),
-            },
-            Ty::Timestamp => match self.rng.below(2) {
-                0 => (format!("date_trunc('day', {c})"), ty),
-                _ => (format!("({c} + interval '1 hour')"), ty),
-            },
-            Ty::Jsonb => match self.rng.below(7) {
-                0 => (format!("jsonb_path_query_array({c}, '$.items[*].p')"), Ty::Jsonb),
-                1 => (format!("jsonb_path_query_first({c}, '$.items[*] ? (@.p > 2).p')"), Ty::Jsonb),
-                2 => (format!(r#"({c} @? '$.t[*] ? (@ == "x")')"#), Ty::Bool),
-                3 => (format!("jsonb_path_exists({c}, 'strict $.items[1]', silent => true)"), Ty::Bool),
-                4 => (format!("jsonb_path_match({c}, '$.a > 2', silent => true)"), Ty::Bool),
-                5 => (format!(r#"jsonb_path_query_array({c}, '$.** ? (@.type() == "number")')"#), Ty::Jsonb),
-                _ => (format!("({c} -> 'a')"), Ty::Jsonb),
-            },
-            Ty::IntArr => match self.rng.below(7) {
-                0 => (format!("cardinality({c})"), Ty::Int),
-                1 => (format!("{c}[1]"), Ty::Int),
-                2 => (format!("{c}[2][1]"), Ty::Int),
-                3 => (format!("{c}[1:1]"), Ty::IntArr),
-                4 => (format!("array_ndims({c})"), Ty::Int),
-                5 => (format!("array_to_string({c}, ',')"), Ty::Text),
-                _ => (format!("({c} || ARRAY[9])"), Ty::IntArr),
-            },
-        }
-    }
-
-    fn pred(&mut self, srcs: &[Src], depth: u32) -> String {
-        if depth < 2 && self.rng.chance(20) {
-            let a = self.pred(srcs, depth + 1);
-            let b = self.pred(srcs, depth + 1);
-            return if self.rng.chance(50) { format!("({a} AND {b})") } else { format!("({a} OR {b})") };
-        }
-        if depth < 2 && self.rng.chance(8) {
-            return format!("NOT {}", self.pred(srcs, depth + 1));
-        }
-        let (c, ty) = self.col_of(srcs, |_| true).unwrap();
-        match self.rng.below(10) {
-            0 => format!("{c} IS NULL"),
-            1 => format!("{c} IS NOT NULL"),
-            2 if ty != Ty::Bool => {
-                let a = literal(self.rng, ty);
-                let b = literal(self.rng, ty);
-                format!("{c} IN ({a}, {b})")
-            }
-            3 if ty.is_num() => format!("{c} BETWEEN {} AND {}", literal(self.rng, ty), literal(self.rng, ty)),
-            4 if ty == Ty::Text => format!("{c} LIKE '{}%'", self.rng.pick(&["a", "b", "f", "B", ""])),
-            _ if ty == Ty::Bool => c,
-            _ => {
-                let op = *self.rng.pick(&["=", "<>", "<", "<=", ">", ">="]);
-                format!("{c} {op} {}", literal(self.rng, ty))
-            }
-        }
-    }
-
-    /// FROM clause with joins; returns (sql, sources).
-    fn from(&mut self, prefix: &str) -> (String, Vec<Src>) {
-        let n = 1 + self.rng.below(3) as usize;
-        let t0 = self.rng.below(self.tables.len() as u64) as usize;
-        let mut srcs = vec![Src { alias: format!("{prefix}0"), table: t0 }];
-        let mut sql = format!("{} {prefix}0", self.tables[t0].name);
-        for k in 1..n {
-            // join along a reference if possible
-            let mut cands: Vec<(usize, String)> = Vec::new();
-            for (ti, t) in self.tables.iter().enumerate() {
-                for c in &t.cols {
-                    if let Some(target) = c.refs {
-                        for s in &srcs {
-                            if s.table == target {
-                                cands.push((ti, format!("{prefix}{k}.{} = {}.id", c.name, s.alias)));
-                            }
-                            if s.table == ti {
-                                cands.push((target, format!("{}.{} = {prefix}{k}.id", s.alias, c.name)));
-                            }
-                        }
-                    }
-                }
-            }
-            let (ti, on) = if cands.is_empty() || self.rng.chance(10) {
-                let ti = self.rng.below(self.tables.len() as u64) as usize;
-                (ti, format!("{prefix}{k}.id = {}.id", srcs[0].alias))
-            } else {
-                self.rng.pick(&cands).clone()
-            };
-            let kind = *self.rng.pick(&["JOIN", "JOIN", "LEFT JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"]);
-            sql.push_str(&format!(" {kind} {} {prefix}{k} ON {on}", self.tables[ti].name));
-            if self.rng.chance(15) {
-                let extra = self.pred(&[srcs[0].clone()], 1);
-                sql.push_str(&format!(" AND {extra}"));
-            }
-            srcs.push(Src { alias: format!("{prefix}{k}"), table: ti });
-        }
-        (sql, srcs)
-    }
-
-    fn subquery_pred(&mut self, srcs: &[Src]) -> String {
-        let t = self.rng.below(self.tables.len() as u64) as usize;
-        let inner = Src { alias: "sq".into(), table: t };
-        // correlate on a reference or on id
-        let mut corr = format!("sq.id = {}.id", srcs[0].alias);
-        for c in &self.tables[t].cols {
-            if let Some(target) = c.refs
-                && let Some(s) = srcs.iter().find(|s| s.table == target)
-            {
-                corr = format!("sq.{} = {}.id", c.name, s.alias);
-            }
-        }
-        let extra = if self.rng.chance(50) { format!(" AND {}", self.pred(std::slice::from_ref(&inner), 1)) } else { String::new() };
-        let tn = &self.tables[t].name;
-        match self.rng.below(8) {
-            5 => {
-                let (oc, _) = self.col_of(srcs, |c| c.ty == Ty::Int).unwrap_or((format!("{}.id", srcs[0].alias), Ty::Int));
-                format!("{oc} = ANY (SELECT sq.id FROM {tn} sq WHERE true{extra})")
-            }
-            6 => {
-                // correlated and possibly empty: ALL over nothing is true
-                let (oc, _) = self.col_of(srcs, |c| c.ty == Ty::Int).unwrap_or((format!("{}.id", srcs[0].alias), Ty::Int));
-                format!("{oc} > ALL (SELECT sq.id FROM {tn} sq WHERE {corr}{extra})")
-            }
-            7 => {
-                let a = &srcs[0].alias;
-                let not = if self.rng.chance(50) { "NOT " } else { "" };
-                format!("({a}.id, {a}.id % 3) {not}IN (SELECT sq.id, sq.id % 3 FROM {tn} sq WHERE true{extra})")
-            }
-            0 => format!("EXISTS (SELECT 1 FROM {tn} sq WHERE {corr}{extra})"),
-            1 => format!("NOT EXISTS (SELECT 1 FROM {tn} sq WHERE {corr}{extra})"),
-            2 => {
-                let (oc, _) = self.col_of(srcs, |c| c.ty == Ty::Int).unwrap_or((format!("{}.id", srcs[0].alias), Ty::Int));
-                format!("{oc} IN (SELECT sq.id FROM {tn} sq WHERE true{extra})")
-            }
-            3 => {
-                let (oc, _) = self.col_of(srcs, |c| c.ty == Ty::Int).unwrap_or((format!("{}.id", srcs[0].alias), Ty::Int));
-                format!("{oc} NOT IN (SELECT sq.id FROM {tn} sq WHERE sq.id IS NOT NULL{extra})")
-            }
-            _ => format!("(SELECT count(*) FROM {tn} sq WHERE {corr}{extra}) > {}", self.rng.below(3)),
-        }
-    }
-
-    fn query(&mut self) -> String {
-        let (from, srcs) = self.from("a");
-        let mut wh = Vec::new();
-        for _ in 0..self.rng.below(3) {
-            wh.push(self.pred(&srcs, 0));
-        }
-        if self.rng.chance(25) {
-            wh.push(self.subquery_pred(&srcs));
-        }
-        let where_sql = if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh.join(" AND ")) };
-        let shape = self.rng.below(10);
-        if shape < 4 {
-            // aggregation
-            let ng = self.rng.below(3) as usize;
-            let mut group = Vec::new();
-            for _ in 0..ng {
-                let (e, _) = self.expr(&srcs, 1);
-                if !group.contains(&e) {
-                    group.push(e);
-                }
-            }
-            let mut sel: Vec<String> = group.clone();
-            let naggs = 1 + self.rng.below(3);
-            for _ in 0..naggs {
-                let (c, ty) = self.col_of(&srcs, |_| true).unwrap();
-                let agg = match self.rng.below(10) {
-                    9 if ty.orderable() => format!("mode() WITHIN GROUP (ORDER BY {c})"),
-                    0 => "count(*)".to_string(),
-                    1 => format!("count({c})"),
-                    2 if ty.is_num() => format!("sum({c})"),
-                    3 if ty.is_num() && ty != Ty::Float => format!("avg({c})"),
-                    4 if ty.minmax() => format!("min({c})"),
-                    5 if ty.minmax() => format!("max({c})"),
-                    6 => format!("count(DISTINCT {c})"),
-                    7 if ty == Ty::Bool => format!("bool_and({c})"),
-                    8 if ty == Ty::Text => format!("string_agg({c}, ',' ORDER BY {c})"),
-                    // arrays accumulate into one more dimension (equal shapes only)
-                    8 if ty == Ty::IntArr => format!(
-                        "array_agg({c} ORDER BY {c}) FILTER (WHERE array_ndims({c}) = 1 AND array_lower({c}, 1) = 1 AND cardinality({c}) = 2)"
-                    ),
-                    _ => format!("count({c})"),
-                };
-                sel.push(agg);
-            }
-            let mut sel = sel;
-            let group_sql = if group.is_empty() {
-                String::new()
-            } else if self.rng.chance(30) {
-                // grouping sets, with grouping() telling the sets apart
-                sel.push(format!("grouping({})", group.join(", ")));
-                match self.rng.below(3) {
-                    0 => format!(" GROUP BY ROLLUP ({})", group.join(", ")),
-                    1 => format!(" GROUP BY CUBE ({})", group.join(", ")),
-                    _ => format!(" GROUP BY GROUPING SETS (({}), ())", group.join(", ")),
-                }
-            } else {
-                format!(" GROUP BY {}", group.join(", "))
-            };
-            let sel_aliased: Vec<String> = sel.iter().enumerate().map(|(i, e)| format!("{e} AS x{i}")).collect();
-            let having = if !group.is_empty() && self.rng.chance(25) { " HAVING count(*) > 1".to_string() } else { String::new() };
-            return format!("SELECT {} FROM {from}{where_sql}{group_sql}{having}", sel_aliased.join(", "));
-        }
-        // projection
-        let n = 1 + self.rng.below(4) as usize;
-        let mut sel = Vec::new();
-        for _ in 0..n {
-            let (e, _) = self.expr(&srcs, 0);
-            sel.push(e);
-        }
-        if shape == 4 {
-            // window function, deterministic order
-            let (p, _) = self.col_of(&srcs, |_| true).unwrap();
-            let all: Vec<String> = srcs.iter().map(|s| format!("{}.id", s.alias)).collect();
-            let order = all.join(", ");
-            let (v, vty) = self.col_of(&srcs, |c| c.ty.is_num()).unwrap_or((format!("{}.id", srcs[0].alias), Ty::Int));
-            let _ = vty;
-            let f = match self.rng.below(10) {
-                0 => "row_number()".to_string(),
-                1 => "rank()".to_string(),
-                2 => "dense_rank()".to_string(),
-                3 => "count(*)".to_string(),
-                4 => format!("sum({v})"),
-                5 => format!("lag({v})"),
-                6 => format!("lead({v}, 2)"),
-                7 => format!("first_value({v})"),
-                8 => format!("max({v})"),
-                _ => format!("min({v})"),
-            };
-            let frame = if f.starts_with("sum") || f.starts_with("max") || f.starts_with("min") {
-                *self.rng.pick(&["", " ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING", " ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"])
-            } else {
-                ""
-            };
-            if self.rng.chance(25)
-                && let Some((oc, _)) = self.col_of(&srcs, |c| matches!(c.ty, Ty::Int | Ty::BigInt | Ty::Numeric))
-            {
-                // RANGE frames include peers, so aggregates are deterministic
-                let agg = *self.rng.pick(&["sum", "count", "max", "min"]);
-                let (lo, hi) = (self.rng.below(5), self.rng.below(3));
-                let frames = [
-                    format!("RANGE BETWEEN {lo} PRECEDING AND CURRENT ROW"),
-                    format!("RANGE BETWEEN {lo} PRECEDING AND {hi} FOLLOWING"),
-                    format!("RANGE BETWEEN CURRENT ROW AND {hi} FOLLOWING"),
-                ];
-                let frame = self.rng.pick(&frames).clone();
-                let dir = if self.rng.chance(30) { " DESC" } else { "" };
-                sel.push(format!("{agg}({v}) OVER (PARTITION BY {p} ORDER BY {oc}{dir} {frame})"));
-            } else {
-                sel.push(format!("{f} OVER (PARTITION BY {p} ORDER BY {order}{frame})"));
-            }
-        }
-        if shape == 7 {
-            // scalar subquery in the select list
-            let t = self.rng.below(self.tables.len() as u64) as usize;
-            let tn = self.tables[t].name.clone();
-            let (agg_col, _) = {
-                let inner = [Src { alias: "sq".into(), table: t }];
-                self.col_of(&inner, |c| c.ty.is_num()).unwrap_or(("sq.id".into(), Ty::Int))
-            };
-            let mut corr = format!("sq.id = {}.id", srcs[0].alias);
-            for c in &self.tables[t].cols {
-                if let Some(target) = c.refs
-                    && let Some(s) = srcs.iter().find(|s| s.table == target)
-                {
-                    corr = format!("sq.{} = {}.id", c.name, s.alias);
-                }
-            }
-            let agg = *self.rng.pick(&["sum", "max", "count", "min"]);
-            sel.push(format!("(SELECT {agg}({agg_col}) FROM {tn} sq WHERE {corr})"));
-        }
-        if shape == 7 && self.rng.chance(40) {
-            // set-returning functions in the select list (several run in lockstep)
-            let a = &srcs[0].alias;
-            sel.push(format!("generate_series(1, ({a}.id % 3) + 1)"));
-            if self.rng.chance(50) {
-                if let Some((c, _)) = self.col_of(&srcs, |c| c.ty == Ty::IntArr) {
-                    sel.push(format!("unnest({c})"));
-                } else if let Some((c, _)) = self.col_of(&srcs, |c| c.ty == Ty::Jsonb) {
-                    sel.push(format!("jsonb_path_query({c}, 'lax $.items[*].p')"));
-                }
-            }
-        }
-        let sel_aliased: Vec<String> = sel.iter().enumerate().map(|(i, e)| format!("{e} AS x{i}")).collect();
-        let distinct = if self.rng.chance(20) { "DISTINCT " } else { "" };
-        let mut q = format!("SELECT {distinct}{} FROM {from}{where_sql}", sel_aliased.join(", "));
-        if shape == 8 {
-            // derived table / CTE wrapping an aggregate
-            let inner = q.clone();
-            let cnt = sel.len();
-            let cols: Vec<String> = (0..cnt).map(|i| format!("x{i}")).collect();
-            q = if self.rng.chance(50) {
-                format!("WITH w AS ({inner}) SELECT {}, count(*) AS n FROM w GROUP BY {}", cols.join(", "), cols.join(", "))
-            } else {
-                format!("SELECT d.*, 1 AS one FROM ({inner}) d WHERE d.x0 IS NOT NULL")
-            };
-            return q;
-        }
-        if shape == 9 {
-            // LATERAL top-1 per row
-            let t = self.rng.below(self.tables.len() as u64) as usize;
-            let tn = self.tables[t].name.clone();
-            q = format!(
-                "SELECT {}, l.id AS lid FROM {from} LEFT JOIN LATERAL (SELECT sq.id FROM {tn} sq WHERE sq.id > {}.id ORDER BY sq.id LIMIT 1) l ON true{where_sql}",
-                sel_aliased.join(", "),
-                srcs[0].alias
-            );
-            return q;
-        }
-        if shape == 5 && distinct.is_empty() && self.rng.chance(30) {
-            // ties on the first column are all kept, so the result is determined
-            q.push_str(&format!(" ORDER BY 1 NULLS FIRST FETCH FIRST {} ROWS WITH TIES", 1 + self.rng.below(6)));
-        } else if shape == 5 && distinct.is_empty() {
-            // top-k with a deterministic order over all output columns
-            let ord: Vec<String> = (0..sel.len()).map(|i| format!("{} NULLS FIRST", i + 1)).collect();
-            let offset = if self.rng.chance(30) { format!(" OFFSET {}", self.rng.below(4)) } else { String::new() };
-            q.push_str(&format!(" ORDER BY {} LIMIT {}{offset}", ord.join(", "), 1 + self.rng.below(10)));
-        } else if shape == 6 {
-            // set operation with a second query of the same shape
-            let (from2, srcs2) = self.from("b");
-            let mut sel2 = Vec::new();
-            for e in &sel {
-                // same types: re-pick a column of the same type from the other query
-                let ty = expr_type_guess(e, &srcs, self.tables);
-                match self.col_of(&srcs2, |c| Some(c.ty) == ty) {
-                    Some((c, _)) => sel2.push(c),
-                    None => sel2.push(format!("NULL::{}", ty.map(|t| t.sql()).unwrap_or("int"))),
-                }
-            }
-            let op = *self.rng.pick(&["UNION", "UNION ALL", "EXCEPT", "INTERSECT", "EXCEPT ALL", "INTERSECT ALL"]);
-            q = format!("{q} {op} SELECT {} FROM {from2}", sel2.join(", "));
-        }
-        q
-    }
-}
-
-/// Best-effort type of a generated expression.
-fn expr_type_guess(e: &str, srcs: &[Src], tables: &[Table]) -> Option<Ty> {
-    if e.starts_with("length(") {
-        return Some(Ty::Int);
-    }
-    if e.starts_with("extract(") {
-        return Some(Ty::Numeric);
-    }
-    if e.starts_with("date_trunc('month'") {
-        return Some(Ty::Timestamp);
-    }
-    for s in srcs {
-        for c in &tables[s.table].cols {
-            if e.contains(&format!("{}.{}", s.alias, c.name)) {
-                return Some(c.ty);
-            }
-        }
-    }
-    None
-}
+use testkit::Rng;
 
 fn connect(conninfo: &str) -> Client {
     let cfg = PgConfig::parse(conninfo).expect("conninfo");
@@ -671,76 +78,186 @@ fn normalize_with(types: &[u32], mut rows: Vec<Vec<Option<String>>>, trim_numeri
             }
         }
     }
-    let mut out: Vec<String> = rows
-        .into_iter()
-        .map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "∅".into())).collect::<Vec<_>>().join("|"))
-        .collect();
+    let mut out: Vec<String> =
+        rows.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "∅".into())).collect::<Vec<_>>().join("|")).collect();
     out.sort();
     out
 }
 
-fn main() {
-    let mut seed = 42u64;
-    let mut nviews = 25usize;
-    let mut rounds = 20usize;
-    let mut keep = false;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--seed" => seed = args.next().unwrap().parse().unwrap(),
-            "--views" => nviews = args.next().unwrap().parse().unwrap(),
-            "--rounds" => rounds = args.next().unwrap().parse().unwrap(),
-            "--keep" => keep = true,
-            _ => {
-                eprintln!("usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--keep]");
+/// The engine under test: in this process, or a child process to SIGKILL.
+enum Engine {
+    InProcess { running: Option<coord::Running>, data: PathBuf },
+    Child { child: std::process::Child, bin: PathBuf, data: PathBuf, port: u16 },
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+impl Engine {
+    fn start(kill: bool, data: &Path) -> (Engine, Client) {
+        if kill {
+            let bin = std::env::current_exe().unwrap().with_file_name("ivm");
+            if !bin.exists() {
+                eprintln!("--kill needs the ivm binary at {} (cargo build --release)", bin.display());
                 std::process::exit(2);
+            }
+            Engine::spawn(bin, data.to_path_buf())
+        } else {
+            let running = coord::start(Config { data_dir: data.to_path_buf(), sync: false, ..Default::default() }).expect("engine");
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let h = running.handle.clone();
+            std::thread::spawn(move || {
+                let _ = server::serve_listener(listener, ServerConfig { listen: String::new(), password: None }, h);
+            });
+            let client = connect(&format!("host=127.0.0.1 port={port} user=ivm dbname=ivm"));
+            (Engine::InProcess { running: Some(running), data: data.to_path_buf() }, client)
+        }
+    }
+
+    fn spawn(bin: PathBuf, data: PathBuf) -> (Engine, Client) {
+        let port = free_port();
+        let child = std::process::Command::new(&bin)
+            .args(["--data-dir", data.to_str().unwrap(), "--listen", &format!("127.0.0.1:{port}"), "--no-sync"])
+            .args(["--tick-ms", "0", "--checkpoint-secs", "1"])
+            .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
+            .spawn()
+            .expect("spawn ivm");
+        let cfg = PgConfig::parse(&format!("host=127.0.0.1 port={port} user=ivm dbname=ivm")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match Client::connect(&cfg) {
+                Ok(c) => return (Engine::Child { child, bin, data, port }, c),
+                Err(e) if Instant::now() > deadline => panic!("ivm did not come up on port {port}: {e}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
     }
+
+    /// Stop (cleanly, or as a crash) and start again; returns a new client.
+    fn restart(&mut self, crash: bool) -> Client {
+        match self {
+            Engine::InProcess { running, data } => {
+                let r = running.take().unwrap();
+                if crash { r.crash() } else { r.shutdown() }
+                let (e, c) = Engine::start(false, data);
+                *self = e;
+                c
+            }
+            Engine::Child { child, bin, data, .. } => {
+                child.kill().expect("kill ivm");
+                let _ = child.wait();
+                let (e, c) = Engine::spawn(bin.clone(), data.clone());
+                *self = e;
+                c
+            }
+        }
+    }
+
+    /// A separate connection (to run a statement the engine is killed in).
+    fn port(&self) -> Option<u16> {
+        match self {
+            Engine::Child { port, .. } => Some(*port),
+            Engine::InProcess { .. } => None,
+        }
+    }
+
+    fn stop(self) {
+        match self {
+            Engine::InProcess { running, .. } => running.unwrap().shutdown(),
+            Engine::Child { mut child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+struct Args {
+    seed: u64,
+    views: usize,
+    rounds: usize,
+    restarts: usize,
+    kill: bool,
+    keep: bool,
+}
+
+fn parse_args() -> Args {
+    let mut a = Args { seed: 42, views: 25, rounds: 20, restarts: 0, kill: false, keep: false };
+    let mut it = std::env::args().skip(1);
+    let usage = || -> ! {
+        eprintln!("usage: ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [--kill] [--keep]");
+        std::process::exit(2)
+    };
+    while let Some(arg) = it.next() {
+        let mut num = || it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(|| usage());
+        match arg.as_str() {
+            "--seed" => a.seed = num(),
+            "--views" => a.views = num() as usize,
+            "--rounds" => a.rounds = num() as usize,
+            "--restarts" => a.restarts = num() as usize,
+            "--kill" => a.kill = true,
+            "--keep" => a.keep = true,
+            _ => usage(),
+        }
+    }
+    if a.kill && a.restarts == 0 {
+        a.restarts = 3;
+    }
+    a
+}
+
+fn main() {
+    let args = parse_args();
+    let seed = args.seed;
+    let verbose = std::env::var("DIFFTEST_VERBOSE").is_ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
-    let pg = TempCluster::start(ClusterOptions { extra_conf: vec!["timezone = 'UTC'".into()], keep, ..Default::default() })
+    let mut rng = Rng::new(seed);
+    let pg = TempCluster::start(ClusterOptions { extra_conf: vec!["timezone = 'UTC'".into()], keep: args.keep, ..Default::default() })
         .expect("start postgres");
     let pg_conn = pg.conninfo("postgres");
     let mut up = connect(&pg_conn);
 
-    // engine + server on a free port
     let data = std::env::temp_dir().join(format!("ivm-difftest-{}-{seed}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
-    let running = coord::start(Config { data_dir: data.clone(), sync: false, ..Default::default() }).expect("engine");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let h = running.handle.clone();
-    std::thread::spawn(move || {
-        let _ = server::serve_listener(listener, ServerConfig { listen: String::new(), password: None }, h);
-    });
-    let mut ivm = connect(&format!("host=127.0.0.1 port={port} user=ivm dbname=ivm"));
+    let (mut engine, mut ivm) = Engine::start(args.kill, &data);
+    // restarts happen in random rounds, at random moments of the round
+    let mut restart_rounds: Vec<usize> = (0..args.restarts).map(|_| 1 + rng.below(args.rounds.max(1) as u64) as usize).collect();
+    restart_rounds.sort();
+    let mut restarts_done = 0;
 
     // schema + initial data
-    let mut tables = gen_schema(&mut rng);
+    let mut tables = sqlgen::gen_schema(&mut rng);
     for t in &tables {
-        let cols: Vec<String> = t
-            .cols
-            .iter()
-            .map(|c| format!("{} {}{}", c.name, c.ty.sql(), if c.name == "id" { " PRIMARY KEY" } else { "" }))
-            .collect();
-        up.execute(&format!("CREATE TABLE {} ({})", t.name, cols.join(", "))).unwrap();
+        if verbose {
+            println!("{};", sqlgen::create_table_sql(t));
+        }
+        up.execute(&sqlgen::create_table_sql(t)).unwrap();
+        for s in sqlgen::toast_sql(t) {
+            up.execute(&s).unwrap();
+        }
     }
     for ti in 0..tables.len() {
-        let n = 30 + rng.below(80);
-        for _ in 0..n {
-            insert_row(&mut rng, &mut tables, ti, &mut up);
+        for _ in 0..(30 + rng.below(80)) {
+            let sql = sqlgen::insert_sql(&mut rng, &mut tables, ti);
+            up.simple_query(&sql).unwrap();
         }
     }
     up.execute("CREATE PUBLICATION difftest FOR ALL TABLES").unwrap();
-    ivm.execute(&format!("CREATE SOURCE src FROM POSTGRES CONNECTION '{pg_conn}' PUBLICATION 'difftest'"))
-        .expect("create source");
+    ivm.execute(&format!("CREATE SOURCE src FROM POSTGRES CONNECTION '{pg_conn}' PUBLICATION 'difftest'")).expect("create source");
+    if args.kill && args.restarts > 0 && rng.chance(30) {
+        // killed during the initial snapshot
+        std::thread::sleep(Duration::from_millis(rng.below(200)));
+        println!("killing the engine during the initial snapshot");
+        ivm = engine.restart(true);
+    }
 
     // views
     let mut views: Vec<(String, String)> = Vec::new();
     let mut unsupported = 0;
     let mut attempts = 0;
-    while views.len() < nviews && attempts < nviews * 20 {
+    while views.len() < args.views && attempts < args.views * 20 {
         attempts += 1;
         let q = Gen { rng: &mut rng, tables: &tables }.query();
         if rows(&mut up, &q).is_err() {
@@ -749,7 +266,7 @@ fn main() {
         let name = format!("v{}", views.len());
         match ivm.execute(&format!("CREATE MATERIALIZED VIEW {name} AS {q}")) {
             Ok(_) => {
-                if std::env::var("DIFFTEST_VERBOSE").is_ok() {
+                if verbose {
                     println!("{name}: {q}");
                 }
                 views.push((name, q))
@@ -760,75 +277,100 @@ fn main() {
             }
         }
     }
-    // views over views
+    // views over views (in the engine they read the view instead of inlining it)
+    let mut reads: std::collections::HashMap<String, String> = Default::default();
     let base = views.len();
     for k in 0..(base / 4) {
         let (src_name, src_q) = views[rng.below(base as u64) as usize].clone();
-        let q = match rng.below(3) {
-            0 => format!("SELECT x0, count(*) AS n FROM ({src_q}) s GROUP BY x0"),
-            1 => format!("SELECT DISTINCT x0 FROM ({src_q}) s WHERE x0 IS NOT NULL"),
-            _ => format!("SELECT s.*, s2.n FROM ({src_q}) s JOIN (SELECT x0, count(*) AS n FROM ({src_q}) z GROUP BY x0) s2 ON s2.x0 = s.x0"),
-        };
+        let (q, ivm_q) = sqlgen::view_over_view(&mut rng, &src_name, &src_q);
         if rows(&mut up, &q).is_err() {
             continue;
         }
-        // in the engine, read from the materialized view instead of inlining
-        let ivm_q = q.replace(&format!("({src_q})"), &src_name.to_string());
         let name = format!("vv{k}");
         match ivm.execute(&format!("CREATE MATERIALIZED VIEW {name} AS {ivm_q}")) {
-            Ok(_) => views.push((name, q)),
+            Ok(_) => {
+                if verbose {
+                    println!("{name}: {ivm_q}");
+                }
+                reads.insert(name.clone(), src_name.clone());
+                views.push((name, q))
+            }
             Err(e) => {
                 unsupported += 1;
                 println!("unsupported: {} :: {ivm_q}", e.message);
             }
         }
     }
+    if let Ok(extra) = std::env::var("DIFFTEST_EXTRA_VIEWS") {
+        for (k, q) in extra.split(";;").map(str::trim).filter(|q| !q.is_empty()).enumerate() {
+            let name = format!("e{k}");
+            match ivm.execute(&format!("CREATE MATERIALIZED VIEW {name} AS {q}")) {
+                Ok(_) => views.push((name, q.to_string())),
+                Err(e) => println!("extra view {name} rejected: {}", e.message),
+            }
+        }
+    }
     println!("created {} views ({unsupported} rejected)", views.len());
 
     let mut failures = 0;
-    for round in 0..=rounds {
-        if round > 0 {
-            // a random transaction batch upstream
-            let ntx = 1 + rng.below(4);
-            for _ in 0..ntx {
-                let mut sql = String::from("BEGIN;");
-                for _ in 0..(1 + rng.below(8)) {
-                    let ti = rng.below(tables.len() as u64) as usize;
-                    match rng.below(10) {
-                        0..=3 => sql.push_str(&insert_sql(&mut rng, &mut tables, ti)),
-                        4..=6 => {
-                            let t = &tables[ti];
-                            let c = rng.pick(&t.cols[1..]).clone();
-                            let v = value(&mut rng, &c, &tables);
-                            sql.push_str(&format!(
-                                "UPDATE {} SET {} = {v} WHERE id % {} = {};",
-                                t.name,
-                                c.name,
-                                2 + rng.below(5),
-                                rng.below(3)
-                            ));
-                        }
-                        7 => {
-                            let t = &tables[ti];
-                            let max = t.next_id.max(2);
-                            if rng.chance(5) && round % 7 == 3 {
-                                sql.push_str(&format!("TRUNCATE {};", t.name));
-                            } else {
-                                sql.push_str(&format!("UPDATE {} SET id = id + 100000 WHERE id = {};", t.name, rng.range(1, max)));
-                            }
-                        }
-                        _ => {
-                            let t = &tables[ti];
-                            sql.push_str(&format!("DELETE FROM {} WHERE id % {} = {};", t.name, 5 + rng.below(7), rng.below(5)));
-                        }
-                    }
-                }
-                sql.push_str("COMMIT;");
-                if let Err(e) = up.simple_query(&sql) {
-                    let _ = up.simple_query("ROLLBACK");
-                    println!("upstream batch failed (ignored): {}", e.message);
+    for round in 0..=args.rounds {
+        let restart_now = restarts_done < restart_rounds.len() && restart_rounds[restarts_done] == round;
+        // when in the round: 0 before the changes, 1 right after them, 2
+        // during a checkpoint (child process only)
+        let when = if restart_now { rng.below(if engine.port().is_some() { 3 } else { 2 }) } else { u64::MAX };
+        let crash = restart_now && (args.kill || rng.chance(70));
+        if when == 0 {
+            println!("round {round}: {} the engine", if crash { "crashing" } else { "restarting" });
+            ivm = engine.restart(crash);
+            restarts_done += 1;
+        }
+        if let Ok(dir) = std::env::var("DIFFTEST_DUMP_DIR") {
+            let mut out = String::new();
+            for t in &tables {
+                for r in up.query(&format!("SELECT * FROM {} ORDER BY id", t.name)).unwrap().rows {
+                    let vals: Vec<String> = r.iter().map(|v| v.as_ref().map(|s| format!("'{}'", s.replace('\'', "''"))).unwrap_or_else(|| "NULL".into())).collect();
+                    out.push_str(&format!("INSERT INTO {} VALUES ({});\n", t.name, vals.join(", ")));
                 }
             }
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(format!("{dir}/round-{round}.sql"), out).unwrap();
+        }
+        if round > 0 {
+            for _ in 0..(1 + rng.below(4)) {
+                let stmts = sqlgen::transaction(&mut rng, &mut tables, false);
+                let sql = format!("BEGIN;{}COMMIT;", stmts.concat());
+                if verbose {
+                    println!("round {round} upstream: {sql}");
+                }
+                if let Err(e) = up.simple_query(&sql) {
+                    let _ = up.simple_query("ROLLBACK");
+                    if verbose {
+                        println!("upstream batch failed (ignored): {}", e.message);
+                    }
+                }
+            }
+            if rng.chance(20) {
+                let _ = ivm.execute("CHECKPOINT");
+            }
+        }
+        if when == 1 {
+            // replication of the changes is in flight
+            std::thread::sleep(Duration::from_millis(rng.below(30)));
+            println!("round {round}: {} the engine after the changes", if crash { "crashing" } else { "restarting" });
+            ivm = engine.restart(crash);
+            restarts_done += 1;
+        } else if when == 2 {
+            let port = engine.port().unwrap();
+            let t = std::thread::spawn(move || {
+                if let Ok(mut c) = Client::connect(&PgConfig::parse(&format!("host=127.0.0.1 port={port} user=ivm dbname=ivm")).unwrap()) {
+                    let _ = c.execute("CHECKPOINT");
+                }
+            });
+            std::thread::sleep(Duration::from_millis(rng.below(20)));
+            println!("round {round}: killing the engine during a checkpoint");
+            ivm = engine.restart(true);
+            let _ = t.join();
+            restarts_done += 1;
         }
         let lsn = up.query("SELECT pg_current_wal_lsn()").unwrap().rows[0][0].clone().unwrap();
         let t0 = Instant::now();
@@ -836,18 +378,26 @@ fn main() {
         let mut both_err = 0;
         let mut matched = 0;
         for (name, q) in &views {
+            // A view over a failing view misses the rows of the failure,
+            // while the inlined query need not compute the failing column
+            // (engine test views_hydrated_from_failing_nodes_report_their_errors).
+            if let Some(src) = reads.get(name)
+                && rows(&mut ivm, &format!("SELECT * FROM {src} AS OF AT LEAST LSN '{lsn}'")).is_err()
+            {
+                if verbose {
+                    println!("note round {round} view {name}: not compared, it reads failing view {src}");
+                }
+                matched += 1;
+                continue;
+            }
             let expect = rows(&mut up, q);
             let got = rows(&mut ivm, &format!("SELECT * FROM {name} AS OF AT LEAST LSN '{lsn}'"));
             match (expect, got) {
                 (Ok((et, er)), Ok((_, gr))) => {
                     let (a, b) = (normalize(&et, er.clone()), normalize(&et, gr.clone()));
                     total_rows += a.len();
-                    let upper = q.to_uppercase();
-                    let dedups = ["GROUP BY", "DISTINCT", "UNION", "INTERSECT", "EXCEPT", "MIN(", "MAX(", "MODE(", "LIMIT", "FETCH"]
-                        .iter()
-                        .any(|k| upper.contains(k));
-                    let same_values = a != b && dedups && normalize_with(&et, er, true) == normalize_with(&et, gr, true);
-                    if same_values && std::env::var("DIFFTEST_VERBOSE").is_ok() {
+                    let same_values = a != b && sqlgen::dedups(q) && normalize_with(&et, er, true) == normalize_with(&et, gr, true);
+                    if same_values && verbose {
                         println!("note round {round} view {name}: equal values in other representations (PostgreSQL keeps the first it meets)");
                     }
                     if a == b || same_values {
@@ -865,6 +415,13 @@ fn main() {
                             println!("  postgres: {a:?}");
                             println!("  ivm:      {b:?}");
                         }
+                        // the same query run ad hoc (not incrementally) in ivm
+                        match rows(&mut ivm, &format!("{q} AS OF AT LEAST LSN '{lsn}'")) {
+                            Ok((_, r)) if normalize(&et, r.clone()) == a => println!("  ivm ad hoc agrees with postgres: a maintenance bug"),
+                            Ok((_, r)) if normalize(&et, r.clone()) == b => println!("  ivm ad hoc agrees with the view: a query semantics bug"),
+                            Ok(_) => println!("  ivm ad hoc agrees with neither"),
+                            Err(e) => println!("  ivm ad hoc fails: {e}"),
+                        }
                     }
                 }
                 (Err(_), Err(_)) => both_err += 1,
@@ -875,17 +432,13 @@ fn main() {
                 }
             }
         }
-        println!(
-            "round {round}: {matched}/{} views match ({total_rows} rows, {both_err} both-error) in {:?}",
-            views.len(),
-            t0.elapsed()
-        );
+        println!("round {round}: {matched}/{} views match ({total_rows} rows, {both_err} both-error) in {:?}", views.len(), t0.elapsed());
         if failures > 0 && round > 0 {
             break;
         }
     }
-    running.shutdown();
-    if !keep {
+    engine.stop();
+    if !args.keep {
         let _ = std::fs::remove_dir_all(&data);
     }
     drop(pg);
@@ -894,18 +447,4 @@ fn main() {
         std::process::exit(1);
     }
     println!("OK (seed {seed})");
-    let _ = Duration::from_secs(0);
-}
-
-fn insert_sql(rng: &mut Rng, tables: &mut [Table], ti: usize) -> String {
-    let id = tables[ti].next_id;
-    tables[ti].next_id += 1;
-    let t = tables[ti].clone();
-    let vals: Vec<String> = t.cols.iter().map(|c| if c.name == "id" { id.to_string() } else { value(rng, c, tables) }).collect();
-    format!("INSERT INTO {} VALUES ({});", t.name, vals.join(", "))
-}
-
-fn insert_row(rng: &mut Rng, tables: &mut [Table], ti: usize, up: &mut Client) {
-    let sql = insert_sql(rng, tables, ti);
-    up.simple_query(&sql).unwrap();
 }

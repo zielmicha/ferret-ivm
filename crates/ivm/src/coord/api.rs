@@ -83,6 +83,8 @@ pub struct Shared {
     /// Reads are parked until a source frontier passes some LSN.
     pub lsn_waiters: AtomicBool,
     pub shutdown: AtomicBool,
+    /// Stop without the final checkpoint (simulated crash, for tests).
+    pub crash: AtomicBool,
 }
 
 impl Shared {
