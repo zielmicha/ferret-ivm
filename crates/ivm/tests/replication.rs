@@ -284,3 +284,40 @@ fn resnapshots_resume_after_a_crash() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A table without a primary key (REPLICA IDENTITY FULL) is a multiset. A
+/// TRUNCATE after other changes to it in the same transaction retracted
+/// those changes twice (leaving negative multiplicities), and the
+/// re-snapshot after a schema change added every row again next to the
+/// old ones.
+#[test]
+fn keyless_tables_truncate_and_resnapshot() {
+    let pg = TempCluster::start(ClusterOptions::default()).expect("start postgres");
+    let conninfo = pg.conninfo("postgres");
+    let mut up = connect(&conninfo);
+    up.simple_query(
+        "CREATE TABLE m (a int, b text);
+         ALTER TABLE m REPLICA IDENTITY FULL;
+         INSERT INTO m VALUES (1, 'x'), (1, 'x'), (2, 'y');
+         CREATE PUBLICATION p FOR TABLE m;",
+    )
+    .unwrap();
+    let dir = scratch("keyless");
+    let running = coord::start(config(&dir)).unwrap();
+    let h = running.handle.clone();
+    create_source(&h, &conninfo);
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT a, count(*) AS n FROM m GROUP BY a", String::new());
+    let q = "SELECT a, b, count(*) FROM m GROUP BY a, b ORDER BY a, b";
+    assert_caught_up(&h, &mut up, &[q]);
+    up.simple_query("BEGIN; INSERT INTO m VALUES (3, 'z'); TRUNCATE m; INSERT INTO m VALUES (4, 'w'), (4, 'w'), (5, 'v'); COMMIT;").unwrap();
+    assert_caught_up(&h, &mut up, &[q]);
+    // (a negative multiplicity hides in reads; adding the row exposes it)
+    up.simple_query("INSERT INTO m VALUES (3, 'z')").unwrap();
+    assert_caught_up(&h, &mut up, &[q]);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY a"), upstream_rows(&mut up, "SELECT a, count(*) FROM m GROUP BY a ORDER BY a"));
+    up.simple_query("ALTER TABLE m ADD COLUMN c int DEFAULT 9; UPDATE m SET b = 'u' WHERE a = 5;").unwrap();
+    assert_caught_up(&h, &mut up, &["SELECT a, b, c, count(*) FROM m GROUP BY a, b, c ORDER BY a, b"]);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY a"), upstream_rows(&mut up, "SELECT a, count(*) FROM m GROUP BY a ORDER BY a"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

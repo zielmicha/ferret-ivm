@@ -227,13 +227,10 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
                 TableChange::Remove { row } => out.data.push((row, -1)),
                 TableChange::Delete { key } => out.data.push((key, -1)),
                 TableChange::Truncate => {
+                    // retract the stored contents; the changes so far in this
+                    // tick are dropped (retracting them as well would leave
+                    // them negative)
                     let mut cur = g.scan_arr(env, *primary, ReadAt::Latest)?;
-                    consolidate(&mut out.data);
-                    // retract current contents plus anything added in this tick
-                    let pending = std::mem::take(&mut out.data);
-                    for (r, w) in pending {
-                        cur.push((r, w));
-                    }
                     consolidate(&mut cur);
                     out.data = cur.into_iter().map(|(r, w)| (r, -w)).collect();
                 }
