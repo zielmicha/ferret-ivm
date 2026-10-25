@@ -281,8 +281,8 @@ impl Case {
 
     /// Compare every view with its query. Only rows are compared: whether
     /// an expression error is raised can depend on the order of evaluation,
-    /// which SQL leaves open (and views reusing a failing shared node miss
-    /// its errors: engine test `views_sharing_a_failing_node_report_its_errors`).
+    /// which SQL leaves open (and a view over a failing view fails with it,
+    /// while the inlined query need not compute the failing column).
     fn check(&mut self, what: &str) {
         let h = self.h();
         let gsn = self.gsn();
@@ -291,15 +291,6 @@ impl Case {
         for v in &self.views {
             let got = query(&h, &format!("SELECT * FROM {}", v.name), v.trim);
             let want = query(&h, &v.query, v.trim);
-            // a view over a failing view misses rows of the failure (engine
-            // test views_hydrated_from_failing_nodes_report_their_errors)
-            if let Some(src) = &v.reads
-                && query(&h, &format!("SELECT * FROM {src}"), false).is_err()
-            {
-                notes.push(format!("-- {} not compared: it reads failing view {src}", v.name));
-                state.insert(v.name.clone(), Err("reads a failing view".into()));
-                continue;
-            }
             match (&got, &want) {
                 (Ok(_), Ok(_)) if got != want => {
                     self.fail(&format!("after {what}: view {} = {}\n  view:  {got:?}\n  query: {want:?}", v.name, v.query))

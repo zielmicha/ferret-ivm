@@ -433,9 +433,8 @@ fn main() {
         let mut both_err = 0;
         let mut matched = 0;
         for (name, q) in &views {
-            // A view over a failing view misses the rows of the failure,
-            // while the inlined query need not compute the failing column
-            // (engine test views_hydrated_from_failing_nodes_report_their_errors).
+            // A view over a failing view fails with it, while PostgreSQL
+            // need not compute the failing column of the inlined query.
             if let Some(src) = reads.get(name)
                 && rows(&mut ivm, &format!("SELECT * FROM {src} AS OF AT LEAST LSN '{lsn}'")).is_err()
             {

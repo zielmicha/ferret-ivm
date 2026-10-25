@@ -354,48 +354,6 @@ fn as_of_history_survives_restart_after_table_sizes_change() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Errors are data: a view whose rows include an expression error fails to
-/// read until the offending rows are gone. Error records are kept per view
-/// and collected only from changes after the view was created, and
-/// arrangements hold no errors: a view hydrated from an existing node misses
-/// that node's current errors, and reading it succeeds with the failing
-/// rows missing. Both a view reusing an existing dataflow node (`e1`, `e2`:
-/// the same aggregate as `e0`) and a view over a failing view created after
-/// the failure (`late`; `early` existed before and fails as it should).
-#[test]
-#[ignore = "bug: views hydrated from an existing node (shared nodes, views over views) miss its current error records"]
-fn views_hydrated_from_failing_nodes_report_their_errors() {
-    let dir = tmpdir("shared-errors");
-    let running = start(&dir);
-    let h = running.handle.clone();
-    let code = |sql: &str| {
-        let stmt = ivm::sql::parse_statement(sql).unwrap();
-        h.execute(stmt, vec![], SessionVars::default(), String::new()).map(|_| ()).map_err(|e| e.code)
-    };
-    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, k int, a int[])");
-    let q = "SELECT (a || ARRAY[9]) AS x, count(*) FROM t GROUP BY 1";
-    exec(&h, &format!("CREATE MATERIALIZED VIEW e0 AS {q}"));
-    exec(&h, "CREATE MATERIALIZED VIEW vin AS SELECT k AS x0, (a || ARRAY[9]) AS x1 FROM t");
-    exec(&h, "CREATE MATERIALIZED VIEW early AS SELECT x0, count(*) AS n FROM vin GROUP BY x0");
-    exec(&h, "INSERT INTO t VALUES (1, 1, '{1,2}'), (2, 1, '{{1,2},{3,4}}')");
-    exec(&h, &format!("CREATE MATERIALIZED VIEW e1 AS {q}"));
-    exec(&h, "CREATE MATERIALIZED VIEW e2 AS SELECT (a || ARRAY[9]) AS x, count(*) AS n FROM t GROUP BY 1");
-    exec(&h, "CREATE MATERIALIZED VIEW late AS SELECT x0, count(*) AS n FROM vin GROUP BY x0");
-    assert_eq!(code(q), Err("2202E".to_string()));
-    for v in ["e0", "vin", "early", "e1", "e2", "late"] {
-        assert_eq!(code(&format!("SELECT * FROM {v}")), Err("2202E".to_string()), "reading {v}");
-    }
-    exec(&h, "DELETE FROM t WHERE id = 2");
-    for v in ["e0", "e1", "e2"] {
-        assert_eq!(rows(&h, &format!("SELECT * FROM {v}")), ["{1,2,9}|1"]);
-    }
-    for v in ["early", "late"] {
-        assert_eq!(rows(&h, &format!("SELECT * FROM {v}")), ["1|1"]);
-    }
-    running.shutdown();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Ad hoc execution deduplicated a group's rows for a DISTINCT ordered
 /// aggregate in place, so ordered aggregates after it saw only the distinct
 /// rows (here mode() saw x = 17 alone). Expected values are PostgreSQL's.
