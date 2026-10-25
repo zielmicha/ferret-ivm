@@ -20,7 +20,7 @@ use pgnumeric::Numeric;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct Summary {
     /// Sum of current weights of all entries.
     pub count: i64,

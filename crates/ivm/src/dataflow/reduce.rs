@@ -77,7 +77,18 @@ type GroupResult = std::result::Result<Option<Row>, SqlError>;
 
 /// Compute the output row of one group (None if the group is empty), with
 /// the group's summary and key values for the cache.
-fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Result<(GroupResult, Option<(Summary, Vec<Datum>)>)> {
+///
+/// `exact_kv`, when given, are the group's key values exactly as in its
+/// first live entry (already read, or the key types have no
+/// representations beyond the canonical key encoding), so that entry need
+/// not be read again.
+fn compute_group(
+    g: &Graph,
+    env: &mut Env,
+    p: &ReducePlan,
+    prefix: &[u8],
+    exact_kv: Option<&[Datum]>,
+) -> Result<(GroupResult, Option<(Summary, Vec<Datum>)>)> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
     let tree = a.tree;
@@ -93,7 +104,11 @@ fn compute_group(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8]) -> Res
     }
     // group key values from the first live entry (exact representation)
     let mut kv: Vec<Datum> = Vec::with_capacity(ng);
-    if ng > 0 {
+    if let Some(exact) = exact_kv
+        && summary.count > 0
+    {
+        kv.extend_from_slice(exact);
+    } else if ng > 0 {
         let mut first = None;
         env.for_each(tree, lo, hib, &mut |k, h| {
             if h.total() > 0 {
@@ -270,7 +285,7 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mu
         let result = match result {
             Some(r) => r,
             None => {
-                let (r, state) = compute_group(g, env, p, &prefix)?;
+                let (r, state) = compute_group(g, env, p, &prefix, (!fidelity_key).then_some(&kv[..]))?;
                 if cacheable && let Some(state) = state {
                     if cache.len() >= GROUP_CACHE_CAP {
                         // evict about half (hash order is effectively random)
@@ -326,16 +341,17 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
     let tree = a.tree;
     let ng = p.group_key.len();
     if ng == 0 {
-        match compute_group(g, env, p, &[])?.0 {
+        match compute_group(g, env, p, &[], None)?.0 {
             Ok(Some(r)) => out.data.push((r, 1)),
             Ok(None) => {}
             Err(e) => out.errs.push((err_record(&e), 1)),
         }
         return Ok(());
     }
-    // enumerate groups in key order, seeking past each group's entries
-    // instead of visiting them
-    let mut prefixes: Vec<Vec<u8>> = Vec::new();
+    // Enumerate groups in key order, seeking past each group's entries
+    // instead of visiting them. The first live entry of a group gives its
+    // key prefix and its exact key values.
+    let mut groups: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
     let mut from: Option<Vec<u8>> = None;
     loop {
         let lo = match &from {
@@ -347,19 +363,20 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
             if h.total() <= 0 {
                 return Ok(true);
             }
-            next = Some(k[..layout.prefix_len(k, ng)?].to_vec());
+            let row = layout.decode_row(k)?;
+            next = Some((k[..layout.prefix_len(k, ng)?].to_vec(), p.group_key.iter().map(|c| row[*c].clone()).collect()));
             Ok(false)
         })?;
-        let Some(prefix) = next else { break };
+        let Some((prefix, kv)) = next else { break };
         from = crate::types::encoding::prefix_successor(&prefix);
-        prefixes.push(prefix);
+        groups.push((prefix, kv));
         if from.is_none() {
             break;
         }
     }
     let mut errors = p.errors.lock();
-    for prefix in prefixes {
-        match compute_group(g, env, p, &prefix)?.0 {
+    for (prefix, kv) in groups {
+        match compute_group(g, env, p, &prefix, Some(&kv))?.0 {
             Ok(Some(r)) => out.data.push((r, 1)),
             Ok(None) => {}
             Err(e) => {
