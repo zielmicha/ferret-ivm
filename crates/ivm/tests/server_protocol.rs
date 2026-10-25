@@ -328,3 +328,27 @@ fn session_commands_clients_send_at_connect() {
     assert_eq!(first_values(&c.query("SHOW server_version_num")), vec!["170000"]);
     running.shutdown();
 }
+
+#[test]
+fn deep_prepared_statements_do_not_crash_sessions() {
+    let (running, port) = start("deepprep");
+    let mut c = Conn::connect(port);
+    c.query("CREATE TABLE t (id int PRIMARY KEY, a int)");
+    c.query("INSERT INTO t VALUES (1, 1), (2, 5)");
+    // prepared statements used to be cloned for every Bind/Describe/Execute,
+    // which overflowed the session thread's stack for long chains
+    let ors = (0..20_000).map(|i| format!("a = {}", i * 5 + 1)).collect::<Vec<_>>().join(" OR ");
+    c.parse("s", &format!("SELECT id FROM t WHERE {ors} ORDER BY id"), &[]);
+    c.describe_stmt("s");
+    c.bind("", "s", &[], 0);
+    c.execute("", 0);
+    let msgs = c.sync();
+    assert_eq!(first_values(&msgs), vec!["1"], "{:?}", error_message(&msgs));
+    let plus = format!("SELECT {}", vec!["1"; 40_000].join("+"));
+    c.parse("p", &plus, &[]);
+    c.describe_stmt("p");
+    let msgs = c.sync();
+    assert!(error_message(&msgs).unwrap_or_default().contains("stack depth limit exceeded"));
+    assert_eq!(first_values(&c.query("SELECT 2")), vec!["2"]);
+    running.shutdown();
+}

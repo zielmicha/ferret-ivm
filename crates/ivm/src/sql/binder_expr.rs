@@ -248,6 +248,9 @@ pub fn is_aggregate_name(n: &str) -> bool {
     AGGREGATES.contains(&n)
 }
 
+/// Deepest expression nesting accepted (see Binder::bind_expr).
+pub const MAX_EXPR_DEPTH: usize = 1000;
+
 /// While a statement is described, a parameter of still unknown type binds
 /// as an unknown literal holding this marker and its index; the first
 /// context that coerces it determines its type, as in PostgreSQL. (A NUL
@@ -361,6 +364,21 @@ impl<'a> Binder<'a> {
     }
 
     pub(crate) fn bind_expr(&mut self, e: &ast::Expr, ctx: &Ctx) -> Result<Expr> {
+        // Deeply nested expressions (long chains of binary operators, which
+        // the parser builds without recursing) would overflow the stack in
+        // binding and in every later pass over the tree: refuse them, like
+        // PostgreSQL's stack depth check does.
+        if self.expr_depth >= MAX_EXPR_DEPTH {
+            return Err(SqlError::new(codes::STATEMENT_TOO_COMPLEX, "stack depth limit exceeded")
+                .with_hint(format!("Expressions may be nested at most {MAX_EXPR_DEPTH} levels deep.")));
+        }
+        self.expr_depth += 1;
+        let r = self.bind_expr_nested(e, ctx);
+        self.expr_depth -= 1;
+        r
+    }
+
+    fn bind_expr_nested(&mut self, e: &ast::Expr, ctx: &Ctx) -> Result<Expr> {
         use ast::Expr as E;
         match e {
             E::Identifier(id) => self.bind_column(None, &ident(id), ctx),
@@ -1142,14 +1160,29 @@ impl<'a> Binder<'a> {
         }
         match op {
             B::And | B::Or => {
-                let l = self.bind_expr(left, ctx)?;
-                let r = self.bind_expr(right, ctx)?;
+                // a chain of ANDs (ORs) is one n-ary node: generated SQL has
+                // chains of thousands of terms, too deep to bind recursively
+                let mut terms = Vec::new();
+                let mut stack = vec![right, left];
+                while let Some(x) = stack.pop() {
+                    match x {
+                        ast::Expr::BinaryOp { left: l, op: o, right: r } if o == op => {
+                            stack.push(r);
+                            stack.push(l);
+                        }
+                        ast::Expr::Nested(inner) if matches!(&**inner, ast::Expr::BinaryOp { op: o, .. } if o == op) => stack.push(inner),
+                        other => terms.push(other),
+                    }
+                }
                 let what = if matches!(op, B::And) { "AND" } else { "OR" };
-                let l = self.coerce_bool(l, what)?;
-                let r = self.coerce_bool(r, what)?;
+                let mut bound = Vec::with_capacity(terms.len());
+                for t in terms {
+                    let b = self.bind_expr(t, ctx)?;
+                    bound.push(self.coerce_bool(b, what)?);
+                }
                 Ok(match op {
-                    B::And => Expr::And(vec![l, r]),
-                    _ => Expr::Or(vec![l, r]),
+                    B::And => Expr::And(bound),
+                    _ => Expr::Or(bound),
                 })
             }
             B::PGLikeMatch | B::PGILikeMatch | B::PGNotLikeMatch | B::PGNotILikeMatch => {
@@ -1887,9 +1920,8 @@ impl<'a> Binder<'a> {
                 // bind as an aggregate to get its type, but with a private collector
                 let tmp = std::cell::RefCell::new(super::binder::Collector::default());
                 let tctx = Ctx { scope: ctx.scope, collector: Some(&tmp), in_agg: false, clause: ctx.clause };
-                let fcopy = ast::Function { over: None, ..f.clone() };
                 // aggregates in the arguments belong to the query's aggregation
-                let _ = self.bind_aggregate(agg, &fcopy, args, dup, &[], star, &tctx, Some(&actx))?;
+                let _ = self.bind_aggregate(agg, f, args, dup, &[], star, &tctx, Some(&actx))?;
                 let mut t = tmp.into_inner();
                 if t.aggs.len() != 1 {
                     sql_bail!(codes::FEATURE_NOT_SUPPORTED, "unsupported window aggregate");

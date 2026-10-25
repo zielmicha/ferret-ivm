@@ -559,3 +559,31 @@ fn pg_attribute_describes_array_columns_as_varlena() {
     );
     running.shutdown();
 }
+
+#[test]
+fn long_operator_chains_do_not_crash_the_engine() {
+    let running = start("deep-exprs");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // a chain of 2000 '+' overflowed the engine thread's stack and aborted
+    // the process; such chains are now refused like PostgreSQL does
+    let deep = format!("SELECT {}", vec!["1"; 2000].join(" + "));
+    assert!(try_rows(&h, &deep).unwrap_err().contains("stack depth limit exceeded"));
+    let ok = format!("SELECT {}", vec!["1"; 900].join(" + "));
+    assert_eq!(rows(&h, &ok), vec!["900"]);
+    // AND / OR chains are flat: generated queries with thousands of terms work
+    let ors = (0..20_000).map(|i| format!("a = {i}")).collect::<Vec<_>>().join(" OR ");
+    assert_eq!(rows(&h, &format!("SELECT count(*) FROM t1 WHERE {ors}")), vec!["4"]);
+    let ands = vec!["a IS NOT NULL"; 20_000].join(" AND ");
+    exec(&h, &format!("CREATE MATERIALIZED VIEW wide AS SELECT id FROM t1 WHERE {ands}"));
+    assert_eq!(rows(&h, "SELECT count(*) FROM wide"), vec!["4"]);
+    // deep (but accepted) expressions in a maintained view
+    exec(&h, &format!("CREATE MATERIALIZED VIEW deep AS SELECT id, {} AS v FROM t1", vec!["a"; 900].join(" + ")));
+    exec(&h, "UPDATE t1 SET a = 10 WHERE id = 1");
+    assert_eq!(rows(&h, "SELECT v FROM deep WHERE id = 1"), vec!["9000"]);
+    // beyond what the parser accepts at all
+    let huge = format!("SELECT {}", vec!["1"; 60_000].join("+"));
+    assert!(try_rows(&h, &huge).unwrap_err().contains("stack depth limit exceeded"));
+    assert_eq!(rows(&h, "SELECT 1"), vec!["1"]);
+    running.shutdown();
+}

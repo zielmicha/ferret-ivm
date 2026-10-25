@@ -158,6 +158,8 @@ pub struct Binder<'a> {
     pub params: Vec<ParamSlot>,
     pub(crate) next_rec_id: u64,
     view_depth: usize,
+    /// Nesting depth of the expression being bound (see MAX_EXPR_DEPTH).
+    pub(crate) expr_depth: usize,
     /// WINDOW clause of the SELECT being bound.
     pub(crate) named_windows: Vec<ast::NamedWindowDefinition>,
 }
@@ -193,6 +195,7 @@ impl<'a> Binder<'a> {
             params: Vec::new(),
             next_rec_id: 1,
             view_depth: 0,
+            expr_depth: 0,
             named_windows: Vec::new(),
         }
     }
@@ -351,10 +354,10 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_query_body(&mut self, q: &ast::Query) -> Result<BoundQuery> {
-        let order_by: Vec<ast::OrderByExpr> = match &q.order_by {
-            None => vec![],
+        let order_by: &[ast::OrderByExpr] = match &q.order_by {
+            None => &[],
             Some(ob) => match &ob.kind {
-                ast::OrderByKind::Expressions(v) => v.clone(),
+                ast::OrderByKind::Expressions(v) => v,
                 ast::OrderByKind::All(_) => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "ORDER BY ALL is not supported"),
             },
         };
@@ -362,7 +365,7 @@ impl<'a> Binder<'a> {
         if with_ties && order_by.is_empty() {
             sql_bail!(codes::SYNTAX_ERROR, "WITH TIES cannot be specified without ORDER BY clause");
         }
-        let mut bq = self.bind_query_body_inner(q, &order_by, limit, offset)?;
+        let mut bq = self.bind_query_body_inner(q, order_by, limit, offset)?;
         bq.with_ties = with_ties;
         Ok(bq)
     }
@@ -1220,8 +1223,7 @@ impl<'a> Binder<'a> {
                 }
                 if let Some(args) = args {
                     let (_, fname) = object_name(name)?;
-                    let fargs: Vec<ast::FunctionArg> = args.args.clone();
-                    return self.bind_table_function(&fname, &fargs, alias.as_ref(), left_scope, *with_ordinality);
+                    return self.bind_table_function(&fname, &args.args, alias.as_ref(), left_scope, *with_ordinality);
                 }
                 let (schema, tname) = object_name(name)?;
                 let (rel, scope) = self.bind_named_relation(schema.as_deref(), &tname, alias.as_ref())?;

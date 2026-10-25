@@ -26,6 +26,11 @@ pub struct ServerConfig {
 
 type CancelMap = Arc<Mutex<HashMap<u32, (u32, Arc<AtomicBool>)>>>;
 
+/// Stack size of session threads: syntax trees of long operator chains (up
+/// to sql::parser::MAX_OPERATOR_CHAIN deep) are dropped recursively.
+/// Reserved, not committed, memory.
+const SESSION_STACK: usize = 16 << 20;
+
 /// Accept connections forever.
 pub fn serve(cfg: ServerConfig, engine: EngineHandle) -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen)?;
@@ -47,6 +52,8 @@ pub fn serve_listener(listener: TcpListener, cfg: ServerConfig, engine: EngineHa
         let pid = next_pid.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
             .name(format!("ivm-session-{pid}"))
+            // statements (and their syntax trees) may nest deeply
+            .stack_size(SESSION_STACK)
             .spawn(move || {
                 let _ = stream.set_nodelay(true);
                 if let Err(e) = Session::run(stream, cfg, engine, cancels.clone(), pid) {
@@ -59,16 +66,18 @@ pub fn serve_listener(listener: TcpListener, cfg: ServerConfig, engine: EngineHa
     Ok(())
 }
 
+/// Prepared statements and portals keep the statement's text and parse it
+/// again when needed: syntax trees can be deep, and cloning one recurses
+/// once per level (parsing does not).
 struct Prepared {
     text: String,
-    stmt: Statement,
     param_types: Vec<SqlType>,
     /// Number of parameters a Bind must supply.
     nparams: usize,
 }
 
 struct Portal {
-    stmt: Statement,
+    text: String,
     params: Vec<ParamSlot>,
     result_formats: Vec<i16>,
     /// Remaining rows of a partially fetched (or exhausted) result.
@@ -620,10 +629,10 @@ impl Session {
             return Err(SqlError::syntax("cannot insert multiple commands into a prepared statement"));
         }
         let text = stmts.into_iter().next().unwrap_or_default();
-        let stmt = parse_statement(&text)?;
+        parse_statement(&text)?;
         let types: Vec<SqlType> = param_types.iter().map(|o| SqlType::from_oid(*o).unwrap_or(SqlType::Unknown)).collect();
         let nparams = crate::sql::parser::max_param_index(&text).max(types.len());
-        self.prepared.insert(name.to_string(), Prepared { text, stmt, param_types: types, nparams });
+        self.prepared.insert(name.to_string(), Prepared { text, param_types: types, nparams });
         Ok(())
     }
 
@@ -656,9 +665,8 @@ impl Session {
             };
             slots.push(ParamSlot { ty: ty.clone(), value: Some(value) });
         }
-        let stmt = p.stmt.clone();
-        let _ = &p.text;
-        self.portals.insert(portal.to_string(), Portal { stmt, params: slots, result_formats, pending: None });
+        let text = p.text.clone();
+        self.portals.insert(portal.to_string(), Portal { text, params: slots, result_formats, pending: None });
         Ok(())
     }
 
@@ -669,23 +677,23 @@ impl Session {
                 .get(name)
                 .ok_or_else(|| SqlError::new(codes::INVALID_SQL_STATEMENT_NAME, format!("prepared statement \"{name}\" does not exist")))?;
             let params: Vec<ParamSlot> = p.param_types.iter().map(|t| ParamSlot { ty: t.clone(), value: None }).collect();
-            (p.stmt.clone(), params, vec![], true)
+            (parse_statement(&p.text)?, params, vec![], true)
         } else {
             let p = self
                 .portals
                 .get(name)
                 .ok_or_else(|| SqlError::new(codes::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist")))?;
-            (p.stmt.clone(), p.params.clone(), p.result_formats.clone(), false)
+            (parse_statement(&p.text)?, p.params.clone(), p.result_formats.clone(), false)
         };
         let (cols, ptypes) = match &stmt {
             Statement::Show(_) | Statement::Explain { .. } => {
                 // run eagerly to learn the columns
-                match self.run_statement(stmt.clone(), params.clone())? {
+                match self.run_statement(stmt, params)? {
                     ExecResult::Query { columns, .. } => (columns, vec![]),
                     _ => (vec![], vec![]),
                 }
             }
-            _ => self.engine.describe(stmt.clone(), params.clone())?,
+            _ => self.engine.describe(stmt, params)?,
         };
         if is_stmt {
             let mut oids: Vec<u32> = ptypes.iter().map(|t| t.oid()).collect();
@@ -728,7 +736,7 @@ impl Session {
             return Err(SqlError::new(codes::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist")));
         };
         if portal.pending.is_none() {
-            let res = self.run_statement(portal.stmt.clone(), portal.params.clone())?;
+            let res = self.run_statement(parse_statement(&portal.text)?, portal.params.clone())?;
             match res {
                 ExecResult::Query { columns, rows } => portal.pending = Some((columns, rows.into_iter())),
                 other => {

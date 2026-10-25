@@ -173,6 +173,77 @@ pub fn max_param_index(sql: &str) -> usize {
     max
 }
 
+/// Longest chain of operators accepted at one nesting level (see
+/// check_operator_chains).
+pub const MAX_OPERATOR_CHAIN: usize = 50_000;
+
+/// The parser turns a chain of binary (or postfix) operators into a tree as
+/// deep as the chain is long without recursing, but cloning or dropping that
+/// tree recurses once per level and would overflow the stack (aborting the
+/// process) for very long chains. Bound the depth from the text: count the
+/// operators (symbols and operator keywords) between commas, per level of
+/// parentheses and CASE.
+fn check_operator_chains(sql: &str) -> Result<()> {
+    // keywords of infix and postfix operators (prefix NOT recurses in the
+    // parser, which limits that by itself; NOT LIKE etc. are one operator)
+    const INFIX: &[&str] = &["and", "or", "is", "like", "ilike", "similar", "between", "in", "at", "collate", "overlaps", "isnull", "notnull"];
+    const RESET: &[&str] = &[
+        "select", "from", "where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "join", "on",
+        "using", "when", "then", "else", "values", "set", "returning", "window",
+    ];
+    let b = sql.as_bytes();
+    let is_op = |c: u8| b"+-*/%^<>=!|&#~@?:".contains(&c);
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let mut counts = vec![0usize];
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(end) = skip_lexical(b, i) {
+            i = end + 1;
+            continue;
+        }
+        let c = b[i];
+        let mut word = None;
+        if is_op(c) {
+            while i < b.len() && is_op(b[i]) && skip_lexical(b, i).is_none() {
+                i += 1;
+            }
+            *counts.last_mut().unwrap() += 1;
+        } else if is_word(c) {
+            let start = i;
+            while i < b.len() && is_word(b[i]) {
+                i += 1;
+            }
+            word = Some(sql[start..i].to_ascii_lowercase());
+        } else {
+            match c {
+                b'(' => counts.push(0),
+                b')' if counts.len() > 1 => {
+                    counts.pop();
+                }
+                b',' | b';' => *counts.last_mut().unwrap() = 0,
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(w) = word {
+            if w == "case" {
+                counts.push(0);
+            } else if w == "end" && counts.len() > 1 {
+                counts.pop();
+            } else if INFIX.contains(&w.as_str()) {
+                *counts.last_mut().unwrap() += 1;
+            } else if RESET.contains(&w.as_str()) {
+                *counts.last_mut().unwrap() = 0;
+            }
+        }
+        if counts.last().is_some_and(|n| *n > MAX_OPERATOR_CHAIN) {
+            return Err(SqlError::new(codes::STATEMENT_TOO_COMPLEX, "stack depth limit exceeded")
+                .with_hint(format!("Chains of more than {MAX_OPERATOR_CHAIN} operators are not supported.")));
+        }
+    }
+    Ok(())
+}
+
 /// Split a query string into statements at top-level semicolons.
 pub fn split_statements(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
@@ -423,6 +494,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     if sql.is_empty() {
         return Ok(Statement::Empty);
     }
+    check_operator_chains(sql)?;
     let mut t = Toks::new(sql);
     let first = t.peek().unwrap_or("").to_string();
     match first.as_str() {
@@ -806,6 +878,25 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(parse_statement("COPY (SUBSCRIBE (select 'İ' from t)) TO STDOUT").is_ok());
+    }
+
+    #[test]
+    fn operator_chains() {
+        // deep syntax trees are dropped recursively: use a session-sized stack
+        std::thread::Builder::new().stack_size(16 << 20).spawn(operator_chains_body).unwrap().join().unwrap();
+    }
+
+    fn operator_chains_body() {
+        let chain = |n: usize, sep: &str| vec!["1"; n].join(sep);
+        assert!(parse_statement(&format!("select {}", chain(MAX_OPERATOR_CHAIN, "+"))).is_ok());
+        let err = parse_statement(&format!("select {}", chain(MAX_OPERATOR_CHAIN + 2, "+"))).unwrap_err();
+        assert!(err.message.contains("stack depth limit exceeded"), "{}", err.message);
+        assert!(parse_statement(&format!("select 1 where {}", vec!["a = 1"; MAX_OPERATOR_CHAIN].join(" or "))).is_err());
+        // commas, CASE branches and parentheses start new chains
+        assert!(parse_statement(&format!("select 1 where a in ({})", vec!["-1"; 3 * MAX_OPERATOR_CHAIN].join(", "))).is_ok());
+        let parened = vec!["(a = 1 and b = 2)"; MAX_OPERATOR_CHAIN / 2].join(" or ");
+        assert!(parse_statement(&format!("select 1 where {parened}")).is_ok());
+        assert!(parse_statement(&format!("select 1 where '{}' = ''", "+".repeat(10 * MAX_OPERATOR_CHAIN))).is_ok());
     }
 
     #[test]
