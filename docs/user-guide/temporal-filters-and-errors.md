@@ -147,7 +147,7 @@ INSERT INTO t VALUES (1, 1), (2, 2);
 CREATE MATERIALIZED VIEW e AS SELECT id, 10 / (x - 1) AS q FROM t;
 
 SELECT * FROM e;          -- ERROR:  division by zero
-SHOW VIEWS;               -- e | materialized | 1 | 1   (one error record)
+SHOW VIEWS;               -- e | materialized | 1 | 1 | ok   (one error record)
 DELETE FROM t WHERE id = 1;
 SELECT * FROM e;          -- 2 | 10
 ```
