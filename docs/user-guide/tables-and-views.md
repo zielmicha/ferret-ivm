@@ -250,10 +250,10 @@ DROP SINK [ IF EXISTS ] name                 -- see Sinks
   unless `CASCADE` is given, which drops them (recursively) first. Indexes
   on a dropped table or materialized view are dropped with it, as in
   PostgreSQL.
-- A statement naming several objects is not atomic: they are dropped one
-  after another, and an error (for example `table "nosuch" does not exist`)
-  leaves the earlier ones dropped. Such a statement is also missing from
-  `ivm.catalog_history`.
+- A statement naming several objects is atomic: every name is checked
+  first, and an error (for example `table "nosuch" does not exist`) drops
+  nothing. Objects named in the same statement do not hold each other back
+  (`DROP VIEW v, view_over_v` needs no `CASCADE`).
 - Subscriptions to a dropped materialized view end with
   `materialized view "x" was dropped`.
 - Dropping releases the object's dataflow nodes and indexes unless other

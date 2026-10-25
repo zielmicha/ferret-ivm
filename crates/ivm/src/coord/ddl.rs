@@ -186,6 +186,9 @@ impl Engine {
                 ast::Statement::CreateView(cv) => self.apply_create_view(gsn, sql, &cv),
                 ast::Statement::CreateIndex(ci) => self.apply_create_index(gsn, sql, &ci),
                 ast::Statement::Drop { object_type, if_exists, names, cascade, .. } => {
+                    // every name is resolved and checked before anything is
+                    // dropped: the statement is atomic, as in PostgreSQL
+                    let mut targets: Vec<ObjectId> = Vec::new();
                     for n in &names {
                         let (_, name) = object_name(n)?;
                         let Some(obj) = self.catalog.by_name(&name).cloned() else {
@@ -210,7 +213,21 @@ impl Engine {
                         {
                             sql_bail!(codes::WRONG_OBJECT_TYPE, "cannot drop source table \"{name}\"; drop the source instead");
                         }
-                        self.drop_with_dependents(obj.id, cascade)?;
+                        if !targets.contains(&obj.id) {
+                            targets.push(obj.id);
+                        }
+                    }
+                    // objects dropped by the same statement do not hold
+                    // each other back
+                    if !cascade {
+                        for &t in &targets {
+                            self.check_dependents(t, &targets)?;
+                        }
+                    }
+                    for t in targets {
+                        if self.catalog.get(t).is_some() {
+                            self.drop_with_dependents(t, true)?;
+                        }
                     }
                     Ok(ExecResult::Command {
                         tag: match object_type {
@@ -826,14 +843,15 @@ impl Engine {
         Ok(())
     }
 
-    fn drop_with_dependents(&mut self, id: ObjectId, cascade: bool) -> Result<()> {
+    /// Fail unless object `id` can be dropped without CASCADE when the
+    /// objects in `dropped` go too. As in PostgreSQL, a relation's indexes
+    /// go with it: only views, sinks and a source's tables need CASCADE.
+    fn check_dependents(&self, id: ObjectId, dropped: &[ObjectId]) -> Result<()> {
         let deps = self.catalog.dependents(id);
-        // as in PostgreSQL, a relation's indexes go with it: only views,
-        // sinks and a source's tables need CASCADE
-        let blocking = deps.iter().find(|d| !matches!(self.catalog.get(**d).map(|o| &o.kind), Some(ObjectKind::Index(_))));
-        if let Some(&first) = blocking
-            && !cascade
-        {
+        let blocking = deps
+            .iter()
+            .find(|d| !dropped.contains(d) && !matches!(self.catalog.get(**d).map(|o| &o.kind), Some(ObjectKind::Index(_))));
+        if let Some(&first) = blocking {
             let obj = self.catalog.get(id).unwrap();
             let dep = self.catalog.get(first).unwrap();
             return Err(SqlError::new(
@@ -843,6 +861,14 @@ impl Engine {
             .with_detail(format!("{} {} depends on {} {}", dep.kind.name(), dep.name, obj.kind.name(), obj.name))
             .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
         }
+        Ok(())
+    }
+
+    fn drop_with_dependents(&mut self, id: ObjectId, cascade: bool) -> Result<()> {
+        if !cascade {
+            self.check_dependents(id, &[])?;
+        }
+        let deps = self.catalog.dependents(id);
         for d in deps {
             if self.catalog.get(d).is_some() {
                 self.drop_with_dependents(d, true)?;

@@ -162,7 +162,7 @@ SELECT * FROM ivm.objects;
 
 | Relation | Columns | Contents |
 |---|---|---|
-| `ivm.catalog_history` | `gsn bigint`, `statement text` | every DDL statement that was applied successfully, with its GSN, in order — including statements of objects that have since been dropped. "What did the catalog look like at GSN g?" is a query over it, with two gaps: upstream schema changes rewrite table definitions without an entry, and a multi-object `DROP` that failed part-way (after dropping some objects) is missing. |
+| `ivm.catalog_history` | `gsn bigint`, `statement text` | every DDL statement that was applied successfully, with its GSN, in order — including statements of objects that have since been dropped. "What did the catalog look like at GSN g?" is a query over it, with one gap: upstream schema changes rewrite table definitions without an entry. |
 | `ivm.objects` | `oid oid`, `name text`, `kind text`, `created_gsn bigint`, `definition text` | the current catalog objects: OID (`16384 + id`), name, kind (`table`, `view`, `materialized view`, `index`, `source`, `sink`), the GSN of the statement that created (or last replaced) the object, and its stored statement |
 
 Both are computed from the catalog when a query is planned; they are not

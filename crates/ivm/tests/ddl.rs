@@ -187,3 +187,34 @@ fn dropping_a_relation_drops_its_indexes() {
     e.exec("CREATE INDEX t_b ON t (b)");
     e.shutdown();
 }
+
+/// A DROP naming several objects is atomic (an error drops nothing) and
+/// lands in the catalog history; the objects it names do not hold each
+/// other back.
+#[test]
+fn multi_name_drop_is_atomic() {
+    let e = Engine::start("multi-drop");
+    e.exec("CREATE TABLE t (a int PRIMARY KEY)");
+    e.exec("CREATE VIEW a AS SELECT a FROM t");
+    e.exec("CREATE MATERIALIZED VIEW b AS SELECT a FROM a");
+    let history = |e: &Engine| e.rows("SELECT statement FROM ivm.catalog_history ORDER BY gsn");
+    let objects = |e: &Engine| e.rows("SELECT name FROM ivm.objects ORDER BY name");
+    let before = history(&e);
+    // errors leave every object in place and record nothing
+    assert_eq!(e.err("DROP VIEW b, a, nosuch"), err("42P01", "view \"nosuch\" does not exist"));
+    assert_eq!(e.err("DROP VIEW b, t"), err("42809", "\"t\" is not a view"));
+    assert_eq!(e.err("DROP VIEW a").0, "2BP01");
+    assert_eq!(objects(&e), ["a", "b", "t"]);
+    assert_eq!(history(&e), before);
+    e.exec("DROP VIEW a, b");
+    assert_eq!(objects(&e), ["t"]);
+    let after = history(&e);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(after.last().unwrap(), "DROP VIEW a, b");
+    e.exec("DROP TABLE IF EXISTS nosuch, t, t");
+    assert_eq!(objects(&e), Vec::<String>::new());
+    let after = history(&e);
+    let e = e.restart();
+    assert_eq!(history(&e), after);
+    e.shutdown();
+}
