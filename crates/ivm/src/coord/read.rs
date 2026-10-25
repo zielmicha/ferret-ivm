@@ -442,6 +442,10 @@ impl Engine {
                 }
                 let mut reads = self.catalog.references(&q.to_string()).unwrap_or_default();
                 gets(&bq.rel, &mut reads);
+                // and what the materialized views it reads read in turn: the
+                // subscription's dataflow is built on their current versions,
+                // so it ends when one of them is replaced or re-planned
+                self.add_view_reads(&mut reads);
                 reads.sort_unstable();
                 reads.dedup();
                 let names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
@@ -474,6 +478,22 @@ impl Engine {
         let _ = tx.send(SubEvent::Progress { gsn: self.processed });
         self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
         Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
+    }
+
+    /// Add to `reads` the relations that the materialized views in it read
+    /// (directly or through views), transitively.
+    fn add_view_reads(&self, reads: &mut Vec<ObjectId>) {
+        let mut i = 0;
+        while i < reads.len() {
+            if let Some(ObjectKind::MaterializedView(v)) = self.catalog.get(reads[i]).map(|o| &o.kind) {
+                for r in self.catalog.references(&v.sql).unwrap_or_default() {
+                    if !reads.contains(&r) {
+                        reads.push(r);
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 
     /// Result columns and parameter types without executing.

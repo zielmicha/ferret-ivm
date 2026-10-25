@@ -377,8 +377,10 @@ different key — the source:
    their columns by name (an index whose column is gone is dropped, one that
    cannot be built is marked broken; both are logged); subscriptions that
    read the table — `SUBSCRIBE TO` the table, a virtual view over it, or a
-   query naming it — end with `table "t" changed its columns upstream`
-   (SQLSTATE `55000`); sinks from the table restart with the new columns
+   query reading it directly or through views (also through materialized
+   views, whose new versions their dataflows would not follow) — end with
+   `table "t" changed its columns upstream` (SQLSTATE `55000`); sinks from
+   the table restart with the new columns
    ([Sinks](sinks.md#schema-changes-and-replacements)); and the materialized
    views reading the table are re-planned (below);
 5. the source re-snapshots the table from the beginning, which fills the new
@@ -425,14 +427,6 @@ re-snapshot fills them, and materialized views that use the old name are
 dropped (see above). To keep such a view with its indexes and sinks,
 replace it before the upstream change by a definition that does not need
 the column.
-
-Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
-
-- A `SUBSCRIBE (query)` whose query reads a materialized view over the
-  table keeps reading the view's old version, which no longer receives
-  changes: the subscription stays open (and with `PROGRESS` keeps reporting
-  progress) but delivers no more changes. Restart such subscriptions after
-  a schema change (`SUBSCRIBE TO` the view itself is not affected).
 
 ### Tables added to or removed from the publication
 

@@ -823,6 +823,19 @@ impl Engine {
                 s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
+        // subscriptions to queries reading the view (directly or through
+        // other views) have dataflows built on its old version, which they
+        // would go on with (and which receives no more changes when the
+        // view was re-planned after an upstream change): they end
+        for s in self.subs.iter() {
+            if s.view != Some(id) && s.reads.contains(&id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                    codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{name}\" was replaced"),
+                )));
+                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         // the view's sinks (not those of other views sharing the old node)
         let sinks: Vec<ObjectId> = self
             .sink_handles

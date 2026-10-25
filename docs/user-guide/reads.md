@@ -337,9 +337,15 @@ A subscription runs until
   modifiers), by `CREATE OR REPLACE` or when an upstream schema change
   re-plans it: `materialized view "x" changed its columns` (SQLSTATE
   `55000`);
-- a replicated table it reads (directly, or through virtual views) changes
-  its columns upstream: `table "x" changed its columns upstream` (SQLSTATE
+- a replicated table it reads changes its columns upstream — the
+  subscribed table, or a table that a subscribed virtual view or query
+  reads, directly or through views, materialized ones included (a
+  subscription to a materialized view itself follows its re-planning
+  instead, see below): `table "x" changed its columns upstream` (SQLSTATE
   `55000`);
+- a materialized view that its query reads (directly or through other
+  views) is replaced with `CREATE OR REPLACE` or re-planned:
+  `materialized view "x" was replaced` (SQLSTATE `55000`);
 - the subscribed relation or query gets a new error record: the
   subscription ends with the error (the retraction of an error record does
   not end it). The initial snapshot of a subscription leaves rows that fail
@@ -347,15 +353,12 @@ A subscription runs until
 - the engine shuts down.
 
 If the subscribed materialized view is replaced with `CREATE OR REPLACE` by
-a materialized view with the same columns, the subscription continues: it
+a materialized view with the same columns, or re-planned after an upstream
+schema change without changing its columns, the subscription continues: it
 receives the difference between the old and the new contents at the
-replacement's GSN. A subscription to a query, by contrast, keeps the
-dataflow it was built with: when a materialized view it reads is replaced,
-or re-planned after an upstream schema change of a table under it, the
-subscription goes on with the view's old version — which no longer
-receives changes at all if the table under it changed shape (see
-[Known problems](troubleshooting.md#known-problems)). Subscribe to the view
-itself, or subscribe again after such changes.
+replacement's GSN. A subscription to a query has a dataflow of its own,
+built over the current versions of the materialized views it reads, so it
+ends instead (see above); subscribe again after such changes.
 
 Changes are queued for each subscription without a bound; a client that
 reads more slowly than changes arrive makes the server's memory grow.

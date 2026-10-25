@@ -203,6 +203,37 @@ fn views_invalidated_upstream_are_dropped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A subscription to a query over a materialized view ends when an
+/// upstream schema change of a table under the view re-plans the view: it
+/// used to stay open on the view's old version, which receives no more
+/// changes (it went on reporting progress). The view itself follows.
+#[test]
+fn query_subscriptions_end_when_a_table_under_a_view_changes() {
+    use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
+    let (mut up, mut ivm, dir) = setup("sub-under-view", &["CREATE TABLE t (id int PRIMARY KEY, a int)", "INSERT INTO t VALUES (1, 1)"]);
+    let _ = caught_up(&mut ivm, &mut up, "SELECT * FROM t");
+    ivm.exec("CREATE MATERIALIZED VIEW m AS SELECT id, a FROM t");
+    let h = ivm.running.as_ref().unwrap().handle.clone();
+    let stmt = ivm::sql::parse_statement("SUBSCRIBE TO (SELECT id, a FROM m) WITH (PROGRESS)").unwrap();
+    let ExecResult::Subscribe { rx, .. } = h.execute(stmt, vec![], SessionVars::default(), String::new()).unwrap() else {
+        panic!("expected a subscription")
+    };
+    up.exec("ALTER TABLE t ADD COLUMN b int");
+    up.exec("INSERT INTO t VALUES (2, 2, 2)");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM m ORDER BY id"), ["1|1", "2|2"]);
+    let t0 = Instant::now();
+    let error = loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(SubEvent::Error(e)) => break Some(e.message),
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) if t0.elapsed() < Duration::from_secs(10) => {}
+            _ => break None,
+        }
+    };
+    assert_eq!(error.as_deref(), Some("table \"t\" changed its columns upstream"));
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A view over `SELECT *` takes the table's new shape (reads used to
 /// mix the old column list with new rows and panic the engine).
 #[test]
