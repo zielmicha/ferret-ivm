@@ -681,6 +681,11 @@ fn current_setting(args: &[Datum]) -> Result<Datum> {
     };
     Ok(txt(v.to_string()))
 }
+/// set_config(name, value, is_local): settings cannot be changed through
+/// expressions; like SET, the call is accepted and returns the value.
+fn set_config(args: &[Datum]) -> Result<Datum> {
+    Ok(args[1].clone())
+}
 fn encoding_name(_: &Datum) -> Result<Datum> {
     Ok(Datum::text("UTF8"))
 }
@@ -1545,6 +1550,8 @@ pub fn register(b: &mut Builder) {
         b.poly(name, vec![P::Any, P::Any, P::Any], Ret::T(T::Bool), Imp::FN(always_true));
     }
     b.f1("pg_encoding_to_char", T::Int4, T::Name, encoding_name);
+    b.fnn("set_config", vec![T::Text, T::Text, T::Bool], T::Text, set_config);
+    b.last().volatility = Volatility::Volatile;
     for params in [vec![T::Text], vec![T::Text, T::Bool]] {
         b.fnn("current_setting", params, T::Text, current_setting);
         b.last().volatility = Volatility::Stable;

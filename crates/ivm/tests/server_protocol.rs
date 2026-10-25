@@ -315,3 +315,16 @@ fn untyped_literal_results_are_described_as_text() {
     assert_eq!(oids, vec![25, 25]);
     running.shutdown();
 }
+
+#[test]
+fn session_commands_clients_send_at_connect() {
+    let (running, port) = start("sessioncmds");
+    let mut c = Conn::connect(port);
+    // used to fail: unsupported statement / unrecognized parameter / no function
+    for sql in ["RESET ALL", "SHOW server_version_num", "SHOW integer_datetimes", "SELECT set_config('search_path', 'public', false)"] {
+        let msgs = c.query(sql);
+        assert_eq!(error_message(&msgs), None, "{sql}");
+    }
+    assert_eq!(first_values(&c.query("SHOW server_version_num")), vec!["170000"]);
+    running.shutdown();
+}

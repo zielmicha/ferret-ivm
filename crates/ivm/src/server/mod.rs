@@ -205,6 +205,10 @@ impl Session {
             pending_copy: false,
         };
         s.settings.insert("application_name".into(), app);
+        // read-only settings clients SHOW (besides those reported above)
+        for (k, v) in [("server_version_num", "170000"), ("integer_datetimes", "on"), ("max_identifier_length", "63")] {
+            s.settings.insert(k.into(), v.into());
+        }
         s.main_loop()
     }
 
@@ -321,6 +325,8 @@ impl Session {
                     self.portals.clear();
                     Some(Ok(ExecResult::Command { tag: "ROLLBACK".into() }))
                 }
+                // settings are fixed or kept per session: nothing to reset
+                sqlparser::ast::Statement::Reset(_) => Some(Ok(ExecResult::Command { tag: "RESET".into() })),
                 sqlparser::ast::Statement::ShowVariable { variable } => {
                     let name = variable.iter().map(|i| i.value.to_lowercase()).collect::<Vec<_>>().join("_");
                     self.settings.get(&name).map(|v| {
