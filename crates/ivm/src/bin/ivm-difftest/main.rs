@@ -18,8 +18,9 @@
 //!   PostgreSQL (another database) by sinks; every round each sink table must
 //!   converge to the view's contents (exactly once, also across restarts).
 //! - `--schema-changes N` (default 1): add N columns to replicated tables
-//!   upstream at random rounds (some with a default); views must survive
-//!   the new table shape.
+//!   upstream at random rounds (some with a default, which existing rows
+//!   get without a replicated change: the source must snapshot the table
+//!   again); views must survive the new table shape.
 //! - Besides the views, every replicated table is compared with upstream.
 //! - `DIFFTEST_VERBOSE=1` prints the views and details of every mismatch.
 //! - `DIFFTEST_DUMP_DIR=dir` writes the upstream tables as INSERT statements
@@ -29,8 +30,8 @@
 //!   choices: to narrow down a mismatch with simplified variants of a query.
 //!
 //! The schema, query and change generators (sqlgen.rs) are shared with the
-//! engine tests (tests/engine.rs), which compare views with ad hoc queries
-//! without PostgreSQL.
+//! self-differential test (tests/selfdiff.rs), which compares views with
+//! ad hoc queries without PostgreSQL.
 
 mod sqlgen;
 #[path = "../../testkit.rs"]
