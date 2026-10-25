@@ -291,12 +291,13 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
     "checkpoint_gsn": 1431, "records_since_checkpoint": 22,
     "last_checkpoint_ms": 1792931627308.5, "clock_ms": 1792931628328.0,
     "cache_used_bytes": 32505856, "cache_capacity_bytes": 268435456, "dirty_bytes": 11953766,
+    "group_cache_bytes": 1048576, "input_queue_bytes": 0, "output_queue_bytes": 20480,
     "nodes": 27, "arrangements": 26, "nodes_created": 27, "arrangements_created": 26,
     "catalog_version": 15,
     "steps": {"steps": 604, "in_rows": 274155, "out_rows": 267461, "nanos": 437892939},
     "subscriptions": 1, "parked_reads": 0, "view_errors": 30
   },
-  "config": {"data_dir": "ivm-data", "cache_bytes": 268435456, "checkpoint_interval_secs": 10.0,
+  "config": {"data_dir": "ivm-data", "memory_bytes": 2147483648, "checkpoint_interval_secs": 10.0,
              "retention_gsns": 1000, "sync": true, "tick_ms": 1000},
   "storage": {"trees": 26, "loaded_nodes": 1520, "dirty_nodes": 410, "segments": 1,
               "segment_bytes": 136314880, "live_bytes": 120586240},
@@ -311,6 +312,13 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
 }
 ```
 
+The `*_bytes` fields of `stats` are bytes of memory: the buffer pool's
+nodes (`cache_used_bytes`, of which `dirty_bytes` are dirty) against the
+pool's current share of the memory budget (`cache_capacity_bytes`, which
+moves as the other parts grow and shrink), the aggregation group caches,
+the records waiting to be applied and the changes queued for subscriptions
+and sinks; `config.memory_bytes` is the budget (`--memory-mb`, see
+[Memory](user-guide/operations.md#memory)).
 `stats.steps` sums the per-operator counters since start (monotonic);
 `catalog_version` is the length of the catalog history, so it changes with
 every applied DDL statement (the history is trimmed back to 10,000 entries

@@ -73,10 +73,10 @@ engine waits at most 5 s for them.
 
 Communication uses `crossbeam` channels (unbounded, except one-shot reply
 channels of capacity 1) and a small block of shared state
-(`coord::api::Shared`). The engine's queue of durable batches is bounded by
-the sequencer's backpressure ([below](#group-commit)); the queues to
-subscriptions and sinks are not. The web UI keeps at most 16 of its
-snapshot requests queued at the engine.
+(`coord::api::Shared`). The records submitted to the log and not yet
+applied are bounded in bytes of memory instead, by sources waiting for room
+([Memory](#memory)); the queues to subscriptions and sinks are not. The web
+UI keeps at most 16 of its snapshot requests queued at the engine.
 
 | Shared field | Meaning |
 |---|---|
@@ -90,6 +90,7 @@ snapshot requests queued at the engine.
 | `shutdown` | stop flag |
 | `failed` | the engine or sequencer thread stopped with an error (also a failed final checkpoint or a panic); the process then exits with status 1 |
 | `crash` | stop without the final checkpoint (a simulated crash, for tests) |
+| `mem` | the memory budget, with the memory of the records waiting to be applied ([Memory](#memory)) |
 
 ## Message flow
 
@@ -196,13 +197,22 @@ record. `--no-sync` skips the `fsync` but keeps the order.
 `SeqMsg::Truncate(gsn)` (sent after each checkpoint) deletes old log
 segments; `SeqMsg::Shutdown` stops the sequencer after the current batch.
 
-Backpressure: before each batch the sequencer waits while the engine has
-`MAX_ENGINE_LAG` (10,000) or more durable records still to apply
-(`durable_gsn - processed_gsn`; not while shutting down). Acknowledgements
-then stop, sources block once 10,000 of their commits are unacknowledged,
-and the engine's queue of durable batches stays bounded. The engine never
-waits for the sequencer (its appends are not acknowledged synchronously),
-so it always catches up.
+Backpressure is applied where records enter, in bytes of memory: a source
+submitting a record (`EngineHandle::log_async`, also behind the blocking
+`log`) first waits while the records submitted and not yet applied take
+their part of the memory budget (`MemBudget::admit_input`: an eighth, at
+least 4 MiB; a record larger than that gets in once the queue is below
+it), polling every millisecond, and gives up with `57P01` when the server
+shuts down. Each record is counted at its size in memory
+(`memory::record_bytes`: its rows as decoded, not as logged, and its place
+in the queues) from its submission until the engine has applied it; the
+engine's own appends (DML, DDL) and the sequencer's ticks are counted
+without waiting. So the sequencer's queue and the engine's queue of durable
+batches both stay bounded, whatever the size of the records, and the
+sequencer itself never waits. The engine never waits for the sequencer
+either (its appends are not acknowledged synchronously), so it always
+catches up. (Sources also stop once 10,000 of their commits are
+unacknowledged, which bounds their acknowledgement bookkeeping.)
 
 ## The engine loop
 
@@ -220,6 +230,7 @@ handles:
 | `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
+gives the buffer pool its share of the memory budget ([Memory](#memory)),
 takes a checkpoint if one is due, and removes cancelled subscriptions.
 
 `apply_record` dispatches on the record kind:
@@ -242,6 +253,32 @@ change.
 Records at or below the last applied GSN are ignored, which makes replay
 idempotent. After each record the retention frontier is moved to
 `processed − max(retention, 1)` (recovery sets it to `processed − retention`).
+
+## Memory
+
+One budget, `Config::memory_bytes` (`--memory-mb`), covers the memory the
+engine keeps data in (`crate::memory`). Every part is measured in bytes of
+memory — struct sizes plus the heap blocks they own, a block of *n* bytes
+counted as *n* + 8 rounded up to 16 (`memory::heap_block`) — so that limits
+do not depend on how wide rows are or how they serialize:
+
+| Part | Meter | Limit | At the limit |
+|---|---|---|---|
+| records submitted to the log and not yet applied | `MemBudget::input` | an eighth, at least 4 MiB | sources wait ([Group commit](#group-commit)) |
+| aggregation group caches | `Graph::group_caches` | an eighth | the group is not cached, and all caches shrink after the record ([Dataflow](dataflow.md#reduce)) |
+| buffer pool | `Env`'s own accounting ([Storage](storage.md#the-node-arena-buffer-pool)) | the rest, at least a quarter | clean nodes are evicted |
+
+After every applied record and every message, the engine sets the buffer
+pool's target to what the other parts leave over (`rebalance_memory`,
+`MemBudget::pool_target`), so that memory used by queues and caches is
+taken from the pool, the one part that can always give memory back; it
+also shrinks the group caches when one of them could not take a group. A
+checkpoint is forced when dirty nodes, which cannot be evicted, exceed
+half of the pool's target.
+
+Not covered: hydration snapshots, ad-hoc query results, the queues of
+subscriptions and sinks, and the buffers of session, source and sink
+threads.
 
 ## The GSN clock and frontiers
 

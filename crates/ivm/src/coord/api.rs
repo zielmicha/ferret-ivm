@@ -124,6 +124,8 @@ pub struct Shared {
     pub failed: AtomicBool,
     /// Stop without the final checkpoint (simulated crash, for tests).
     pub crash: AtomicBool,
+    /// The memory budget, and the memory of queued records and changes.
+    pub mem: crate::memory::MemBudget,
 }
 
 impl Shared {

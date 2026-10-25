@@ -12,26 +12,144 @@
 //! of summarizing the group's range again. The cache is only an
 //! accelerator: whenever a change cannot be folded in exactly (a MIN/MAX
 //! loses its extreme, or a key representation may change) the group is
-//! summarized from the index as before.
+//! summarized from the index as before. All group caches of the graph share
+//! one byte budget, their part of the memory budget.
 
 use super::agg::AggSpec;
 use super::*;
+use crate::memory::{datum_heap, heap_block, CacheMeter};
 use crate::storage::Summary;
 use crate::types::datum::exact_cmp;
 use crate::types::Datum;
 use std::ops::Bound;
 
-/// Groups cached per Reduce; when full, half of them are evicted.
-const GROUP_CACHE_CAP: usize = 1 << 18;
-
 /// Summaries (and key values) of recently touched groups, current as of the
 /// last step. Cloning a plan yields an empty cache.
 #[derive(Default)]
-pub struct GroupCache(parking_lot::Mutex<FxHashMap<Vec<u8>, (Summary, Vec<Datum>)>>);
+pub struct GroupCache(parking_lot::Mutex<CacheState>);
+
+/// A group cache's entries — each with its bytes in memory and the epoch
+/// of the meter it was last used in — and its meter: the graph's
+/// `group_caches`, which it is attached to when it is first used.
+#[derive(Default)]
+struct CacheState {
+    groups: FxHashMap<Vec<u8>, (GroupState, usize, u64)>,
+    bytes: usize,
+    meter: Option<Arc<CacheMeter>>,
+}
+
+/// Memory of a cache entry: the map's slot (at its 7/8 load factor, with
+/// its control byte) and what the key, summary and key values own.
+fn entry_bytes(prefix: &[u8], (s, kv): &GroupState) -> usize {
+    std::mem::size_of::<(Vec<u8>, (GroupState, usize, u64))>() * 8 / 7
+        + 1
+        + heap_block(prefix.len())
+        + s.heap_size()
+        + heap_block(kv.capacity() * std::mem::size_of::<Datum>())
+        + kv.iter().map(datum_heap).sum::<usize>()
+}
+
+impl CacheState {
+    fn attach(&mut self, meter: &Arc<CacheMeter>) {
+        if self.meter.is_none() {
+            self.meter = Some(meter.clone());
+        }
+    }
+
+    fn remove(&mut self, prefix: &[u8]) -> Option<GroupState> {
+        let (state, bytes, _) = self.groups.remove(prefix)?;
+        self.release(bytes);
+        Some(state)
+    }
+
+    /// Cache a group's state, unless the shared budget has no room for it
+    /// (the meter is then squeezed, and every cache shrinks after the step).
+    fn insert(&mut self, prefix: Vec<u8>, state: GroupState) {
+        let Some(meter) = self.meter.clone() else { return };
+        let bytes = entry_bytes(&prefix, &state);
+        if !meter.fits(bytes) {
+            meter.squeeze();
+            return;
+        }
+        self.bytes += bytes;
+        meter.add(bytes);
+        if let Some((_, old, _)) = self.groups.insert(prefix, (state, bytes, meter.epoch())) {
+            self.release(old);
+        }
+    }
+
+    /// Evict the groups not used since the last shrink (in an epoch before
+    /// `epoch`, the one ending), and if that leaves more than half of the
+    /// cache, every other one of the rest (hash order is effectively random).
+    fn shrink(&mut self, epoch: u64) {
+        let before = self.bytes;
+        let mut freed = 0usize;
+        self.groups.retain(|_, (_, bytes, used)| {
+            let keep = *used >= epoch;
+            if !keep {
+                freed += *bytes;
+            }
+            keep
+        });
+        if before - freed > before / 2 {
+            let mut n = 0usize;
+            self.groups.retain(|_, (_, bytes, _)| {
+                n += 1;
+                let keep = n % 2 == 1;
+                if !keep {
+                    freed += *bytes;
+                }
+                keep
+            });
+        }
+        self.release(freed);
+    }
+
+    fn clear(&mut self) {
+        self.groups.clear();
+        self.release(self.bytes);
+    }
+
+    fn release(&mut self, bytes: usize) {
+        self.bytes -= bytes;
+        if let Some(m) = &self.meter {
+            m.sub(bytes);
+        }
+    }
+}
+
+impl Drop for CacheState {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Shrink every group cache when one of them could not take a group (or
+/// the caches are over a lowered limit): groups not used since the last
+/// shrink go first, so caches of aggregations that no longer change give
+/// way to those in use; each cache loses at least half.
+pub fn trim_caches(g: &Graph) {
+    if !g.group_caches.take_squeezed() {
+        return;
+    }
+    let epoch = g.group_caches.next_epoch();
+    for n in g.live_nodes() {
+        if let NodeKind::Reduce(p) = &n.kind {
+            p.cache.0.lock().shrink(epoch);
+        }
+    }
+}
 
 impl Clone for GroupCache {
     fn clone(&self) -> Self {
         GroupCache::default()
+    }
+}
+
+impl GroupCache {
+    /// Memory of the cached groups.
+    pub fn bytes(&self) -> usize {
+        self.0.lock().bytes
     }
 }
 
@@ -261,6 +379,7 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mu
     let fidelity_key = layout.key_types[..ng].iter().any(crate::types::encoding::has_fidelity);
     let mut errors = p.errors.lock();
     let mut cache = p.cache.0.lock();
+    cache.attach(&g.group_caches);
     for (prefix, (kv, rows)) in groups {
         let mut old: Option<Option<Row>> = None;
         let mut result = None;
@@ -294,14 +413,6 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mu
             None => {
                 let (r, state) = compute_group(g, env, p, &prefix, (!fidelity_key).then_some(&kv[..]))?;
                 if cacheable && let Some(state) = state {
-                    if cache.len() >= GROUP_CACHE_CAP {
-                        // evict about half (hash order is effectively random)
-                        let mut n = 0usize;
-                        cache.retain(|_, _| {
-                            n += 1;
-                            n % 2 == 0
-                        });
-                    }
                     cache.insert(prefix.clone(), state);
                 }
                 r

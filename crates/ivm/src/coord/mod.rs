@@ -29,7 +29,9 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
-    pub cache_bytes: usize,
+    /// The memory budget (`--memory-mb`): the buffer pool, group caches and
+    /// queues together (`crate::memory`).
+    pub memory_bytes: usize,
     pub checkpoint_interval: Duration,
     /// fsync the input log on every commit batch.
     pub sync: bool,
@@ -43,7 +45,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             data_dir: PathBuf::from("ivm-data"),
-            cache_bytes: 1 << 30,
+            memory_bytes: crate::memory::DEFAULT_TOTAL,
             checkpoint_interval: Duration::from_secs(10),
             sync: true,
             retention_gsns: 1000,
@@ -282,12 +284,20 @@ impl EngineHandle {
         rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))
     }
 
-    /// Append a record without waiting; the receiver yields its GSN once durable.
+    /// Append a record without waiting for it to be durable; the receiver
+    /// yields its GSN once it is. Waits first while the records the engine
+    /// has yet to apply fill their part of the memory budget: this is the
+    /// backpressure on sources, in bytes of memory.
     pub fn log_async(&self, rec: LogRecord) -> Result<Receiver<Gsn>> {
+        let bytes = crate::memory::record_bytes(&rec);
+        if !self.shared.mem.admit_input(bytes, || self.shared.shutdown.load(Ordering::Acquire)) {
+            return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"));
+        }
         let (tx, rx) = bounded(1);
-        self.seq
-            .send(SeqMsg::Append { rec, ack: Some(tx) })
-            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))?;
+        if self.seq.send(SeqMsg::Append { rec, ack: Some(tx) }).is_err() {
+            self.shared.mem.input.sub(bytes);
+            return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"));
+        }
         Ok(rx)
     }
 
@@ -353,12 +363,13 @@ pub fn start(cfg: Config) -> Result<Running> {
         ));
     }
     let shared = Arc::new(Shared::default());
+    shared.mem.set_total(cfg.memory_bytes);
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
     let mut writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
     let (env, recovered) = Env::open(
         &cfg.data_dir.join("store"),
-        EnvOptions { cache_bytes: cfg.cache_bytes, ..Default::default() },
+        EnvOptions { cache_bytes: shared.mem.pool_target(0), ..Default::default() },
     )?;
     let mut engine = Engine::new(cfg.clone(), env, stx.clone(), shared.clone());
     engine.recover(recovered)?;
@@ -414,10 +425,12 @@ pub fn start(cfg: Config) -> Result<Running> {
 impl Engine {
     /// An engine with an empty catalog over `env`, before recovery.
     fn new(cfg: Config, env: Env, seq: Sender<SeqMsg>, shared: Arc<Shared>) -> Engine {
+        let graph = Graph::new();
+        graph.group_caches.set_limit(shared.mem.cache_limit());
         Engine {
             cfg,
             env,
-            graph: Graph::new(),
+            graph,
             catalog: Catalog::new(),
             rt: Runtime::default(),
             processed: 0,
@@ -583,7 +596,12 @@ impl Engine {
                             LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
                             _ => None,
                         };
-                        if let Err(e) = self.apply_record(gsn, rec) {
+                        // (counted from its submission until it is applied)
+                        let bytes = crate::memory::record_bytes(&rec);
+                        let r = self.apply_record(gsn, rec);
+                        self.shared.mem.input.sub(bytes);
+                        self.rebalance_memory();
+                        if let Err(e) = r {
                             log::error!("failed to apply gsn {gsn}: {e}");
                             if e.code.starts_with("XX") || e.code.starts_with("58") {
                                 return Err(e);
@@ -614,6 +632,7 @@ impl Engine {
                     self.handle_request(r, &handle);
                 }
             }
+            self.rebalance_memory();
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
@@ -656,11 +675,23 @@ impl Engine {
         if matches!(rec, LogRecord::Commit { source: 0, .. }) {
             self.dml_inflight = Some(req);
         }
-        if self.seq.send(SeqMsg::Append { rec, ack: None }).is_err()
+        if !self.append(rec)
             && let Some(r) = self.pending.remove(&req)
         {
             let _ = r.send(Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
         }
+    }
+
+    /// Hand a record to the sequencer, counted in the input queue's memory
+    /// but without waiting for room: the engine is what empties the queue.
+    fn append(&mut self, rec: LogRecord) -> bool {
+        let bytes = crate::memory::record_bytes(&rec);
+        self.shared.mem.input.add(bytes);
+        let sent = self.seq.send(SeqMsg::Append { rec, ack: None }).is_ok();
+        if !sent {
+            self.shared.mem.input.sub(bytes);
+        }
+        sent
     }
 
     pub(crate) fn reply_pending(&mut self, req: u64, res: Result<ExecResult>) {
@@ -686,7 +717,7 @@ impl Engine {
                 let _ = reply.send(r);
             }
             Request::Log { rec } => {
-                let _ = self.seq.send(SeqMsg::Append { rec, ack: None });
+                self.append(rec);
             }
             Request::Inspect(r) => self.inspect(r),
             other => self.run_execute(other, handle),
@@ -882,12 +913,22 @@ impl Engine {
         }
     }
 
+    /// Give the buffer pool what the other parts of the memory budget leave
+    /// over (the next access evicts down to it), and shrink the group caches
+    /// if they ran out of room.
+    pub(crate) fn rebalance_memory(&mut self) {
+        let target = self.shared.mem.pool_target(self.graph.group_caches.used());
+        self.env.set_cache_bytes(target);
+        crate::dataflow::reduce::trim_caches(&self.graph);
+    }
+
     fn maybe_checkpoint(&mut self) -> Result<()> {
         if self.records_since_checkpoint == 0 {
             return Ok(());
         }
+        // dirty nodes cannot be evicted until a checkpoint writes them
         let dirty = self.env.dirty_bytes();
-        if self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.cfg.cache_bytes / 2 {
+        if self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.env.cache_capacity() / 2 {
             self.checkpoint()?;
         }
         Ok(())
@@ -1026,6 +1067,115 @@ mod tests {
         let mut e = Engine::new(Config { data_dir: dir.to_path_buf(), ..Default::default() }, env, seq, Arc::new(Shared::default()));
         e.replaying = false;
         e
+    }
+
+    /// Sources wait for room before submitting a record: by the bytes the
+    /// records still to be applied take in memory (an eighth of the
+    /// budget), not by their number (10,000 commits of any size per source
+    /// were let in, and the sequencer's queue was unbounded).
+    #[test]
+    fn source_records_wait_for_room_by_their_bytes() {
+        use crate::dataflow::TableChange;
+        use crate::memory::record_bytes;
+        fn rec(kb: usize) -> LogRecord {
+            let row = vec![crate::types::Datum::Text("x".repeat(kb << 10).into())];
+            LogRecord::Commit { source: 1, lsn: 0, changes: vec![(1, TableChange::Insert { row })] }
+        }
+        let shared = Arc::new(Shared::default());
+        shared.mem.set_total(64 << 20);
+        assert_eq!(shared.mem.input_limit(), 8 << 20);
+        let (seq, seq_rx) = unbounded();
+        let (tx, _rx) = unbounded();
+        let h = EngineHandle { tx, seq, shared: shared.clone() };
+        // the engine applying what was submitted
+        let apply_all = || {
+            while let Ok(SeqMsg::Append { rec, .. }) = seq_rx.try_recv() {
+                shared.mem.input.sub(record_bytes(&rec));
+            }
+        };
+        // small records: many more than 10,000 get in
+        for _ in 0..20_000 {
+            h.log_async(rec(0)).unwrap();
+        }
+        assert!(shared.mem.input.used() < 8 << 20);
+        apply_all();
+        assert_eq!(shared.mem.input.used(), 0);
+        // 3 MiB records: the third gets in while the queue is below the
+        // limit, the fourth waits until the engine applies some
+        for _ in 0..3 {
+            h.log_async(rec(3 << 10)).unwrap();
+        }
+        let h2 = h.clone();
+        let waiting = std::thread::spawn(move || h2.log_async(rec(3 << 10)).is_ok());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiting.is_finished(), "a record got in with {} bytes queued", shared.mem.input.used());
+        apply_all();
+        assert!(waiting.join().unwrap());
+        apply_all();
+        // a shutdown releases a waiting source
+        for _ in 0..3 {
+            h.log_async(rec(3 << 10)).unwrap();
+        }
+        let h2 = h.clone();
+        let waiting = std::thread::spawn(move || h2.log_async(rec(3 << 10)).map_err(|e| e.code));
+        std::thread::sleep(Duration::from_millis(50));
+        shared.shutdown.store(true, Ordering::Release);
+        assert_eq!(waiting.join().unwrap().unwrap_err(), codes::ADMIN_SHUTDOWN);
+    }
+
+    /// The group caches of all aggregations share one byte budget: they
+    /// never hold more than it, and the cache of an aggregation that no
+    /// longer changes gives way to one in use (each Reduce used to cache up
+    /// to 2^18 groups of any size, never giving any back).
+    #[test]
+    fn group_caches_share_a_byte_budget() {
+        use crate::dataflow::{NodeKind, TableChange};
+        use crate::types::Datum;
+        let tmp = crate::testkit::TempDir::new("coord-group-caches");
+        let mut e = engine(tmp.path());
+        let limit = 1 << 20;
+        e.graph.group_caches.set_limit(limit);
+        e.apply_ddl(1, "CREATE TABLE ta (id int PRIMARY KEY, g int)", "").unwrap();
+        e.apply_ddl(2, "CREATE TABLE tb (id int PRIMARY KEY, g int)", "").unwrap();
+        e.apply_ddl(3, "CREATE MATERIALIZED VIEW va AS SELECT g, count(*) AS n, sum(id) AS s FROM ta GROUP BY g", "").unwrap();
+        e.apply_ddl(4, "CREATE MATERIALIZED VIEW vb AS SELECT g, count(*) AS n, sum(id) AS s FROM tb GROUP BY g", "").unwrap();
+        e.processed = 4;
+        let ids = |e: &Engine| ["ta", "tb"].map(|n| e.catalog.by_name(n).unwrap().id);
+        let [ta, tb] = ids(&e);
+        let cache_bytes = |e: &Engine, view: &str| {
+            let node = e.rt.views[&e.catalog.by_name(view).unwrap().id].node;
+            let mut n = node;
+            // the view's node, or the Reduce under its projection
+            loop {
+                match &e.graph.node(n).kind {
+                    NodeKind::Reduce(p) => return p.cache.bytes(),
+                    _ => n = e.graph.node(n).inputs[0],
+                }
+            }
+        };
+        let mut gsn = 4;
+        let mut insert = |e: &mut Engine, table, from: i32, version: i32| {
+            for chunk in 0..20 {
+                gsn += 1;
+                let changes = (from + chunk * 1000..from + (chunk + 1) * 1000)
+                    .map(|i| (table, TableChange::Upsert { row: vec![Datum::Int4(i), Datum::Int4(i + version)], unchanged: vec![] }))
+                    .collect();
+                e.apply_record(gsn, LogRecord::Commit { source: 1, lsn: 0, changes }).unwrap();
+                e.rebalance_memory();
+                assert!(e.graph.group_caches.used() <= limit, "{} bytes cached", e.graph.group_caches.used());
+            }
+        };
+        // 20,000 groups: more than the budget holds
+        insert(&mut e, ta, 0, 0);
+        let a = cache_bytes(&e, "va");
+        assert!(a > limit / 2, "va caches {a} bytes");
+        // only vb changes from now on: va's cache gives way
+        for round in 0..3 {
+            insert(&mut e, tb, 0, round);
+        }
+        let (a, b) = (cache_bytes(&e, "va"), cache_bytes(&e, "vb"));
+        assert!(b > 4 * a, "vb caches {b} bytes, the idle va {a}");
+        assert_eq!(e.graph.group_caches.used(), a + b);
     }
 
     /// A subscription whose query fails to lower releases the operators

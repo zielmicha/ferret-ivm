@@ -175,6 +175,9 @@ pub struct Graph {
     /// output errors). Authoritative for nodes with a hydrated arrangement:
     /// their snapshots read the arrangement, which holds rows only.
     node_errors: FxHashMap<NodeId, BTreeMap<(String, String), i64>>,
+    /// Memory of the group caches of all `Reduce`s, against their share of
+    /// the memory budget (`reduce::trim_caches`).
+    pub group_caches: Arc<crate::memory::CacheMeter>,
 }
 
 /// Error state that must survive restarts, by node fingerprint: the error

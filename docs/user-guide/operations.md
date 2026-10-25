@@ -11,7 +11,7 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 
 | Knob | Default | Trade-off |
 |---|---|---|
-| `--cache-mb` | 1024 | Target size of the node cache. Clean index nodes beyond it are evicted (CLOCK) and re-read from segment files on demand; dirty nodes stay until the next checkpoint, and a checkpoint is forced when dirty nodes exceed half of it. Working sets that fit run from memory; larger ones degrade gradually. |
+| `--memory-mb` | 2048 | The memory budget: the buffer pool of index nodes, the aggregation group caches, the records waiting to be applied and the changes queued for subscriptions and sinks together ([Memory](#memory)). The buffer pool gets what the others leave; clean index nodes beyond its share are evicted (CLOCK) and re-read from segment files on demand. Working sets that fit run from memory; larger ones degrade gradually. `--cache-mb` is an older name of this flag (it used to size the buffer pool alone, counted in serialized bytes: about a quarter of the memory it took). |
 | `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
 | `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes, more input-log segments on disk, and more clock ticks in each checkpoint. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
@@ -25,10 +25,11 @@ Fixed internal parameters (not configurable):
 | storage segment size (roll-over threshold) | 256 MiB |
 | input-log segment size (roll-over threshold) | 64 MiB |
 | maximum records per sequencer batch (group commit) | 4096 |
-| durable records the engine may lag behind before the sequencer stops taking appends | 10,000 |
+| records waiting to be applied, before sources wait | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
+| aggregation group caches, all together | an eighth of `--memory-mb` |
+| buffer pool | what the above leave of `--memory-mb`, at least a quarter of it |
 | unacknowledged commits per source | 10,000 |
 | initial-snapshot chunk | 10,000 rows |
-| groups cached in memory per aggregation | 2^18 (half evicted when full) |
 | nodes relocated per garbage-collection pass | 1000 |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
@@ -46,14 +47,29 @@ Things to keep in mind when sizing:
   thread, so the engine uses about one core for its work (plus the
   sequencer, one thread per source, sink and client session, and three
   threads for the web UI when it is enabled).
-- **Memory outside the cache**: hydration of a new view holds snapshots of
-  intermediate results; aggregation group caches; subscription and sink
-  queues are unbounded. The queue of logged records the engine has yet to
-  apply is bounded: when the engine is 10,000 records behind, the log stops
-  taking new records until it catches up (sources then pause reading the
-  replication stream, and the upstream keeps the WAL).
+- **Memory**: see [below](#memory). Outside the budget: hydration of a
+  new view holds snapshots of intermediate results, an ad-hoc query's
+  result is built in memory, subscription and sink queues are unbounded,
+  and each session, source and sink thread has its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
+
+### Memory
+
+`--memory-mb` is one budget for the memory the server keeps data in. Every
+part is counted in bytes of memory — the sizes of the structures and of the
+heap blocks they own — not in serialized bytes or numbers of records, so
+the limits mean the same for narrow and wide rows:
+
+| Part | Limit | When it is reached |
+|---|---|---|
+| records logged (or submitted to the log) that the engine has not applied yet | an eighth (at least 4 MiB) | sources wait before logging more, so they stop reading the replication stream for a while (the upstream keeps the WAL); the engine never waits, so it always catches up. A single record larger than the limit is let in once the queue is below it |
+| aggregation group caches (all of them) | an eighth | the group is not cached; after the record every cache drops the groups not used since the last time this happened, and at least half of its size, so idle aggregations give way |
+| buffer pool (index nodes) | the rest, at least a quarter | clean nodes are evicted (also between the leaves of a scan); dirty nodes stay until the next checkpoint, which is forced when they exceed half of the pool's share |
+
+The web UI's `/api/overview` reports each part (`cache_used_bytes` against
+`cache_capacity_bytes`, `group_cache_bytes`, `input_queue_bytes`;
+[Web UI](../web-ui.md#get-apioverview)).
 
 ## The data directory
 
@@ -163,8 +179,9 @@ view).
 ## Checkpoints and garbage collection
 
 A checkpoint is taken every `--checkpoint-secs` seconds if anything was
-applied since the last one, when dirty index nodes exceed half of
-`--cache-mb` (also only if something was applied), on the `CHECKPOINT`
+applied since the last one, when the memory of dirty index nodes exceeds
+half of the buffer pool's share of `--memory-mb` (also only if something
+was applied), on the `CHECKPOINT`
 statement, and as the final step of a requested shutdown. It:
 
 1. serialises the engine state (the catalog and its DDL history, index

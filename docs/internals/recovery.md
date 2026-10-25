@@ -133,7 +133,8 @@ fingerprint mismatch only costs a rebuild.
 ## Checkpoints
 
 `Engine::checkpoint` (every `--checkpoint-secs` if anything changed, when
-dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
+the memory of dirty nodes exceeds half of the buffer pool's share of the
+memory budget, on `CHECKPOINT`, and on shutdown):
 
 1. build `AppState`: the catalog (with its DDL history), the fingerprint →
    tree id and fingerprint → `since` maps of all hydrated arrangements, each

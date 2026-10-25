@@ -142,7 +142,7 @@ export default {
       const config = card('Engine', h('dl.kv',
         h('dt', 'Version'), h('dd', ov.version),
         h('dt', 'Data directory'), h('dd.mono', cfg.data_dir),
-        h('dt', 'Buffer pool'), h('dd', fmt.bytes(cfg.cache_bytes)),
+        h('dt', 'Memory budget'), h('dd', fmt.bytes(cfg.memory_bytes)),
         h('dt', 'Checkpoints'), h('dd', `every ${fmt.duration(cfg.checkpoint_interval_secs)} (or when half the pool is dirty)`),
         h('dt', 'Retention'), h('dd', `${fmt.int(cfg.retention_gsns)} GSNs readable with AS OF`),
         h('dt', 'Log sync'), h('dd', cfg.sync ? 'fsync per commit batch' : 'off (--no-sync)'),
