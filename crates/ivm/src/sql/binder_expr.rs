@@ -790,6 +790,11 @@ impl<'a> Binder<'a> {
             }
             V::DoubleQuotedString(s) => Expr::Literal(Datum::text(s), SqlType::Unknown),
             V::HexStringLiteral(s) => {
+                // the literal may hold any characters: check them before
+                // slicing by byte offsets
+                if let Some(c) = s.chars().find(|c| !c.is_ascii_hexdigit()) {
+                    sql_bail!(codes::INVALID_TEXT_REPRESENTATION, "\"{c}\" is not a valid hexadecimal digit");
+                }
                 let bytes = (0..s.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&s[i..(i + 2).min(s.len())], 16))
