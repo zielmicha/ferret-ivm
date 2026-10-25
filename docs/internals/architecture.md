@@ -172,6 +172,14 @@ record. `--no-sync` skips the `fsync` but keeps the order.
 `SeqMsg::Truncate(gsn)` (sent after each checkpoint) deletes old log
 segments; `SeqMsg::Shutdown` stops the sequencer after the current batch.
 
+Backpressure: before each batch the sequencer waits while the engine has
+`MAX_ENGINE_LAG` (10,000) or more durable records still to apply
+(`durable_gsn - processed_gsn`; not while shutting down). Acknowledgements
+then stop, sources block once 10,000 of their commits are unacknowledged,
+and the engine's queue of durable batches stays bounded. The engine never
+waits for the sequencer (its appends are not acknowledged synchronously),
+so it always catches up.
+
 ## The engine loop
 
 The engine thread waits for an `EngineMsg` with a 200 ms timeout and

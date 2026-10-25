@@ -37,9 +37,11 @@ Things to keep in mind when sizing:
   thread, so the engine uses about one core for its work (plus the
   sequencer, one thread per source, sink and client session).
 - **Memory outside the cache**: hydration of a new view holds snapshots of
-  intermediate results; aggregation group caches; subscription queues are
-  unbounded; the in-memory LSN→GSN map keeps the last 100,000 upstream
-  commits.
+  intermediate results; aggregation group caches; subscription and sink
+  queues are unbounded. The queue of logged records the engine has yet to
+  apply is bounded: when the engine is 10,000 records behind, the log stops
+  taking new records until it catches up (sources then pause reading the
+  replication stream, and the upstream keeps the WAL).
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
 
