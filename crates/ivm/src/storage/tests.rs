@@ -457,7 +457,12 @@ fn check_structure(env: &mut Env) {
     }
     let occupied = env.slots.iter().flatten().count();
     assert_eq!(w.slots, occupied, "in-memory nodes unreachable from any root");
-    let mem: usize = env.slots.iter().flatten().map(|s| s.bytes).sum();
+    for s in env.slots.iter().flatten() {
+        let node = s.node.as_ref().unwrap();
+        assert_eq!(s.bytes, node.byte_size(), "byte size of a slot");
+        assert_eq!(s.mem, node.mem_size() + SLOT_BYTES, "memory of a slot");
+    }
+    let mem: usize = env.slots.iter().flatten().map(|s| s.mem).sum();
     assert_eq!(env.mem_bytes, mem, "mem_bytes");
     let _ = env.dirty_bytes(); // debug-asserts the dirty byte count
     for (seg, (total, live)) in &env.seg_live {

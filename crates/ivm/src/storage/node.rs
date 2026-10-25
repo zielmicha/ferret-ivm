@@ -4,7 +4,9 @@ use super::history::History;
 use super::summary::Summary;
 use super::Gsn;
 use crate::error::{Result, SqlError};
+use crate::memory::heap_block;
 use crate::types::codec::{get_bytes, get_ivarint, get_u8, get_uvarint, put_bytes, put_ivarint, put_uvarint};
+use std::mem::size_of;
 
 /// Location of a serialized node frame in a segment file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,11 +72,36 @@ impl Node {
         }
     }
 
-    /// Approximate serialized size, used for split decisions and cache accounting.
+    /// Approximate serialized size, used for split decisions.
     pub fn byte_size(&self) -> usize {
         match self {
             Node::Leaf(entries) => entries.iter().map(entry_size).sum::<usize>() + 8,
             Node::Internal(children) => children.iter().map(child_size).sum::<usize>() + 8,
+        }
+    }
+
+    /// Bytes the node occupies in memory: its vector of entries or children
+    /// (by capacity) and the heap blocks they own. In memory a leaf entry
+    /// whose serialized size is a few bytes takes a `LeafEntry` struct plus
+    /// a block for its key; summaries take what their values own.
+    pub fn mem_size(&self) -> usize {
+        self.mem_base() + self.heap_size()
+    }
+
+    /// What the entries (`entry_heap`) or children (`child_heap`) own.
+    pub fn heap_size(&self) -> usize {
+        match self {
+            Node::Leaf(entries) => entries.iter().map(entry_heap).sum(),
+            Node::Internal(children) => children.iter().map(child_heap).sum(),
+        }
+    }
+
+    /// The vector of entries or children: `mem_size` is this plus
+    /// `heap_size` (which in-place edits maintain incrementally).
+    pub fn mem_base(&self) -> usize {
+        match self {
+            Node::Leaf(entries) => heap_block(entries.capacity() * size_of::<LeafEntry>()),
+            Node::Internal(children) => heap_block(children.capacity() * size_of::<Child>()),
         }
     }
 
@@ -162,4 +189,16 @@ pub fn entry_size(e: &LeafEntry) -> usize {
 
 pub fn child_size(c: &Child) -> usize {
     c.sep.len() + 24 + 8 * c.summary.aggs.len() + 8
+}
+
+/// Heap bytes a leaf entry owns: its key, and its history once that
+/// outgrows the two changes kept inline.
+pub fn entry_heap(e: &LeafEntry) -> usize {
+    let hist = if e.hist.0.spilled() { heap_block(e.hist.0.capacity() * size_of::<(Gsn, i64)>()) } else { 0 };
+    heap_block(e.key.len()) + hist
+}
+
+/// Heap bytes a child pointer owns: its separator and its summary's values.
+pub fn child_heap(c: &Child) -> usize {
+    heap_block(c.sep.len()) + c.summary.heap_size()
 }
