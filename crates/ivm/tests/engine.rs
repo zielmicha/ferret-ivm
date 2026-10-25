@@ -4,7 +4,7 @@
 //! bugs that are still open). Randomized comparisons of views with their
 //! queries are in selfdiff.rs.
 
-use ivm::coord::api::{ExecResult, SessionVars};
+use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
 use ivm::log::LogRecord;
 use ivm::types::text::format_datum;
@@ -439,6 +439,41 @@ fn presence_changes_keep_exact_representations() {
         assert_eq!(rows(&h, "SELECT * FROM v ORDER BY a"), rows(&h, &format!("{q} ORDER BY a")), "after {sql}");
     }
     assert_eq!(rows(&h, "SELECT * FROM v"), ["0|1000058||0.000"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dropping a view cancelled every subscription on its dataflow node, also
+/// those to other views sharing the node (here an identical view): they got
+/// a "was dropped" error and no further changes.
+#[test]
+fn dropping_a_view_leaves_subscriptions_to_its_twin_alone() {
+    let dir = tmpdir("subscribe-twin");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1), (2, 2)");
+    exec(&h, "CREATE MATERIALIZED VIEW a AS SELECT DISTINCT a FROM t");
+    exec(&h, "CREATE MATERIALIZED VIEW b AS SELECT DISTINCT a FROM t");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO a") else { panic!("not a subscription") };
+    exec(&h, "DROP VIEW b");
+    exec(&h, "INSERT INTO t VALUES (3, 3)");
+    exec(&h, "DELETE FROM t WHERE id = 1");
+    let mut acc = std::collections::BTreeMap::new();
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            SubEvent::Data { rows, .. } => {
+                for (r, w) in rows {
+                    *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
+                }
+            }
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => panic!("subscription failed: {e}"),
+        }
+    }
+    acc.retain(|_, w| *w != 0);
+    assert_eq!(acc.keys().cloned().collect::<Vec<_>>(), rows(&h, "SELECT * FROM a ORDER BY 1"));
+    assert_eq!(rows(&h, "SELECT * FROM a ORDER BY 1"), ["2", "3"]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

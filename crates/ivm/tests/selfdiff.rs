@@ -10,8 +10,10 @@
 //! times), checkpoints, clean restarts, crash restarts (no final checkpoint,
 //! so recovery replays the log; sometimes the log ends in a torn record),
 //! views created and dropped on the way, and
-//! reads AS OF earlier GSNs, which must return what the views held then. All
-//! views are compared after every action.
+//! reads AS OF earlier GSNs, which must return what the views held then.
+//! Every view is also subscribed to (some views' queries too, which builds
+//! their own dataflow): the stream of changes must add up to the view's
+//! (query's) contents. All views are compared after every action.
 //!
 //! Cases come from proptest, so a failure shrinks to a minimal set of views
 //! and actions, and is recorded under `proptest-regressions/`.
@@ -25,13 +27,15 @@ mod sqlgen;
 #[path = "../src/testkit.rs"]
 mod testkit;
 
-use ivm::coord::api::{ExecResult, SessionVars};
+use ivm::coord::api::{ExecResult, ResultColumn, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
-use ivm::types::SqlType;
+use ivm::types::{Datum, SqlType};
 use ivm::types::text::format_datum;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use testkit::{proptest_cases, Rng, TempDir};
 
@@ -87,38 +91,80 @@ fn execute(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {
     h.execute(stmt, vec![], SessionVars::default(), String::new()).map_err(|e| format!("{} ({})", e.message, e.code))
 }
 
-/// Result rows as sorted text; floats rounded, and numerics trimmed where SQL
-/// may keep any representation of equal values.
+/// A result row as text; floats rounded, and numerics trimmed where SQL may
+/// keep any representation of equal values.
+fn row_text(r: &[Datum], columns: &[ResultColumn], trim_numeric: bool) -> String {
+    r.iter()
+        .zip(columns)
+        .map(|(d, c)| {
+            if d.is_null() {
+                return "∅".to_string();
+            }
+            let s = format_datum(d);
+            match c.ty {
+                SqlType::Float4 | SqlType::Float8 => match s.parse::<f64>() {
+                    Ok(f) => if f == 0.0 { "0".into() } else { format!("{f:.9e}") },
+                    Err(_) => s,
+                },
+                SqlType::Numeric if trim_numeric && s.contains('.') => {
+                    let t = s.trim_end_matches('0').trim_end_matches('.');
+                    if t == "-0" || t.is_empty() { "0".into() } else { t.to_string() }
+                }
+                _ => s,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Result rows as sorted text (see `row_text`).
 fn query(h: &EngineHandle, sql: &str, trim_numeric: bool) -> Rows {
     let ExecResult::Query { columns, rows } = execute(h, sql)? else { return Err(format!("{sql}: no rows")) };
-    let mut out: Vec<String> = rows
-        .iter()
-        .map(|r| {
-            r.iter()
-                .zip(&columns)
-                .map(|(d, c)| {
-                    if d.is_null() {
-                        return "∅".to_string();
-                    }
-                    let s = format_datum(d);
-                    match c.ty {
-                        SqlType::Float4 | SqlType::Float8 => match s.parse::<f64>() {
-                            Ok(f) => if f == 0.0 { "0".into() } else { format!("{f:.9e}") },
-                            Err(_) => s,
-                        },
-                        SqlType::Numeric if trim_numeric && s.contains('.') => {
-                            let t = s.trim_end_matches('0').trim_end_matches('.');
-                            if t == "-0" || t.is_empty() { "0".into() } else { t.to_string() }
-                        }
-                        _ => s,
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("|")
-        })
-        .collect();
+    let mut out: Vec<String> = rows.iter().map(|r| row_text(r, &columns, trim_numeric)).collect();
     out.sort();
     Ok(out)
+}
+
+/// A subscription to a view (or to its query), with the rows its stream of
+/// changes adds up to.
+struct Sub {
+    view: String,
+    /// Subscribed to the view's query, not to the view.
+    to_query: bool,
+    columns: Vec<ResultColumn>,
+    rx: crossbeam_channel::Receiver<SubEvent>,
+    cancel: Arc<AtomicBool>,
+    rows: BTreeMap<String, i64>,
+    failed: Option<String>,
+}
+
+impl Sub {
+    /// Apply the changes delivered so far (every applied commit delivers
+    /// before it returns).
+    fn drain(&mut self, trim: bool) {
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                SubEvent::Data { rows, .. } => {
+                    for (r, w) in rows {
+                        let k = row_text(&r, &self.columns, trim);
+                        let e = self.rows.entry(k.clone()).or_default();
+                        *e += w;
+                        if *e == 0 {
+                            self.rows.remove(&k);
+                        }
+                    }
+                }
+                SubEvent::Progress { .. } => {}
+                SubEvent::Error(e) => self.failed = Some(e.message),
+            }
+        }
+    }
+
+    fn contents(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.rows.iter().flat_map(|(r, w)| std::iter::repeat_n(r.clone(), (*w).max(0) as usize)).collect();
+        v.sort();
+        v
+    }
 }
 
 struct View {
@@ -141,6 +187,7 @@ struct Case {
     next_view: usize,
     /// (gsn, view name -> rows) after each action
     history: Vec<(u64, BTreeMap<String, Rows>)>,
+    subs: Vec<Sub>,
     log: Vec<String>,
 }
 
@@ -177,7 +224,29 @@ impl Case {
             self.next_view += 1;
             let created = self.gsn();
             self.note(format!("{name} (gsn {created}): {def}"));
+            let to_query = rng.chance(30);
             self.views.push(View { name, reads, trim: sqlgen::dedups(&q), query: q, created });
+            self.subscribe(self.views.len() - 1, to_query);
+        }
+    }
+
+    /// Subscribe to view `i` (and, with `to_query`, to its query as well).
+    fn subscribe(&mut self, i: usize, to_query: bool) {
+        let h = self.h();
+        let v = &self.views[i];
+        let mut targets = vec![(false, v.name.clone())];
+        if to_query {
+            targets.push((true, format!("({})", v.query)));
+        }
+        for (q, target) in targets {
+            match execute(&h, &format!("SUBSCRIBE TO {target}")) {
+                Ok(ExecResult::Subscribe { columns, rx, cancel, .. }) => {
+                    self.subs.push(Sub { view: v.name.clone(), to_query: q, columns, rx, cancel, rows: BTreeMap::new(), failed: None })
+                }
+                Ok(other) => panic!("SUBSCRIBE TO {target}: {other:?}"),
+                // the query may not be accepted outside a view (e.g. ORDER BY)
+                Err(e) => self.log.push(format!("-- SUBSCRIBE TO {target} -- {e}")),
+            }
         }
     }
 
@@ -196,7 +265,14 @@ impl Case {
         if !AS_OF_ACROSS_RESTARTS {
             self.history.clear();
         }
+        // subscriptions end with the engine: subscribe again
+        let resubscribe: Vec<(usize, bool)> =
+            (0..self.views.len()).map(|i| (i, self.subs.iter().any(|s| s.to_query && s.view == self.views[i].name))).collect();
+        self.subs.clear();
         self.running = Some(coord::start(config(&self.dir, self.cache_bytes)).expect("engine restarts"));
+        for (i, q) in resubscribe {
+            self.subscribe(i, q);
+        }
     }
 
     /// Compare every view with its query. Only rows are compared: whether
@@ -226,6 +302,19 @@ impl Case {
                 }
                 (Ok(_), Err(e)) | (Err(e), Ok(_)) => notes.push(format!("-- {} and its query differ in raising {e}", v.name)),
                 _ => {}
+            }
+            // what subscriptions to it (or to its query) add up to
+            for sub in self.subs.iter_mut().filter(|s| s.view == v.name) {
+                sub.drain(v.trim);
+                let (expect, of) = if sub.to_query { (&want, "its query") } else { (&got, "the view") };
+                if let (Ok(expect), None) = (expect, &sub.failed) {
+                    let acc = sub.contents();
+                    if &acc != expect {
+                        let msg = format!("after {what}: subscription to {} of {} = {}\n  stream adds up to: {acc:?}\n  {of} holds:       {expect:?}", if sub.to_query { "the query" } else { "view" }, v.name, v.query);
+                        panic!("{msg}\ncase:\n  {}", self.log.join("\n  "));
+                    }
+                }
+                sub.failed = None;
             }
             state.insert(v.name.clone(), got);
         }
@@ -280,7 +369,7 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
     let cache_bytes = if rng.chance(30) { 256 << 10 } else { 1 << 30 };
     let running = coord::start(config(&dir, cache_bytes)).expect("engine starts");
     let tables = sqlgen::gen_schema(&mut rng);
-    let mut case = Case { _tmp: tmp, dir, cache_bytes, running: Some(running), tables, views: vec![], next_view: 0, history: vec![], log: vec![] };
+    let mut case = Case { _tmp: tmp, dir, cache_bytes, running: Some(running), tables, views: vec![], next_view: 0, history: vec![], subs: vec![], log: vec![] };
     let h = case.h();
     for sql in case.tables.iter().map(sqlgen::create_table_sql).collect::<Vec<_>>() {
         execute(&h, &sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -336,6 +425,10 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
                     if !has_dependents && execute(&case.h(), &format!("DROP VIEW {name}")).is_ok() {
                         case.note(format!("DROP VIEW {name}"));
                         case.views.remove(i);
+                        for sub in case.subs.iter().filter(|s| s.view == name) {
+                            sub.cancel.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        case.subs.retain(|s| s.view != name);
                     }
                 }
             }

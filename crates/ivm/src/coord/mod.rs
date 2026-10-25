@@ -81,6 +81,9 @@ pub(crate) struct Subscription {
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
     pub progress: bool,
+    /// The materialized view subscribed to by name (its node may be shared
+    /// with other views, so dropping it is matched by view, not by node).
+    pub view: Option<ObjectId>,
 }
 
 /// A read waiting for the engine to reach a GSN.

@@ -343,6 +343,7 @@ impl Engine {
     }
 
     fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
+        let mut view = None;
         let (node, pinned, columns): (NodeId, Option<NodeId>, Vec<ResultColumn>) = match target {
             SubscribeTarget::Name(name) => {
                 let Some(obj) = self.catalog.by_name(&name).cloned() else {
@@ -350,6 +351,7 @@ impl Engine {
                 };
                 match &obj.kind {
                     ObjectKind::MaterializedView(v) => {
+                        view = Some(obj.id);
                         let rt = &self.rt.views[&obj.id];
                         (rt.node, None, v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect())
                     }
@@ -396,7 +398,7 @@ impl Engine {
             }
         }
         let _ = tx.send(SubEvent::Progress { gsn: self.processed });
-        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress });
+        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view });
         Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
     }
 

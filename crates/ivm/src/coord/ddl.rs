@@ -640,7 +640,7 @@ impl Engine {
             ObjectKind::MaterializedView(_) => {
                 if let Some(v) = self.rt.views.remove(&id) {
                     for s in self.subs.iter() {
-                        if s.node == v.node {
+                        if s.view == Some(id) {
                             let _ = s.tx.send(SubEvent::Error(SqlError::new(
                                 codes::UNDEFINED_TABLE,
                                 format!("materialized view \"{}\" was dropped", obj.name),
