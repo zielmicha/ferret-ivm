@@ -27,6 +27,19 @@ fn lit(d: &Datum, c: &Column) -> String {
     format!("'{}'::{}", format_datum(d).replace('\'', "''"), format_type(&c.ty.ty, c.ty.typmod))
 }
 
+/// Columns a retraction must match by text: types PostgreSQL has no
+/// equality for (json, jsonpath), and types whose equal values differ in
+/// representation (numeric scales, -0, jsonb numbers), where equality could
+/// delete a row holding another representation than the retracted one.
+fn compare_as_text(ty: &crate::types::SqlType) -> bool {
+    use crate::types::SqlType;
+    match ty {
+        SqlType::Json | SqlType::JsonPath | SqlType::Jsonb | SqlType::Numeric | SqlType::Float4 | SqlType::Float8 => true,
+        SqlType::Array(e) => compare_as_text(e),
+        _ => false,
+    }
+}
+
 fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -131,7 +144,14 @@ impl Writer {
                     .columns
                     .iter()
                     .zip(r)
-                    .map(|(c, d)| format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c)))
+                    .map(|(c, d)| {
+                        if compare_as_text(&c.ty.ty) {
+                            // the text identifies the value exactly
+                            format!("{}::text IS NOT DISTINCT FROM ({})::text", qident(&c.name), lit(d, c))
+                        } else {
+                            format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c))
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" AND ");
                 format!("DELETE FROM {0} WHERE ctid = (SELECT ctid FROM {0} WHERE {cond} LIMIT 1)", self.table)
@@ -207,8 +227,14 @@ pub fn run(
                     *status.lock() = format!("error: {e}");
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_secs(10));
-                    if matches!(rx.try_recv(), Ok(SinkMsg::Stop)) {
-                        return;
+                    // keep the changes that arrived meanwhile: dropping one
+                    // loses it for good (only Stop ends the retries)
+                    while let Ok(m) = rx.try_recv() {
+                        match m {
+                            SinkMsg::Stop => return,
+                            SinkMsg::Data(g, d) if g > applied.unwrap_or(snapshot_gsn) => pending.push((g, d)),
+                            SinkMsg::Data(..) | SinkMsg::Progress(_) => {}
+                        }
                     }
                     continue;
                 }

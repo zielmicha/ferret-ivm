@@ -1,7 +1,7 @@
-//! Replication edge cases against a private PostgreSQL 17 (pgproto's
-//! `TempCluster`; set `PG_BIN` if it is not in /usr/lib/postgresql/17/bin).
-//! Broad randomized coverage lives in ivm-difftest; these are regression
-//! tests for specific bugs.
+//! Replication and sink edge cases against a private PostgreSQL 17
+//! (pgproto's `TempCluster`; set `PG_BIN` if it is not in
+//! /usr/lib/postgresql/17/bin). Broad randomized coverage lives in
+//! ivm-difftest; these are regression tests for specific bugs.
 
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
@@ -69,6 +69,49 @@ fn toasted_values_survive_primary_key_changes() {
     assert_eq!(want.len(), 6);
     assert_eq!(rows(&h, &format!("{q} AS OF AT LEAST LSN '{lsn}'")), want);
     assert_eq!(rows(&h, "SELECT * FROM v ORDER BY id"), want);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink without a key deletes a retracted row by comparing every column.
+/// PostgreSQL has no equality for json, so every batch retracting a json
+/// value failed and was retried forever (the target stopped following the
+/// view while the sink reported itself running); and equality matches other
+/// representations of equal values, so retracting 1.50 could delete 1.5.
+/// Also, a sink whose first connection attempt failed (here: two sinks
+/// creating their progress table at once) discarded a batch that arrived
+/// while it retried, leaving the snapshot's row behind.
+#[test]
+fn sinks_retract_json_and_exact_representations() {
+    let pg = TempCluster::start(ClusterOptions::default()).expect("start postgres");
+    let conninfo = pg.conninfo("postgres");
+    let mut target = Client::connect(&PgConfig::parse(&conninfo).unwrap()).unwrap();
+    let dir = PathBuf::from(std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()))
+        .join(format!("ivm-sink-retract-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let running = coord::start(coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() }).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int, d numeric)", String::new());
+    exec(&h, "INSERT INTO t VALUES (1, 10, 1.5), (2, 20, 1.50), (3, 30, -0.0)", String::new());
+    exec(&h, "CREATE MATERIALIZED VIEW j AS SELECT json_agg(a ORDER BY a) AS j, count(*) AS n FROM t", String::new());
+    exec(&h, "CREATE MATERIALIZED VIEW d AS SELECT d FROM t", String::new());
+    for v in ["j", "d"] {
+        exec(&h, &format!("CREATE SINK s_{v} FROM {v} INTO POSTGRES (CONNECTION '{conninfo}', TABLE '{v}_copy')"), String::new());
+    }
+    exec(&h, "UPDATE t SET a = 40 WHERE id = 1", String::new());
+    exec(&h, "DELETE FROM t WHERE id = 2", String::new());
+    for (q, want) in [("SELECT j::text, n FROM j_copy", vec!["[30, 40]|2"]), ("SELECT d FROM d_copy ORDER BY d::text", vec!["0.0", "1.5"])] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let got = target.query(q).map(|r| r.rows).unwrap_or_default();
+            let got: Vec<String> = got.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>().join("|")).collect();
+            if got == want {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{q}: sink target {got:?}, expected {want:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
