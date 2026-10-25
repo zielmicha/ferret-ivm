@@ -614,11 +614,13 @@ impl<'a> Binder<'a> {
             match item {
                 ast::SelectItem::UnnamedExpr(e) => {
                     names.push(derive_name(e));
-                    sel_exprs.push(self.bind_expr(e, &ctx)?);
+                    let x = self.bind_expr(e, &ctx)?;
+                    sel_exprs.push(self.display_reg(e, x));
                 }
                 ast::SelectItem::ExprWithAlias { expr, alias } => {
                     names.push(ident(alias));
-                    sel_exprs.push(self.bind_expr(expr, &ctx)?);
+                    let x = self.bind_expr(expr, &ctx)?;
+                    sel_exprs.push(self.display_reg(expr, x));
                 }
                 ast::SelectItem::Wildcard(_) => {
                     let cols = scope.star(None)?;
@@ -1537,6 +1539,9 @@ fn figure_colname(e: &ast::Expr) -> (String, u8) {
 
 /// The type name a cast contributes to a column name (arrays: the element's).
 fn type_name_for_alias(dt: &ast::DataType) -> Option<String> {
+    if let Some(reg) = super::binder_expr::reg_kind(dt) {
+        return Some(reg);
+    }
     let name = |t: SqlType| -> String {
         match t {
             SqlType::Int2 => "int2".into(),

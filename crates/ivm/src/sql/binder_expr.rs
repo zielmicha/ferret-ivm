@@ -149,6 +149,18 @@ fn interval_typmod(range: Option<i32>, precision: Option<u64>) -> i32 {
     (range.unwrap_or(0x7FFF) << 16) | precision.map(|p| p as i32).unwrap_or(0xFFFF)
 }
 
+/// The reg* type a cast targets (regclass, regtype, regnamespace).
+pub(crate) fn reg_kind(dt: &ast::DataType) -> Option<String> {
+    match dt {
+        ast::DataType::Custom(name, _) => {
+            let n = name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default();
+            matches!(n.as_str(), "regclass" | "regtype" | "regnamespace").then_some(n)
+        }
+        ast::DataType::Regclass => Some("regclass".to_string()),
+        _ => None,
+    }
+}
+
 fn binop_name(op: &ast::BinaryOperator) -> Option<&'static str> {
     use ast::BinaryOperator as B;
     Some(match op {
@@ -586,14 +598,7 @@ impl<'a> Binder<'a> {
                 let (t, tm) = sql_type_of(data_type)?;
                 let x = self.bind_expr(expr, ctx)?;
                 // reg* types print as names: map OIDs through the catalog
-                let reg = match data_type {
-                    ast::DataType::Custom(name, _) => {
-                        let n = name.0.last().map(|p| p.to_string().to_lowercase()).unwrap_or_default();
-                        matches!(n.as_str(), "regclass" | "regtype" | "regnamespace").then_some(n)
-                    }
-                    ast::DataType::Regclass => Some("regclass".to_string()),
-                    _ => None,
-                };
+                let reg = reg_kind(data_type);
                 // and read names: 'users'::regclass is the OID of users (kept
                 // an oid, so that it compares with oid columns)
                 if let (Some(kind), Expr::Literal(Datum::Text(name), SqlType::Unknown | SqlType::Text)) = (&reg, &x)
@@ -1068,6 +1073,23 @@ impl<'a> Binder<'a> {
             }
             other => sql_bail!(codes::FEATURE_NOT_SUPPORTED, "unsupported literal {other}"),
         })
+    }
+
+    /// A select-list item that is a reg* cast prints the name (as regclassout
+    /// does) also when the cast read a name, which yields an oid so that it
+    /// compares with oid columns elsewhere.
+    pub(crate) fn display_reg(&self, item: &ast::Expr, x: Expr) -> Expr {
+        let mut e = item;
+        while let ast::Expr::Nested(inner) = e {
+            e = inner;
+        }
+        match (e, &x) {
+            (ast::Expr::Cast { data_type, .. }, Expr::Literal(_, SqlType::Oid)) => match reg_kind(data_type) {
+                Some(kind) => self.oid_lookup(x, &kind, true),
+                None => x,
+            },
+            _ => x,
+        }
     }
 
     /// `CASE oid WHEN o1 THEN 'text1' ... END` over a catalog mapping; with

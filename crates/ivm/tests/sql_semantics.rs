@@ -504,6 +504,11 @@ fn reg_types_accept_names() {
     assert_eq!(rows(&h, "SELECT 'integer'::regtype::oid, 'int4'::regtype::oid, 'text[]'::regtype::oid, 'public'::regnamespace::oid"), vec!["23|23|1009|2200"]);
     // OIDs still print as names
     assert_eq!(rows(&h, "SELECT (SELECT oid FROM pg_class WHERE relname = 't2')::regclass"), vec!["t2"]);
+    // a reg* cast in the select list prints the name, also when it read one;
+    // system catalogs have PostgreSQL's fixed OIDs
+    let q = "SELECT 't1'::regclass, 'pg_class'::regclass, 'pg_catalog.pg_type'::regclass::oid, 'int4'::regtype, 1259::regclass";
+    assert_eq!(rows(&h, q), vec!["t1|pg_class|1247|integer|pg_class"]);
+    assert_eq!(column_names(&h, q), vec!["regclass", "regclass", "oid", "regtype", "regclass"]);
     running.shutdown();
 }
 

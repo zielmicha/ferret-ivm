@@ -17,6 +17,24 @@ const AM_HEAP: u32 = 2;
 const AM_BTREE: u32 = 403;
 const COLL_DEFAULT: u32 = 100;
 
+/// The system catalog tables of PostgreSQL 17 and their (fixed) OIDs.
+const SYSTEM_CATALOG_OIDS: &[(u32, &str)] = &[
+    (2600, "pg_aggregate"), (2601, "pg_am"), (2602, "pg_amop"), (2603, "pg_amproc"), (2604, "pg_attrdef"), (1249, "pg_attribute"),
+    (1261, "pg_auth_members"), (1260, "pg_authid"), (2605, "pg_cast"), (1259, "pg_class"), (3456, "pg_collation"),
+    (2606, "pg_constraint"), (2607, "pg_conversion"), (1262, "pg_database"), (2964, "pg_db_role_setting"), (826, "pg_default_acl"),
+    (2608, "pg_depend"), (2609, "pg_description"), (3501, "pg_enum"), (3466, "pg_event_trigger"), (3079, "pg_extension"),
+    (2328, "pg_foreign_data_wrapper"), (1417, "pg_foreign_server"), (3118, "pg_foreign_table"), (2610, "pg_index"),
+    (2611, "pg_inherits"), (3394, "pg_init_privs"), (2612, "pg_language"), (2613, "pg_largeobject"),
+    (2995, "pg_largeobject_metadata"), (2615, "pg_namespace"), (2616, "pg_opclass"), (2617, "pg_operator"),
+    (2753, "pg_opfamily"), (6243, "pg_parameter_acl"), (3350, "pg_partitioned_table"), (3256, "pg_policy"), (1255, "pg_proc"),
+    (6104, "pg_publication"), (6237, "pg_publication_namespace"), (6106, "pg_publication_rel"), (3541, "pg_range"),
+    (6000, "pg_replication_origin"), (2618, "pg_rewrite"), (3596, "pg_seclabel"), (2224, "pg_sequence"), (1214, "pg_shdepend"),
+    (2396, "pg_shdescription"), (3592, "pg_shseclabel"), (2619, "pg_statistic"), (3381, "pg_statistic_ext"),
+    (3429, "pg_statistic_ext_data"), (6100, "pg_subscription"), (6102, "pg_subscription_rel"), (1213, "pg_tablespace"),
+    (3576, "pg_transform"), (2620, "pg_trigger"), (3602, "pg_ts_config"), (3603, "pg_ts_config_map"), (3600, "pg_ts_dict"),
+    (3601, "pg_ts_parser"), (3764, "pg_ts_template"), (1247, "pg_type"), (1418, "pg_user_mapping"),
+];
+
 /// OID of a catalog object.
 pub fn rel_oid(id: u64) -> u32 {
     16384 + id as u32
@@ -890,6 +908,11 @@ pub fn definitions(cat: &Catalog, kind: &str) -> Vec<(u32, String)> {
     let cols = |t: &crate::catalog::TableDef, idx: &[usize]| idx.iter().map(|c| t.columns[*c].name.clone()).collect::<Vec<_>>().join(", ");
     match kind {
         "regclass" => {
+            // PostgreSQL's system catalogs have fixed OIDs; clients write
+            // e.g. classoid = 'pg_class'::regclass
+            for (o, n) in SYSTEM_CATALOG_OIDS {
+                out.push((*o, n.to_string()));
+            }
             for o in cat.objects.values() {
                 match &o.kind {
                     ObjectKind::Table(t) => {
