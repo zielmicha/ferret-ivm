@@ -702,3 +702,20 @@ fn constant_folding_skips_unreachable_branches() {
     assert!(try_rows(&h, "SELECT 1/0 = 1 AND false").unwrap_err().contains("division by zero"));
     running.shutdown();
 }
+
+#[test]
+fn distinct_aggregates_order_by_their_arguments() {
+    let running = start("distinct-agg-order");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // ordering DISTINCT values by another column used to be accepted
+    for q in ["SELECT string_agg(DISTINCT s, ',' ORDER BY a) FROM t1", "SELECT count(DISTINCT a ORDER BY b) FROM t1"] {
+        let err = try_rows(&h, q).unwrap_err();
+        assert!(err.contains("ORDER BY expressions must appear in argument list"), "{q}: {err}");
+    }
+    assert_eq!(
+        rows(&h, "SELECT string_agg(DISTINCT s, ',' ORDER BY s DESC), array_agg(DISTINCT a ORDER BY a DESC) FROM t1"),
+        vec!["c,b,a|{NULL,3,2,1}"]
+    );
+    running.shutdown();
+}

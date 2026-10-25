@@ -1635,6 +1635,15 @@ impl<'a> Binder<'a> {
             }
         }
         let distinct = matches!(dup, Some(ast::DuplicateTreatment::Distinct));
+        // (fingerprints of the arguments as written, before coercions)
+        let arg_fps: Vec<Vec<u8>> = bound
+            .iter()
+            .map(|b| {
+                let mut v = Vec::new();
+                b.fingerprint(&mut v);
+                v
+            })
+            .collect();
         let filter = match &f.filter {
             Some(fe) => {
                 let e = self.bind_expr(fe, inner)?;
@@ -1782,8 +1791,18 @@ impl<'a> Binder<'a> {
                 types.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
             ),
         };
-        if distinct && func.is_ordered() && !order.is_empty() {
-            // ORDER BY must match the argument for DISTINCT aggregates (PG rule)
+        if distinct {
+            // with DISTINCT, rows are ordered by (some of) the argument values
+            for (o, _) in &order {
+                let mut fp = Vec::new();
+                o.fingerprint(&mut fp);
+                if !arg_fps.contains(&fp) {
+                    sql_bail!(
+                        codes::INVALID_COLUMN_REFERENCE,
+                        "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+                    );
+                }
+            }
         }
         // pin down order-sensitive aggregates without ORDER BY: order by arguments
         if func.is_ordered() && order.is_empty() {
