@@ -391,3 +391,30 @@ fn distinct_ordered_aggregates_leave_other_aggregates_alone() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A join seeded by a presence change (here the decorrelated EXISTS, whose
+/// presence index is keyed by the whole outer row) took the outer row's
+/// columns from the canonically decoded key: c0 = 0 instead of 0.000. Rows
+/// derived that way did not retract the ones derived from the stored rows,
+/// so the renamed row 58 lived on in the view (found by ivm-difftest).
+#[test]
+fn presence_changes_keep_exact_representations() {
+    let dir = tmpdir("presence-repr");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t2 (id int PRIMARY KEY, c0 numeric, r0 int, pr int)");
+    exec(&h, "CREATE TABLE t3 (id int PRIMARY KEY)");
+    exec(&h, "INSERT INTO t2 VALUES (43, 0.000, 35, 24), (58, 0.000, 5, 16)");
+    exec(&h, "INSERT INTO t3 VALUES (4)");
+    let q = "SELECT (SELECT count(*) FROM t2 sq WHERE sq.pr = a1.id) AS n, a1.id AS a, a2.id AS b, a1.c0 AS c \
+             FROM t2 a1 LEFT JOIN t2 a2 ON a2.r0 = a1.r0 + 30 \
+             WHERE a1.c0 IS DISTINCT FROM a2.c0 AND EXISTS (SELECT 1 FROM t3 sq WHERE sq.id < a1.r0 AND sq.id > a1.r0 - 3)";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    for sql in ["UPDATE t2 SET r0 = 2 WHERE id = 43", "UPDATE t2 SET id = id + 1000000 WHERE id = 58", "INSERT INTO t2 VALUES (75, 10, 44, 58)"] {
+        exec(&h, sql);
+        assert_eq!(rows(&h, "SELECT * FROM v ORDER BY a"), rows(&h, &format!("{q} ORDER BY a")), "after {sql}");
+    }
+    assert_eq!(rows(&h, "SELECT * FROM v"), ["0|1000058||0.000"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
