@@ -142,7 +142,10 @@ impl Catalog {
         }
         let q = crate::sql::parser::parse_single_query(sql).ok()?;
         let rec = Recording { cat: self, seen: Default::default() };
-        crate::sql::Binder::new(&rec).bind_query(&q).ok()?;
+        let mut b = crate::sql::Binder::new(&rec);
+        // a stored definition: tolerate what earlier versions accepted
+        b.stored_definition = true;
+        b.bind_query(&q).ok()?;
         Some(rec.seen.into_inner())
     }
 

@@ -2,10 +2,13 @@
 //! of definitions, DROP and its dependencies, the catalog history.
 
 use ivm::coord::api::{ExecResult, SessionVars};
+use ivm::coord::inspect::{InspectQuery, InspectReply};
 use ivm::coord::{self, EngineHandle};
 use ivm::error::SqlError;
+use ivm::log::LogRecord;
 use ivm::types::text::format_datum;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
@@ -238,5 +241,50 @@ fn subscriptions_use_the_view_column_names() {
             other => panic!("expected a subscription, got {other:?}"),
         }
     }
+    e.shutdown();
+}
+
+/// Definitions stored by earlier versions may contain a parameter
+/// placeholder (it binds as NULL). Wherever the engine plans a stored
+/// definition it must accept one, as recovery does, instead of rejecting it
+/// like a new statement: the web UI showed such a view as broken, EXPLAIN
+/// failed, replacing a view it reads dropped it, and replacing any other
+/// materialized view was refused.
+#[test]
+fn legacy_definitions_with_placeholders() {
+    let e = Engine::start("legacy-placeholders");
+    e.exec("CREATE TABLE t (a int PRIMARY KEY, b int)");
+    e.exec("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    e.exec("CREATE VIEW pv AS SELECT a, b FROM t");
+    // statements as an earlier version logged them
+    for sql in ["CREATE MATERIALIZED VIEW lv AS SELECT a FROM pv WHERE b = $1 OR a > 1", "CREATE VIEW lpv AS SELECT a FROM t WHERE a > $1 OR a = 1"] {
+        e.h.log(LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() }).unwrap();
+    }
+    assert_eq!(e.rows("SELECT a FROM lv ORDER BY a"), ["2", "3"]);
+    assert_eq!(e.rows("SELECT a FROM lpv"), ["1"]);
+    // new statements still reject placeholders
+    assert_eq!(e.err("CREATE VIEW nv AS SELECT a FROM t WHERE a > $1").0, "42P02");
+    assert!(!e.rows("EXPLAIN PLAN FOR VIEW lv").is_empty());
+    match e.h.inspect_wait(InspectQuery::Object { name: "lv".into(), sample: 0 }, Duration::from_secs(10)).unwrap() {
+        InspectReply::Object(d) => {
+            assert_eq!(d.problems, Vec::<String>::new());
+            assert!(d.plan.is_some());
+        }
+        other => panic!("unexpected reply {other:?}"),
+    }
+    // replacing a view it reads re-plans it; replacing another one checks
+    // that it still plans
+    e.exec("CREATE OR REPLACE VIEW pv AS SELECT a, b + 1 AS b FROM t");
+    e.exec("CREATE MATERIALIZED VIEW other AS SELECT a FROM t");
+    e.exec("CREATE OR REPLACE MATERIALIZED VIEW other AS SELECT a, b FROM t");
+    e.exec("INSERT INTO t VALUES (4, 40)");
+    assert_eq!(e.rows("SELECT a FROM lv ORDER BY a"), ["2", "3", "4"]);
+    // replayed from the log, then recovered from a checkpoint
+    let e = e.restart();
+    assert_eq!(e.rows("SELECT a FROM lv ORDER BY a"), ["2", "3", "4"]);
+    e.exec("CHECKPOINT");
+    let e = e.restart();
+    assert_eq!(e.rows("SELECT a FROM lv ORDER BY a"), ["2", "3", "4"]);
+    assert_eq!(e.rows("SELECT a FROM lpv"), ["1"]);
     e.shutdown();
 }

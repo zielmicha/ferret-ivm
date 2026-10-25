@@ -1533,7 +1533,8 @@ impl Engine {
         let mut dataflow = None;
         let mut maintenance = None;
         if let ObjectKind::View(v) | ObjectKind::MaterializedView(v) = &o.kind {
-            match crate::sql::parser::parse_single_query(&v.sql).and_then(|q| crate::sql::plan_query(&self.catalog, &q, vec![])) {
+            // a stored definition (as recovery plans it)
+            match crate::sql::parser::parse_single_query(&v.sql).and_then(|q| crate::sql::plan_stored_query(&self.catalog, &q)) {
                 Ok(bq) => plan = Some(bq.rel.explain().lines().map(|l| l.to_string()).collect()),
                 Err(e) => problems.push(format!("plan: {e}")),
             }

@@ -125,7 +125,7 @@ impl Engine {
                         sql_bail!(codes::DUPLICATE_TABLE, "relation \"{name}\" already exists");
                     }
                     // planning, the determinism check and the column names
-                    self.view_def(cv)?;
+                    self.view_def(cv, false)?;
                 }
                 ast::Statement::CreateTable(ct) => {
                     let (_, name) = object_name(&ct.name)?;
@@ -509,9 +509,16 @@ impl Engine {
     }
 
     /// Definition (query text and output columns) of CREATE [MATERIALIZED]
-    /// VIEW against the current catalog.
-    fn view_def(&self, cv: &ast::CreateView) -> Result<ViewDef> {
-        let bq = crate::sql::plan_query(&self.catalog, &cv.query, vec![])?;
+    /// VIEW against the current catalog. `stored`: a logged statement or a
+    /// stored definition, which earlier versions may have accepted with a
+    /// parameter placeholder (statements are checked with `stored` false
+    /// before they are logged).
+    fn view_def(&self, cv: &ast::CreateView, stored: bool) -> Result<ViewDef> {
+        let bq = if stored {
+            crate::sql::plan_stored_query(&self.catalog, &cv.query)?
+        } else {
+            crate::sql::plan_query(&self.catalog, &cv.query, vec![])?
+        };
         if cv.materialized {
             check_deterministic(&bq.rel)?;
         }
@@ -537,7 +544,7 @@ impl Engine {
     fn view_def_of_sql(&self, create_sql: &str) -> Result<ViewDef> {
         match parse_statement(create_sql)? {
             Statement::Sql(s) => match *s {
-                ast::Statement::CreateView(cv) => self.view_def(&cv),
+                ast::Statement::CreateView(cv) => self.view_def(&cv, true),
                 _ => sql_bail!(codes::INTERNAL_ERROR, "not a view definition: {create_sql}"),
             },
             _ => sql_bail!(codes::INTERNAL_ERROR, "not a view definition: {create_sql}"),
@@ -559,7 +566,7 @@ impl Engine {
                 sql_bail!(codes::WRONG_OBJECT_TYPE, "\"{name}\" is not a view");
             }
         }
-        let def = self.view_def(cv)?;
+        let def = self.view_def(cv, true)?;
         let query_sql = def.sql.clone();
         let id = match &existing {
             Some(e) => e.id,
@@ -632,7 +639,7 @@ impl Engine {
             {
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
                 // (it inlines the views it reads: they must keep it deterministic)
-                if let Err(e) = crate::sql::plan_query(&cat, &q, vec![]).and_then(|bq| check_deterministic(&bq.rel)) {
+                if let Err(e) = crate::sql::plan_stored_query(&cat, &q).and_then(|bq| check_deterministic(&bq.rel)) {
                     return refuse(format!("materialized view \"{}\" would no longer be valid: {}", o.name, e.message));
                 }
             }

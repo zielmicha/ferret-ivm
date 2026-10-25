@@ -165,7 +165,7 @@ impl Engine {
                 }
                 Some(ObjectKind::View(v)) | Some(ObjectKind::MaterializedView(v)) => {
                     if let Ok(q) = crate::sql::parser::parse_single_query(&v.sql)
-                        && let Ok(bq) = crate::sql::plan_query(&self.catalog, &q, vec![])
+                        && let Ok(bq) = crate::sql::plan_stored_query(&self.catalog, &q)
                     {
                         gets(&bq.rel, &mut ids);
                     }
@@ -647,7 +647,9 @@ impl Engine {
                     sql_bail!(codes::WRONG_OBJECT_TYPE, "\"{name}\" is not a view");
                 };
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
-                self.explain(ExplainKind::Plan, ExplainTarget::Query(Box::new(q)), params)
+                // a stored definition (as recovery plans it)
+                let bq = crate::sql::plan_stored_query(&self.catalog, &q)?;
+                Ok(text_rows(&["QUERY PLAN"], bq.rel.explain().lines().map(|l| vec![l.to_string()]).collect()))
             }
             (k, ExplainTarget::Name(name)) => {
                 let Some(o) = self.catalog.by_name(&name).cloned() else {

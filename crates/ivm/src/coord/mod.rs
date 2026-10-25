@@ -420,7 +420,7 @@ impl Engine {
             let deps = match &o.kind {
                 ObjectKind::Index(i) => Ok(vec![i.on]),
                 ObjectKind::MaterializedView(v) => crate::sql::parser::parse_single_query(&v.sql)
-                    .and_then(|q| crate::sql::plan_query(&self.catalog, &q, vec![]))
+                    .and_then(|q| crate::sql::plan_stored_query(&self.catalog, &q))
                     .map(|bq| {
                         let mut ids = self.catalog.mentioned_views(&v.sql);
                         gets(&bq.rel, &mut ids);
