@@ -54,10 +54,11 @@ errors:
   ([Slots](sources.md#slots)).
 - authentication or permission errors: fix the role; the source picks the
   change up on its next attempt.
-- `relation "s.t" does not exist` or `permission denied for table t` while a
-  table still has to be copied: the source cannot continue at all until the
-  table is readable again; if it was removed from the publication or
-  dropped, drop and re-create the source
+- `cannot copy table s.t: relation "s.t" does not exist` or
+  `... permission denied for table t`: the table still has to be copied but
+  cannot be read. The source retries it (up to every 60 s) and streams the
+  other tables meanwhile; fix the privilege, or, if the table was dropped,
+  drop and re-create the source
   ([Sources](sources.md#tables-added-to-or-removed-from-the-publication)).
 
 The reconnect delay doubles up to 10 s while sessions keep failing, and is
@@ -269,7 +270,7 @@ Problems found while writing and checking this documentation (at commit
 | Only `SUBSCRIBE` can be cancelled | reads waiting for a snapshot, an LSN or a GSN wait forever if the condition never holds | disconnect |
 | `AS OF AT LEAST LSN` without sources | waits forever | do not use it without sources |
 | `DROP SINK` of a sink that is retrying its connection | the engine thread waits for the sink, possibly for a long time | stop and restart the engine; the drop is replayed |
-| A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
+| A table that cannot be read while its snapshot is incomplete (dropped, no `SELECT`) | it stays incomplete and is retried; the source's frontier does not advance, so `AS OF AT LEAST LSN` reads wait | grant `SELECT`, or re-create the source |
 | `SUBSCRIBE` ends when an error record is retracted; a subscription to a dropped table never ends | spurious errors; a subscription that never finishes | re-subscribe; end it from the client |
 | A multi-object `DROP` that fails part-way | the earlier objects are dropped anyway, and the statement is missing from `ivm.catalog_history` | drop objects one at a time |
 | `CREATE SINK` does not check `KEY` columns | the sink fails every connection attempt (`sink key column "x" does not exist`) | check the names; drop and re-create the sink |

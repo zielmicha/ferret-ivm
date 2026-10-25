@@ -24,6 +24,7 @@ fn connect(conninfo: &str) -> Client {
 struct Ivm {
     running: Option<coord::Running>,
     client: Client,
+    port: u16,
 }
 
 impl Ivm {
@@ -37,7 +38,12 @@ impl Ivm {
             let _ = server::serve_listener(listener, ServerConfig { listen: String::new(), password: None }, h);
         });
         let client = connect(&format!("host=127.0.0.1 port={port} user=ivm dbname=ivm"));
-        Ivm { running: Some(running), client }
+        Ivm { running: Some(running), client, port }
+    }
+
+    /// Another session.
+    fn connect(&self) -> Client {
+        connect(&format!("host=127.0.0.1 port={} user=ivm dbname=ivm", self.port))
     }
 
     fn exec(&mut self, sql: &str) {
@@ -397,6 +403,47 @@ fn replica_identity_and_key_changes_are_detected() {
     up.exec("DELETE FROM m WHERE a = 5");
     up.exec("INSERT INTO x VALUES (6, 6)");
     all(&mut ivm, &mut up);
+}
+
+/// A table the source cannot read (here: no SELECT privilege) does not stop
+/// the others: they are copied and streamed while it is retried, the error
+/// shows in the source's status, fresh reads of that table wait, and it is
+/// copied once it can be read. The failing chunk query used to end every
+/// session, so the source never streamed again.
+#[test]
+fn an_unreadable_table_does_not_stop_the_others() {
+    let mut up = Upstream::start();
+    for t in ["a", "secret", "z"] {
+        up.exec(&format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)"));
+        up.exec(&format!("INSERT INTO {t} SELECT g, g FROM generate_series(1, 100) g"));
+    }
+    up.exec("CREATE ROLE repl LOGIN REPLICATION");
+    up.exec("GRANT SELECT ON a, z TO repl");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let conninfo = up.conninfo.replace("user=postgres", "user=repl");
+    let dir = tmpdir("unreadable");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{conninfo}' PUBLICATION 'p'"));
+    // the tables before and after it are copied, and their changes stream
+    up.exec("INSERT INTO a VALUES (1000, 1000)");
+    up.exec("DELETE FROM z WHERE id = 1");
+    eventually("the readable tables", || {
+        ivm.rows("SELECT count(*), sum(v) FROM a") == ["101|6050"] && ivm.rows("SELECT count(*) FROM z") == ["99"]
+    });
+    let status = ivm.rows("SHOW SOURCES")[0].split('|').nth(5).unwrap().to_string();
+    assert!(status.starts_with("error: cannot copy table public.secret: permission denied"), "{status}");
+    // a fresh read of the table waits for it
+    let mut session = ivm.connect();
+    let read = std::thread::spawn(move || session.query("SELECT count(*), sum(v) FROM secret").map(|r| r.rows));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!read.is_finished(), "a fresh read of a table that is not copied waited");
+    up.exec("UPDATE secret SET v = 0 WHERE id = 1"); // skipped until it is copied
+    up.exec("GRANT SELECT ON secret TO repl");
+    let rows = read.join().unwrap().expect("read");
+    assert_eq!(rows, [vec![Some("100".to_string()), Some("5049".to_string())]]);
+    let q = "SELECT count(*), sum(v) FROM secret";
+    assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    assert_eq!(ivm.rows("SHOW SOURCES")[0].split('|').nth(5).unwrap(), "streaming");
 }
 
 /// The replication slot of the (only) source.

@@ -38,6 +38,8 @@ pub struct SourceGauges {
     pub commits: AtomicU64,
     /// Row changes in those transactions (including snapshot rows).
     pub changes: AtomicU64,
+    /// Tables whose snapshot chunk cannot be read, with the error.
+    pub table_errors: Mutex<std::collections::BTreeMap<ObjectId, String>>,
 }
 
 impl SourceGauges {

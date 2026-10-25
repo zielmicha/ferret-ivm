@@ -41,6 +41,11 @@ const CHUNK_ROWS: usize = 10_000;
 const RECONNECT_MIN: Duration = Duration::from_millis(200);
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
 
+/// Delay before retrying a table whose snapshot chunk could not be read:
+/// doubles from the minimum up to the maximum while it keeps failing.
+const TABLE_RETRY_MIN: Duration = Duration::from_secs(1);
+const TABLE_RETRY_MAX: Duration = Duration::from_secs(60);
+
 fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -218,6 +223,21 @@ struct Session {
     progressed: bool,
 }
 
+/// A table whose snapshot chunk could not be read, retried at `retry_at`.
+struct TableFailure {
+    error: String,
+    delay: Duration,
+    retry_at: Instant,
+}
+
+/// Why a snapshot chunk could not be read.
+enum ChunkError {
+    /// The table cannot be read (now), but the connection is fine.
+    Table(SqlError),
+    /// The connection failed: the session ends.
+    Session(SqlError),
+}
+
 struct Txn {
     xid: u32,
     changes: Vec<(ObjectId, TableChange)>,
@@ -252,6 +272,8 @@ struct PgSource {
     /// a table added later (ALTER SOURCE REFRESH) is mapped from these.
     unmapped_rels: HashMap<u32, Relation>,
     session: Session,
+    /// Tables whose snapshot chunk failed (see `maybe_start_chunk`).
+    failing: BTreeMap<ObjectId, TableFailure>,
 }
 
 fn pk_bytes(row: &[Datum], pk: &[usize]) -> Vec<u8> {
@@ -484,6 +506,7 @@ impl PgSource {
                     st.boundary = ch.max_key_text.clone().or(st.boundary.clone());
                     st.done = ch.last;
                     progress = true;
+                    self.refresh_status();
                 }
                 if !txn.changes.is_empty() {
                     self.gauges.commit(txn.changes.len());
@@ -644,6 +667,7 @@ impl PgSource {
         self.state.tables.insert(table, SnapState { truncate: !same_key && !pk.is_empty(), ..Default::default() });
         if self.chunk.as_ref().is_some_and(|c| c.table == table) {
             self.chunk = None;
+            self.refresh_status();
         }
         self.log_progress(self.durable_lsn)?;
         self.engine.log(LogRecord::Schema { source: self.id, table, columns: columns.clone(), pk: pk.clone() })?;
@@ -713,16 +737,24 @@ impl PgSource {
         (format!("L:{tag}"), format!("H:{tag}"))
     }
 
-    /// Start the next snapshot chunk if none is in flight.
+    /// Start the next snapshot chunk if none is in flight. A table whose
+    /// chunk cannot be read (no SELECT privilege, dropped upstream, a value
+    /// that does not parse, ...) does not hold up the others: it is retried
+    /// with a growing delay, shown in the status, while the other tables
+    /// are copied and the stream goes on. Its changes are skipped until it
+    /// is copied, as for any table not copied yet, and fresh reads of it
+    /// keep waiting.
     fn maybe_start_chunk(&mut self) -> Result<()> {
         if self.chunk.is_some() {
             return Ok(());
         }
+        let now = Instant::now();
         let next = self
             .tables
             .keys()
             .copied()
             .filter(|t| !self.state.tables.get(t).is_some_and(|s| s.done))
+            .filter(|t| !self.failing.get(t).is_some_and(|f| f.retry_at > now))
             .min();
         let Some(table) = next else { return Ok(()) };
         let t = self.tables[&table].clone();
@@ -740,11 +772,8 @@ impl PgSource {
             self.log_progress(self.durable_lsn)?;
         }
         let (low, high) = self.watermarks(table);
+        let boundary = self.state.tables.get(&table).and_then(|s| s.boundary.clone());
         let q = self.query.as_mut().unwrap();
-        let tname = format!("{}.{}", qident(&t.upstream.0), qident(&t.upstream.1));
-        // values arrive in text format through the simple query protocol;
-        // no casts here, so ORDER BY below refers to the real columns
-        let cols = t.columns.iter().map(|c| qident(&c.name)).collect::<Vec<_>>().join(", ");
         q.simple_query(&format!("SELECT pg_logical_emit_message(true, 'ivm', {})", qlit(&low)))?;
         let mut chunk = Chunk {
             table,
@@ -759,82 +788,147 @@ impl PgSource {
             max_key_text: None,
             last: true,
         };
-        if t.pk.is_empty() {
-            let (snap_text, rows) = chunk_query(
-                q,
-                &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; SELECT {cols} FROM {tname}; COMMIT"),
-                &t,
-                &mut Vec::new(),
-            )?;
-            chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
-            chunk.multiset = rows;
-        } else {
-            // Chunks must be ordered as the engine orders keys (memcmp of
-            // the key encoding). For string columns that is the byte order
-            // of the text: compare as text in the C collation. Upstream
-            // types replicated as text (enums, inet, ...) compare as their
-            // text too, and they do not take a collation themselves.
-            let pk_cols: Vec<String> = t
-                .pk
-                .iter()
-                .map(|c| {
-                    let col = &t.columns[*c];
-                    if col.ty.ty.is_string() {
-                        format!("{}::text COLLATE \"C\"", qident(&col.name))
-                    } else {
-                        qident(&col.name)
-                    }
-                })
-                .collect();
-            let where_clause = match self.state.tables.get(&table).and_then(|s| s.boundary.clone()) {
-                None => String::new(),
-                Some(b) => {
-                    let lits: Vec<String> = b
-                        .iter()
-                        .zip(&t.pk)
-                        .map(|(v, c)| {
-                            let col = &t.columns[*c];
-                            let ty = crate::types::format_type(&col.ty.ty, col.ty.typmod);
-                            if col.ty.ty.is_string() {
-                                // compared as the column is: via its own type to text
-                                format!("{}::{ty}::text COLLATE \"C\"", qlit(v))
-                            } else {
-                                format!("{}::{ty}", qlit(v))
-                            }
-                        })
-                        .collect();
-                    format!(" WHERE ({}) > ({})", pk_cols.join(", "), lits.join(", "))
+        match read_chunk(q, &t, boundary.as_deref(), &mut chunk) {
+            Ok(()) => {}
+            Err(ChunkError::Session(e)) => return Err(e),
+            Err(ChunkError::Table(e)) => {
+                // (its low watermark is ignored: no chunk carries it)
+                if q.transaction_status() != b'I' {
+                    q.simple_query("ROLLBACK")?;
                 }
-            };
-            // the snapshot tells which commits before the low watermark the
-            // chunk may have missed
-            let mut last_pk_text = Vec::new();
-            let (snap_text, rows) = chunk_query(
-                q,
-                &format!(
-                    "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; \
-                     SELECT {cols} FROM {tname}{where_clause} ORDER BY {} LIMIT {CHUNK_ROWS}; COMMIT",
-                    pk_cols.join(", ")
-                ),
-                &t,
-                &mut last_pk_text,
-            )?;
-            chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
-            chunk.last = rows.len() < CHUNK_ROWS;
-            if !rows.is_empty() {
-                chunk.max_key_text = Some(last_pk_text);
-            }
-            for row in rows {
-                let kb = pk_bytes(&row, &t.pk);
-                chunk.max_key = Some(kb.clone());
-                chunk.rows.insert(kb, row);
+                let delay = self.failing.get(&table).map(|f| (f.delay * 2).min(TABLE_RETRY_MAX)).unwrap_or(TABLE_RETRY_MIN);
+                log::warn!(
+                    "source {}: cannot copy table {}.{}: {e}; retrying in {}s, streaming the other tables",
+                    self.id,
+                    t.upstream.0,
+                    t.upstream.1,
+                    delay.as_secs()
+                );
+                self.failing.insert(table, TableFailure { error: e.to_string(), delay, retry_at: Instant::now() + delay });
+                self.publish_failures();
+                self.refresh_status();
+                return Ok(());
             }
         }
         q.simple_query(&format!("SELECT pg_logical_emit_message(true, 'ivm', {})", qlit(&high)))?;
+        if self.failing.remove(&table).is_some() {
+            log::info!("source {}: table {}.{} can be copied again", self.id, t.upstream.0, t.upstream.1);
+            self.publish_failures();
+        }
         self.chunk = Some(chunk);
-        *self.status.lock() = format!("snapshotting {}.{}", t.upstream.0, t.upstream.1);
+        self.refresh_status();
         Ok(())
     }
+
+    /// Set the status line: a table that cannot be copied is an error (the
+    /// other tables are still copied and streamed), else what the source
+    /// is doing.
+    fn refresh_status(&self) {
+        let upstream = |t: &ObjectId| self.tables.get(t).map(|t| format!("{}.{}", t.upstream.0, t.upstream.1)).unwrap_or_default();
+        let status = match (self.failing.iter().next(), &self.chunk) {
+            (Some((t, f)), _) => {
+                let more = match self.failing.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more tables)", n - 1),
+                };
+                format!(
+                    "error: cannot copy table {}: {}{more}; retrying every {}s, streaming the other tables",
+                    upstream(t),
+                    f.error,
+                    f.delay.as_secs()
+                )
+            }
+            (None, Some(ch)) => format!("snapshotting {}", upstream(&ch.table)),
+            (None, None) => "streaming".to_string(),
+        };
+        *self.status.lock() = status;
+    }
+
+    /// Show the failing tables' errors (web UI).
+    fn publish_failures(&self) {
+        *self.gauges.table_errors.lock() = self.failing.iter().map(|(t, f)| (*t, f.error.clone())).collect();
+    }
+}
+
+/// Read a snapshot chunk of `t` after `boundary` into `chunk`: its rows and
+/// the snapshot they were read with, in one REPEATABLE READ transaction.
+fn read_chunk(q: &mut Client, t: &SourceTable, boundary: Option<&[String]>, chunk: &mut Chunk) -> std::result::Result<(), ChunkError> {
+    let tname = format!("{}.{}", qident(&t.upstream.0), qident(&t.upstream.1));
+    // values arrive in text format through the simple query protocol;
+    // no casts here, so ORDER BY below refers to the real columns
+    let cols = t.columns.iter().map(|c| qident(&c.name)).collect::<Vec<_>>().join(", ");
+    if t.pk.is_empty() {
+        let (snap_text, rows) = chunk_query(
+            q,
+            &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; SELECT {cols} FROM {tname}; COMMIT"),
+            t,
+            &mut Vec::new(),
+        )?;
+        chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
+        chunk.multiset = rows;
+        return Ok(());
+    }
+    // Chunks must be ordered as the engine orders keys (memcmp of the key
+    // encoding). For string columns that is the byte order of the text:
+    // compare as text in the C collation. Upstream types replicated as text
+    // (enums, inet, ...) compare as their text too, and they do not take a
+    // collation themselves.
+    let pk_cols: Vec<String> = t
+        .pk
+        .iter()
+        .map(|c| {
+            let col = &t.columns[*c];
+            if col.ty.ty.is_string() {
+                format!("{}::text COLLATE \"C\"", qident(&col.name))
+            } else {
+                qident(&col.name)
+            }
+        })
+        .collect();
+    let where_clause = match boundary {
+        None => String::new(),
+        Some(b) => {
+            let lits: Vec<String> = b
+                .iter()
+                .zip(&t.pk)
+                .map(|(v, c)| {
+                    let col = &t.columns[*c];
+                    let ty = crate::types::format_type(&col.ty.ty, col.ty.typmod);
+                    if col.ty.ty.is_string() {
+                        // compared as the column is: via its own type to text
+                        format!("{}::{ty}::text COLLATE \"C\"", qlit(v))
+                    } else {
+                        format!("{}::{ty}", qlit(v))
+                    }
+                })
+                .collect();
+            format!(" WHERE ({}) > ({})", pk_cols.join(", "), lits.join(", "))
+        }
+    };
+    // the snapshot tells which commits before the low watermark the chunk
+    // may have missed
+    let mut last_pk_text = Vec::new();
+    let (snap_text, rows) = chunk_query(
+        q,
+        &format!(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; \
+             SELECT {cols} FROM {tname}{where_clause} ORDER BY {} LIMIT {CHUNK_ROWS}; COMMIT",
+            pk_cols.join(", ")
+        ),
+        t,
+        &mut last_pk_text,
+    )?;
+    chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
+    chunk.last = rows.len() < CHUNK_ROWS;
+    if !rows.is_empty() {
+        chunk.max_key_text = Some(last_pk_text);
+    }
+    for row in rows {
+        let kb = pk_bytes(&row, &t.pk);
+        chunk.max_key = Some(kb.clone());
+        chunk.rows.insert(kb, row);
+    }
+    Ok(())
 }
 
 /// The key a Relation message implies for a table known as `t`, as
@@ -902,7 +996,12 @@ fn reshape_changes(changes: &mut Vec<(ObjectId, TableChange)>, old: &SourceTable
 /// and the table's rows, parsed from the text values as they arrive (no
 /// strings collected per value). `last_pk_text` receives the text of the
 /// last row's primary key.
-fn chunk_query(q: &mut Client, sql: &str, t: &SourceTable, last_pk_text: &mut Vec<String>) -> Result<(Option<String>, Vec<Row>)> {
+fn chunk_query(
+    q: &mut Client,
+    sql: &str,
+    t: &SourceTable,
+    last_pk_text: &mut Vec<String>,
+) -> std::result::Result<(Option<String>, Vec<Row>), ChunkError> {
     let mut snap = None;
     let mut rows = Vec::new();
     let mut err = None;
@@ -939,7 +1038,13 @@ fn chunk_query(q: &mut Client, sql: &str, t: &SourceTable, last_pk_text: &mut Ve
         rows.push(row);
         Ok(())
     })
-    .map_err(|e| err.take().unwrap_or_else(|| e.into()))?;
+    .map_err(|e| match err.take() {
+        // a value that does not parse, or a server error that leaves the
+        // connection usable: the table cannot be read
+        Some(e) => ChunkError::Table(e),
+        None if e.kind == pgproto::ErrorKind::Server && q.is_usable() => ChunkError::Table(e.into()),
+        None => ChunkError::Session(e.into()),
+    })?;
     Ok((snap, rows))
 }
 
@@ -1001,6 +1106,7 @@ pub fn run(
         gauges,
         unmapped_rels: HashMap::new(),
         session: Session::default(),
+        failing: BTreeMap::new(),
     };
     let mut backoff = RECONNECT_MIN;
     loop {
@@ -1139,7 +1245,7 @@ fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
         }
     };
     src.session.streaming_since = Some(Instant::now());
-    *src.status.lock() = "streaming".into();
+    src.refresh_status();
     let mut last_status = Instant::now();
     let mut last_wal_end = 0u64;
     loop {
@@ -1152,9 +1258,6 @@ fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
         }
         if src.txn.is_none() {
             src.maybe_start_chunk()?;
-            if src.chunk.is_none() && !src.status.lock().starts_with("streaming") {
-                *src.status.lock() = "streaming".into();
-            }
         }
         let ev = stream.recv(Some(Duration::from_millis(100)))?;
         if let Some(ReplicationEvent::XLogData { wal_end, server_time, .. } | ReplicationEvent::Keepalive { wal_end, server_time, .. }) = &ev {
@@ -1260,6 +1363,7 @@ mod tests {
             pending_wal_end: 0,
             unmapped_rels: HashMap::new(),
             session: Session::default(),
+            failing: BTreeMap::new(),
         };
         (src, log)
     }

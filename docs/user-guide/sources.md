@@ -247,10 +247,10 @@ least once per second, and immediately when a read waits for an LSN
 
 Consequently WAL is retained upstream only for the ingestion lag (usually
 milliseconds) while the engine runs and the source is streaming. While the
-engine is stopped, after it fails to start, or while the source is stuck in
-an error (for example a table it cannot read, see
-[below](#tables-added-to-or-removed-from-the-publication)), the slot holds
-back WAL removal indefinitely.
+engine is stopped, after it fails to start, or while the source cannot
+stream (it keeps reconnecting with `error: ...`), the slot holds back WAL
+removal indefinitely. (A table the source cannot copy does not stop the
+stream, see [below](#tables-added-to-or-removed-from-the-publication).)
 
 ## Initial snapshot
 
@@ -398,11 +398,19 @@ upstream, simply stop receiving changes once their snapshot (or re-snapshot)
 is complete; the replicated table and its contents stay until the source is
 dropped.
 
-If the source still has to copy a table that it can no longer read — removed
-from the publication, dropped, or without `SELECT` privilege — the failing
-chunk query is retried on every reconnect and the source never streams
-again: none of its tables receive changes, and the slot retains WAL. Drop
-and re-create the source (a single table cannot be removed from a source).
+If the source has to copy a table whose chunk query fails — the table was
+dropped upstream, the role lacks `SELECT` on it, a value does not parse, or
+any other error that leaves the connection usable — that table alone is
+retried, after 1 s, doubling up to 60 s, while the source copies its other
+tables and keeps streaming. `SHOW SOURCES` shows
+`error: cannot copy table <schema>.<table>: <message>; retrying every <n>s,
+streaming the other tables`, and the web UI marks the table. Its changes are
+skipped until it is copied (as for any table not copied yet), fresh reads of
+it wait, and, as the source's LSN frontier does not advance while one of its
+tables is incomplete, so do `AS OF AT LEAST LSN` reads. Once it can be read
+(after a `GRANT`, say), it is copied and the status clears. A dropped table
+keeps failing; drop and re-create the source to get rid of it (a single
+table cannot be removed from a source).
 
 ## ALTER SOURCE ... REFRESH
 
@@ -446,7 +454,7 @@ slot remains and must be dropped by hand (see below). Replaying a
 | `slot` | replication slot name |
 | `tables` | number of replicated tables |
 | `lsn` | the source's LSN frontier (`X/Y`): every upstream commit at or below it has been logged. It stays `0/0` until all of the source's tables have completed their initial snapshot, and does not advance during a re-snapshot. |
-| `status` | `starting`, `streaming`, `snapshotting <schema>.<table>`, `error: <message>` (while reconnecting), or `stopped` (the source thread could not be started) |
+| `status` | `starting`, `streaming`, `snapshotting <schema>.<table>`, `error: <message>` (while reconnecting), `error: cannot copy table <schema>.<table>: ...` (a table that cannot be read, retried while the rest streams), or `stopped` (the source thread could not be started) |
 
 `SHOW FRONTIERS` repeats the frontier per source; `SHOW TABLES` shows each
 table's source and row count. Source warnings and errors are written to the
