@@ -324,6 +324,13 @@ Known problems (see [Troubleshooting](troubleshooting.md#known-problems)):
 - Rows deleted upstream between the schema change and the moment the
   re-snapshot reaches them stay in the replica: the re-snapshot only
   upserts the rows it reads.
+- The decision to re-snapshot is not logged until the re-snapshot's first
+  chunk completes. If the engine restarts in between (for example because
+  the chunk's `SELECT` fails or waits for a lock), the re-snapshot is
+  forgotten: the table counts as complete, and existing rows keep NULL in
+  the new columns (and the values cast from the old types) until they change
+  upstream. Check new columns after a restart that followed a schema change,
+  and re-create the source if they are incomplete.
 - A materialized view that cannot be re-planned (for example it uses a
   dropped column) keeps its old dataflow and **stops being updated**; the
   failure is only logged (`view ... could not be re-planned after a schema

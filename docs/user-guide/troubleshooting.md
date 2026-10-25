@@ -187,9 +187,9 @@ See [Queries](../sql/queries.md) for the full list. Notable:
   happens to return.
 - In maintained views, expression errors become error records instead of
   failing a statement.
-- `current_user`, `session_user`, `user` and `current_role` fail with
-  `function current_user() does not exist`; `current_schema`,
-  `current_database()` and `current_catalog` work.
+- `current_user`, `session_user`, `user` and `current_catalog` fail with
+  `function current_user() does not exist` (and so on); `current_role`,
+  `current_schema` and `current_database()` work.
 
 ## Known problems
 
@@ -201,13 +201,14 @@ workarounds:
 | Dependency detection lowercases view text (`catalog.rs`, `sql_mentions`) | Dropping a table/view with a quoted mixed-case name succeeds while views use it; the engine fails to start after the next checkpoint | avoid mixed-case quoted names; drop dependent views first |
 | Upstream schema change that breaks a materialized view | The view silently stops updating; the engine fails to start after the next checkpoint | drop affected views before dropping/renaming upstream columns |
 | Deletes during a re-snapshot after a schema change are skipped | Rows deleted upstream right after a schema change stay in the replica | re-create the source after the change if it matters |
+| A restart before a re-snapshot's first chunk completes forgets the re-snapshot | Existing rows keep NULL in columns added upstream | re-create the source |
 | A sink drops queued changes while reconnecting | Sink target misses changes after an outage, or after concurrent `CREATE SINK`s race on `ivm_sink_progress` | create `ivm_sink_progress` in advance; create sinks one at a time; resynchronise (see above) after outages |
 | Aggregate-group errors are not retracted after a restart | The view keeps failing although the data is fixed | drop and re-create the view |
 | Errors in join conditions and probed join inputs are dropped | Rows silently missing instead of an error | avoid expressions that can fail in join conditions |
 | A dropped slot is never re-created | Source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
 | `AS OF AT LEAST LSN` without sources | waits forever | do not use it without sources |
 | `SHOW read_mode` before `SET read_mode` | `unrecognized configuration parameter` | `SET read_mode = fresh` first |
-| `current_user` and friends | error | use a literal |
+| `current_user`, `session_user`, `user`, `current_catalog` | `function ...() does not exist` | use a literal |
 | Ticks can be postponed under continuous input | `now()` and temporal filters lag | none |
 | Stop file / signals | no final checkpoint; replay on next start (harmless) | none needed |
 | `--no-sync` and OS crashes | lost records, GSN reuse | do not use `--no-sync` for real data |

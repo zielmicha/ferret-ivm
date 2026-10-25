@@ -270,10 +270,10 @@ stops at the first non-NULL argument.
 | `CEIL(x)`, `FLOOR(x)` | (field forms are not supported) |
 | `x COLLATE "C"` | only `C`, `default`, `ucs_basic`, `pg_c_utf8`, `C.UTF-8` (all mean code-point order) |
 | `current_date`, `current_timestamp`, `localtimestamp` | the clock ([Temporal filters](../user-guide/temporal-filters-and-errors.md)) |
-| `current_schema`, `current_catalog` | `public`, `ivm` |
+| `current_schema`, `current_role` | `public`, `ivm` |
 
-`current_user`, `session_user`, `user` and `current_role` currently fail
-(`function current_user() does not exist`).
+`current_user`, `session_user`, `user` and `current_catalog` currently fail
+(`function current_user() does not exist` and so on).
 
 ### Arrays
 
