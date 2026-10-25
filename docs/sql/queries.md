@@ -12,9 +12,15 @@ Materialized views have additional restrictions
 ### Select list
 
 - Expressions with optional `AS alias`; `*` and `table.*`.
-- Output column names follow PostgreSQL's rules (`count`, `?column?`,
-  `case`, the function or column name, the type name for casts of
-  literals).
+- Output column names mostly follow PostgreSQL's rules (`count`,
+  `?column?`, `case`, the function or column name, the type name for casts
+  of literals). Differences: `SELECT true` is named `bool` (PostgreSQL:
+  `?column?`); a nested cast is named after the innermost type
+  (`2.5::float8::int` → `float8`, PostgreSQL: `int4`); a literal cast to an
+  array type, subscripts (`a[1]`, `j['k']`), `OVERLAPS` and `COLLATE` give
+  `?column?` (PostgreSQL: the type, column or operator name); `substr(...)` is
+  named `substring` and `trim(LEADING|TRAILING ...)` `btrim`; and the column
+  of `jsonb_array_elements_text(...) t` is named `t` (PostgreSQL: `value`).
 - Set-returning functions in the select list (`SELECT id, unnest(a) FROM t`)
   — see [Set-returning functions](#set-returning-functions).
 
@@ -77,10 +83,13 @@ start/end: UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | UNBOU
   `nth_value(x, n)`, and every [aggregate](#aggregate-functions) except with
   `DISTINCT` or `FILTER`.
 - Default frame: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
-- `ROWS` and `GROUPS` offsets are non-negative integer constants. `RANGE`
-  offsets need exactly one `ORDER BY` column of a numeric type (offset of the
-  same type) or of a date/time type (`interval` offset); `date` values are
-  compared as timestamps.
+- `ROWS` and `GROUPS` offsets are integer constants. `RANGE` offsets need
+  exactly one `ORDER BY` column of a numeric type (offset of the same type)
+  or of a date/time type (`interval` offset); `date` values are compared as
+  timestamps. Negative integer and `numeric` offsets are not rejected (a
+  known problem; PostgreSQL fails with SQLSTATE `22013`): a negative `ROWS`
+  offset acts like `UNBOUNDED`, a negative `RANGE` offset gives wrong
+  results, and a negative `GROUPS` offset crashes the engine thread.
 - Named windows follow PostgreSQL's copy rules (a referencing window may add
   `ORDER BY` and a frame, but not `PARTITION BY`, and cannot copy a window
   that has a frame).
@@ -105,10 +114,11 @@ like PostgreSQL's `UNION` type resolution ([common types](types.md#common-type-r
   `NULLS LAST` for `ASC` and `NULLS FIRST` for `DESC`. Rows that are equal
   on all sort keys are ordered by a deterministic internal tie-break (their
   encoded bytes), so the output order is repeatable.
-- `LIMIT n`, `LIMIT ALL`, `LIMIT NULL`, `OFFSET n [ROWS]`, `LIMIT x, y`
-  (offset, limit), `FETCH FIRST|NEXT [n] ROW|ROWS ONLY|WITH TIES`
-  (`WITH TIES` needs `ORDER BY`). Counts must be constants (`LIMIT` and
-  `OFFSET` must not be negative).
+- `LIMIT n`, `LIMIT ALL`, `LIMIT NULL`, `OFFSET n [ROWS]`,
+  `FETCH FIRST|NEXT [n] ROW|ROWS ONLY|WITH TIES` (`WITH TIES` needs
+  `ORDER BY`). Counts must be constants (`LIMIT` and `OFFSET` must not be
+  negative). `OFFSET` cannot be combined with `FETCH`
+  (`cannot use both LIMIT and FETCH`; PostgreSQL accepts it).
 - `ORDER BY` in a subquery or view without `LIMIT`/`OFFSET` does not affect
   the result (relations have no order); with them it selects the rows
   (top-k).
@@ -128,7 +138,9 @@ like PostgreSQL's `UNION` type resolution ([common types](types.md#common-type-r
 
 - `VALUES (...), (...)` as a query or `FROM` item; columns are named
   `column1`, `column2`, ...; their types are unified across rows.
-- `TABLE name` is `SELECT * FROM name`.
+- `TABLE name` only works as the right operand of `UNION`, `INTERSECT` or
+  `EXCEPT`; as a statement, in `FROM`, in a CTE or in a view it is a syntax
+  error. Write `SELECT * FROM name`.
 
 ## Subqueries
 
@@ -183,8 +195,10 @@ agg( fraction ) WITHIN GROUP ( ORDER BY sort_expr )      -- ordered-set aggregat
 - Floating-point `sum`, `avg`, `stddev*` and `var*` are computed exactly
   (the sum of the exact binary values) and rounded once at the end; the
   result is independent of the order of the inputs, and may differ from
-  PostgreSQL's sequential summation in the last digits. `sum` of floats that
-  overflows the type fails with `value out of range: overflow`.
+  PostgreSQL's sequential summation in the last digits. `sum` of
+  `double precision` values that overflows fails with
+  `value out of range: overflow`; `sum` of `real` values returns `Infinity`
+  instead (PostgreSQL fails).
 - `numeric` sums keep NaN and infinities apart from the finite sum (like
   PostgreSQL) and use the largest display scale among the inputs.
 - Not supported: other aggregates (`bit_and`, `bit_or`, `regr_*`, `corr`,
@@ -220,16 +234,22 @@ not available.
 | Syntax | Type |
 |---|---|
 | `42`, `-2147483648` | `integer`; `bigint` if it does not fit; `numeric` if it does not fit `bigint` |
-| `1.5`, `1e3`, `1_000` | `numeric` (underscores allowed) |
+| `1.5`, `1e3` | `numeric`; underscores are allowed in all numeric literals (`1_000` is an `integer`) |
 | `'text'`, `E'tab\t'`, `U&'d\0061t'`, `$tag$...$tag$` | untyped string, resolved by context (like PostgreSQL's `unknown`) |
 | `X'0a0b'` | `bytea` |
 | `TRUE`, `FALSE`, `NULL` | |
 | `DATE '2024-01-01'`, `TIMESTAMP '...'`, `INTERVAL '1 day'`, `INTERVAL '5' DAY`, `type 'string'` | typed constants |
 | `$1`, `$2`, ... | parameters (extended protocol); types are inferred from context or given by the client |
 
-Differences: `0x1F` is parsed as a `bytea` hex string (`\x1f`), not as the
+Differences: `X'0a0b'` is a `bytea` constant (in PostgreSQL it is a bit
+string); `0x1F` is parsed as a `bytea` hex string (`\x1f`), not as the
 integer 31, and `0o17` / `0b101` parse as `0` with a column alias; bit-string
-literals (`B'101'`) are not supported.
+literals (`B'101'`) are not supported. Untyped literals that nothing gives a
+type keep the type `unknown` (OID 705) in results, subqueries and views,
+where PostgreSQL resolves them to `text`: `SELECT 'a'` reports type
+`unknown`, and `SELECT v = 1 FROM (SELECT '1' AS v) s` is true where
+PostgreSQL fails with `operator does not exist: text = integer` (only
+`VALUES` and set operations resolve them).
 
 ### Operators and predicates
 
@@ -254,7 +274,10 @@ literals (`B'101'`) are not supported.
 
 `CASE` (simple and searched), `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`.
 As in PostgreSQL, `CASE` evaluates only the branch it selects and `COALESCE`
-stops at the first non-NULL argument.
+stops at the first non-NULL argument — at run time. Constant folding,
+however, evaluates every constant subexpression first, so
+`CASE WHEN true THEN 1 ELSE 1/0 END` and `COALESCE(1, 1/0)` fail with
+`division by zero` where PostgreSQL returns 1.
 
 ### Special syntax
 
@@ -265,15 +288,21 @@ stops at the first non-NULL argument.
 | `EXTRACT(field FROM x)` | `extract(text, x)` (returns `numeric`) |
 | `SUBSTRING(s FROM a FOR b)`, `SUBSTRING(s FROM pattern)` | `substring(...)` |
 | `POSITION(a IN b)` | `strpos(b, a)` |
-| `TRIM([LEADING | TRAILING | BOTH] [chars] FROM s)` | `ltrim` / `rtrim` / `btrim` |
+| `TRIM([LEADING | TRAILING | BOTH] chars FROM s)`, `TRIM(s)` | `ltrim` / `rtrim` / `btrim` (with `FROM`, `chars` is required) |
 | `OVERLAY(s PLACING r FROM a [FOR b])` | `overlay(...)` |
 | `CEIL(x)`, `FLOOR(x)` | (field forms are not supported) |
-| `x COLLATE "C"` | only `C`, `default`, `ucs_basic`, `pg_c_utf8`, `C.UTF-8` (all mean code-point order) |
+| `x COLLATE "C"` | only `C`, `default`, `ucs_basic`, `pg_c_utf8`, `C.UTF-8` (all mean code-point order); `x::type COLLATE "C"` is a parse error, write `(x::type) COLLATE "C"` |
 | `current_date`, `current_timestamp`, `localtimestamp` | the clock ([Temporal filters](../user-guide/temporal-filters-and-errors.md)) |
 | `current_schema`, `current_role` | `public`, `ivm` |
 
 `current_user`, `session_user`, `user` and `current_catalog` currently fail
 (`function current_user() does not exist` and so on).
+
+Not supported, although PostgreSQL has them: `current_time`, `localtime`,
+`current_timestamp(p)`; `TRIM(LEADING FROM s)` and `TRIM(FROM s)` without
+characters; `SUBSTRING(s SIMILAR pattern ESCAPE e)` (and
+`SUBSTRING(s FROM pattern FOR escape)` is taken as positions); `U&'...'`
+with `UESCAPE`; string literals continued across lines.
 
 ### Arrays
 

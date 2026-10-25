@@ -80,7 +80,12 @@ recomputation, whatever the order of past changes.
 ## What can be maintained
 
 Every construct of the [query language](queries.md) can be used in a
-maintained view (subject to the rules above). How it is maintained:
+maintained view (subject to the rules above), with two exceptions found while
+checking this documentation: a `DISTINCT` aggregate with `FILTER` crashes the
+engine (see [Known problems](../user-guide/troubleshooting.md#known-problems)),
+and `agg(DISTINCT x ORDER BY y)` with `y` not among the arguments — which
+PostgreSQL rejects — is accepted, ordered by `x` in a materialized view but by
+`y` in an ad hoc query. How each construct is maintained:
 
 | Construct | Operator | Work per changed input row | State |
 |---|---|---|---|
@@ -88,12 +93,12 @@ maintained view (subject to the rules above). How it is maintained:
 | inner joins (any number of inputs), `CROSS JOIN`, comma joins | `DeltaJoin` | one chain of index lookups into the other inputs, in an order chosen to keep intermediate results small | indexes of each input on its join keys; primary-key indexes are reused, identical indexes shared |
 | join with no equality condition between two inputs | `DeltaJoin` lookup with an empty key | a scan of the whole other input | an index of the input |
 | `LEFT` / `RIGHT` / `FULL` joins | inner join plus anti-joins, NULL-padded, in a `Union` | as the joins | as the joins |
-| `EXISTS`, `IN`, `= ANY`, semi-joins | presence join: lookup of the key's count in a count-summarised index | one lookup | index of the subquery's key columns |
+| `EXISTS`, `IN`, `= ANY`, semi-joins | presence join: lookup of the key's count in a count-summarised index (when correlated by equalities; other conditions become a join, `Distinct` and then a presence lookup) | one lookup | index of the subquery's key columns |
 | `NOT EXISTS`, `NOT IN`, anti-joins | input minus its semi-join | as semi-join | as semi-join |
 | correlated and scalar subqueries | decorrelated into joins and aggregations | as those | as those |
-| `GROUP BY` with `count`, `sum`, `avg`, `min`, `max`, `bool_and/or`, `every`, `stddev*`, `var*`, `any_value` | `Reduce` | per changed group, one range summary over the group in an index whose nodes carry partial aggregates — O(log n) regardless of group size; recently touched groups are cached in memory | input index keyed by the group key, with per-node summaries; output index keyed by the group key |
+| `GROUP BY` with `count`, `sum`, `avg`, `min`, `max`, `bool_and/or`, `every`, `stddev*`, `var*`, `any_value` | `Reduce` | per changed group, one range summary over the group in an index whose nodes carry partial aggregates — O(log n) regardless of group size; recently touched groups are cached in memory. If the query also has an ordered aggregate (next row), all its aggregates share one `Reduce` that rescans each changed group | input index keyed by the group key, with per-node summaries; output index keyed by the group key |
 | `string_agg`, `array_agg`, `json(b)_agg`, `json(b)_object_agg`, `mode`, `percentile_cont/disc` | `Reduce` | rescan of each changed group | as above (input index ordered by group key, then the aggregate's `ORDER BY`) |
-| `DISTINCT` aggregates | aggregation over `DISTINCT (group, arguments)` | as `Distinct` + `Reduce` | as those |
+| `DISTINCT` aggregates (not with `FILTER`, see above) | aggregation over `DISTINCT (group, arguments)` | as `Distinct` + `Reduce` | as those |
 | several ordered aggregates with different orders, or several different `DISTINCT` argument sets | one `Reduce` per kind, joined on the group key | sum of the parts | sum of the parts |
 | `GROUPING SETS`, `ROLLUP`, `CUBE` | one aggregation per grouping set, unioned | per set | per set |
 | `SELECT DISTINCT`, `UNION` | `Distinct` | two key-prefix scans per changed value (before and after) | index of all columns |

@@ -14,7 +14,7 @@ double-quoted names keep their case. String literals use single quotes.
 
 | Statement | Reference |
 |---|---|
-| `SELECT`, `WITH`, `VALUES`, `TABLE` (+ `AS OF ...`) | [Queries](queries.md), [Reads](../user-guide/reads.md) |
+| `SELECT`, `WITH`, `VALUES` (+ `AS OF ...`) | [Queries](queries.md), [Reads](../user-guide/reads.md) |
 | `CREATE TABLE` | [Tables](../user-guide/tables-and-views.md#create-table) |
 | `INSERT`, `UPDATE`, `DELETE` | [DML](../user-guide/tables-and-views.md#insert) |
 | `CREATE [OR REPLACE] [MATERIALIZED] VIEW` | [Views](../user-guide/tables-and-views.md#views-and-materialized-views), [Maintained views](maintained-views.md) |
@@ -32,8 +32,12 @@ double-quoted names keep their case. String literals use single quotes.
 
 Everything else — `ALTER TABLE`, `TRUNCATE`, `CREATE TABLE AS`,
 `CREATE SEQUENCE`, `CREATE FUNCTION`, `GRANT`, `COPY` (other forms),
-`DECLARE`, `PREPARE`, `EXECUTE`, `LISTEN`, `VACUUM`, ... — fails with
-`unsupported statement: ...` (SQLSTATE `0A000`).
+`DECLARE`, `PREPARE`, `EXECUTE`, `LISTEN`, `VACUUM`, ... — fails with SQLSTATE
+`0A000`, mostly as `unsupported statement: ...` (`CREATE TABLE AS` and
+`COPY` have messages of their own: `CREATE TABLE AS is not supported`,
+`COPY is only supported as COPY (SUBSCRIBE ...) TO STDOUT`). The `TABLE name`
+statement is a syntax error (it only works as the right operand of `UNION`,
+`INTERSECT` or `EXCEPT`).
 
 DDL statements (`CREATE`, `DROP`, `ALTER SOURCE`) are logged and get a GSN;
 their canonical text is visible in `ivm.catalog_history`. DML statements are
@@ -58,8 +62,10 @@ SELECT [ ALL | DISTINCT | DISTINCT ON ( expr [ , ... ] ) ] select_list
   [ AS OF { gsn | FRESH | LATEST | AT LEAST LSN 'X/Y' } ]
 
 VALUES ( expr [ , ... ] ) [ , ... ]
-TABLE name
 ```
+
+`OFFSET` cannot be combined with `FETCH` (`cannot use both LIMIT and FETCH`,
+although PostgreSQL accepts it); use `LIMIT ... OFFSET ...` instead.
 
 Details: [Queries](queries.md). `AS OF` only at the very end of a top-level
 statement ([Reads](../user-guide/reads.md#syntax)).
@@ -123,10 +129,14 @@ SUBSCRIBE [ TO ] { name | ( query ) }
 COPY ( SUBSCRIBE ... ) TO STDOUT
 ```
 
+`AS OF` is accepted but ignored: a subscription always starts at the last
+applied GSN.
+
 ### Introspection and control
 
 ```sql
-EXPLAIN [ PLAN | DATAFLOW | MAINTENANCE ] [ FOR ] { query | [ MATERIALIZED ] [ VIEW ] name }
+EXPLAIN [ PLAN ] [ FOR ] { query | [ MATERIALIZED ] [ VIEW ] name }
+EXPLAIN { DATAFLOW | MAINTENANCE } [ FOR ] [ MATERIALIZED ] [ VIEW ] name   -- a materialized view
 
 SHOW { SOURCES | TABLES | VIEWS | MATERIALIZED VIEWS | INDEXES | SINKS
      | ARRANGEMENTS | FRONTIERS | GSN | ALL }

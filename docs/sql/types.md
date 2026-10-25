@@ -10,7 +10,7 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 
 | Type | Accepted names | OID | Notes |
 |---|---|---|---|
-| `boolean` | `bool`, `boolean` | 16 | input `t`/`true`/`yes`/`on`/`1`..., output `t`/`f` |
+| `boolean` | `bool`, `boolean` | 16 | input `t`/`true`/`yes`/`on`/`1`..., output `t`/`f`; a cast to `text` also gives `t`/`f` (PostgreSQL: `true`/`false`) |
 | `smallint` | `smallint`, `int2` | 21 | |
 | `integer` | `integer`, `int`, `int4`, `serial`, `serial4` | 23 | `serial` creates no sequence |
 | `bigint` | `bigint`, `int8`, `bigserial`, `serial8` | 20 | |
@@ -18,7 +18,7 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 | `double precision` | `double precision`, `float8`, `float`, `float(25..53)` | 701 | |
 | `numeric(p,s)` | `numeric`, `decimal`, `dec` with optional precision and scale | 1700 | arbitrary precision, NaN and ±Infinity, PostgreSQL's display scale rules (`crates/pgnumeric`) |
 | `text` | `text` | 25 | |
-| `character varying(n)` | `varchar(n)`, `character varying(n)` | 1043 | length checked on assignment, truncated by explicit casts |
+| `character varying(n)` | `varchar(n)`, `character varying(n)` | 1043 | length checked on assignment, truncated by explicit casts of typed values (an untyped literal fails instead: `'abc'::varchar(2)` gives `value too long for type character varying(2)`, PostgreSQL returns `ab`) |
 | `character(n)` | `char(n)`, `character(n)`, `bpchar` | 1042 | blank-padded; `char` without length is `char(1)` |
 | `name` | `name` | 19 | |
 | `bytea` | `bytea` | 17 | hex output (`\x...`), escape input |
@@ -31,7 +31,7 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 | `json` | `json` | 114 | stored as validated text |
 | `jsonb` | `jsonb` | 3802 | |
 | `jsonpath` | `jsonpath` | 4072 | SQL/JSON path, stored as its canonical text |
-| `oid` | `oid`, `regclass`, `regtype`, `regproc`, `regnamespace`, `regrole`, `regprocedure`, `regoper` | 26 | the `reg*` names are aliases of `oid`; casts to `regclass`, `regtype`, `regnamespace` print names |
+| `oid` | `oid`, `regclass`, `regtype`, `regproc`, `regnamespace`, `regrole`, `regprocedure`, `regoper` | 26 | the `reg*` names are aliases of `oid`; casts of OIDs to `pg_catalog.regclass`, `regtype` and `regnamespace` print names (an unqualified `::regclass` prints the number), and names cannot be cast to them (`'integer'::regtype` fails with `invalid input syntax for type oid`) |
 | arrays | `type[]`, `type[n]` | | of every type above; multi-dimensional (up to 6), with lower bounds |
 
 Type modifiers (`numeric(10,2)`, `varchar(20)`, `timestamp(3)`,
@@ -43,7 +43,8 @@ Not supported: `time with time zone`, `money`, `bit`/`varbit`, `inet`,
 multiranges, geometric types, `xml`, `tsvector`/`tsquery`, `hstore` and other
 extension types. Upstream columns of such types are replicated as `text`
 ([type mapping](../user-guide/sources.md#type-mapping)); `CREATE TABLE`
-with them fails with `type "x" does not exist`.
+with them fails with `type "x" does not exist` (`bit(n)` and
+`time with time zone` with SQLSTATE `0A000`, `... is not supported`).
 
 ## Text format
 
@@ -139,7 +140,8 @@ common type:
 
 - untyped values take the type of the others (all untyped → `text`);
 - numeric types → the highest in the numeric hierarchy;
-- string types → `text`;
+- string types → `text` (PostgreSQL keeps `varchar` or `name` in some
+  combinations, for example `COALESCE(varchar, char)` is `varchar` there);
 - `date`/`timestamp`/`timestamptz` → the highest of them;
 - arrays → array of the common element type;
 - anything else must be identical, otherwise

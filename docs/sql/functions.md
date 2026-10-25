@@ -29,11 +29,11 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 
 | Operator | Operand types | Result |
 |---|---|---|
-| `+` `-` `*` `/` | `smallint`, `integer`, `bigint`, `real`, `double precision`, `numeric` (same type both sides; mixed types are promoted) | same type (integer division truncates) |
+| `+` `-` `*` `/` | `smallint`, `integer`, `bigint`, `real`, `double precision`, `numeric` (same type both sides; mixed types are promoted — but `real` mixed with an integer or `numeric` is computed in `real`, where PostgreSQL uses `double precision`) | same type (integer division truncates) |
 | `%` | integers, `numeric` | remainder |
 | `^` | `double precision`, `numeric` | power |
 | unary `-`, `+`, `@` (absolute value) | numeric types | |
-| `\|/`, `\|\|/` | numeric | square root, cube root (as `sqrt`, `cbrt`) |
+| `\|/`, `\|\|/` | numeric types | square root, cube root (rewritten to `sqrt`, `cbrt`, so a `numeric` operand gives `numeric`; PostgreSQL's operators return `double precision`) |
 | `&` `\|` `#` `~` `<<` `>>` | integers | bitwise and, or, xor, not, shifts |
 | `=` `<>` `<` `<=` `>` `>=` | `boolean`, numeric types, `text`, `character`, `bytea`, `date`, `time`, `timestamp`, `timestamptz`, `interval`, `uuid`, `jsonb`, `oid`, arrays | `boolean` |
 | `\|\|` | `text`, `text` / `text`, any non-array / any non-array, `text` | `text` |
@@ -206,7 +206,9 @@ methods), with PostgreSQL's parser tables ported so that syntax errors match.
 
 Functions not listed here do not exist (`function f(...) does not exist`),
 for example: `age(timestamp)` (one argument), `to_tsvector` and the other
-text-search functions, `regexp_instr`, `string_agg` over non-text types,
+text-search functions, `regexp_instr`, `sum(interval)`, `avg(interval)`,
+`percentile_cont` over `interval` or with an array of fractions,
+`date_trunc(field, timestamptz, zone)`, `array_position(a, x, start)`,
 `jsonb_to_record[set]`, `jsonb_populate_record`, `json_each` and the other
 `json` (non-`jsonb`) processing functions, `generate_subscripts`,
 `array_fill`, `encode`/`decode` formats other than those listed, and the
