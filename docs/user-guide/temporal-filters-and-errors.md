@@ -32,7 +32,7 @@ Where the clock is used:
 | Context | `now()` (and `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date`) |
 |---|---|
 | materialized views, `SUBSCRIBE (query)` | only in temporal filters (below), evaluated against the logical clock |
-| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN (except across a restart: reads as of a GSN older than the last checkpoint then see the checkpoint's clock) |
+| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN, also across restarts (the checkpoint keeps the last 100,000 clock ticks of the retention window; a read as of an older GSN after a restart sees the oldest kept tick's clock) |
 | `INSERT`/`UPDATE`/`DELETE` | the wall clock when the statement runs (the resulting values are logged) |
 
 `clock_timestamp()` always returns the wall clock and is rejected in

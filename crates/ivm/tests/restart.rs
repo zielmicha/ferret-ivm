@@ -222,3 +222,37 @@ fn indexes_follow_upstream_schema_changes() {
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// now() in a read AS OF an earlier GSN is the logical clock of that GSN,
+/// also after a restart: the checkpoint keeps the clock ticks of the
+/// retention window (a restart used to answer every earlier GSN with the
+/// checkpoint's clock).
+#[test]
+fn now_as_of_earlier_gsns_after_a_restart() {
+    let dir = tmpdir("now-as-of");
+    let e = Engine::start(&dir);
+    let tick = |e: &Engine, secs: i64| {
+        let base = 1_767_225_600_000_000i64; // 2026-01-01T00:00:00Z in Unix microseconds
+        e.h.log(ivm::log::LogRecord::Tick { micros: base + secs * 1_000_000 }).unwrap();
+    };
+    e.exec("CREATE TABLE t (id int PRIMARY KEY)");
+    tick(&e, 10);
+    e.exec("INSERT INTO t VALUES (1)");
+    let g1: u64 = e.rows("SHOW GSN")[0].parse().unwrap();
+    tick(&e, 20);
+    e.exec("INSERT INTO t VALUES (2)");
+    let g2: u64 = e.rows("SHOW GSN")[0].parse().unwrap();
+    tick(&e, 30);
+    let reads = |e: &Engine| {
+        [g1, g2].map(|g| e.rows(&format!("SELECT now(), count(*) FROM t AS OF {g}"))[0].clone())
+    };
+    let want = ["2026-01-01 00:00:10+00|1", "2026-01-01 00:00:20+00|2"];
+    assert_eq!(reads(&e), want);
+    e.exec("CHECKPOINT");
+    e.shutdown();
+    let e = Engine::start(&dir);
+    assert_eq!(reads(&e), want);
+    assert_eq!(e.rows("SELECT now()"), ["2026-01-01 00:00:30+00"]);
+    e.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

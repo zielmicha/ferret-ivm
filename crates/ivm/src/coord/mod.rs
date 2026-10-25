@@ -128,7 +128,17 @@ pub(crate) struct AppState {
     /// GSN from which each tree's history is complete (by fingerprint).
     #[serde(default)]
     pub arr_since: Vec<(Vec<u8>, Gsn)>,
+    /// Recent (gsn, clock) ticks (`Engine::ticks`, the last MAX_SAVED_TICKS
+    /// of the retention window), for now() in reads as of earlier GSNs
+    /// (absent in older checkpoints).
+    #[serde(default)]
+    pub ticks: Vec<(Gsn, i64)>,
 }
+
+/// Most clock ticks kept in a checkpoint: a day of ticks at the default
+/// interval. now() in a read as of an older GSN (within a larger retention
+/// window) after a restart is the oldest kept tick's clock.
+const MAX_SAVED_TICKS: usize = 100_000;
 
 pub struct Engine {
     pub cfg: Config,
@@ -420,7 +430,11 @@ impl Engine {
         self.graph.recovery_since = app.arr_since.into_iter().collect();
         self.clock = app.clock;
         self.graph.now = app.clock;
-        self.ticks.push_back((rec.gsn, app.clock));
+        if app.ticks.is_empty() {
+            self.ticks.push_back((rec.gsn, app.clock));
+        } else {
+            self.ticks = app.ticks.into_iter().collect();
+        }
         self.source_states = app.source_states.into_iter().collect();
         self.source_lsns = app.source_lsns.into_iter().collect();
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
@@ -832,6 +846,7 @@ impl Engine {
             clock: self.clock,
             errors: self.graph.error_state(),
             arr_since: self.graph.arrangement_since().into_iter().collect(),
+            ticks: self.ticks.iter().skip(self.ticks.len().saturating_sub(MAX_SAVED_TICKS)).copied().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;

@@ -260,6 +260,7 @@ client is gone.
 The engine's logical clock (`Engine::clock`, PostgreSQL epoch microseconds)
 is the maximum of the tick times applied so far. A deque of recent
 (GSN, clock) pairs lets a read at GSN *g* evaluate `now()` as the clock at
-*g* (`clock_at`); pairs older than the retention frontier are dropped, and
-after a restart the deque starts at the checkpoint's clock. The dataflow sees
+*g* (`clock_at`); pairs older than the retention frontier are dropped.
+Checkpoints save the deque (at most its last 100,000 pairs; `AppState::ticks`),
+so reads as of earlier GSNs see the same clock after a restart. The dataflow sees
 the clock as `Graph::now`; temporal-filter operators run whenever it moves.
