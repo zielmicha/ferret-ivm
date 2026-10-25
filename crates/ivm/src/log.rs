@@ -323,10 +323,13 @@ impl LogWriter {
     }
 }
 
-/// Read all records with gsn > `after`.
+/// Read all records with gsn > `after`. Only the last segment can end in a
+/// torn write (which `LogWriter::open` truncates); invalid data anywhere
+/// else, or a missing GSN, is corruption: replaying around it would
+/// silently skip records.
 pub fn read_from(dir: &Path, after: Gsn) -> Result<Vec<(Gsn, LogRecord)>> {
     let segs = list_segments(dir)?;
-    let mut out = Vec::new();
+    let mut out: Vec<(Gsn, LogRecord)> = Vec::new();
     for (i, first) in segs.iter().enumerate() {
         // skip segments entirely before `after`
         if let Some(next) = segs.get(i + 1)
@@ -334,10 +337,20 @@ pub fn read_from(dir: &Path, after: Gsn) -> Result<Vec<(Gsn, LogRecord)>> {
         {
             continue;
         }
+        let path = seg_path(dir, *first);
         let mut data = Vec::new();
-        File::open(seg_path(dir, *first))?.read_to_end(&mut data)?;
-        let (recs, _) = parse_frames(&data);
-        out.extend(recs.into_iter().filter(|(g, _)| *g > after));
+        File::open(&path)?.read_to_end(&mut data)?;
+        let (recs, valid) = parse_frames(&data);
+        if valid < data.len() && i + 1 < segs.len() {
+            return Err(SqlError::corrupt(format!("input log segment {} is corrupt at byte {valid}", path.display())));
+        }
+        for (g, r) in recs.into_iter().filter(|(g, _)| *g > after) {
+            let expect = out.last().map(|(p, _)| p + 1).unwrap_or(after + 1);
+            if g != expect {
+                return Err(SqlError::corrupt(format!("input log is missing records: expected gsn {expect}, found {g} in {}", path.display())));
+            }
+            out.push((g, r));
+        }
     }
     Ok(out)
 }
@@ -346,6 +359,54 @@ pub fn read_from(dir: &Path, after: Gsn) -> Result<Vec<(Gsn, LogRecord)>> {
 mod tests {
     use super::*;
     use crate::types::Datum;
+
+    fn tick(g: Gsn) -> LogRecord {
+        LogRecord::Tick { micros: g as i64 }
+    }
+
+    /// A log of two segments (first GSNs 1 and `split`) holding `gsns`.
+    fn two_segments(dir: &Path, gsns: &[Gsn], split: Gsn) {
+        let _ = std::fs::remove_dir_all(dir);
+        let parts: [(Gsn, Vec<Gsn>); 2] =
+            [(1, gsns.iter().copied().filter(|g| *g < split).collect()), (split, gsns.iter().copied().filter(|g| *g >= split).collect())];
+        for (first, part) in parts {
+            let tmp = dir.join("tmp");
+            let mut w = LogWriter::open(&tmp, false).unwrap();
+            for g in part {
+                w.append(g, &tick(g)).unwrap();
+            }
+            w.flush().unwrap();
+            drop(w);
+            std::fs::rename(seg_path(&tmp, 1), seg_path(dir, first)).unwrap();
+            std::fs::remove_dir(&tmp).unwrap();
+        }
+    }
+
+    /// Damage before the last segment, or a missing record, is reported
+    /// instead of being replayed around.
+    #[test]
+    fn corruption_before_the_tail_is_an_error() {
+        let base = std::env::var("IVM_TEST_TMP").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("ivm-log-corrupt-{}", std::process::id()));
+        let all: Vec<Gsn> = (1..=10).collect();
+        two_segments(&dir, &all, 6);
+        assert_eq!(read_from(&dir, 0).unwrap().len(), 10);
+        assert_eq!(read_from(&dir, 7).unwrap().iter().map(|(g, _)| *g).collect::<Vec<_>>(), vec![8, 9, 10]);
+        // a flipped byte in the middle of the first segment
+        let first = seg_path(&dir, 1);
+        let mut data = std::fs::read(&first).unwrap();
+        let mid = data.len() / 2;
+        data[mid] ^= 0xFF;
+        std::fs::write(&first, &data).unwrap();
+        assert!(read_from(&dir, 0).is_err());
+        // a segment's records are missing
+        let gap: Vec<Gsn> = (1..=10).filter(|g| *g != 7).collect();
+        two_segments(&dir, &gap, 6);
+        assert!(read_from(&dir, 0).is_err());
+        assert!(read_from(&dir, 3).is_err());
+        assert_eq!(read_from(&dir, 7).unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn roundtrip_and_torn_tail() {
