@@ -100,7 +100,40 @@ fn sqrt_n(a: &Datum) -> Result<Datum> {
     Ok(Datum::numeric(n(a).sqrt()?))
 }
 fn cbrt_f(a: &Datum) -> Result<Datum> {
-    f8(f(a).cbrt())
+    f8(glibc_cbrt(f(a)))
+}
+
+/// cbrt() as PostgreSQL computes it with glibc (sysdeps/ieee754/dbl-64/
+/// s_cbrt.c, constants verbatim), which is not correctly rounded:
+/// cbrt(27) = 3.0000000000000004. Rust's f64::cbrt gives other last digits.
+#[allow(clippy::excessive_precision)]
+fn glibc_cbrt(x: f64) -> f64 {
+    const CBRT2: f64 = 1.2599210498948731648; // 2^(1/3)
+    const SQR_CBRT2: f64 = 1.5874010519681994748; // 2^(2/3)
+    const FACTOR: [f64; 5] = [1.0 / SQR_CBRT2, 1.0 / CBRT2, 1.0, CBRT2, SQR_CBRT2];
+    if x == 0.0 || !x.is_finite() {
+        return x + x;
+    }
+    // frexp: |x| = xm * 2^xe with xm in [0.5, 1)
+    let (mut ax, mut adj) = (x.abs(), 0);
+    if ax < f64::MIN_POSITIVE {
+        ax *= f64::from_bits(0x4350_0000_0000_0000); // 2^54
+        adj = -54;
+    }
+    let bits = ax.to_bits();
+    let xe = ((bits >> 52) & 0x7ff) as i32 - 1022 + adj;
+    let xm = f64::from_bits((bits & !(0x7ff_u64 << 52)) | (1022_u64 << 52));
+    let u = 0.354895765043919860
+        + ((1.50819193781584896
+            + ((-2.11499494167371287
+                + ((2.44693122563534430 + ((-1.83469277483613086 + (0.784932344976639262 - 0.145263899385486377 * xm) * xm) * xm))
+                    * xm))
+                * xm))
+            * xm);
+    let t2 = u * u * u;
+    let ym = u * (t2 + 2.0 * xm) / (2.0 * t2 + xm) * FACTOR[(2 + xe % 3) as usize];
+    // ldexp(±ym, xe / 3); the exponent stays well inside the normal range
+    (if x > 0.0 { ym } else { -ym }) * f64::from_bits(((0x3ff + xe / 3) as u64) << 52)
 }
 fn exp_f(a: &Datum) -> Result<Datum> {
     let x = f(a);

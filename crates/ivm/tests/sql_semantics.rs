@@ -669,3 +669,19 @@ fn bool_casts_to_text_and_case_typing() {
     );
     running.shutdown();
 }
+
+#[test]
+fn cbrt_matches_postgresql_bit_for_bit() {
+    let running = start("cbrt");
+    let h = running.handle.clone();
+    // PostgreSQL uses glibc's cbrt, which is not correctly rounded
+    assert_eq!(
+        rows(&h, "SELECT cbrt(5), cbrt(27), cbrt(0.001), cbrt(1e300), cbrt(5e-324), cbrt(-0.0::float8)"),
+        vec!["1.7099759466766968|3.0000000000000004|0.1|1e+100|1.7031839360032601e-108|-0"]
+    );
+    // checksum of 5000 values over many magnitudes, as computed by PostgreSQL 17
+    let q = "SELECT md5(string_agg(cbrt(x)::text, ',' ORDER BY g)) FROM \
+             (SELECT g, ((g * 1.7 - 2000.3) * power(10::float8, (g % 41) - 20)) AS x FROM generate_series(1, 5000) g) v";
+    assert_eq!(rows(&h, q), vec!["0d12115ba9db9890a67ac84d017eac9b"]);
+    running.shutdown();
+}
