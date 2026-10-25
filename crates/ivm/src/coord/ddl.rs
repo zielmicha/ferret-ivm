@@ -124,10 +124,8 @@ impl Engine {
                         }
                         sql_bail!(codes::DUPLICATE_TABLE, "relation \"{name}\" already exists");
                     }
-                    let bq = crate::sql::plan_query(&self.catalog, &cv.query, vec![])?;
-                    if cv.materialized {
-                        check_deterministic(&bq.rel)?;
-                    }
+                    // planning, the determinism check and the column names
+                    self.view_def(cv)?;
                 }
                 ast::Statement::CreateTable(ct) => {
                     let (_, name) = object_name(&ct.name)?;
@@ -463,6 +461,15 @@ impl Engine {
             check_deterministic(&bq.rel)?;
         }
         let mut names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
+        // as in PostgreSQL: the column list renames the leading columns and
+        // must not be longer than the query's select list
+        if cv.columns.len() > names.len() {
+            sql_bail!(
+                codes::SYNTAX_ERROR,
+                "{}",
+                if cv.materialized { "too many column names were specified" } else { "CREATE VIEW specifies more column names than columns" }
+            );
+        }
         for (n, c) in names.iter_mut().zip(&cv.columns) {
             *n = ident(&c.name);
         }
