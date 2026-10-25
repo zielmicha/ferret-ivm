@@ -9,14 +9,15 @@
 //! actions: random DML (also primary key changes and rows changed several
 //! times), checkpoints, clean restarts, crash restarts (no final checkpoint,
 //! so recovery replays the log; sometimes the log ends in a torn record),
-//! views created and dropped on the way, and
-//! reads AS OF earlier GSNs, which must return what the views held then.
-//! Every view is also subscribed to (some views' queries too, which builds
-//! their own dataflow): the stream of changes must add up to the view's
-//! (query's) contents. All views are compared after every action.
+//! views created and dropped on the way, and reads AS OF earlier GSNs, which
+//! must return what the views held then. Every view is also subscribed to
+//! (some views' queries too, which builds their own dataflow): the stream of
+//! changes must add up to the view's (query's) contents. All views are
+//! compared after every action.
 //!
 //! Cases come from proptest, so a failure shrinks to a minimal set of views
-//! and actions, and is recorded under `proptest-regressions/`.
+//! and actions, and is recorded in `selfdiff.proptest-regressions` next to
+//! this file.
 //! `PROPTEST_CASES=N` runs N cases (default 10), `PROPTEST_RNG_SEED=N` fixes
 //! the seed; the long variant runs bigger cases:
 //! `cargo test -p ivm --release --test selfdiff -- --ignored`.
