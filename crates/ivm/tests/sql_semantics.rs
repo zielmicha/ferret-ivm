@@ -738,3 +738,20 @@ fn sql_value_functions_and_catalog_helpers() {
     assert_eq!(rows(&h, "SELECT pg_get_ruledef(0::oid, true) IS NULL"), vec!["t"]);
     running.shutdown();
 }
+
+#[test]
+fn sum_of_reals_overflows_like_postgresql() {
+    let running = start("sum-real");
+    let h = running.handle.clone();
+    // used to return Infinity
+    let err = try_rows(&h, "SELECT sum(r) FROM (VALUES (3e38::real), (3e38::real)) v(r)").unwrap_err();
+    assert!(err.contains("value out of range: overflow"), "{err}");
+    assert_eq!(rows(&h, "SELECT sum(r) FROM (VALUES (1.5::real), ('Infinity'::real)) v(r)"), vec!["Infinity"]);
+    exec(&h, "CREATE TABLE rr (id int PRIMARY KEY, r real)");
+    exec(&h, "CREATE MATERIALIZED VIEW rs AS SELECT sum(r) AS s FROM rr");
+    exec(&h, "INSERT INTO rr VALUES (1, 3e38), (2, 3e38)");
+    assert!(try_rows(&h, "SELECT * FROM rs").unwrap_err().contains("overflow"));
+    exec(&h, "DELETE FROM rr WHERE id = 2");
+    assert_eq!(rows(&h, "SELECT * FROM rs"), vec!["3e+38"]);
+    running.shutdown();
+}
