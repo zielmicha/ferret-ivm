@@ -8,8 +8,9 @@
 //! - `checkpoint`: explicit checkpoints, their time and the on-disk size
 //! - `hydrate`: CREATE MATERIALIZED VIEW over the loaded data (by_region,
 //!   acct_totals)
-//! - `small`: catch-up over N small upstream transactions (single-row
-//!   inserts, updates, deletes) committed while the engine was down
+//! - `small`: N small upstream transactions (single-row inserts, updates,
+//!   deletes) applied while the engine runs (`small_live`), and as many
+//!   committed while it was down, caught up after a restart (`small_catchup`)
 //! - `recovery`: engine restart from its checkpoint
 //! - `large`: one 500k-row INSERT and one 500k-row UPDATE transaction, live
 //! - `reads`: point / range / scan SELECTs on views and tables, ad hoc joins
@@ -31,7 +32,7 @@
 //! cargo build --release
 //! ./target/release/ivm-bench                       # 100k accounts, 2M txns
 //! ./target/release/ivm-bench --txns 500000 --small 5000 --large 100000
-//! ./target/release/ivm-bench --upstream 'host=/tmp/sock port=5432 user=postgres dbname=postgres'
+//! ./target/release/ivm-bench --upstream 'host=/var/run/postgresql port=5432 user=postgres dbname=postgres'
 //! ./target/release/ivm-bench --skip reads,subscribe --json out.json
 //! ```
 //!
