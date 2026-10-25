@@ -149,3 +149,27 @@ fn invalidating_view_replacements_are_rejected() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Variance and standard deviation of large int8 values: the sum of their
+/// squares does not fit 128 bits (it used to overflow, panicking debug
+/// builds and wrapping around in release builds).
+#[test]
+fn int8_variance_does_not_overflow() {
+    let dir = tmpdir("int8-var");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, b int8)");
+    let q = "SELECT var_pop(b) AS vp, stddev_samp(b) AS ss, variance(b) AS v, count(*) AS n FROM t";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    exec(&h, "INSERT INTO t VALUES (1, 9223372036854775807), (2, 9223372036854775807), (3, 9223372036854775807), (4, -9223372036854775808)");
+    // values computed by PostgreSQL 17
+    let want = [
+        "63802943797675961892465209865815457792|9223372036854775807|85070591730234615856620279821087277056|4".to_string(),
+    ];
+    assert_eq!(rows(&h, "SELECT * FROM v"), want);
+    assert_eq!(rows(&h, q), want);
+    exec(&h, "DELETE FROM t WHERE id = 4");
+    assert_eq!(rows(&h, "SELECT * FROM v"), ["0|0|0|3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -61,6 +61,11 @@ impl AggSpec {
             A::Max => vec![(AggKind::Max, self.arg_expr())],
             A::BoolAnd => vec![(AggKind::CountFalse, self.arg_expr()), (AggKind::CountNonNull, self.arg_expr())],
             A::BoolOr => vec![(AggKind::CountTrue, self.arg_expr()), (AggKind::CountNonNull, self.arg_expr())],
+            // squares of int8 values overflow 128-bit sums: sum as numeric
+            A::StddevSamp | A::StddevPop | A::VarSamp | A::VarPop if self.arg_type == SqlType::Int8 => {
+                let arg = Expr::Cast(Box::new(self.arg_expr()), SqlType::Numeric, -1, false);
+                vec![(AggKind::SumNumeric, arg.clone()), (AggKind::SumSqNumeric, arg), (AggKind::CountNonNull, self.arg_expr())]
+            }
             A::StddevSamp | A::StddevPop | A::VarSamp | A::VarPop => vec![
                 (sum_kind(false), self.arg_expr()),
                 (sum_kind(true), self.arg_expr()),
