@@ -354,6 +354,8 @@ A subscription runs until
   subscription ends with the error (the retraction of an error record does
   not end it). The initial snapshot of a subscription leaves rows that fail
   out instead of failing;
+- its client does not read changes as fast as they come and their queue
+  reaches its memory limit (SQLSTATE `53000`, see below);
 - the engine shuts down.
 
 If the subscribed materialized view is replaced with `CREATE OR REPLACE` by
@@ -364,5 +366,13 @@ replacement's GSN. A subscription to a query has a dataflow of its own,
 built over the current versions of the materialized views it reads, so it
 ends instead (see above); subscribe again after such changes.
 
-Changes are queued for each subscription without a bound; a client that
-reads more slowly than changes arrive makes the server's memory grow.
+Changes are queued for each subscription in memory, up to a sixteenth of
+the memory budget (`--memory-mb`, at least 4 MiB) per subscription. A client
+that reads more slowly than changes arrive, or stops reading while keeping
+its connection, fills its queue; the subscription then ends with an error
+(SQLSTATE `53000`, `subscription ended: its client does not read changes as
+fast as they come ...`) and its queued changes are dropped. The client
+receives what was already written to its connection, then the error.
+While the server waits for such a client to take what it wrote, a cancel
+request ends the subscription as well (`57014`, reported when the client
+reads again), and a client that closed its connection ends the session.

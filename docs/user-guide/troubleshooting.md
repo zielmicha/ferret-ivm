@@ -241,8 +241,10 @@ background, retried until the upstream answers. Check
   `pg_c_utf8` and `C.UTF-8`.
 - `AS OF` reads use the current catalog, and only read indexes whose
   history covers the requested GSN.
-- Changes queued for a subscription or a sink are kept in memory without a
-  bound (see [Known problems](#known-problems)).
+- Changes queued for a subscription or a sink are bounded in memory: a
+  subscription whose client does not keep up ends with `53000`, a sink that
+  does not keep up is restarted from a snapshot (see
+  [Operations](operations.md#memory)).
 - Upstream: PostgreSQL 14+, not `SQL_ASCII`; tables need a primary key,
   `REPLICA IDENTITY USING INDEX` or `REPLICA IDENTITY FULL`; publication row
   filters and column lists are not supported; unknown types replicate as
@@ -346,4 +348,4 @@ test, with workarounds.
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| Changes for subscriptions and sinks are queued in memory without a bound (the engine never waits for a client or a sink target) | a subscriber that reads slowly, or a sink whose target is unreachable for long (or whose batches keep failing), makes the server's memory grow | watch `SHOW SINKS`; drop a sink whose target is gone for long and create it again later (it resynchronises the target) |
+| The engine never waits for a client or a sink target: changes queue in memory up to each consumer's limit (a sixteenth of `--memory-mb`) | a subscriber that reads slowly ends with `53000`; a sink whose target is unreachable for long (or whose batches keep failing) stops receiving changes and rewrites the whole target once it can write again | subscribe again; give the server more memory if consumers are merely bursty |

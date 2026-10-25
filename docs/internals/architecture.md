@@ -73,10 +73,11 @@ engine waits at most 5 s for them.
 
 Communication uses `crossbeam` channels (unbounded, except one-shot reply
 channels of capacity 1) and a small block of shared state
-(`coord::api::Shared`). The records submitted to the log and not yet
-applied are bounded in bytes of memory instead, by sources waiting for room
-([Memory](#memory)); the queues to subscriptions and sinks are not. The web
-UI keeps at most 16 of its snapshot requests queued at the engine.
+(`coord::api::Shared`). What the channels hold is bounded in bytes of
+memory instead ([Memory](#memory)): records submitted to the log and not
+yet applied by sources waiting for room, the queues to subscriptions and
+sinks by their consumers' limits. The web UI keeps at most 16 of its
+snapshot requests queued at the engine.
 
 | Shared field | Meaning |
 |---|---|
@@ -90,7 +91,7 @@ UI keeps at most 16 of its snapshot requests queued at the engine.
 | `shutdown` | stop flag |
 | `failed` | the engine or sequencer thread stopped with an error (also a failed final checkpoint or a panic); the process then exits with status 1 |
 | `crash` | stop without the final checkpoint (a simulated crash, for tests) |
-| `mem` | the memory budget, with the memory of the records waiting to be applied ([Memory](#memory)) |
+| `mem` | the memory budget, with the memory of the records waiting to be applied and of the changes queued for subscriptions and sinks ([Memory](#memory)) |
 
 ## Message flow
 
@@ -227,11 +228,12 @@ handles:
 | `Request(Checkpoint)` | take a checkpoint |
 | `Request(Inspect)` | build a snapshot for the web UI (`coord/inspect.rs`) between two records, so that it is consistent at one GSN, and hand it to the requester's callback |
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
-| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |
+| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress (except one that fell behind) and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
-gives the buffer pool its share of the memory budget ([Memory](#memory)),
-takes a checkpoint if one is due, and removes cancelled subscriptions.
+gives the buffer pool its share of the memory budget, restarts sinks that
+fell behind and have written what they held ([Memory](#memory)), takes a
+checkpoint if one is due, and removes cancelled subscriptions.
 
 `apply_record` dispatches on the record kind:
 
@@ -248,7 +250,10 @@ view's root are merged into the view's error counts; each subscription gets
 the data changes of its node, ends at the first error record that is added
 (retracted ones do not end it), and gets a progress mark; each sink gets the
 changes of its node, or the GSN alone as progress when its relation did not
-change.
+change. A node's changes are moved into one shared copy (`SharedRows`) for
+all of its consumers; each queued event holds a charge on its consumer's
+queue until the consumer drops it, and a consumer whose queue would exceed
+its limit is not sent the event ([Memory](#memory)).
 
 Records at or below the last applied GSN are ignored, which makes replay
 idempotent. After each record the retention frontier is moved to
@@ -265,6 +270,8 @@ do not depend on how wide rows are or how they serialize:
 | Part | Meter | Limit | At the limit |
 |---|---|---|---|
 | records submitted to the log and not yet applied | `MemBudget::input` | an eighth, at least 4 MiB | sources wait ([Group commit](#group-commit)) |
+| changes queued for a subscription | `Subscription::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB | the subscription ends with `53000` |
+| changes queued for a sink, until written | `SinkHandle::queue` (likewise) | a sixteenth, at least 4 MiB | the sink falls behind and is restarted |
 | aggregation group caches | `Graph::group_caches` | an eighth | the group is not cached, and all caches shrink after the record ([Dataflow](dataflow.md#reduce)) |
 | buffer pool | `Env`'s own accounting ([Storage](storage.md#the-node-arena-buffer-pool)) | the rest, at least a quarter | clean nodes are evicted |
 
@@ -276,9 +283,34 @@ also shrinks the group caches when one of them could not take a group. A
 checkpoint is forced when dirty nodes, which cannot be evicted, exceed
 half of the pool's target.
 
-Not covered: hydration snapshots, ad-hoc query results, the queues of
-subscriptions and sinks, and the buffers of session, source and sink
-threads.
+Queued changes release their memory wherever they are dropped: a charge
+(`memory::Charge`) travels with each event and gives its bytes back when the
+event is dropped — consumed, discarded with its channel, or (for a sink)
+once written. Consumers never make the engine wait:
+
+- **Subscriptions.** When an event would take a subscription's queue over
+  its limit, the engine sends it an error (`53000`, `subscription ended: its
+  client does not read changes as fast as they come ...`) instead and marks
+  it cancelled. The session writes to its client with a write timeout of
+  200 ms (`server::Conn`), retrying a write that made no progress; between
+  attempts it checks whether the client closed the connection, and, while
+  streaming a subscription, whether the statement was cancelled or the
+  engine ended the subscription: it then marks the subscription cancelled,
+  drops the queued events (releasing them) and reports the error once the
+  client has taken what was written. Large changes are written as they are
+  encoded (every 1 MiB), so a session buffers little of its own.
+- **Sinks.** When an event would take a sink's queue over its limit, the
+  sink falls behind: it is sent nothing more, not even progress marks (a
+  progress row past changes the target did not get would let a restarted
+  sink resume without resynchronising). Once its thread has written or
+  dropped everything it held (its queue's meter is back to zero, which also
+  shows that the thread is not stuck), the engine stops it and starts the
+  sink again from a snapshot of its relation at the current GSN, which
+  rewrites the target, as a sink created anew does
+  ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)).
+
+Not covered: hydration snapshots, ad-hoc query results and the buffers of
+session, source and sink threads.
 
 ## The GSN clock and frontiers
 

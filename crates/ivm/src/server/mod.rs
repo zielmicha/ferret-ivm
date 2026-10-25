@@ -87,7 +87,7 @@ struct Portal {
 struct Session {
     engine: EngineHandle,
     reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    writer: BufWriter<Conn>,
     out: BackendWriter,
     vars: SessionVars,
     prepared: HashMap<String, Prepared>,
@@ -135,6 +135,52 @@ fn encode_value(d: &Datum, ty: &SqlType, binary: bool) -> Option<Vec<u8>> {
     if binary { send_datum(d, ty) } else { Some(format_datum(d).into_bytes()) }
 }
 
+/// How long a write to a client waits before it checks whether the client
+/// is still there (and runs `Conn::on_stall`), then goes on waiting.
+const WRITE_POLL: Duration = Duration::from_millis(200);
+
+/// The session's socket for writing. A write that the client does not take
+/// (it stopped reading but keeps the connection) times out every
+/// `WRITE_POLL` and is retried, so that the session notices a client that
+/// went away and can react to a cancellation instead of blocking in the
+/// write for good.
+struct Conn {
+    stream: TcpStream,
+    /// Run whenever a write made no progress for `WRITE_POLL`; an error
+    /// abandons the write (the connection is then unusable).
+    on_stall: Option<Box<dyn FnMut() -> std::io::Result<()>>>,
+}
+
+impl Conn {
+    fn new(stream: TcpStream) -> std::io::Result<Conn> {
+        stream.set_write_timeout(Some(WRITE_POLL))?;
+        Ok(Conn { stream, on_stall: None })
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            match self.stream.write(buf) {
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    if client_gone(&self.stream) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"));
+                    }
+                    if let Some(f) = &mut self.on_stall {
+                        f()?;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                r => return r,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 /// Has the client closed the connection (or did it reset)? Peeks without
 /// blocking; pending messages (a pipelining client) mean it is there.
 fn client_gone(stream: &TcpStream) -> bool {
@@ -167,7 +213,7 @@ fn copy_escape(s: &str) -> String {
 impl Session {
     fn run(stream: TcpStream, cfg: ServerConfig, engine: EngineHandle, cancels: CancelMap, pid: u32) -> Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = BufWriter::new(stream.try_clone()?);
+        let mut writer = BufWriter::new(Conn::new(stream.try_clone()?)?);
         let mut out = BackendWriter::new();
         // startup (SSL / GSS negotiation refused)
         let params = loop {
@@ -645,6 +691,7 @@ impl Session {
             }
             ExecResult::Subscribe { columns, rx, cancel, progress } => {
                 let r = self.stream_subscription(&columns, rx, &cancel, progress, formats, describe);
+                self.writer.get_mut().on_stall = None;
                 cancel.store(true, Ordering::Release);
                 match r {
                     Ok(()) => Ok(true),
@@ -661,15 +708,42 @@ impl Session {
     /// Stream a subscription's rows: as DataRows in the portal's result
     /// formats (text without a Bind, as for any statement), or as COPY data
     /// in text format.
+    ///
+    /// While the client does not take what is written, the subscription
+    /// can end: by a cancel request, or by the engine (its queue reached
+    /// its limit, or the relation was replaced or dropped). The session
+    /// then drops the queued events at once, releasing their memory, and
+    /// ends with the error once the client has taken what was written.
     fn stream_subscription(
         &mut self,
         columns: &[ResultColumn],
         rx: crossbeam_channel::Receiver<SubEvent>,
-        _cancel: &Arc<AtomicBool>,
+        cancel: &Arc<AtomicBool>,
         progress: bool,
         formats: &[i16],
         describe: bool,
     ) -> Result<()> {
+        let ended: Arc<Mutex<Option<SqlError>>> = Arc::default();
+        {
+            let (ended, interrupts, cancel, rx) = (ended.clone(), self.interrupts.clone(), cancel.clone(), rx.clone());
+            self.writer.get_mut().on_stall = Some(Box::new(move || {
+                let cancelled = interrupts.cancelled();
+                let mut ended = ended.lock();
+                if ended.is_none() && (cancelled || cancel.load(Ordering::Acquire)) {
+                    // the engine stops queueing (or already has)
+                    cancel.store(true, Ordering::Release);
+                    let mut err = None;
+                    while let Ok(ev) = rx.try_recv() {
+                        if let SubEvent::Error(e) = ev {
+                            err.get_or_insert(e);
+                        }
+                    }
+                    let canceled = || SqlError::new(codes::QUERY_CANCELED, "canceling statement due to user request");
+                    *ended = Some(if cancelled { canceled() } else { err.unwrap_or_else(canceled) });
+                }
+                Ok(())
+            }));
+        }
         let copy = self.pending_copy;
         let mut cols = vec![ResultColumn { name: "gsn".into(), ty: SqlType::Int8, typmod: -1 }];
         if progress {
@@ -687,6 +761,13 @@ impl Session {
         self.flush()?;
         let ncols = columns.len();
         loop {
+            // (ended while a write waited for the client)
+            if let Some(e) = ended.lock().take() {
+                if copy {
+                    self.out.copy_done();
+                }
+                return Err(e);
+            }
             if self.interrupts.cancelled() {
                 if copy {
                     self.out.copy_done();
@@ -712,17 +793,21 @@ impl Session {
             };
             match ev {
                 SubEvent::Data { gsn, rows } => {
-                    for (r, diff) in rows {
+                    for (r, diff) in rows.iter() {
                         let mut vals = vec![Datum::Int8(gsn as i64)];
                         if progress {
                             vals.push(Datum::Bool(false));
                         }
-                        vals.push(Datum::Int8(diff));
-                        vals.extend(r);
+                        vals.push(Datum::Int8(*diff));
+                        vals.extend(r.iter().cloned());
                         self.emit_sub_row(copy, &cols, &binary, &vals);
+                        // (a large change is written as it is encoded)
+                        if self.out.len() > 1 << 20 {
+                            self.flush_subscription(&ended, copy)?;
+                        }
                     }
                 }
-                SubEvent::Progress { gsn } => {
+                SubEvent::Progress { gsn, .. } => {
                     if progress {
                         let mut vals = vec![Datum::Int8(gsn as i64), Datum::Bool(true), Datum::Null];
                         vals.extend(std::iter::repeat_n(Datum::Null, ncols));
@@ -736,9 +821,24 @@ impl Session {
                     return Err(e);
                 }
             }
-            if let Err(e) = self.flush() {
-                return Err(SqlError::new(codes::IO_ERROR, format!("client disconnected: {e}")));
+            self.flush_subscription(&ended, copy)?;
+        }
+    }
+
+    /// Flush a subscription's output; fails with the error that ended the
+    /// subscription while the write waited for the client, if one did.
+    fn flush_subscription(&mut self, ended: &Mutex<Option<SqlError>>, copy: bool) -> Result<()> {
+        if let Err(e) = self.flush() {
+            return Err(SqlError::new(codes::IO_ERROR, format!("client disconnected: {e}")));
+        }
+        match ended.lock().take() {
+            Some(e) => {
+                if copy {
+                    self.out.copy_done();
+                }
+                Err(e)
             }
+            None => Ok(()),
         }
     }
 

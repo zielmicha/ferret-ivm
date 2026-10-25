@@ -483,11 +483,13 @@ impl Engine {
         if snapshot {
             let snap = self.graph.snapshot(&mut self.env, node)?;
             if !snap.data.is_empty() {
-                let _ = tx.send(SubEvent::Data { gsn: self.processed, rows: snap.data });
+                let _ = tx.send(SubEvent::Data { gsn: self.processed, rows: SharedRows::new(snap.data) });
             }
         }
-        let _ = tx.send(SubEvent::Progress { gsn: self.processed });
-        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
+        let _ = tx.send(SubEvent::Progress { gsn: self.processed, charge: crate::memory::Charge::none() });
+        // (changes queued after the snapshot are bounded by its share of the memory budget)
+        let queue = crate::memory::Meter::child(&self.shared.mem.outputs);
+        self.subs.push(Subscription { node, tx, queue, cancel: cancel.clone(), pinned, progress, view, reads });
         Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
     }
 

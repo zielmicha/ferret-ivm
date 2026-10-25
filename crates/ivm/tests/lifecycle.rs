@@ -25,11 +25,23 @@ struct Engine {
 
 impl Engine {
     fn start(name: &str) -> Engine {
+        Engine::start_with(name, |_| {})
+    }
+
+    fn start_with(name: &str, configure: impl FnOnce(&mut coord::Config)) -> Engine {
         let dir = tmpdir(name);
-        let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+        let mut cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+        configure(&mut cfg);
         let running = coord::start(cfg).expect("engine starts");
         let h = running.handle.clone();
         Engine { running, dir, h }
+    }
+
+    fn stats(&self) -> ivm::coord::inspect::EngineStats {
+        match self.h.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
+            ivm::coord::inspect::InspectReply::Stats(s) => s,
+            other => panic!("unexpected reply {other:?}"),
+        }
     }
 
     fn shutdown(self) {
@@ -236,4 +248,70 @@ fn stuck_sinks_and_sources_do_not_block_the_engine() {
         let _ = tx.send(());
     });
     rx.recv_timeout(Duration::from_secs(20)).expect("the engine stops");
+}
+
+/// Insert `n` rows of about 1 KB into `t` (id, s), 1000 per statement.
+fn insert_kb_rows(e: &Engine, from: i64, n: i64) {
+    let mut i = from;
+    while i < from + n {
+        e.exec(&format!("INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series({i}, {}) g", i + 999));
+        i += 1000;
+    }
+}
+
+/// A subscription whose client does not read ends with an error once its
+/// queued changes reach their limit (a sixteenth of the memory budget, at
+/// least 4 MiB), instead of queueing every change for good; dropping the
+/// queue releases its memory.
+#[test]
+fn a_subscription_that_is_not_read_ends_at_its_memory_limit() {
+    use ivm::coord::api::SubEvent;
+    let e = Engine::start_with("slow-subscriber", |c| c.memory_bytes = 16 << 20);
+    e.exec("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    let rx = subscribe(&e, "SUBSCRIBE TO t");
+    // about 12 MB of changes, three times the limit
+    insert_kb_rows(&e, 0, 12_000);
+    let st = e.stats();
+    assert_eq!(st.subscriptions, 0, "the subscription goes on");
+    assert!(st.output_queue_bytes < 5 << 20, "{} bytes queued with a 4 MiB limit", st.output_queue_bytes);
+    // the changes up to the limit, then the error
+    let (mut rows, mut error) = (0, None);
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            SubEvent::Data { rows: r, .. } => {
+                assert!(error.is_none(), "changes after the error");
+                rows += r.len();
+            }
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => error = Some((e.code, e.message)),
+        }
+    }
+    let (code, message) = error.expect("the subscription ends with an error");
+    assert_eq!(code, "53000");
+    assert!(message.contains("does not read changes as fast as they come"), "{message}");
+    assert!((1000..12_000).contains(&rows), "{rows} rows before the error");
+    drop(rx);
+    assert_eq!(e.stats().output_queue_bytes, 0);
+    e.shutdown();
+}
+
+/// A sink whose target is unreachable stops receiving changes once its
+/// unwritten changes reach their limit, instead of keeping them all in
+/// memory (it is restarted from a new snapshot once it has written what it
+/// holds); dropping it releases them.
+#[test]
+fn a_sink_that_cannot_write_stops_receiving_changes_at_its_memory_limit() {
+    let e = Engine::start_with("slow-sink", |c| c.memory_bytes = 16 << 20);
+    e.exec("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    e.exec("CREATE SINK s FROM t INTO POSTGRES CONNECTION 'host=127.0.0.1 port=1 connect_timeout=1' TABLE 'target'");
+    insert_kb_rows(&e, 0, 12_000);
+    let queued = e.stats().output_queue_bytes;
+    assert!((1 << 20..5 << 20).contains(&queued), "{queued} bytes queued for the sink with a 4 MiB limit");
+    e.exec("DROP SINK s");
+    let t0 = std::time::Instant::now();
+    while e.stats().output_queue_bytes != 0 {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the dropped sink's changes are not released");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    e.shutdown();
 }

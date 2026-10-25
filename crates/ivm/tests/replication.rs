@@ -6,7 +6,7 @@ use ivm::server::{self, ServerConfig};
 use pgproto::testutil::{ClusterOptions, TempCluster};
 use pgproto::{Client, Config as PgConfig};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn tmpdir(name: &str) -> PathBuf {
@@ -29,7 +29,12 @@ struct Ivm {
 
 impl Ivm {
     fn start(dir: &PathBuf) -> Ivm {
-        let cfg = Config { data_dir: dir.clone(), sync: false, ..Default::default() };
+        Ivm::start_with(dir, |_| {})
+    }
+
+    fn start_with(dir: &Path, configure: impl FnOnce(&mut Config)) -> Ivm {
+        let mut cfg = Config { data_dir: dir.to_path_buf(), sync: false, ..Default::default() };
+        configure(&mut cfg);
         let running = coord::start(cfg).expect("engine starts");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -876,6 +881,40 @@ fn sink_delivers_exactly_once_across_restarts() {
         up.exec(&format!("DELETE FROM t WHERE id = {}", 10 + round * 10));
         synced(&mut up);
     }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink whose writes block (here on a lock held on its target) stops
+/// receiving changes once its unwritten ones reach their memory limit, and
+/// once it has written them it is restarted from a snapshot, rewriting the
+/// target: memory stays bounded and the target ends up equal to the
+/// relation. (Its queue used to grow with every change.)
+#[test]
+fn a_sink_that_falls_behind_is_restarted_from_a_snapshot() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-behind");
+    let mut ivm = Ivm::start_with(&dir, |c| c.memory_bytes = 16 << 20);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    ivm.exec("INSERT INTO t VALUES (0, 'first')");
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 't_copy' KEY (id)", up.conninfo));
+    let count = |up: &mut Upstream| up.client.query("SELECT count(*) FROM t_copy").ok().map(|r| r.rows[0][0].clone().unwrap());
+    eventually("the sink's first write", || count(&mut up).as_deref() == Some("1"));
+    let first_xmin = up.rows("SELECT xmin FROM t_copy WHERE id = 0");
+    let mut locker = connect(&up.conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE t_copy IN ACCESS EXCLUSIVE MODE").unwrap();
+    // about 12 MB of changes, three times the sink's limit
+    for i in 0..12 {
+        ivm.exec(&format!("INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series({}, {}) g", 1 + i * 1000, (i + 1) * 1000));
+    }
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    eventually("the sink to fall behind", || status(&mut ivm).starts_with("behind"));
+    locker.simple_query("ROLLBACK").unwrap();
+    eventually("the restarted sink to catch up", || count(&mut up).as_deref() == Some("12001") && status(&mut ivm).starts_with("running"));
+    // the restart rewrote the target
+    assert_ne!(up.rows("SELECT xmin FROM t_copy WHERE id = 0"), first_xmin);
+    ivm.exec("UPDATE t SET s = 'changed' WHERE id = 0");
+    eventually("a change after the restart", || up.rows("SELECT s FROM t_copy WHERE id = 0") == ["changed"]);
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }

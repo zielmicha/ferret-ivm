@@ -226,7 +226,10 @@ the target is current, as committed in the progress row), `error: <message>`
 while it cannot connect or its writes fail (the error of the last attempt,
 shown until a write succeeds: reconnecting alone does not clear the error of
 a batch the target rejects), `error: broken: <reason>` (the relation is a
-broken materialized view; the sink is not started), or `stopped`.
+broken materialized view; the sink is not started), `behind (<status>)`
+(its unwritten changes reached their memory limit: it is sent nothing more
+and is restarted from a snapshot once it has written them, see
+[Known problems](#known-problems)), or `stopped`.
 
 ```sql
 DROP SINK [ IF EXISTS ] name
@@ -251,6 +254,12 @@ engine waits up to 5 s for its sinks to stop.
 
 See also [Troubleshooting](troubleshooting.md#known-problems).
 
-- The queue of changes from the engine to each sink is unbounded: while a
-  sink cannot write (its target is down, or a batch keeps failing), the
-  changes it has not written accumulate in memory.
+- While a sink cannot write (its target is down, or a batch keeps failing),
+  the changes it has not written accumulate in memory, up to a sixteenth of
+  the memory budget (`--memory-mb`, at least 4 MiB). Beyond that the engine
+  sends it nothing more — not even progress, so its progress row stays
+  behind — and once it has written what it holds, it is restarted from a
+  snapshot of its relation, which rewrites the whole target
+  ([resynchronisation](#start-up-and-resynchronisation)) and is expensive
+  for a large relation. The log says `sink <id> fell behind ...` and
+  `restarting sink <name> from a snapshot ...`.

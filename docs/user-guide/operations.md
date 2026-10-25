@@ -26,6 +26,7 @@ Fixed internal parameters (not configurable):
 | input-log segment size (roll-over threshold) | 64 MiB |
 | maximum records per sequencer batch (group commit) | 4096 |
 | records waiting to be applied, before sources wait | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
+| changes queued per subscription or sink | a sixteenth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | aggregation group caches, all together | an eighth of `--memory-mb` |
 | buffer pool | what the above leave of `--memory-mb`, at least a quarter of it |
 | unacknowledged commits per source | 10,000 |
@@ -49,8 +50,8 @@ Things to keep in mind when sizing:
   threads for the web UI when it is enabled).
 - **Memory**: see [below](#memory). Outside the budget: hydration of a
   new view holds snapshots of intermediate results, an ad-hoc query's
-  result is built in memory, subscription and sink queues are unbounded,
-  and each session, source and sink thread has its own buffers.
+  result is built in memory, and each session, source and sink thread has
+  its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
 
@@ -64,12 +65,20 @@ the limits mean the same for narrow and wide rows:
 | Part | Limit | When it is reached |
 |---|---|---|
 | records logged (or submitted to the log) that the engine has not applied yet | an eighth (at least 4 MiB) | sources wait before logging more, so they stop reading the replication stream for a while (the upstream keeps the WAL); the engine never waits, so it always catches up. A single record larger than the limit is let in once the queue is below it |
+| changes queued for one subscription | a sixteenth (at least 4 MiB) | the subscription ends with `53000` and its queue is dropped ([Reads](reads.md#ending-a-subscription)) |
+| changes queued for one sink and not written yet | a sixteenth (at least 4 MiB) | the sink is sent nothing more, and once it has written what it holds it is restarted from a snapshot, rewriting its target ([Sinks](sinks.md#known-problems)) |
 | aggregation group caches (all of them) | an eighth | the group is not cached; after the record every cache drops the groups not used since the last time this happened, and at least half of its size, so idle aggregations give way |
 | buffer pool (index nodes) | the rest, at least a quarter | clean nodes are evicted (also between the leaves of a scan); dirty nodes stay until the next checkpoint, which is forced when they exceed half of the pool's share |
 
-The web UI's `/api/overview` reports each part (`cache_used_bytes` against
-`cache_capacity_bytes`, `group_cache_bytes`, `input_queue_bytes`;
-[Web UI](../web-ui.md#get-apioverview)).
+Queued changes are shared: a change delivered to several subscriptions and
+sinks is held once (each consumer's queue still counts it). The web UI's
+`/api/overview` reports each part (`cache_used_bytes` against
+`cache_capacity_bytes`, `group_cache_bytes`, `input_queue_bytes`,
+`output_queue_bytes`; [Web UI](../web-ui.md#get-apioverview)).
+
+Subscriptions and sinks can queue a sixteenth each, so many slow consumers
+can together exceed the budget; the buffer pool then shrinks to its
+quarter.
 
 ## The data directory
 

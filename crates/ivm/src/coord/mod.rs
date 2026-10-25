@@ -86,6 +86,9 @@ pub struct Runtime {
 pub(crate) struct Subscription {
     pub node: NodeId,
     pub tx: Sender<SubEvent>,
+    /// Memory of the events queued for the client (each event holds its
+    /// charge until the session drops it).
+    pub queue: Arc<crate::memory::Meter>,
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
@@ -633,6 +636,7 @@ impl Engine {
                 }
             }
             self.rebalance_memory();
+            self.restart_lagging_sinks();
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
@@ -765,7 +769,7 @@ impl Engine {
                 }
                 let outputs = self.graph.step(&mut self.env, gsn, by_node)?;
                 self.processed = gsn;
-                self.deliver(gsn, &outputs);
+                self.deliver(gsn, outputs);
                 if source == 0 {
                     // local DML: lsn carries the request id
                     let n = self.dml_counts.remove(&lsn).unwrap_or_default();
@@ -840,7 +844,7 @@ impl Engine {
                 // temporal filters release the events that became due
                 let outputs = self.graph.step(&mut self.env, gsn, FxHashMap::default())?;
                 self.processed = gsn;
-                self.deliver(gsn, &outputs);
+                self.deliver(gsn, outputs);
             }
         }
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
@@ -864,14 +868,24 @@ impl Engine {
         if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
     }
 
-    /// Route outputs to views (errors) and subscriptions.
-    fn deliver(&mut self, gsn: Gsn, outputs: &FxHashMap<NodeId, Output>) {
+    /// Route outputs to views (errors), subscriptions and sinks. Each node's
+    /// changes are delivered as one copy shared by all its consumers, and
+    /// each consumer's queue is bounded in bytes: a subscription whose
+    /// client does not keep up ends with an error, a sink that does not
+    /// keep up is restarted from a new snapshot once it has caught up with
+    /// what it holds.
+    fn deliver(&mut self, gsn: Gsn, mut outputs: FxHashMap<NodeId, Output>) {
         for v in self.rt.views.values_mut() {
             if let Some(o) = outputs.get(&v.node) {
                 merge_errors(&mut v.errors, &o.errs);
             }
         }
+        let limit = self.shared.mem.consumer_limit();
+        let mut shared = FxHashMap::default();
         for s in self.subs.iter() {
+            if s.cancel.load(Ordering::Acquire) {
+                continue;
+            }
             if let Some(o) = outputs.get(&s.node) {
                 // a new error record ends the subscription, as it fails
                 // reads (a retracted one does not)
@@ -882,19 +896,58 @@ impl Engine {
                         let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
                     }
                 }
-                if !o.data.is_empty() {
-                    let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
+                if let Some((rows, bytes)) = shared_rows(&mut shared, &mut outputs, s.node) {
+                    if s.queue.used() + bytes > limit {
+                        end_slow_subscription(s, bytes, limit);
+                        continue;
+                    }
+                    let _ = s.tx.send(SubEvent::Data { gsn, rows: SharedRows::shared(&rows, s.queue.charge(bytes)) });
                 }
             }
             if s.progress {
-                let _ = s.tx.send(SubEvent::Progress { gsn });
+                if s.queue.used() + SUB_EVENT_BYTES > limit {
+                    end_slow_subscription(s, SUB_EVENT_BYTES, limit);
+                    continue;
+                }
+                let _ = s.tx.send(SubEvent::Progress { gsn, charge: s.queue.charge(SUB_EVENT_BYTES) });
             }
         }
-        for sink in self.sink_handles.values() {
-            if let Some(o) = outputs.get(&sink.node) {
-                sink.send(gsn, &o.data);
-            } else {
-                sink.progress(gsn);
+        for (id, sink) in self.sink_handles.iter_mut() {
+            if sink.behind() {
+                continue;
+            }
+            let sent = match shared_rows(&mut shared, &mut outputs, sink.node) {
+                Some((rows, bytes)) => sink.send(gsn, &rows, bytes, limit),
+                None => {
+                    sink.progress(gsn);
+                    true
+                }
+            };
+            if !sent {
+                log::warn!(
+                    "sink {id} fell behind: its unwritten changes reached {} MiB; it is restarted from a new snapshot once it has written them",
+                    limit >> 20
+                );
+            }
+        }
+    }
+
+    /// Restart the sinks that fell behind and have written (or dropped)
+    /// what they held: from a new snapshot, which they write over their
+    /// targets (they were sent nothing since they fell behind, so their
+    /// targets' progress is older).
+    fn restart_lagging_sinks(&mut self) {
+        let Some(handle) = self.handle.clone() else { return };
+        let idle: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.behind_and_idle()).map(|(id, _)| *id).collect();
+        for id in idle {
+            let Some(h) = self.sink_handles.remove(&id) else { continue };
+            // (it has nothing left to write: no need to wait for it)
+            let _ = h.stop();
+            if let Some(obj) = self.catalog.get(id).cloned()
+                && let ObjectKind::Sink(def) = &obj.kind
+            {
+                log::info!("restarting sink {} from a snapshot at gsn {}", obj.name, self.processed);
+                self.start_sink_or_mark_broken(id, &obj.name, def, &handle);
             }
         }
     }
@@ -1042,6 +1095,44 @@ impl Engine {
             })
             .collect()
     }
+}
+
+/// Bytes of a subscription event without rows in its queue.
+const SUB_EVENT_BYTES: usize = std::mem::size_of::<SubEvent>() + 8;
+
+/// The changes of `node` in `outputs`, moved into one shared copy (made at
+/// the first consumer that asks) with its bytes in memory; None if empty.
+fn shared_rows(
+    shared: &mut FxHashMap<NodeId, (Arc<crate::dataflow::Delta>, usize)>,
+    outputs: &mut FxHashMap<NodeId, Output>,
+    node: NodeId,
+) -> Option<(Arc<crate::dataflow::Delta>, usize)> {
+    if let Some((rows, bytes)) = shared.get(&node) {
+        return Some((rows.clone(), *bytes));
+    }
+    let o = outputs.get_mut(&node).filter(|o| !o.data.is_empty())?;
+    let rows = Arc::new(std::mem::take(&mut o.data));
+    let bytes = crate::memory::delta_bytes(&rows);
+    shared.insert(node, (rows.clone(), bytes));
+    Some((rows, bytes))
+}
+
+/// End a subscription whose queue would exceed its limit with `more`
+/// bytes: its client does not read as fast as changes come.
+fn end_slow_subscription(s: &Subscription, more: usize, limit: usize) {
+    let queued = s.queue.used() + more;
+    let _ = s.tx.send(SubEvent::Error(
+        SqlError::new(
+            codes::INSUFFICIENT_RESOURCES,
+            format!(
+                "subscription ended: its client does not read changes as fast as they come ({:.1} MiB queued, the limit is {:.1} MiB)",
+                queued as f64 / (1 << 20) as f64,
+                limit as f64 / (1 << 20) as f64
+            ),
+        )
+        .with_hint("Read subscriptions promptly, or give the server more memory (--memory-mb; each subscription may queue a sixteenth of it)."),
+    ));
+    s.cancel.store(true, Ordering::Release);
 }
 
 pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &ErrDelta) {

@@ -836,7 +836,7 @@ impl Engine {
             if same {
                 s.node = new_node;
                 if !diff.is_empty() {
-                    let _ = s.tx.send(SubEvent::Data { gsn, rows: diff.clone() });
+                    let _ = s.tx.send(SubEvent::Data { gsn, rows: SharedRows::new(diff.clone()) });
                 }
             } else {
                 // they were promised the old columns
@@ -868,10 +868,17 @@ impl Engine {
             .filter(|sid| matches!(self.catalog.get(*sid).map(|o| &o.kind), Some(ObjectKind::Sink(sd)) if sd.from == id))
             .collect();
         if same {
+            let rows = Arc::new(diff.clone());
+            let (bytes, limit) = (crate::memory::delta_bytes(&rows), self.shared.mem.consumer_limit());
             for sid in &sinks {
                 if let Some(sink) = self.sink_handles.get_mut(sid) {
                     sink.node = new_node;
-                    sink.send(gsn, &diff);
+                    if rows.is_empty() {
+                        sink.progress(gsn);
+                    } else {
+                        // (one that falls behind is restarted by the next delivery)
+                        sink.send(gsn, &rows, bytes, limit);
+                    }
                 }
             }
         } else {
