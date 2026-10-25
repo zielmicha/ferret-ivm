@@ -218,3 +218,25 @@ fn multi_name_drop_is_atomic() {
     assert_eq!(history(&e), after);
     e.shutdown();
 }
+
+/// SUBSCRIBE to a view streams the view's columns, named by its column
+/// list, as reads of the view see them.
+#[test]
+fn subscriptions_use_the_view_column_names() {
+    let e = Engine::start("subscribe-columns");
+    e.exec("CREATE TABLE base (a int PRIMARY KEY, b int, c int)");
+    e.exec("INSERT INTO base VALUES (1, 2, 3)");
+    e.exec("CREATE VIEW v (x) AS SELECT a, b, c FROM base");
+    e.exec("CREATE MATERIALIZED VIEW m (x) AS SELECT a, b, c FROM base");
+    for name in ["v", "m"] {
+        assert_eq!(e.columns(&format!("SELECT * FROM {name}")), ["x", "b", "c"]);
+        match e.exec(&format!("SUBSCRIBE TO {name}")) {
+            ExecResult::Subscribe { columns, cancel, .. } => {
+                assert_eq!(columns.into_iter().map(|c| c.name).collect::<Vec<_>>(), ["x", "b", "c"], "SUBSCRIBE TO {name}");
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            other => panic!("expected a subscription, got {other:?}"),
+        }
+    }
+    e.shutdown();
+}

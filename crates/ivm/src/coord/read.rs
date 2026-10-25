@@ -358,9 +358,12 @@ impl Engine {
                         None,
                         t.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect(),
                     ),
-                    ObjectKind::View(v) => {
-                        let q = crate::sql::parser::parse_single_query(&v.sql)?;
-                        return self.subscribe(SubscribeTarget::Query(Box::new(q), v.sql.clone()), snapshot, progress, params);
+                    ObjectKind::View(_) => {
+                        // through the view (not its query): its column list
+                        // names the columns, as in reads of it
+                        let text = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+                        let q = crate::sql::parser::parse_single_query(&text)?;
+                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params);
                     }
                     _ => sql_bail!(codes::WRONG_OBJECT_TYPE, "cannot subscribe to {} \"{name}\"", obj.kind.name()),
                 }
