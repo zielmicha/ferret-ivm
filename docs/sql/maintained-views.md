@@ -38,8 +38,9 @@ decorrelated subqueries — is checked (`check_deterministic` in
 
    | Function | Volatility |
    |---|---|
-   | `random()`, `gen_random_uuid()`, `clock_timestamp()` | volatile |
+   | `random()`, `gen_random_uuid()`, `clock_timestamp()`, `set_config()` | volatile |
    | `now()`, `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date` | stable (the clock) |
+   | `current_setting()` | stable |
 
    ```
    ERROR:  function random() is not allowed in a materialized view
@@ -58,11 +59,20 @@ decorrelated subqueries — is checked (`check_deterministic` in
    ```
 
 Virtual views and ad hoc queries are not checked; they may use any function.
+A materialized view that reads a virtual view inlines its query, so the
+check covers it, and `CREATE OR REPLACE` of a view is rejected (SQLSTATE
+`2BP01`, `cannot replace view "v": materialized view "m" would no longer be
+valid: ...`) when a materialized view reading it would then no longer plan
+or would fail the check.
 
 All other functions are immutable — including those that are only stable in
 PostgreSQL because they depend on the session time zone, which is fixed to
 UTC here (`to_char(timestamptz, ...)`, `date_trunc(text, timestamptz)`,
-`timestamp` ↔ `timestamptz` casts).
+`timestamp` ↔ `timestamptz` casts), and the session-independent catalog
+helpers (`version()`, `current_user`, ...). One of them is not a constant:
+`pg_backend_pid()` returns the process id, which changes when the engine
+restarts, yet is accepted
+([Known problems](../user-guide/troubleshooting.md#known-problems)).
 
 ## What is pinned down instead
 
@@ -80,26 +90,22 @@ recomputation, whatever the order of past changes.
 ## What can be maintained
 
 Every construct of the [query language](queries.md) can be used in a
-maintained view (subject to the rules above), with two exceptions found while
-checking this documentation: a `DISTINCT` aggregate with `FILTER` crashes the
-engine (see [Known problems](../user-guide/troubleshooting.md#known-problems)),
-and `agg(DISTINCT x ORDER BY y)` with `y` not among the arguments — which
-PostgreSQL rejects — is accepted, ordered by `x` in a materialized view but by
-`y` in an ad hoc query. How each construct is maintained:
+maintained view, subject to the rules above. How each construct is
+maintained:
 
 | Construct | Operator | Work per changed input row | State |
 |---|---|---|---|
 | `WHERE`, select-list expressions, projections | `Mfp` (fused map/filter/project) | constant | none |
-| inner joins (any number of inputs), `CROSS JOIN`, comma joins | `DeltaJoin` | one chain of index lookups into the other inputs, in an order chosen to keep intermediate results small | indexes of each input on its join keys; primary-key indexes are reused, identical indexes shared |
+| inner joins (any number of inputs), `CROSS JOIN`, comma joins | `DeltaJoin` | one chain of index lookups into the other inputs, in an order chosen to keep intermediate results small | indexes of each input on its join keys; primary-key indexes are reused, identical indexes shared. A key computed by an expression (`ON a.x = b.y + 1`) is computed by an `Mfp` over that input, after its filters, and indexed as a column |
 | join with no equality condition between two inputs | `DeltaJoin` lookup with an empty key | a scan of the whole other input | an index of the input |
 | `LEFT` / `RIGHT` / `FULL` joins | inner join plus anti-joins, NULL-padded, in a `Union` | as the joins | as the joins |
-| `EXISTS`, `IN`, `= ANY`, semi-joins | presence join: lookup of the key's count in a count-summarised index (when correlated by equalities; other conditions become a join, `Distinct` and then a presence lookup) | one lookup | index of the subquery's key columns |
+| `EXISTS`, `IN`, `= ANY`, semi-joins | presence join: lookup of the key's count in a count-summarised index (when correlated by equalities). With other conditions an inner join finds the matching left rows, and the left rows are looked up in a presence index of those, by identity (equal values in different representations, `1.0` and `1.00`, stay apart) | one lookup | index of the subquery's key columns (or of the matching left rows) |
 | `NOT EXISTS`, `NOT IN`, anti-joins | input minus its semi-join | as semi-join | as semi-join |
 | correlated and scalar subqueries | decorrelated into joins and aggregations | as those | as those |
 | `GROUP BY` with `count`, `sum`, `avg`, `min`, `max`, `bool_and/or`, `every`, `stddev*`, `var*`, `any_value` | `Reduce` | per changed group, one range summary over the group in an index whose nodes carry partial aggregates — O(log n) regardless of group size; recently touched groups are cached in memory. If the query also has an ordered aggregate (next row), all its aggregates share one `Reduce` that rescans each changed group | input index keyed by the group key, with per-node summaries; output index keyed by the group key |
 | `string_agg`, `array_agg`, `json(b)_agg`, `json(b)_object_agg`, `mode`, `percentile_cont/disc` | `Reduce` | rescan of each changed group | as above (input index ordered by group key, then the aggregate's `ORDER BY`) |
-| `DISTINCT` aggregates (not with `FILTER`, see above) | aggregation over `DISTINCT (group, arguments)` | as `Distinct` + `Reduce` | as those |
-| several ordered aggregates with different orders, or several different `DISTINCT` argument sets | one `Reduce` per kind, joined on the group key | sum of the parts | sum of the parts |
+| `DISTINCT` aggregates | aggregation over `DISTINCT (group, arguments [, FILTER condition])` | as `Distinct` + `Reduce` | as those |
+| several ordered aggregates with different orders, several different `DISTINCT` argument sets or filters, or `DISTINCT` and other aggregates together | one `Reduce` per kind, joined on the group key | sum of the parts | sum of the parts |
 | `GROUPING SETS`, `ROLLUP`, `CUBE` | one aggregation per grouping set, unioned | per set | per set |
 | `SELECT DISTINCT`, `UNION` | `Distinct` | two key-prefix scans per changed value (before and after) | index of all columns |
 | `UNION ALL` | `Union` | constant | none |
@@ -126,3 +132,9 @@ Expression errors inside a maintained view do not fail the statement that
 caused them; they become error records that make reads of the view fail
 until the offending rows are gone
 ([Errors as data](../user-guide/temporal-filters-and-errors.md#errors-as-data)).
+This includes aggregates whose result is out of range: a `float8` or
+`real` sum that overflows, or a `numeric` sum beyond numeric's range (the
+sum itself is kept exactly, so the group recovers when rows are removed),
+replaces the group's row by an error record of the group. Which groups (and
+recursive queries) are in error is part of the checkpointed state, so their
+error records are retracted correctly after a restart too.

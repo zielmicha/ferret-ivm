@@ -10,7 +10,7 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 
 | Type | Accepted names | OID | Notes |
 |---|---|---|---|
-| `boolean` | `bool`, `boolean` | 16 | input `t`/`true`/`yes`/`on`/`1`..., output `t`/`f`; a cast to `text` also gives `t`/`f` (PostgreSQL: `true`/`false`) |
+| `boolean` | `bool`, `boolean` | 16 | input `t`/`true`/`yes`/`on`/`1`..., output `t`/`f`; a cast to `text`, `varchar` or `char` gives `true`/`false`, as in PostgreSQL |
 | `smallint` | `smallint`, `int2` | 21 | |
 | `integer` | `integer`, `int`, `int4`, `serial`, `serial4` | 23 | `serial` creates no sequence |
 | `bigint` | `bigint`, `int8`, `bigserial`, `serial8` | 20 | |
@@ -18,8 +18,8 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 | `double precision` | `double precision`, `float8`, `float`, `float(25..53)` | 701 | |
 | `numeric(p,s)` | `numeric`, `decimal`, `dec` with optional precision and scale | 1700 | arbitrary precision, NaN and ±Infinity, PostgreSQL's display scale rules (`crates/pgnumeric`) |
 | `text` | `text` | 25 | |
-| `character varying(n)` | `varchar(n)`, `character varying(n)` | 1043 | length checked on assignment, truncated by explicit casts of typed values (an untyped literal fails instead: `'abc'::varchar(2)` gives `value too long for type character varying(2)`, PostgreSQL returns `ab`) |
-| `character(n)` | `char(n)`, `character(n)`, `bpchar` | 1042 | blank-padded; `char` without length is `char(1)` |
+| `character varying(n)` | `varchar(n)`, `character varying(n)` | 1043 | length checked on assignment (`value too long for type character varying(2)`), truncated by explicit casts (`'abc'::varchar(2)` is `ab`) |
+| `character(n)` | `char(n)`, `character(n)`, `bpchar` | 1042 | blank-padded; `char` without length is `char(1)`; trailing spaces are ignored by comparisons and dropped by casts to `text`, `varchar` and `name` (see [Comparison and ordering](#comparison-and-ordering)) |
 | `name` | `name` | 19 | |
 | `bytea` | `bytea` | 17 | hex output (`\x...`), escape input |
 | `date` | `date` | 1082 | including `infinity`, BC dates |
@@ -31,12 +31,30 @@ error messages. Code: `crates/ivm/src/types/` (`mod.rs`, `datum.rs`,
 | `json` | `json` | 114 | stored as validated text |
 | `jsonb` | `jsonb` | 3802 | |
 | `jsonpath` | `jsonpath` | 4072 | SQL/JSON path, stored as its canonical text |
-| `oid` | `oid`, `regclass`, `regtype`, `regproc`, `regnamespace`, `regrole`, `regprocedure`, `regoper` | 26 | the `reg*` names are aliases of `oid`; casts of OIDs to `pg_catalog.regclass`, `regtype` and `regnamespace` print names (an unqualified `::regclass` prints the number), and names cannot be cast to them (`'integer'::regtype` fails with `invalid input syntax for type oid`) |
+| `oid` | `oid`, `regclass`, `regtype`, `regproc`, `regnamespace`, `regrole`, `regprocedure`, `regoper` | 26 | the `reg*` names are aliases of `oid`, see below |
 | arrays | `type[]`, `type[n]` | | of every type above; multi-dimensional (up to 6), with lower bounds |
 
 Type modifiers (`numeric(10,2)`, `varchar(20)`, `timestamp(3)`,
-`interval(2)`) are kept on columns and applied on input and on casts.
-Interval field restrictions (`INTERVAL DAY TO SECOND`) are not applied.
+`interval(2)`, `interval day to second`) are kept on columns and applied on
+input and on casts, including interval field restrictions (`INTERVAL '1 day
+2 hours' DAY` and `'1 day 2 hours'::interval day` are `1 day`). The modifier
+of an array type applies to every element (`'{abc}'::varchar(2)[]` is
+`{ab}`, and inserts into a `numeric(5,2)[]` column check every element).
+
+`reg*` casts: `regclass`, `regtype` and `regnamespace` read names, like
+PostgreSQL's input functions: `'users'::regclass` (possibly
+schema-qualified or quoted), `'integer'::regtype` (any type spelling) and
+`'pg_catalog'::regnamespace` are the object's OID, as an `oid` value that
+compares with `oid` columns; unknown names fail with PostgreSQL's errors
+(`relation "x" does not exist`). The system catalogs have PostgreSQL 17's
+fixed OIDs (`'pg_class'::regclass` is 1259). An OID cast to one of these
+types gives the object's name as `text` (an OID that names nothing gives the
+number), and a select-list item that is a `reg*` cast prints the name and is
+named after the type, so `SELECT 'users'::regclass` shows `users`. Because
+such a cast of an OID is `text`, `oid_col::regclass = 'users'::regclass`
+fails (`operator does not exist: text = oid`); compare `oid_col =
+'users'::regclass` instead. `regproc`, `regrole`, `regprocedure` and
+`regoper` are plain `oid`s: names cannot be cast to them.
 
 Not supported: `time with time zone`, `money`, `bit`/`varbit`, `inet`,
 `cidr`, `macaddr`, enums, domains, composite and record types, ranges and
@@ -86,9 +104,10 @@ has a context in which the conversion is applied automatically
 | `oid` | `integer`, `bigint` | assignment |
 | `integer` ↔ `boolean` | | explicit |
 | `varchar`, `char`, `name` | `text` | implicit |
-| `text`, `char`, `name` | `varchar` | implicit |
+| `text`, `char` | `varchar` | implicit |
+| `text`, `varchar` | `char` | implicit |
 | `text`, `varchar`, `char` | `name` | implicit |
-| `text`, `varchar` | `char` | assignment |
+| `name` | `varchar`, `char` | assignment |
 | `date` | `timestamp`, `timestamptz` | implicit |
 | `timestamp` | `timestamptz` | implicit |
 | `timestamp`, `timestamptz` | `date`, `time` | assignment |
@@ -97,7 +116,7 @@ has a context in which the conversion is applied automatically
 | `interval` | `time` | assignment |
 | `json` ↔ `jsonb` | | assignment |
 | `jsonb` | `boolean`, `numeric`, integers, floats | explicit (scalar values only) |
-| any type | `text`, `varchar`, `char`, `name` | assignment (output function) |
+| any type | `text`, `varchar`, `char`, `name` | assignment (output function; `boolean` gives `true`/`false`) |
 | `text`, `varchar`, `char`, `name` | any type | explicit (input function) |
 | `T[]` | `U[]` | element-wise, context of `T` → `U` |
 
@@ -109,7 +128,13 @@ has a context in which the conversion is applied automatically
 
 Untyped literals (`'...'`, `NULL`) convert to any type. Numeric conversions
 round like PostgreSQL (half away from zero for `numeric`, to nearest even for
-floats → integers) and check ranges (`integer out of range`).
+floats → integers) and check ranges (`integer out of range`). Casts from
+`character(n)` to `text`, `varchar` and `name` drop the trailing spaces (as
+PostgreSQL's `text(bpchar)`), and so do the functions taking `text` and the
+`||` operator; `LIKE`, `SIMILAR TO` and the regular-expression operators see
+the padded value, and `octet_length` counts the padding, as in PostgreSQL.
+An explicit cast truncates a value that is too long for `varchar(n)` or
+`char(n)`; an assignment (`INSERT`, `UPDATE`) fails instead.
 
 ## Type resolution
 
@@ -127,30 +152,63 @@ Function and operator calls are resolved as in PostgreSQL
    `oid`) plus the distance in the numeric (`smallint` < `integer` <
    `bigint` < `numeric` < `real` < `double precision`) or date/time
    (`date` < `timestamp` < `timestamptz`) hierarchy. The cheapest candidate
-   wins; ties prefer resolving untyped literals as `text`.
+   wins; ties prefer resolving untyped literals as `text`, then as the
+   preferred type of their category (`abs('-1.5')` is
+   `abs(double precision)`).
 4. No candidate: `function f(...) does not exist` or
    `operator does not exist: a op b` (SQLSTATE `42883`), with PostgreSQL's
    hint.
+
+As in PostgreSQL, `+`, `-`, `*` and `/` exist for (`real`,
+`double precision`) and (`double precision`, `real`), so `real` combined
+with an integer or `numeric` is computed in `double precision`
+(`0.1::real + 1` is `1.1000000014901161`). There are no cross-type
+comparison operators (equi-join keys rely on `=` comparing one type), so a
+comparison of `real` with an integer or `numeric` value is done in `real`;
+see [Comparison and ordering](#comparison-and-ordering).
 
 ### Common type resolution
 
 `UNION`/`INTERSECT`/`EXCEPT` columns, `CASE` results, `COALESCE`,
 `GREATEST`/`LEAST`, `IN` lists, `ARRAY[...]` and `VALUES` columns use one
-common type:
+common type, chosen like PostgreSQL's `select_common_type`:
 
-- untyped values take the type of the others (all untyped → `text`);
-- numeric types → the highest in the numeric hierarchy;
-- string types → `text` (PostgreSQL keeps `varchar` or `name` in some
-  combinations, for example `COALESCE(varchar, char)` is `varchar` there);
-- `date`/`timestamp`/`timestamptz` → the highest of them;
-- arrays → array of the common element type;
-- anything else must be identical, otherwise
-  `<context> types X and Y cannot be matched` (SQLSTATE `42804`).
+- untyped values are ignored (all untyped → `text`);
+- every other input must be of the same type category as the first one
+  (boolean; numeric, including `oid`; string; date/time; `interval`;
+  arrays; other), otherwise `<context> types X and Y cannot be matched`
+  (SQLSTATE `42804`);
+- the first type is the candidate; a later type replaces it when the
+  candidate is not the category's preferred type (`boolean`,
+  `double precision`, `text`, `timestamptz`, `interval`, `oid`) and converts
+  to the later type implicitly but not back;
+- the inputs are then converted to the result with implicit casts; an
+  input without one fails (`expression is of type jsonb but json is
+  required`);
+- `CASE` considers its `ELSE` result first.
+
+So numeric types give the widest of them (`integer` and `numeric` →
+`numeric`, `numeric` and `real` → `real`), dates and timestamps the latest
+(`date` and `timestamp` → `timestamp`), `varchar` with `text` stays
+`varchar` but `text` with `varchar` is `text`, `COALESCE(char_col,
+text_col)` is `character` while `CASE WHEN ... THEN char_col ELSE text_col
+END` is `text`, and arrays take the common element type.
 
 ## Comparison and ordering
 
 - Strings compare by Unicode code point (byte order of UTF-8), like the
   `C.UTF-8` / `C` collation.
+- `character(n)`: comparisons (`=`, `<`, ..., `IN`, `IS DISTINCT FROM`,
+  `NULLIF`, joins) ignore trailing spaces, as in PostgreSQL. Grouping,
+  `DISTINCT`, set operations and `ORDER BY` use the stored, padded value,
+  which differs from PostgreSQL only when values of different padding are
+  mixed (columns of different lengths, or untyped `character`):
+  `SELECT k FROM c3 UNION SELECT k FROM c5` over `char(3)` and `char(5)`
+  columns returns `'a'` twice.
+- `real` compared with an integer or `numeric` value is compared as `real`:
+  `0.1::real = 0.1` is true here and false in PostgreSQL, which compares in
+  `double precision` (`real` with `double precision` is compared as
+  `double precision`, as in PostgreSQL).
 - Floats: NaN equals NaN and sorts above all other values; `-0` equals `0`.
 - `numeric`: `1.0 = 1.00`; NaN sorts above all numbers; infinities at the
   ends.

@@ -2,8 +2,13 @@
 
 This page lists every built-in scalar function and operator, by category.
 The list is the engine's function registry (`crates/ivm/src/expr/ops.rs`
-and `builtins.rs`); aggregates, window functions and set-returning functions
-are described in [Queries](queries.md). There are no user-defined functions.
+and `builtins.rs`, resolved by `expr/func.rs`) plus the few names the binder
+answers itself (`crates/ivm/src/sql/binder_expr.rs`: `coalesce`, `nullif`,
+`greatest`, `least`, `pg_typeof`, `version`, `current_user` and the other SQL
+value functions, and the catalog lookups of `pg_get_indexdef`,
+`pg_get_constraintdef` and `pg_get_viewdef`); aggregates, window functions
+and set-returning functions are described in [Queries](queries.md). There
+are no user-defined functions.
 
 Semantics — results, rounding, formats, error messages and SQLSTATEs — are
 PostgreSQL 17's. Most functions are thin wrappers around ports of
@@ -17,31 +22,36 @@ PostgreSQL 17 server ([Testing](../testing.md#golden-tests)):
 | `crates/pgfuncs` | string functions (`text`), `LIKE`/`SIMILAR TO`/POSIX regular expressions (port of PostgreSQL's regex engine), `bytea`, `uuid`, array text I/O, `json`/`jsonb` operators and functions, SQL/JSON path (`jsonpath`) |
 
 All functions are *strict* (a NULL argument gives NULL) unless noted
-(`concat`, `concat_ws`, `format`, `num_nulls`, `num_nonnulls`,
-`format_type`, `coalesce`, ...). Functions whose results depend on the clock
-or are random are marked; they cannot be used in materialized views
-([Maintained views](maintained-views.md)). Because the session time zone is
-always UTC, functions that are only *stable* in PostgreSQL because of
-`TimeZone` (`to_char(timestamptz, ...)`, `date_trunc(text, timestamptz)`,
-casts between `timestamp` and `timestamptz`, ...) are immutable here.
+(`concat`, `concat_ws`, `format`, `quote_nullable`, `num_nulls`,
+`num_nonnulls`, `format_type`, `string_to_array`, the `json(b)_build_*`
+functions, `jsonb_extract_path`, the array functions marked below,
+`coalesce`, ...). As in PostgreSQL, a strict function's arguments are all
+evaluated before the NULL check, so an error in one argument is raised even
+when another one is NULL. Functions that are not immutable — they depend on
+the clock or the session, or are random — are marked; they cannot be used in
+materialized views ([Maintained views](maintained-views.md)). Because the
+session time zone is always UTC, functions that are only *stable* in
+PostgreSQL because of `TimeZone` (`to_char(timestamptz, ...)`,
+`date_trunc(text, timestamptz)`, casts between `timestamp` and
+`timestamptz`, ...) are immutable here.
 
 ## Operators
 
 | Operator | Operand types | Result |
 |---|---|---|
-| `+` `-` `*` `/` | `smallint`, `integer`, `bigint`, `real`, `double precision`, `numeric` (same type both sides; mixed types are promoted — but `real` mixed with an integer or `numeric` is computed in `real`, where PostgreSQL uses `double precision`) | same type (integer division truncates) |
+| `+` `-` `*` `/` | `smallint`, `integer`, `bigint`, `real`, `double precision`, `numeric` (same type both sides; mixed types are promoted by implicit casts). `real` combined with `double precision` — and, as in PostgreSQL, with an integer or `numeric` — is computed in `double precision` | same type (integer division truncates) |
 | `%` | integers, `numeric` | remainder |
 | `^` | `double precision`, `numeric` | power |
 | unary `-`, `+`, `@` (absolute value) | numeric types | |
-| `\|/`, `\|\|/` | numeric types | square root, cube root (rewritten to `sqrt`, `cbrt`, so a `numeric` operand gives `numeric`; PostgreSQL's operators return `double precision`) |
-| `&` `\|` `#` `~` `<<` `>>` | integers | bitwise and, or, xor, not, shifts |
-| `=` `<>` `<` `<=` `>` `>=` | `boolean`, numeric types, `text`, `character`, `bytea`, `date`, `time`, `timestamp`, `timestamptz`, `interval`, `uuid`, `jsonb`, `oid`, arrays | `boolean` |
-| `\|\|` | `text`, `text` / `text`, any non-array / any non-array, `text` | `text` |
+| `\|/`, `\|\|/` | numeric types | square root, cube root (rewritten to `sqrt` and `cbrt`: `\|/` of a `numeric` gives `numeric`, where PostgreSQL's operator returns `double precision`; `\|\|/` always gives `double precision`) |
+| `&` `\|` `#` `~` `<<` `>>` | integers | bitwise and, or, xor, not, shifts (the shift count is an `integer`) |
+| `=` `<>` `<` `<=` `>` `>=` | `boolean`, numeric types, `text`, `character` (trailing spaces ignored), `bytea`, `date`, `time`, `timestamp`, `timestamptz`, `interval`, `uuid`, `jsonb`, `oid`, arrays | `boolean` |
+| `\|\|` | `text`, `text` / `text`, any non-array / any non-array, `text` (a `character` operand loses its trailing spaces) | `text` |
 | `\|\|` | `bytea` | `bytea` |
 | `\|\|` | `jsonb` | `jsonb` (concatenation) |
-| `\|\|` | arrays: array‖array, array‖element, element‖array | array |
-| `~` `~*` `!~` `!~*` | `text` | POSIX regex match (case-insensitive with `*`, negated with `!`) |
-| `LIKE` `ILIKE` `SIMILAR TO` (and `~~`, `~~*`, `!~~`, `!~~*`) | `text`; `LIKE` also `bytea` | `boolean` |
+| `\|\|` | arrays: array‖array, array‖element, element‖array (not strict) | array |
+| `~` `~*` `!~` `!~*` | `text`, `character` (matched with its padding), with a `text` pattern | POSIX regex match (case-insensitive with `*`, negated with `!`) |
+| `LIKE` `ILIKE` `SIMILAR TO` (and `~~`, `~~*`, `!~~`, `!~~*`) | `text`, `character` (matched with its padding); `LIKE` also `bytea` | `boolean` |
 | `->` `->>` | `jsonb`/`json` with `text` key or `integer` index | `jsonb`/`json`, `text` |
 | `#>` `#>>` | `jsonb`, `text[]` path | `jsonb`, `text` |
 | `@>` `<@` | `jsonb`; arrays | containment |
@@ -53,6 +63,10 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 | `+` `-` | `date` ± `integer` → `date`; `date` − `date` → `integer`; `date` ± `interval` → `timestamp`; `date` + `time` → `timestamp`; `timestamp[tz]` ± `interval`; `timestamp[tz]` − `timestamp[tz]` → `interval`; `time` ± `interval`; `time` − `time` → `interval`; `interval` ± `interval`; unary `-interval` | |
 | `*` `/` | `interval` × / ÷ `double precision` | `interval` |
 
+There are no cross-type comparison operators: both sides are converted to
+one type first (`integer = bigint` compares as `bigint`, `real = double
+precision` as `double precision`).
+
 ## Mathematical functions
 
 | Function | Notes |
@@ -61,7 +75,8 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 | `ceil(x)`, `ceiling(x)`, `floor(x)` | `double precision`, `numeric` |
 | `round(x)`, `round(numeric, integer)` | floats round half to even, `numeric` half away from zero |
 | `trunc(x)`, `trunc(numeric, integer)` | |
-| `sign(x)`, `sqrt(x)`, `cbrt(double precision)` | |
+| `sign(x)`, `sqrt(x)` | `double precision`, `numeric` |
+| `cbrt(double precision)` | the C library's results, bit for bit (as PostgreSQL on glibc) |
 | `exp(x)`, `ln(x)`, `log(x)` (base 10), `log10(x)`, `log(b numeric, x numeric)` | |
 | `power(a, b)`, `pow(a, b)` | `double precision`, `numeric` |
 | `mod(a, b)`, `div(numeric, numeric)` | |
@@ -70,14 +85,14 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 | `pi()`, `degrees(x)`, `radians(x)` | |
 | `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` | `double precision` |
 | `scale(numeric)`, `min_scale(numeric)`, `trim_scale(numeric)` | |
-| `width_bucket(x, lo, hi, count)` | `double precision` |
+| `width_bucket(x, lo, hi, count)` | `double precision` or `numeric` (exact) |
 | `random()` | volatile |
 
 ## String functions
 
 | Function | Notes |
 |---|---|
-| `length(s)`, `char_length(s)`, `character_length(s)`, `octet_length(s)`, `bit_length(s)` | also `bytea` for `length`, `octet_length`, `bit_length` |
+| `length(s)`, `char_length(s)`, `character_length(s)`, `octet_length(s)`, `bit_length(s)` | also `bytea` for `length`, `octet_length`, `bit_length`; `octet_length` of a `character(n)` value counts its padding, `length` does not |
 | `lower(s)`, `upper(s)`, `initcap(s)` | Unicode simple case mapping (PostgreSQL's tables, Unicode 15.1) |
 | `substr(s, from [, count])`, `substring(s, from [, count])`, `substring(s, pattern)` | also `bytea`; the pattern form is a POSIX regex |
 | `strpos(s, sub)`, `POSITION(sub IN s)` | |
@@ -90,7 +105,8 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 | `starts_with(s, prefix)` | |
 | `concat(...)`, `concat_ws(sep, ...)` | not strict; NULLs are skipped |
 | `format(fmt, ...)` | `%s`, `%I`, `%L`, `%%`, positions and widths as in PostgreSQL |
-| `quote_ident(s)`, `quote_literal(x)`, `quote_nullable(x)` | |
+| `quote_ident(s)`, `quote_literal(x)`, `quote_nullable(x)` | a `character(n)` value is quoted without its padding |
+| `text(character)` | the value without trailing spaces (the cast to `text`) |
 | `to_hex(integer \| bigint)` | |
 | `md5(text \| bytea)` | → `text` |
 | `sha224`, `sha256`, `sha384`, `sha512` (`bytea`) | → `bytea` |
@@ -104,13 +120,14 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 | Function | Notes |
 |---|---|
 | `LIKE`, `ILIKE`, `NOT LIKE`, ... with optional `ESCAPE` | the default escape is `\`; an empty escape disables it |
+| `x [NOT] LIKE ANY (array)`, `x [NOT] ILIKE ANY (array)` | the `~~` / `~~*` / `!~~` / `!~~*` operators applied with `ANY` to the patterns (so `NOT LIKE ANY` is true if some pattern does not match); without `ESCAPE`. `LIKE ALL` is not supported |
 | `SIMILAR TO` | constant patterns only (translated to a regex) |
 | `~`, `~*`, `!~`, `!~*` | POSIX regular expressions (advanced, extended and basic syntax, back-references, lookaround, PostgreSQL's leftmost-longest rules) |
-| `regexp_replace(s, pattern, replacement [, flags])` | |
+| `regexp_replace(s, pattern, replacement [, flags])` | no `start` / `N` arguments |
 | `regexp_match(s, pattern [, flags])` | → `text[]` |
 | `regexp_like(s, pattern [, flags])` | |
 | `regexp_count(s, pattern [, start [, flags]])` | |
-| `regexp_substr(s, pattern [, start [, n]])` | |
+| `regexp_substr(s, pattern [, start [, n]])` | no `flags` / `subexpr` arguments |
 | `regexp_split_to_array(s, pattern [, flags])` | |
 | `regexp_split_to_table`, `regexp_matches` | set-returning ([Queries](queries.md#set-returning-functions)) |
 
@@ -118,7 +135,7 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 
 | Function | Notes |
 |---|---|
-| `now()`, `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date` | the logical clock in reads, the wall clock in DML; only in temporal filters in materialized views ([Temporal filters](../user-guide/temporal-filters-and-errors.md)) |
+| `now()`, `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date` | stable: the logical clock in reads, the wall clock in DML; in materialized views only in temporal filters ([Temporal filters](../user-guide/temporal-filters-and-errors.md)) |
 | `clock_timestamp()` | wall clock; volatile |
 | `extract(field FROM x)`, `date_part(field, x)` | `date`, `time`, `timestamp`, `timestamptz`, `interval`; `extract` returns `numeric`, `date_part` `double precision` |
 | `date_trunc(field, x)` | `timestamp`, `timestamptz`, `interval` |
@@ -130,8 +147,8 @@ casts between `timestamp` and `timestamptz`, ...) are immutable here.
 | `to_char(timestamp \| timestamptz \| interval, format)` | |
 | `justify_days(i)`, `justify_hours(i)`, `justify_interval(i)` | |
 | `isfinite(x)` | `date`, `timestamp`, `timestamptz`, `interval` |
-| `timezone(zone, x)`, `x AT TIME ZONE zone` | IANA names, abbreviations, POSIX offsets |
-| `(a, b) OVERLAPS (c, d)` | `timestamp`, `timestamptz`, `time` (dates as timestamps) |
+| `timezone(zone, x)`, `x AT TIME ZONE zone` | `timestamp` → `timestamptz` and back; IANA names, abbreviations, POSIX offsets |
+| `(a, b) OVERLAPS (c, d)` | `timestamp`, `timestamptz`, `time` (dates as timestamps); `b` and `d` may be `interval` lengths |
 | `generate_series(start, stop, step)` | set-returning, `interval` step |
 
 ## Numeric formatting
@@ -183,11 +200,11 @@ methods), with PostgreSQL's parser tables ported so that syntax errors match.
 | Function | Notes |
 |---|---|
 | `array_length(a, dim)`, `array_upper(a, dim)`, `array_lower(a, dim)`, `cardinality(a)`, `array_ndims(a)`, `array_dims(a)` | |
-| `array_append(a, x)`, `array_prepend(x, a)`, `array_cat(a, b)` | |
-| `array_position(a, x)`, `array_remove(a, x)`, `array_replace(a, x, y)` | |
+| `array_append(a, x)`, `array_prepend(x, a)`, `array_cat(a, b)` | not strict |
+| `array_position(a, x)`, `array_remove(a, x)`, `array_replace(a, x, y)` | not strict |
 | `array_to_string(a, delimiter [, null_string])`, `string_to_array(...)` | |
 | `array_to_json(a [, pretty])` | |
-| `unnest(a)` | set-returning |
+| `unnest(a)` | set-returning; `unnest(a, b, ...)` with several arrays in `FROM` |
 | `array_agg(x)` | aggregate |
 
 ## Other functions
@@ -198,19 +215,28 @@ methods), with PostgreSQL's parser tables ported so that syntax errors match.
 | `gen_random_uuid()` | volatile |
 | `pg_typeof(x)` | the type name as `text` |
 | `version()` | `PostgreSQL 17.0 (ivm)` |
-| `current_database()`, `current_schema()`, `current_schemas(bool)` | `ivm`, `public` |
+| `current_user`, `session_user`, `user`, `current_role`, `current_catalog` | `ivm` (type `name`) |
+| `current_database()`, `current_schema`, `current_schema()`, `current_schemas(bool)` | `ivm`, `public`, `{pg_catalog,public}` with `true` (`{public}` with `false`) |
+| `current_setting(name [, missing_ok])` | stable; the server's fixed settings, independent of the session: `server_version`, `server_version_num`, `server_encoding`, `client_encoding`, `TimeZone`, `DateStyle`, `IntervalStyle`, `search_path`, `standard_conforming_strings`, `integer_datetimes`, `is_superuser`, `transaction_isolation`, `default_transaction_isolation`, `transaction_read_only`, `default_transaction_read_only`, `extra_float_digits`, `bytea_output`, `max_identifier_length`, the `lc_*` settings (`C`) and `application_name` (always empty). Values set with `SET`, and the session's `read_mode`, are not reflected (`SHOW` reports those, see [Session settings](../user-guide/reads.md#session-settings)). Other names fail with `unrecognized configuration parameter` (SQLSTATE `42704`), or return NULL with `missing_ok` |
+| `set_config(name, value, is_local)` | volatile; returns `value` and changes nothing |
+| `pg_backend_pid()` | the server's process id (the same for every session). Materialized views do not reject it, although its value changes when the server restarts (see [Known problems](../user-guide/troubleshooting.md#known-problems)) |
 | `grouping(...)` | with `GROUP BY` |
-| catalog helpers (`pg_table_is_visible`, `format_type`, `pg_get_indexdef`, `has_table_privilege`, ...) | for client tools ([Introspection](../user-guide/introspection.md#postgresql-system-catalogs)) |
+| catalog helpers (`pg_table_is_visible`, `format_type`, `pg_get_indexdef`, `has_table_privilege`, `pg_relation_size`, ...) | for client tools ([Introspection](../user-guide/introspection.md#postgresql-system-catalogs)) |
+
+The functions that special syntax is bound to can also be called directly:
+`extract(field, x)`, `timezone(zone, x)`, `overlaps(a, b, c, d)`, and the
+internal `array_get(a, i, ...)` and `array_slice(a, lo, hi, ...)` behind
+subscripts and slices.
 
 ## Not available
 
 Functions not listed here do not exist (`function f(...) does not exist`),
 for example: `age(timestamp)` (one argument), `to_tsvector` and the other
-text-search functions, `regexp_instr`, `sum(interval)`, `avg(interval)`,
-`percentile_cont` over `interval` or with an array of fractions,
-`date_trunc(field, timestamptz, zone)`, `array_position(a, x, start)`,
-`jsonb_to_record[set]`, `jsonb_populate_record`, `json_each` and the other
-`json` (non-`jsonb`) processing functions, `generate_subscripts`,
-`array_fill`, `encode`/`decode` formats other than those listed, and the
-sequence and administration functions (`nextval`, `pg_sleep`,
-`pg_cancel_backend`, ...).
+text-search functions, `regexp_instr`, `date_trunc(field, timestamptz,
+zone)`, `array_position(a, x, start)`, `jsonb_to_record[set]`,
+`jsonb_populate_record`, `json_each` and the other `json` (non-`jsonb`)
+processing functions, `generate_subscripts`, `array_fill`, `sum(interval)`,
+`avg(interval)`, and the sequence and administration functions (`nextval`,
+`pg_sleep`, `pg_cancel_backend`, ...). `percentile_cont` over `interval` or
+with an array of fractions, and `encode`/`decode` formats other than those
+listed, are rejected with errors of their own.
