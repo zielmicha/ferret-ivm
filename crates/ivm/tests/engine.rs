@@ -422,6 +422,48 @@ fn predicates_on_derived_columns_filter_before_other_columns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A quantified comparison with a correlated subquery (`x <> ANY (...)`,
+/// `x > ALL (...)`) was decorrelated into a mark computed per distinct
+/// outer row: whole rows became grouping and join keys, so a view over a
+/// wide join (TOASTed text in it) kept several arrangements of every
+/// column; one in ivm-difftest grew to gigabytes and never finished
+/// hydrating. The mark is now computed per distinct correlation and
+/// compared values. Three-valued logic, empty subqueries, duplicate outer
+/// rows and exact correlation values (1.0 and 1.00) must come out as in
+/// PostgreSQL, ad hoc and maintained.
+#[test]
+fn quantified_subqueries() {
+    let dir = tmpdir("quantified");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE qa (id int PRIMARY KEY, k numeric, x int, big text)");
+    exec(&h, "CREATE TABLE qb (id int PRIMARY KEY, k numeric, y int)");
+    exec(
+        &h,
+        "INSERT INTO qa VALUES (1, 1.0, 5, repeat('a', 3000)), (2, 1.00, 5, repeat('b', 3000)), (3, 2, NULL, 'c'), \
+         (4, 3, 7, 'd'), (5, 1.0, 9, 'e'), (6, 4, 5, 'f'), (7, 1.0, 5, 'g')",
+    );
+    exec(&h, "INSERT INTO qb VALUES (1, 1, 5), (2, 1, 6), (3, 2, 1), (4, 3, NULL), (5, 3, 7)");
+    let marks = "SELECT a.id, a.x <> ANY (SELECT b.y FROM qb b WHERE b.k = a.k), a.x = ANY (SELECT b.y FROM qb b WHERE b.k = a.k), \
+                 a.x > ALL (SELECT b.y FROM qb b WHERE b.k = a.k), a.x + 4 <= ALL (SELECT b.y + length(a.k::text) FROM qb b WHERE b.k = a.k) \
+                 FROM qa a";
+    let wide = "SELECT count(*), sum(length(big)) FROM qa a WHERE a.x <> ANY (SELECT b.y FROM qb b WHERE b.k = a.k)";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW marks AS {marks}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW wide AS {wide}"));
+    let check = |want: &[&str], want_wide: &str| {
+        assert_eq!(rows(&h, &format!("{marks} ORDER BY 1")), want);
+        assert_eq!(rows(&h, "SELECT * FROM marks ORDER BY 1"), want);
+        assert_eq!(rows(&h, wide), [want_wide]);
+        assert_eq!(rows(&h, "SELECT * FROM wide"), [want_wide]);
+    };
+    check(&["1|t|t|f|f", "2|t|t|f|t", "3||||", "4||t|f|f", "5|t|f|t|f", "6|f|f|t|t", "7|t|t|f|f"], "4|6002");
+    exec(&h, "UPDATE qb SET y = 9 WHERE id = 2");
+    exec(&h, "DELETE FROM qb WHERE id = 4");
+    check(&["1|t|t|f|f", "2|t|t|f|t", "3||||", "4|f|t|f|f", "5|t|t|f|f", "6|f|f|t|t", "7|t|t|f|f"], "4|6002");
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Ad hoc execution deduplicated a group's rows for a DISTINCT ordered
 /// aggregate in place, so ordered aggregates after it saw only the distinct
 /// rows (here mode() saw x = 17 alone). Expected values are PostgreSQL's.
