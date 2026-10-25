@@ -305,3 +305,72 @@ fn keyless_tables_resnapshot_without_duplicates() {
     assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
     assert_eq!(up.rows(q), ["1|x|5", "1|x|5", "3|z|6"]);
 }
+
+/// Wait until `f` returns true (or fail after a timeout).
+fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    let t0 = Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(60), "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A sink keeps its target equal to the view across engine restarts.
+#[test]
+fn sink_delivers_exactly_once_across_restarts() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, a int)");
+    up.exec("INSERT INTO t SELECT g, g % 5 FROM generate_series(1, 100) g");
+    up.exec("CREATE PUBLICATION p FOR TABLE t");
+    let dir = tmpdir("sink");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT a, count(*) AS n FROM t GROUP BY a");
+    ivm.exec("CREATE MATERIALIZED VIEW w AS SELECT a FROM t WHERE id % 10 = 0");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy' KEY (a)", up.conninfo));
+    ivm.exec(&format!("CREATE SINK sw FROM w INTO POSTGRES CONNECTION '{}' TABLE 'w_copy'", up.conninfo));
+    let want_v = "SELECT a, count(*) FROM t GROUP BY a ORDER BY a";
+    let want_w = "SELECT a FROM t WHERE id % 10 = 0 ORDER BY a";
+    let mut synced = |up: &mut Upstream| {
+        eventually("sinks", || {
+            let v = up.client.query("SELECT a, n FROM v_copy ORDER BY a").map(|r| r.rows).unwrap_or_default();
+            let w = up.client.query("SELECT a FROM w_copy ORDER BY a").map(|r| r.rows).unwrap_or_default();
+            let ev = up.client.query(want_v).unwrap().rows;
+            let ew = up.client.query(want_w).unwrap().rows;
+            v == ev && w == ew
+        })
+    };
+    synced(&mut up);
+    up.exec("UPDATE t SET a = 7 WHERE id <= 30");
+    up.exec("DELETE FROM t WHERE id > 90");
+    synced(&mut up);
+    for round in 0..3 {
+        ivm.shutdown();
+        up.exec(&format!("UPDATE t SET a = a + 1 WHERE id % 3 = {round}"));
+        up.exec(&format!("INSERT INTO t VALUES ({}, 1)", 1000 + round));
+        ivm = Ivm::start(&dir);
+        up.exec(&format!("DELETE FROM t WHERE id = {}", 10 + round * 10));
+        synced(&mut up);
+    }
+}
+
+/// A sink without a key deletes a retracted row by comparing every column;
+/// json has no equality operator, so the first retraction of a row with a
+/// json column used to fail, and the sink stopped delivering for good.
+#[test]
+fn keyless_sink_with_json_columns() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, j json)");
+    up.exec("INSERT INTO t VALUES (1, '{\"a\": 1}'), (2, '[1, 2]'), (3, NULL)");
+    up.exec("CREATE PUBLICATION p FOR TABLE t");
+    let dir = tmpdir("sink-json");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT j FROM t");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy'", up.conninfo));
+    let copy = |up: &mut Upstream| up.client.query("SELECT j::text FROM v_copy ORDER BY 1").map(|r| r.rows).unwrap_or_default();
+    eventually("snapshot", || copy(&mut up).len() == 3);
+    up.exec("DELETE FROM t WHERE id IN (1, 3)");
+    up.exec("INSERT INTO t VALUES (4, '{\"b\": 2}')");
+    eventually("retractions", || copy(&mut up) == up.client.query("SELECT j::text FROM t ORDER BY 1").unwrap().rows);
+}

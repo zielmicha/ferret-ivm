@@ -131,7 +131,14 @@ impl Writer {
                     .columns
                     .iter()
                     .zip(r)
-                    .map(|(c, d)| format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c)))
+                    .map(|(c, d)| {
+                        if c.ty.ty == crate::types::SqlType::Json {
+                            // json has no equality operator; its text is kept as written
+                            format!("{}::text IS NOT DISTINCT FROM {}::text", qident(&c.name), lit(d, c))
+                        } else {
+                            format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c))
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" AND ");
                 format!("DELETE FROM {0} WHERE ctid = (SELECT ctid FROM {0} WHERE {cond} LIMIT 1)", self.table)
