@@ -298,12 +298,12 @@ Example (`COPY` form, `PROGRESS`):
 114	t	\N	\N	\N	\N
 ```
 
-Values are always sent in text format (the PostgreSQL output format of each
-type), even when a client asks for binary results. With the extended
-protocol the portal's row description still announces the requested binary
-format, so a client that asks for binary results misreads the rows: request
-text results for `SUBSCRIBE` (see
-[Known problems](troubleshooting.md#known-problems)).
+Values are sent in text format (the PostgreSQL output format of each
+type) unless the client asks for binary results: with the extended
+protocol, the rows follow the result formats of the `Bind` message (one
+for every column, or one per column, `gsn` and `diff` counting as `bigint`
+and `progressed` as `boolean`), as the portal's row description announces
+them ([binary format](../sql/types.md#binary-format)).
 
 ### COPY form
 

@@ -446,6 +446,103 @@ fn subscribe_through_the_extended_protocol_is_described() {
     running.shutdown();
 }
 
+/// The fields of a DataRow (None: NULL).
+fn data_fields(body: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut pos = 2;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        if len < 0 {
+            out.push(None);
+        } else {
+            out.push(Some(body[pos..pos + len as usize].to_vec()));
+            pos += len as usize;
+        }
+    }
+    out
+}
+
+/// The format codes of a RowDescription's fields.
+fn field_formats(body: &[u8]) -> Vec<i16> {
+    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut pos = 2;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        pos += body[pos..].iter().position(|c| *c == 0).unwrap() + 1;
+        // table oid, attribute number, type oid, size, modifier, format
+        out.push(i16::from_be_bytes([body[pos + 16], body[pos + 17]]));
+        pos += 18;
+    }
+    out
+}
+
+/// SUBSCRIBE through the extended protocol sends its rows in the result
+/// formats of the Bind, which the portal's row description announces. The
+/// rows used to be text whatever the description said, so a client asking
+/// for binary results misread them (psycopg: "unpack requires a buffer of 8
+/// bytes").
+#[test]
+fn subscribe_rows_follow_the_result_formats() {
+    let (running, port) = start("subscribe-binary");
+    let (mut c, pid, secret) = connect_with_key(port);
+    c.query("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    c.query("INSERT INTO t VALUES (1, 'x')");
+    // all binary, then one format per column
+    for formats in [vec![1i16], vec![0, 1, 1, 0, 1]] {
+        c.parse("", "SUBSCRIBE TO t WITH (PROGRESS)", &[]);
+        let mut b = cstr("");
+        b.extend(cstr(""));
+        b.extend_from_slice(&0i16.to_be_bytes()); // parameter formats
+        b.extend_from_slice(&0i16.to_be_bytes()); // parameters
+        b.extend_from_slice(&(formats.len() as i16).to_be_bytes());
+        for f in &formats {
+            b.extend_from_slice(&f.to_be_bytes());
+        }
+        c.send(b'B', &b);
+        let mut d = vec![b'P'];
+        d.extend(cstr(""));
+        c.send(b'D', &d);
+        c.execute("", 0);
+        c.send(b'H', &[]);
+        let mut rows = Vec::new();
+        let mut description = None;
+        while rows.len() < 2 {
+            let (tag, body) = c.recv();
+            match tag {
+                b'T' => description = Some(field_formats(&body)),
+                b'D' => rows.push(data_fields(&body)),
+                b'1' | b'2' => {}
+                other => panic!("unexpected message {}", other as char),
+            }
+        }
+        let binary: Vec<bool> = (0..5).map(|i| if formats.len() == 1 { formats[0] == 1 } else { formats[i] == 1 }).collect();
+        assert_eq!(description, Some(binary.iter().map(|b| *b as i16).collect()), "{formats:?}");
+        // the snapshot row, then the progress row
+        let gsn = |v: &Option<Vec<u8>>, bin: bool| -> i64 {
+            let v = v.as_ref().unwrap();
+            if bin { i64::from_be_bytes(v[..].try_into().expect("8 bytes")) } else { String::from_utf8(v.clone()).unwrap().parse().unwrap() }
+        };
+        let (data, prog) = (&rows[0], &rows[1]);
+        assert_eq!(gsn(&data[0], binary[0]), gsn(&prog[0], binary[0]), "{formats:?}");
+        let want_data: Vec<Option<Vec<u8>>> = vec![
+            data[0].clone(),
+            Some(if binary[1] { vec![0] } else { b"f".to_vec() }),
+            Some(if binary[2] { 1i64.to_be_bytes().to_vec() } else { b"1".to_vec() }),
+            Some(if binary[3] { 1i32.to_be_bytes().to_vec() } else { b"1".to_vec() }),
+            Some(b"x".to_vec()),
+        ];
+        assert_eq!(data, &want_data, "{formats:?}");
+        assert_eq!(prog[1], Some(if binary[1] { vec![1] } else { b"t".to_vec() }), "{formats:?}");
+        assert_eq!(&prog[2..], &[None, None, None], "{formats:?}");
+        cancel(port, pid, secret);
+        let msgs = c.sync();
+        assert!(error_message(&msgs).unwrap_or_default().contains("canceling statement"), "{msgs:?}");
+    }
+    running.shutdown();
+}
+
 #[test]
 fn show_read_mode_before_set() {
     let (running, port) = start("readmode");

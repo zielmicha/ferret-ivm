@@ -81,7 +81,9 @@ floats, `numeric` as PostgreSQL's base-10000 format, date/time types as
 days or microseconds since 2000-01-01, `interval` as microseconds, days and
 months, `uuid` as 16 bytes, `jsonb` and `jsonpath` as a version byte `1`
 followed by text, arrays with PostgreSQL's array header, and text types as
-UTF-8. `SUBSCRIBE` rows are always text.
+UTF-8. `SUBSCRIBE` rows follow the requested result formats too (the
+`gsn` and `diff` columns as `bigint`, `progressed` as `boolean`); its `COPY`
+form is always text.
 
 ## Casts
 
