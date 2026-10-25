@@ -380,13 +380,15 @@ fn main() {
         for _ in schema_rounds.iter().filter(|r| **r == round) {
             // a new column (sometimes with a default, which the existing rows
             // get without a change being replicated), then updates so that
-            // the new shape reaches the replication stream
+            // the new shape reaches the replication stream: of at least one
+            // row, as PostgreSQL announces a table's new shape only with a
+            // change to it (the engine cannot know of the column before)
             let ti = rng.below(tables.len() as u64) as usize;
             let ty = *rng.pick(&[sqlgen::Ty::Int, sqlgen::Ty::Text, sqlgen::Ty::Decimal]);
             let col = sqlgen::Col { name: format!("s{}", tables[ti].cols.len()), ty, nullable: true, refs: None };
             let default = if rng.chance(50) { format!(" DEFAULT {}", sqlgen::literal(&mut rng, ty)) } else { String::new() };
             let t = &tables[ti].name;
-            let sql = format!("ALTER TABLE {t} ADD COLUMN {} {}{default}; UPDATE {t} SET id = id WHERE id % 3 = 0;", col.name, ty.sql());
+            let sql = format!("ALTER TABLE {t} ADD COLUMN {} {}{default}; UPDATE {t} SET id = id WHERE id % 3 = 0 OR id = (SELECT min(id) FROM {t});", col.name, ty.sql());
             println!("round {round}: {sql}");
             up.simple_query(&sql).unwrap();
             tables[ti].cols.push(col);
