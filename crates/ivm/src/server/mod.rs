@@ -4,7 +4,7 @@
 use crate::coord::api::{ExecResult, ResultColumn, SessionVars, SubEvent};
 use crate::coord::EngineHandle;
 use crate::error::{codes, Result, SqlError};
-use crate::sql::parser::{parse_statement, split_statements, ShowKind, Statement};
+use crate::sql::parser::{parse_statement, split_statements, AsOf, ShowKind, Statement, SubscribeTarget};
 use crate::sql::ParamSlot;
 use crate::types::text::{format_datum, parse_datum, recv_datum, send_datum};
 use crate::types::{Datum, Row, SqlType};
@@ -693,6 +693,23 @@ impl Session {
                     _ => (vec![], vec![]),
                 }
             }
+            // rows streamed by SUBSCRIBE: gsn [, progressed], diff, then the
+            // target's columns (COPY (SUBSCRIBE ...) has no row description)
+            Statement::Subscribe { target, progress, copy: false, .. } => {
+                let text = match target {
+                    SubscribeTarget::Name(n) => format!("SELECT * FROM \"{}\"", n.replace('"', "\"\"")),
+                    SubscribeTarget::Query(_, text) => text.clone(),
+                };
+                let query = Box::new(crate::sql::parser::parse_single_query(&text)?);
+                let (columns, ptypes) = self.engine.describe(Statement::Select { query, as_of: AsOf::Default, text }, params)?;
+                let mut cols = vec![ResultColumn { name: "gsn".into(), ty: SqlType::Int8, typmod: -1 }];
+                if *progress {
+                    cols.push(ResultColumn { name: "progressed".into(), ty: SqlType::Bool, typmod: -1 });
+                }
+                cols.push(ResultColumn { name: "diff".into(), ty: SqlType::Int8, typmod: -1 });
+                cols.extend(columns);
+                (cols, ptypes)
+            }
             _ => self.engine.describe(stmt, params)?,
         };
         if is_stmt {
@@ -736,7 +753,9 @@ impl Session {
             return Err(SqlError::new(codes::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist")));
         };
         if portal.pending.is_none() {
-            let res = self.run_statement(parse_statement(&portal.text)?, portal.params.clone())?;
+            let stmt = parse_statement(&portal.text)?;
+            self.pending_copy = matches!(stmt, Statement::Subscribe { copy: true, .. });
+            let res = self.run_statement(stmt, portal.params.clone())?;
             match res {
                 ExecResult::Query { columns, rows } => portal.pending = Some((columns, rows.into_iter())),
                 other => {

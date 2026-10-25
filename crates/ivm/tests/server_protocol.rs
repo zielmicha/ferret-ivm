@@ -363,3 +363,71 @@ fn comment_only_statements_are_empty() {
     assert_eq!(tags(&c.query("/* nothing */ ;")), "IZ");
     running.shutdown();
 }
+
+/// The BackendKeyData (pid, secret) of a fresh connection, and the connection.
+fn connect_with_key(port: u16) -> (Conn, u32, u32) {
+    let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut c = Conn { s };
+    let mut body = 196608u32.to_be_bytes().to_vec();
+    body.extend_from_slice(b"user\0ivm\0\0");
+    let mut pkt = ((body.len() + 4) as u32).to_be_bytes().to_vec();
+    pkt.extend_from_slice(&body);
+    c.s.write_all(&pkt).unwrap();
+    let msgs = c.until_ready();
+    let (_, k) = msgs.iter().find(|m| m.0 == b'K').expect("BackendKeyData");
+    let (pid, secret) = (u32::from_be_bytes(k[0..4].try_into().unwrap()), u32::from_be_bytes(k[4..8].try_into().unwrap()));
+    (c, pid, secret)
+}
+
+fn cancel(port: u16, pid: u32, secret: u32) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut m = 16u32.to_be_bytes().to_vec();
+    m.extend_from_slice(&80877102u32.to_be_bytes());
+    m.extend_from_slice(&pid.to_be_bytes());
+    m.extend_from_slice(&secret.to_be_bytes());
+    s.write_all(&m).unwrap();
+}
+
+#[test]
+fn subscribe_through_the_extended_protocol_is_described() {
+    let (running, port) = start("subscribe-ext");
+    let (mut c, pid, secret) = connect_with_key(port);
+    c.query("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    c.query("INSERT INTO t VALUES (1, 'x')");
+    // Describe used to answer NoData, and Execute then streamed DataRows
+    c.parse("", "SUBSCRIBE TO t WITH (PROGRESS)", &[]);
+    c.bind("", "", &[], 0);
+    let mut b = vec![b'P'];
+    b.extend(cstr(""));
+    c.send(b'D', &b);
+    c.execute("", 0);
+    c.send(b'H', &[]);
+    let mut seen = Vec::new();
+    loop {
+        let m = c.recv();
+        seen.push(m.0);
+        if m.0 == b'D' {
+            break;
+        }
+    }
+    assert_eq!(seen.iter().map(|t| *t as char).collect::<String>(), "12TD");
+    cancel(port, pid, secret);
+    let msgs = c.sync();
+    assert!(error_message(&msgs).unwrap_or_default().contains("canceling statement"));
+    // COPY (SUBSCRIBE ...) through Execute streams COPY data
+    c.parse("", "COPY (SUBSCRIBE TO t) TO STDOUT", &[]);
+    c.bind("", "", &[], 0);
+    c.execute("", 0);
+    c.send(b'H', &[]);
+    let first = loop {
+        let m = c.recv();
+        if m.0 != b'1' && m.0 != b'2' {
+            break m.0;
+        }
+    };
+    assert_eq!(first as char, 'H', "CopyOutResponse");
+    cancel(port, pid, secret);
+    c.sync();
+    running.shutdown();
+}
