@@ -178,7 +178,7 @@ impl Engine {
                     }
                     let def = table_def_from_ast(&ct)?;
                     let id = self.catalog.alloc_id();
-                    self.create_table_rt(id, &def)?;
+                    self.create_table_rt(id, &def, gsn)?;
                     self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::Table(def), created_gsn: gsn, create_sql: sql.to_string() });
                     Ok(ExecResult::Command { tag: "CREATE TABLE".into() })
                 }
@@ -367,7 +367,7 @@ impl Engine {
                 upstream: Some((t.schema.clone(), t.name.clone())),
                 version: 0,
             };
-            self.create_table_rt(id, &def)?;
+            self.create_table_rt(id, &def, gsn)?;
             self.catalog.insert(CatalogObject {
                 id,
                 name: t.name.clone(),
@@ -379,9 +379,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Create the Table node and primary index of a new (empty) base table.
-    pub(crate) fn create_table_rt(&mut self, id: ObjectId, def: &TableDef) -> Result<()> {
-        self.table_rt(id, def, false)
+    /// Create the Table node and primary index of a new (empty) base table
+    /// at `gsn`.
+    pub(crate) fn create_table_rt(&mut self, id: ObjectId, def: &TableDef, gsn: Gsn) -> Result<()> {
+        self.table_rt(id, def, false)?;
+        let node = self.rt.tables[&id];
+        let NodeKind::Table { primary, .. } = self.graph.node(node).kind else { unreachable!() };
+        self.graph.arrs[primary].as_mut().unwrap().since = gsn;
+        Ok(())
     }
 
     /// Create the Table node and primary index of a base table: a new table
@@ -858,7 +863,7 @@ impl Engine {
         def.columns = columns.clone();
         def.pk = pk;
         def.version += 1;
-        self.create_table_rt(table, &def)?;
+        self.create_table_rt(table, &def, gsn)?;
         let new_node = self.rt.tables[&table];
         let mut rows = Vec::with_capacity(old_rows.len());
         for (r, w) in old_rows {

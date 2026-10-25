@@ -211,3 +211,34 @@ fn log_tail_lost_behind_a_checkpoint() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// AS OF reads use only arrangements whose history covers the read's GSN:
+/// an index built later (it has no history before its creation) used to
+/// answer point queries with nothing, and a view rebuilt by CREATE OR
+/// REPLACE silently read as empty before the replacement. Also across a
+/// restart (the history starts are checkpointed).
+#[test]
+fn as_of_reads_use_arrangements_with_history() {
+    let dir = tmpdir("asof-history");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, v int)");
+    exec(&h, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    exec(&h, "CREATE MATERIALIZED VIEW x AS SELECT id, v FROM t WHERE v > 10");
+    let g: String = rows(&h, "SHOW GSN").remove(0);
+    exec(&h, "INSERT INTO t VALUES (3, 10)");
+    exec(&h, "CREATE INDEX ti ON t (v)");
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW x AS SELECT id, v FROM t WHERE v > 0");
+    let check = |h: &EngineHandle| {
+        assert_eq!(rows(h, &format!("SELECT * FROM t WHERE v = 10 ORDER BY id AS OF {g}")), ["1|10"]);
+        assert_eq!(rows(h, &format!("SELECT * FROM t WHERE v = 10 ORDER BY id")), ["1|10", "3|10"]);
+        let err = try_exec(h, &format!("SELECT * FROM x AS OF {g}")).unwrap_err();
+        assert!(err.contains("before the history"), "{err}");
+    };
+    check(&h);
+    running.shutdown();
+    let running = start(&dir);
+    check(&running.handle);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

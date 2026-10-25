@@ -127,6 +127,21 @@ pub struct Arrangement {
     pub refs: usize,
     pub fp: Vec<u8>,
     pub hydrated: bool,
+    /// GSN from which the arrangement's history is complete (it was
+    /// hydrated then): reads as of earlier GSNs must not use it.
+    pub since: Gsn,
+}
+
+impl Arrangement {
+    /// Can a read at `at` use this arrangement?
+    pub fn covers(&self, at: ReadAt) -> bool {
+        self.hydrated
+            && match at {
+                ReadAt::Latest => true,
+                ReadAt::AsOf(t) => self.since <= t,
+                ReadAt::Before(t) => self.since < t,
+            }
+    }
 }
 
 /// Recovered arrangement trees, by fingerprint.
@@ -142,6 +157,8 @@ pub struct Graph {
     topo_dirty: bool,
     /// Trees from the checkpoint to attach instead of creating new ones.
     pub recovery: RecoveryMap,
+    /// `since` of the recovered trees, by fingerprint.
+    pub recovery_since: FxHashMap<Vec<u8>, Gsn>,
     /// Per-node delta-rate statistics (rows per tick, EWMA) for the planner.
     pub stats: FxHashMap<NodeId, NodeStats>,
     /// Logical time of the current GSN (timestamptz microseconds), from the
@@ -347,8 +364,9 @@ impl Graph {
             }
             _ => (env.create_tree(summarizer), false),
         };
+        let since = self.recovery_since.get(&afp).copied().unwrap_or(0);
         let arr = self.arrs.len();
-        self.arrs.push(Some(Arrangement { id: arr, node: id, layout, tree, refs: 0, fp: afp.clone(), hydrated }));
+        self.arrs.push(Some(Arrangement { id: arr, node: id, layout, tree, refs: 0, fp: afp.clone(), hydrated, since }));
         self.arr_by_fp.insert(afp, arr);
         patch(&mut kind, arr);
         for i in &inputs {
@@ -432,8 +450,9 @@ impl Graph {
             }
             _ => (env.create_tree(summarizer), false),
         };
+        let since = self.recovery_since.get(&full_fp).copied().unwrap_or(0);
         let id = self.arrs.len();
-        self.arrs.push(Some(Arrangement { id, node, layout, tree, refs: 0, fp: full_fp.clone(), hydrated }));
+        self.arrs.push(Some(Arrangement { id, node, layout, tree, refs: 0, fp: full_fp.clone(), hydrated, since }));
         self.arr_by_fp.insert(full_fp, id);
         self.node_mut(node).arrangements.push(id);
         id
@@ -651,7 +670,9 @@ impl Graph {
                         }
                         env.apply(arr.tree, &mut ups, gsn)?;
                     }
-                    self.arrs[a].as_mut().unwrap().hydrated = true;
+                    let a = self.arrs[a].as_mut().unwrap();
+                    a.hydrated = true;
+                    a.since = gsn;
                 }
                 if !snap.errs.is_empty() {
                     errors.insert(id, snap.errs.clone());
@@ -678,6 +699,16 @@ impl Graph {
     /// Arrangement fingerprint -> tree for checkpoints.
     pub fn arrangement_trees(&self) -> BTreeMap<Vec<u8>, TreeId> {
         self.live_arrangements().filter(|a| a.hydrated).map(|a| (a.fp.clone(), a.tree)).collect()
+    }
+
+    /// Arrangement fingerprint -> `since` for checkpoints.
+    pub fn arrangement_since(&self) -> BTreeMap<Vec<u8>, Gsn> {
+        self.live_arrangements().filter(|a| a.hydrated).map(|a| (a.fp.clone(), a.since)).collect()
+    }
+
+    /// The first of a node's arrangements holding its history as of `at`.
+    pub fn arrangement_at(&self, node: NodeId, at: ReadAt) -> Option<ArrId> {
+        self.node(node).arrangements.iter().copied().find(|a| self.arr(*a).covers(at))
     }
 }
 

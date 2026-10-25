@@ -112,6 +112,9 @@ pub(crate) struct AppState {
     /// Logical clock (timestamptz microseconds) at the checkpoint.
     #[serde(default)]
     pub clock: i64,
+    /// GSN from which each tree's history is complete (by fingerprint).
+    #[serde(default)]
+    pub arr_since: Vec<(Vec<u8>, Gsn)>,
 }
 
 pub struct Engine {
@@ -342,6 +345,7 @@ impl Engine {
         self.next_req = app.next_req;
         self.processed = rec.gsn;
         self.graph.recovery = app.trees.into_iter().collect();
+        self.graph.recovery_since = app.arr_since.into_iter().collect();
         self.clock = app.clock;
         self.graph.now = app.clock;
         self.ticks.push_back((rec.gsn, app.clock));
@@ -374,6 +378,7 @@ impl Engine {
             self.env.drop_tree(t)?;
         }
         self.graph.recovery.clear();
+        self.graph.recovery_since.clear();
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns));
         Ok(())
     }
@@ -707,6 +712,7 @@ impl Engine {
             source_lsns: self.source_lsns.iter().map(|(k, v)| (*k, *v)).collect(),
             next_req: self.next_req,
             clock: self.clock,
+            arr_since: self.graph.arrangement_since().into_iter().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;
