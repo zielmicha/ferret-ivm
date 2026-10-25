@@ -293,9 +293,9 @@ fixed once logged.
 
 - **Upstream restart or network failure**: the source thread logs a warning,
   shows `error: <message>` in `SHOW SOURCES`, and reconnects with exponential
-  backoff (starting at 200 ms, doubling up to 10 s; the delay is never reset
-  after a successful reconnect, so once a source has had a few errors, every
-  later reconnect waits 10 s). It resumes streaming from the end
+  backoff: starting at 200 ms and doubling up to 10 s while sessions keep
+  failing; a session that replicated an upstream transaction, or stayed
+  connected for 10 s, resets the delay to 200 ms. It resumes streaming from the end
   LSN of the last commit that is durable in the input log; transactions at
   or below that LSN that the server sends again are skipped. An interrupted
   snapshot chunk is discarded and redone.

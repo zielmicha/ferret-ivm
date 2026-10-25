@@ -58,8 +58,9 @@ errors:
   dropped, drop and re-create the source
   ([Sources](sources.md#tables-added-to-or-removed-from-the-publication)).
 
-The reconnect delay doubles up to 10 s and is never reset, so a source that
-has failed a few times retries only every 10 s.
+The reconnect delay doubles up to 10 s while sessions keep failing, and is
+reset to 200 ms by a session that replicated an upstream transaction or
+stayed connected for 10 s.
 
 ### Reads of a view fail with an error
 
@@ -270,7 +271,6 @@ Problems found while writing and checking this documentation (at commit
 | `DROP SINK` of a sink that is retrying its connection | the engine thread waits for the sink, possibly for a long time | stop and restart the engine; the drop is replayed |
 | A table that cannot be read while its snapshot is incomplete (removed from the publication, dropped, no `SELECT`) | the whole source stops streaming and the slot retains WAL | re-create the source |
 | A dropped slot is never re-created | source stuck in `error: replication slot ... does not exist` | drop and re-create the source |
-| The source reconnect delay is never reset | after a few failures every reconnect waits 10 s | none |
 | `SUBSCRIBE` ends when an error record is retracted; a subscription to a dropped table never ends | spurious errors; a subscription that never finishes | re-subscribe; end it from the client |
 | A multi-object `DROP` that fails part-way | the earlier objects are dropped anyway, and the statement is missing from `ivm.catalog_history` | drop objects one at a time |
 | `CREATE SINK` does not check `KEY` columns | the sink fails every connection attempt (`sink key column "x" does not exist`) | check the names; drop and re-create the sink |

@@ -315,6 +315,50 @@ fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// Process ids of the engine's walsenders (its sources' replication sessions).
+fn walsenders(up: &mut Upstream) -> Vec<String> {
+    up.rows("SELECT pid FROM pg_stat_replication WHERE application_name = 'ivm' ORDER BY pid")
+}
+
+/// Terminate the source's replication session and wait until it has
+/// reconnected; returns how long the reconnection took.
+fn kill_walsender(up: &mut Upstream) -> Duration {
+    let mut old = Vec::new();
+    eventually("a walsender", || {
+        old = walsenders(up);
+        !old.is_empty()
+    });
+    up.exec("SELECT pg_terminate_backend(pid) FROM pg_stat_replication WHERE application_name = 'ivm'");
+    let t0 = Instant::now();
+    eventually("the source to reconnect", || {
+        let now = walsenders(up);
+        !now.is_empty() && now.iter().all(|p| !old.contains(p))
+    });
+    t0.elapsed()
+}
+
+/// The reconnect delay starts small again after a session that worked: it
+/// used to keep doubling for good, so a source that had failed a few times
+/// waited 10 s before every later reconnect.
+#[test]
+fn reconnect_backoff_resets_after_a_working_session() {
+    let (mut up, mut ivm, _dir) = setup("backoff", &["CREATE TABLE t (id int PRIMARY KEY)"]);
+    let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t");
+    // sessions that end at once, without doing anything: the delay grows
+    // (0.2 s, 0.4 s, 0.8 s, 1.6 s)
+    for _ in 0..4 {
+        kill_walsender(&mut up);
+    }
+    // a session that replicates something works: the next delay is short
+    // again (it would be 3.2 s otherwise)
+    up.exec("INSERT INTO t VALUES (1)");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t"), ["1"]);
+    let took = kill_walsender(&mut up);
+    assert!(took < Duration::from_millis(1500), "reconnecting took {took:?}");
+    up.exec("INSERT INTO t VALUES (2)");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t"), ["2"]);
+}
+
 /// A sink keeps its target equal to the view across engine restarts.
 #[test]
 fn sink_delivers_exactly_once_across_restarts() {

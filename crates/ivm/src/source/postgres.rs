@@ -36,6 +36,11 @@ use std::time::{Duration, Instant};
 
 const CHUNK_ROWS: usize = 10_000;
 
+/// Delay before reconnecting after a failed session: doubles from the
+/// minimum up to the maximum while sessions keep failing.
+const RECONNECT_MIN: Duration = Duration::from_millis(200);
+const RECONNECT_MAX: Duration = Duration::from_secs(10);
+
 fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -165,6 +170,15 @@ struct Chunk {
     last: bool,
 }
 
+/// What the current replication session achieved (see `run`).
+#[derive(Default)]
+struct Session {
+    /// When streaming started.
+    streaming_since: Option<Instant>,
+    /// An upstream transaction was processed.
+    progressed: bool,
+}
+
 struct Txn {
     xid: u32,
     changes: Vec<(ObjectId, TableChange)>,
@@ -195,6 +209,7 @@ struct PgSource {
     /// replicate (yet). pgoutput announces a relation once per session, so
     /// a table added later (ALTER SOURCE REFRESH) is mapped from these.
     unmapped_rels: HashMap<u32, Relation>,
+    session: Session,
 }
 
 fn pk_bytes(row: &[Datum], pk: &[usize]) -> Vec<u8> {
@@ -407,6 +422,7 @@ impl PgSource {
                     // already logged before a restart
                     return Ok(());
                 }
+                self.session.progressed = true;
                 let Some(mut txn) = txn else { return Ok(()) };
                 let mut progress = false;
                 if txn.finish_chunk
@@ -847,13 +863,24 @@ pub fn run(
         pending_wal_end: 0,
         gauges,
         unmapped_rels: HashMap::new(),
+        session: Session::default(),
     };
-    let mut backoff = Duration::from_millis(200);
+    let mut backoff = RECONNECT_MIN;
     loop {
         if src.engine.shared.shutdown.load(Ordering::Acquire) {
             return;
         }
-        match stream_once(&mut src, &ctl) {
+        src.session = Session::default();
+        let result = stream_once(&mut src, &ctl);
+        // A session that replicated something, or stayed up for as long as
+        // the longest delay, worked: its failure is a new incident and is
+        // retried quickly. Sessions that fail without getting anywhere (the
+        // upstream is down, or the same message fails every time) keep
+        // doubling the delay.
+        if src.session.progressed || src.session.streaming_since.is_some_and(|t| t.elapsed() >= RECONNECT_MAX) {
+            backoff = RECONNECT_MIN;
+        }
+        match result {
             Ok(true) => return,
             Ok(false) => {}
             Err(e) => {
@@ -877,7 +904,7 @@ pub fn run(
             }
             Err(_) => {}
         }
-        backoff = (backoff * 2).min(Duration::from_secs(10));
+        backoff = (backoff * 2).min(RECONNECT_MAX);
     }
 }
 
@@ -901,6 +928,7 @@ fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
     let opts2 = [("proto_version", "1"), ("publication_names", pub_quoted.as_str()), ("messages", "true")];
     let _ = opts;
     let mut stream: ReplicationStream = repl.start_logical_replication(&src.def.slot, Lsn(src.resume_lsn.max(src.durable_lsn)), &opts2)?;
+    src.session.streaming_since = Some(Instant::now());
     *src.status.lock() = "streaming".into();
     let mut last_status = Instant::now();
     let mut last_wal_end = 0u64;
@@ -1020,6 +1048,7 @@ mod tests {
             inflight: std::collections::VecDeque::new(),
             pending_wal_end: 0,
             unmapped_rels: HashMap::new(),
+            session: Session::default(),
         };
         (src, log)
     }
