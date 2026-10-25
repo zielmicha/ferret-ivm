@@ -320,9 +320,9 @@ impl PgSource {
                     let nk: Row = pk.iter().map(|c| row[*c].clone()).collect();
                     if pk_bytes(o, &pk) != pk_bytes(&row, &pk) && !ok.iter().any(|d| d.is_null()) {
                         let kb = pk_bytes(o, &pk);
-                        if self.snapshot_filter(table, &kb).is_some() {
-                            self.push_change(table, TableChange::Delete { key: ok });
-                        }
+                        // deletes always apply (see the Delete case)
+                        let _ = self.snapshot_filter(table, &kb);
+                        self.push_change(table, TableChange::Delete { key: ok });
                     }
                     let _ = nk;
                 }
@@ -339,11 +339,16 @@ impl PgSource {
                     }
                     return Ok(());
                 }
+                // A delete always applies, whatever the snapshot filter says
+                // (which still decides what happens to the chunk's row): of a
+                // key not snapshotted yet it removes nothing, unless the table
+                // is being re-snapshotted after a schema change. Then its old
+                // row is stored, and no chunk would remove it: chunks only
+                // upsert the rows that exist.
                 let kb = pk_bytes(&row, &pk);
-                if self.snapshot_filter(table, &kb).is_some() {
-                    let key: Row = pk.iter().map(|c| row[*c].clone()).collect();
-                    self.push_change(table, TableChange::Delete { key });
-                }
+                let _ = self.snapshot_filter(table, &kb);
+                let key: Row = pk.iter().map(|c| row[*c].clone()).collect();
+                self.push_change(table, TableChange::Delete { key });
             }
             LogicalMessage::Truncate { relation_ids, .. } => {
                 for r in relation_ids {

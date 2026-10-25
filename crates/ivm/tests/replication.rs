@@ -267,3 +267,23 @@ fn ddl_and_dml_in_one_upstream_transaction() {
     let mut ivm = Ivm::start(&dir);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), want);
 }
+
+/// Rows deleted upstream while a table is re-snapshotted after a schema
+/// change are deleted: the re-snapshot only upserts the rows it reads, and
+/// the deletes of keys it had not reached yet used to be skipped.
+#[test]
+fn deletes_during_a_resnapshot_apply() {
+    let (mut up, mut ivm, _dir) = setup(
+        "resnap-delete",
+        &["CREATE TABLE t (id int PRIMARY KEY, a int)", "INSERT INTO t SELECT g, g FROM generate_series(1, 12000) g"],
+    );
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*) FROM t"), ["12000"]);
+    up.exec("ALTER TABLE t ADD COLUMN b int DEFAULT 7");
+    up.exec("INSERT INTO t VALUES (12001, 0, 0)");
+    // beyond the first chunk of the re-snapshot
+    up.exec("DELETE FROM t WHERE id = 11999");
+    up.exec("UPDATE t SET id = 20000 WHERE id = 11998");
+    let q = "SELECT count(*), count(b), sum(b), sum(id) FROM t";
+    assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT id FROM t WHERE id > 11996 ORDER BY id"), ["11997", "12000", "12001", "20000"]);
+}
