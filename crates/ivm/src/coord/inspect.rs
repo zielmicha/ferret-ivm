@@ -17,7 +17,6 @@ use crate::types::text::format_datum;
 use crate::types::{ColumnType, Datum, Row};
 use rustc_hash::FxHashSet;
 use serde::Serialize;
-use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Most nodes listed by a dataflow snapshot.
@@ -878,10 +877,12 @@ impl Engine {
         })
     }
 
-    /// Dependencies by the catalog's own rule (the one DROP uses): views
-    /// depend on every object their SQL mentions by name.
+    /// Dependencies by the rule DROP uses: a view depends on the relations
+    /// its query names, as the binder resolves them (relations read through
+    /// a virtual view are that view's dependencies, so the graph reaches
+    /// them through it); a definition that no longer binds depends on the
+    /// relations whose names its text mentions.
     fn dependency_map(&self) -> HashMap<ObjectId, Vec<ObjectId>> {
-        let by_name: HashMap<&str, ObjectId> = self.catalog.objects.values().map(|o| (o.name.as_str(), o.id)).collect();
         let mut deps: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         for o in self.catalog.objects.values() {
             let mut d: Vec<ObjectId> = match &o.kind {
@@ -889,10 +890,21 @@ impl Engine {
                 ObjectKind::Sink(s) => vec![s.from],
                 ObjectKind::Table(t) => t.source.into_iter().collect(),
                 ObjectKind::MaterializedView(v) | ObjectKind::View(v) => {
-                    let lower = v.sql.to_lowercase();
-                    let words: HashSet<&str> =
-                        lower.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).map(|w| w.trim_matches('"')).collect();
-                    words.into_iter().filter_map(|w| by_name.get(w).copied()).filter(|id| *id != o.id).collect()
+                    let refs = self.catalog.direct_references(&v.sql).or_else(|| self.catalog.references(&v.sql));
+                    match refs {
+                        Some(refs) => refs.into_iter().filter(|id| *id != o.id).collect(),
+                        None => self
+                            .catalog
+                            .objects
+                            .values()
+                            .filter(|x| {
+                                x.id != o.id
+                                    && matches!(x.kind, ObjectKind::Table(_) | ObjectKind::View(_) | ObjectKind::MaterializedView(_))
+                                    && crate::catalog::sql_mentions(&v.sql, &x.name)
+                            })
+                            .map(|x| x.id)
+                            .collect(),
+                    }
                 }
                 ObjectKind::Source(_) => vec![],
             };

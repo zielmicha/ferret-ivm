@@ -339,9 +339,3 @@ test, with workarounds.
 | Problem | Effect | Workaround |
 |---|---|---|
 | Changes for subscriptions and sinks are queued in memory without a bound (the engine never waits for a client or a sink target) | a subscriber that reads slowly, or a sink whose target is unreachable for long (or whose batches keep failing), makes the server's memory grow | watch `SHOW SINKS`; drop a sink whose target is gone for long and create it again later (it resynchronises the target) |
-
-### Web UI
-
-| Problem | Effect | Workaround |
-|---|---|---|
-| The catalog's dependencies and lineage graphs are found textually (an object counts when its name occurs as a word in a view's SQL), not by the rule `DROP` uses | they can show dependencies that do not exist (a column or alias named like another object) and miss real ones (quoted names with capitals) | do not plan drops from the graphs; `DROP` without `CASCADE` refuses to drop an object that views or sinks depend on |

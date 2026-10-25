@@ -129,8 +129,20 @@ impl Catalog {
     /// Relations a query reads as the binder resolves their names, including
     /// those of the views it expands; None when it does not bind.
     pub fn references(&self, sql: &str) -> Option<Vec<ObjectId>> {
+        self.recorded_references(sql, true)
+    }
+
+    /// Relations a query names, as the binder resolves them: as
+    /// `references`, but views are not expanded, so the relations read
+    /// through them are left out (they are the views' own references).
+    pub fn direct_references(&self, sql: &str) -> Option<Vec<ObjectId>> {
+        self.recorded_references(sql, false)
+    }
+
+    fn recorded_references(&self, sql: &str, expand_views: bool) -> Option<Vec<ObjectId>> {
         struct Recording<'a> {
             cat: &'a Catalog,
+            expand_views: bool,
             seen: std::cell::RefCell<Vec<ObjectId>>,
         }
         impl BindCatalog for Recording<'_> {
@@ -138,15 +150,23 @@ impl Catalog {
                 self.cat.definitions(kind)
             }
             fn resolve_relation(&self, schema: Option<&str>, name: &str) -> Option<CatalogRelation> {
-                let r = self.cat.resolve_relation(schema, name);
-                if let Some(CatalogRelation::Table { id, .. } | CatalogRelation::View { id, .. }) = &r {
-                    self.seen.borrow_mut().push(*id);
+                match self.cat.resolve_relation(schema, name) {
+                    Some(CatalogRelation::View { id, name, columns, .. }) if !self.expand_views => {
+                        // bound by its stored columns, without its query
+                        self.seen.borrow_mut().push(id);
+                        Some(CatalogRelation::Table { id, name, columns, keys: vec![] })
+                    }
+                    r => {
+                        if let Some(CatalogRelation::Table { id, .. } | CatalogRelation::View { id, .. }) = &r {
+                            self.seen.borrow_mut().push(*id);
+                        }
+                        r
+                    }
                 }
-                r
             }
         }
         let q = crate::sql::parser::parse_single_query(sql).ok()?;
-        let rec = Recording { cat: self, seen: Default::default() };
+        let rec = Recording { cat: self, expand_views, seen: Default::default() };
         let mut b = crate::sql::Binder::new(&rec);
         // a stored definition: tolerate what earlier versions accepted
         b.stored_definition = true;

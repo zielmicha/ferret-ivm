@@ -116,8 +116,11 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
   catalog wrapper that records every relation the binder resolves, also
   inside the views it expands; these are the objects a view depends on (for
   `DROP` and `CASCADE`, re-planning after a change, the recovery order, and
-  the relations a subscription reads). Only a definition that no longer
-  binds falls back to matching relation names in its text.
+  the relations a subscription reads). `Catalog::direct_references`
+  presents views to the binder as tables of their stored columns instead
+  of expanding them, which gives only the relations a query names (the web
+  UI's dependency graphs). Only a definition that no longer binds falls back
+  to matching relation names in its text.
 - **Aggregates, window functions and select-list set-returning functions**
   are collected while binding the select list, `HAVING` and `ORDER BY`, and
   replaced by placeholders (`AggRef`, `WindowRef`, `SrfRef`). The `SELECT`
