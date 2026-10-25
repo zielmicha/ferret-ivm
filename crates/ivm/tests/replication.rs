@@ -287,3 +287,21 @@ fn deletes_during_a_resnapshot_apply() {
     assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT id FROM t WHERE id > 11996 ORDER BY id"), ["11997", "12000", "12001", "20000"]);
 }
+
+/// Re-snapshotting a table without a primary key (REPLICA IDENTITY FULL)
+/// after a schema change replaces its rows; it used to add a second copy
+/// of every row.
+#[test]
+fn keyless_tables_resnapshot_without_duplicates() {
+    let (mut up, mut ivm, _dir) = setup(
+        "multiset-schema",
+        &["CREATE TABLE m (a int, b text)", "ALTER TABLE m REPLICA IDENTITY FULL", "INSERT INTO m VALUES (1, 'x'), (1, 'x'), (2, 'y')"],
+    );
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM m ORDER BY a, b"), ["1|x", "1|x", "2|y"]);
+    up.exec("ALTER TABLE m ADD COLUMN c int DEFAULT 5");
+    up.exec("INSERT INTO m VALUES (3, 'z', 6)");
+    up.exec("DELETE FROM m WHERE a = 2");
+    let q = "SELECT * FROM m ORDER BY a, b, c";
+    assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    assert_eq!(up.rows(q), ["1|x|5", "1|x|5", "3|z|6"]);
+}

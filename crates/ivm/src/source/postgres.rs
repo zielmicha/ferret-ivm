@@ -371,9 +371,12 @@ impl PgSource {
                         if tag == ch.low {
                             ch.phase = Phase::InWindow;
                             if self.tables[&ch.table].pk.is_empty() {
-                                // multiset chunk is emitted at the low watermark
+                                // multiset chunk is emitted at the low watermark;
+                                // it is the whole table, replacing what is stored
+                                // (rows kept from before a schema change)
                                 let rows = std::mem::take(&mut ch.multiset);
                                 let t = ch.table;
+                                self.push_change(t, TableChange::Truncate);
                                 for r in rows {
                                     self.push_change(t, TableChange::Insert { row: r });
                                 }
