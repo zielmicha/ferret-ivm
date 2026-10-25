@@ -339,3 +339,23 @@ fn float4_arithmetic_with_other_numbers_is_float8() {
     );
     running.shutdown();
 }
+
+#[test]
+fn nullif_keeps_the_type_of_its_first_argument() {
+    let running = start("nullif-type");
+    let h = running.handle.clone();
+    setup_t1_t2(&h);
+    // used to return timestamps (the type '=' coerced both arguments to)
+    assert_eq!(
+        rows(&h, "SELECT nullif(d, '2024-01-02 00:00'::timestamp), pg_typeof(nullif(d, '2024-01-02'::timestamp)) FROM t1 ORDER BY id"),
+        vec!["2024-01-01|date", "|date", "|date", "2024-01-01|date", "2024-01-03|date"]
+    );
+    assert_eq!(
+        rows(&h, "SELECT nullif(1::int2, 2), pg_typeof(nullif(1::int2, 2)), nullif(0.5::float4, 0.5::float8), \
+                  pg_typeof(nullif(0.1::float4, 0.5::float8)), nullif(0.1::float4, 0.5::float8), nullif(2, 2::int8)"),
+        vec!["1|smallint||real|0.1|"]
+    );
+    // without a cross-type operator the arguments share the common type
+    assert_eq!(rows(&h, "SELECT nullif(1, 2.5), pg_typeof(nullif(1, 2.5))"), vec!["1|numeric"]);
+    running.shutdown();
+}

@@ -1300,6 +1300,17 @@ impl<'a> Binder<'a> {
                     sql_bail!(codes::UNDEFINED_FUNCTION, "function nullif requires 2 arguments");
                 }
                 let res = resolve("=", &types)?;
+                // PostgreSQL compares these with cross-type operators, so the
+                // first argument (and the result) keeps its own type
+                let datetime = |t: &SqlType| matches!(t, SqlType::Date | SqlType::Timestamp | SqlType::TimestampTz);
+                let (t0, t1) = (&types[0], &types[1]);
+                if res.arg_types[0] != *t0
+                    && ((t0.is_integer() && t1.is_integer()) || (t0.is_float() && t1.is_float()) || (datetime(t0) && datetime(t1)))
+                {
+                    let eq = self.make_binary("=", bound[0].clone(), t0.clone(), bound[1].clone(), t1.clone())?;
+                    let whens = vec![(eq, Expr::null(t0.clone()))];
+                    return Ok(Expr::Case(Box::new(CaseExpr { whens, else_: bound[0].clone(), ty: t0.clone() })));
+                }
                 let mut it = bound.into_iter();
                 let a = self.coerce(it.next().unwrap(), &types[0], &res.arg_types[0], CastContext::Implicit, "NULLIF")?;
                 let b = self.coerce(it.next().unwrap(), &types[1], &res.arg_types[1], CastContext::Implicit, "NULLIF")?;
