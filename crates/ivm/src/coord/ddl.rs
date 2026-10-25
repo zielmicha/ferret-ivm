@@ -719,8 +719,19 @@ impl Engine {
         let tree = arr.tree;
         self.env.apply(tree, &mut ups, gsn)?;
         self.catalog.insert(CatalogObject { kind: ObjectKind::Table(def), ..obj });
-        // re-plan dependent materialized views in creation order
-        let mut deps: Vec<ObjectId> = self.catalog.dependents(table);
+        // Re-plan dependent materialized views, also views over those (they
+        // would otherwise go on reading the old version, which no longer
+        // receives changes), in creation order: a view after what it reads.
+        let mut deps: Vec<ObjectId> = Vec::new();
+        let mut todo = vec![table];
+        while let Some(x) = todo.pop() {
+            for d in self.catalog.dependents(x) {
+                if !deps.contains(&d) {
+                    deps.push(d);
+                    todo.push(d);
+                }
+            }
+        }
         deps.sort();
         for d in deps {
             if let Some(o) = self.catalog.get(d).cloned()

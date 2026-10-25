@@ -115,3 +115,46 @@ fn sinks_retract_json_and_exact_representations() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An upstream schema change re-planned the views reading the table, but
+/// not views over those views: they kept reading the old version of their
+/// source view, which no longer received changes, and went stale.
+#[test]
+fn schema_changes_replan_views_over_views() {
+    let pg = TempCluster::start(ClusterOptions::default()).expect("start postgres");
+    let conninfo = pg.conninfo("postgres");
+    let mut up = Client::connect(&PgConfig::parse(&conninfo).unwrap()).unwrap();
+    up.simple_query(
+        "CREATE TABLE t (id int PRIMARY KEY, k int);
+         INSERT INTO t SELECT g, g % 3 FROM generate_series(1, 9) g;
+         CREATE PUBLICATION p FOR TABLE t;",
+    )
+    .unwrap();
+    let dir = PathBuf::from(std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()))
+        .join(format!("ivm-schema-vv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let running = coord::start(coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() }).unwrap();
+    let h = running.handle.clone();
+    let discovered = serde_json::to_string(&ivm::source::discover(&conninfo, "p", None).unwrap()).unwrap();
+    exec(&h, &format!("CREATE SOURCE src FROM POSTGRES CONNECTION '{conninfo}' PUBLICATION 'p'"), discovered);
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT k, count(*) AS n FROM t GROUP BY k", String::new());
+    exec(&h, "CREATE MATERIALIZED VIEW vv AS SELECT sum(n) AS total, count(*) AS groups FROM v", String::new());
+    // after the initial snapshot: earlier changes reach the engine through
+    // the snapshot only, which would not announce the new shape
+    let lsn = upstream_rows(&mut up, "SELECT pg_current_wal_lsn()")[0].clone();
+    assert_eq!(rows(&h, &format!("SELECT count(*) FROM t AS OF AT LEAST LSN '{lsn}'")), ["9"]);
+    up.simple_query(
+        "ALTER TABLE t ADD COLUMN x int DEFAULT 7;
+         UPDATE t SET k = 5 WHERE id = 1;
+         INSERT INTO t VALUES (10, 6, 1), (11, 6, 2);",
+    )
+    .unwrap();
+    let lsn = upstream_rows(&mut up, "SELECT pg_current_wal_lsn()")[0].clone();
+    // (a read is planned before it waits: wait without the new column first)
+    assert_eq!(rows(&h, &format!("SELECT count(*) FROM t AS OF AT LEAST LSN '{lsn}'")), ["11"]);
+    assert_eq!(rows(&h, "SELECT count(*), sum(x) FROM t"), ["11|66"]);
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY k"), ["0|3", "1|2", "2|3", "5|1", "6|2"]);
+    assert_eq!(rows(&h, "SELECT * FROM vv"), ["11|5"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
