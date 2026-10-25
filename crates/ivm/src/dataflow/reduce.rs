@@ -234,7 +234,8 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mu
         let prefix = layout.encode_prefix(&kv);
         groups.entry(prefix).or_insert_with(|| (kv, Vec::new())).1.push((row, *w));
     }
-    let cacheable = !p.ordered() && std::env::var("IVM_NO_GROUP_CACHE").is_err();
+    static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cacheable = !p.ordered() && !*NO_CACHE.get_or_init(|| std::env::var("IVM_NO_GROUP_CACHE").is_ok());
     let fidelity_key = layout.key_types[..ng].iter().any(crate::types::encoding::has_fidelity);
     let mut errors = p.errors.lock();
     let mut cache = p.cache.0.lock();

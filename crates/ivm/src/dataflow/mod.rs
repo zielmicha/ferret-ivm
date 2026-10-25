@@ -735,15 +735,16 @@ pub fn consolidate(delta: &mut Delta) {
         return;
     }
     delta.sort_unstable_by(|a, b| crate::types::datum::exact_row_cmp(&a.0, &b.0));
-    let mut out: Delta = Vec::with_capacity(delta.len());
-    for (r, w) in delta.drain(..) {
-        match out.last_mut() {
-            Some((lr, lw)) if crate::types::datum::exact_row_cmp(lr, &r) == std::cmp::Ordering::Equal => *lw += w,
-            _ => out.push((r, w)),
+    // merge runs of equal rows in place (the later ones are dropped)
+    delta.dedup_by(|cur, kept| {
+        if crate::types::datum::exact_row_cmp(&cur.0, &kept.0) == std::cmp::Ordering::Equal {
+            kept.1 += cur.1;
+            true
+        } else {
+            false
         }
-    }
-    out.retain(|(_, w)| *w != 0);
-    *delta = out;
+    });
+    delta.retain(|(_, w)| *w != 0);
 }
 
 pub fn consolidate_errs(errs: &mut ErrDelta) {
