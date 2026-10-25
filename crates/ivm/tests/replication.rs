@@ -356,3 +356,46 @@ fn snapshots_keep_rows_added_after_a_truncate() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A row whose primary key changes while a snapshot chunk holding it is in
+/// flight (the change after the chunk's snapshot), its TOASTed values
+/// unchanged: the replicated new row has placeholders for them, and the old
+/// key's tuple carries only the key. The values are in the chunk's row of
+/// the old key, which the source dropped (the stream wins) instead of
+/// filling them in from it; the engine, which has yet to receive that row,
+/// had nothing to fill them from either, and they became NULL.
+#[test]
+fn key_changes_during_a_snapshot_keep_toasted_values() {
+    let pg = TempCluster::start(ClusterOptions::default()).expect("start postgres");
+    let conninfo = pg.conninfo("postgres");
+    let mut up = connect(&conninfo);
+    up.simple_query(
+        "CREATE TABLE t (id int PRIMARY KEY, n int, big text);
+         ALTER TABLE t ALTER COLUMN big SET STORAGE EXTERNAL;
+         INSERT INTO t SELECT g, g, repeat(md5(g::text), 200) FROM generate_series(1, 4) g;
+         CREATE PUBLICATION p FOR TABLE t;",
+    )
+    .unwrap();
+    let dir = scratch("snapshot-key-change");
+    let running = coord::start(config(&dir)).unwrap();
+    create_source(&running.handle, &conninfo);
+    assert_caught_up(&running.handle, &mut up, &["SELECT count(*) FROM t"]);
+    running.shutdown();
+
+    // while the engine is down: a schema change (the engine snapshots the
+    // table again when it sees it) and a new row, which the snapshot reads
+    up.simple_query("ALTER TABLE t ADD COLUMN x int DEFAULT 7; UPDATE t SET n = -1 WHERE id = 1;").unwrap();
+    up.simple_query("INSERT INTO t VALUES (50, 50, repeat(md5('50'), 200))").unwrap();
+    // the chunk takes its snapshot, then waits for this lock; the key
+    // change commits after that snapshot, within the chunk's window
+    let mut locker = connect(&conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE").unwrap();
+    let running = coord::start(config(&dir)).unwrap();
+    wait_until("the chunk to wait for the lock", || {
+        !upstream_rows(&mut up, "SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND backend_type = 'client backend'").is_empty()
+    });
+    locker.simple_query("UPDATE t SET id = 1050 WHERE id = 50; COMMIT").unwrap();
+    assert_caught_up(&running.handle, &mut up, &["SELECT id, n, x, md5(big) FROM t ORDER BY id"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

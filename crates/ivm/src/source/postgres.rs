@@ -318,20 +318,22 @@ impl PgSource {
                     return Ok(());
                 }
                 // key change: delete the old key first
+                let mut moved = None;
                 if let Some(o) = &old_row
                     && (old_is_key || !o.is_empty())
                 {
                     let ok: Row = pk.iter().map(|c| o[*c].clone()).collect();
                     let nk: Row = pk.iter().map(|c| row[*c].clone()).collect();
                     if pk_bytes(o, &pk) != pk_bytes(&row, &pk) && !ok.iter().any(|d| d.is_null()) {
-                        self.push_delete(table, o, ok);
+                        moved = self.push_delete(table, o, ok);
                     }
                     let _ = nk;
                 }
                 // a key-only old tuple (a key change under REPLICA IDENTITY
-                // DEFAULT) has no values for unchanged TOAST columns: the
-                // engine fills them from the row stored under the old key
-                self.push_upsert(table, row, unchanged, if old_is_key { None } else { old_row })?;
+                // DEFAULT) has no values for unchanged TOAST columns: they
+                // come from the old key's row, in the chunk in flight or else
+                // (filled in by the engine) the row stored under the old key
+                self.push_upsert(table, row, unchanged, if old_is_key { moved } else { old_row })?;
             }
             LogicalMessage::Delete { relation_id, old, .. } => {
                 let Some(rm) = self.rels.get(&relation_id) else { return Ok(()) };
@@ -345,7 +347,7 @@ impl PgSource {
                     return Ok(());
                 }
                 let key: Row = pk.iter().map(|c| row[*c].clone()).collect();
-                self.push_delete(table, &row, key);
+                let _ = self.push_delete(table, &row, key);
             }
             LogicalMessage::Truncate { relation_ids, .. } => {
                 let xid = self.txn.as_ref().map(|t| t.xid);
@@ -468,11 +470,14 @@ impl PgSource {
     /// re-snapshot after a schema change, or from a chunk logged before a
     /// restart whose progress was not), and a deleted row is not there to be
     /// read. Deleting a key the engine does not hold changes nothing.
-    fn push_delete(&mut self, table: ObjectId, row: &[Datum], key: Row) {
+    ///
+    /// Returns the row the chunk in flight had for the key, if the stream
+    /// wins over it there.
+    fn push_delete(&mut self, table: ObjectId, row: &[Datum], key: Row) -> Option<Row> {
         let kb = pk_bytes(row, &self.tables[&table].pk);
-        // (drops the key from the chunk in flight where the stream wins)
-        let _ = self.snapshot_filter(table, &kb);
+        let chunk_row = self.snapshot_filter(table, &kb).flatten();
         self.push_change(table, TableChange::Delete { key });
+        chunk_row
     }
 
     fn push_upsert(&mut self, table: ObjectId, mut row: Row, unchanged: Vec<usize>, old: Option<Row>) -> Result<()> {
