@@ -379,6 +379,24 @@ fn percentiles_with_different_fractions() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A set-returning function after an explicit LATERAL dropped its WITH
+/// ORDINALITY column (the column list then named one column too many).
+#[test]
+fn lateral_functions_with_ordinality() {
+    let dir = tmpdir("lateral-ordinality");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int[])");
+    exec(&h, "INSERT INTO t VALUES (1, '{5,6}'), (2, '{7}')");
+    let q = "SELECT t.id, x.v, x.n FROM t, LATERAL unnest(t.a) WITH ORDINALITY AS x(v, n)";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    assert_eq!(rows(&h, &format!("{q} ORDER BY 1, 3")), ["1|5|1", "1|6|2", "2|7|1"]);
+    exec(&h, "UPDATE t SET a = '{8,9,10}' WHERE id = 2");
+    assert_eq!(rows(&h, "SELECT * FROM v ORDER BY 1, 3"), ["1|5|1", "1|6|2", "2|8|1", "2|9|2", "2|10|3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Ad hoc execution deduplicated a group's rows for a DISTINCT ordered
 /// aggregate in place, so ordered aggregates after it saw only the distinct
 /// rows (here mode() saw x = 17 alone). Expected values are PostgreSQL's.
