@@ -102,6 +102,7 @@ fn temporal_filters_follow_the_logged_clock() {
     tick(&h, 0);
     assert_eq!(rows(&h, "SELECT now()"), vec!["2026-01-02 00:00:50+00".to_string()]);
     running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -122,6 +123,7 @@ fn temporal_filter_errors() {
         assert!(r.is_err(), "{sql} should be rejected");
     }
     running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 struct Rng(u64);
@@ -203,6 +205,7 @@ fn temporal_views_match_recompute_as_time_passes() {
         }
     }
     running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

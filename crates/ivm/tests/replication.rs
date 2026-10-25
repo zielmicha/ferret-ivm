@@ -134,10 +134,12 @@ fn setup(name: &str, ddl: &[&str]) -> (Upstream, Ivm, PathBuf) {
 /// Initial snapshot and streaming through the test harness.
 #[test]
 fn snapshot_then_stream() {
-    let (mut up, mut ivm, _dir) = setup("smoke", &["CREATE TABLE t (id int PRIMARY KEY, a int)", "INSERT INTO t VALUES (1, 1), (2, 2)"]);
+    let (mut up, mut ivm, dir) = setup("smoke", &["CREATE TABLE t (id int PRIMARY KEY, a int)", "INSERT INTO t VALUES (1, 1), (2, 2)"]);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), ["1|1", "2|2"]);
     up.exec("UPDATE t SET a = 10 WHERE id = 1");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), ["1|10", "2|2"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -158,6 +160,8 @@ fn views_over_views_follow_upstream_schema_changes() {
     let mut ivm = Ivm::start(&dir);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM z"), ["3|6"]);
     assert_eq!(ivm.rows("SHOW ARRANGEMENTS").len(), arrs);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A view that an upstream schema change invalidates is dropped (with its
@@ -183,13 +187,15 @@ fn views_invalidated_upstream_are_dropped() {
     let mut ivm = Ivm::start(&dir);
     up.exec("INSERT INTO t VALUES (3, 3)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM ok ORDER BY id"), ["1|1", "2|2", "3|3"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A view over `SELECT *` takes the table's new shape (reads used to
 /// mix the old column list with new rows and panic the engine).
 #[test]
 fn star_views_take_the_new_table_shape() {
-    let (mut up, mut ivm, _dir) = setup("star", &["CREATE TABLE t (id int PRIMARY KEY, a text, b int)", "INSERT INTO t VALUES (1, 'one', 10)"]);
+    let (mut up, mut ivm, dir) = setup("star", &["CREATE TABLE t (id int PRIMARY KEY, a text, b int)", "INSERT INTO t VALUES (1, 'one', 10)"]);
     let _ = caught_up(&mut ivm, &mut up, "SELECT * FROM t");
     ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT * FROM t");
     up.exec("ALTER TABLE t DROP COLUMN a");
@@ -199,6 +205,8 @@ fn star_views_take_the_new_table_shape() {
     up.exec("ALTER TABLE t ADD COLUMN c int DEFAULT 5");
     up.exec("INSERT INTO t VALUES (3, 30, 6)");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM v ORDER BY id"), ["1|10|5", "2|20|5", "3|30|6"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Tables keyed by upstream types replicated as text (enum, inet) are
@@ -206,7 +214,7 @@ fn star_views_take_the_new_table_shape() {
 /// used to apply COLLATE to them and fail, stalling the whole source).
 #[test]
 fn text_replicated_keys_snapshot_in_chunks() {
-    let (mut up, mut ivm, _dir) = setup(
+    let (mut up, mut ivm, dir) = setup(
         "enum",
         &[
             "CREATE TYPE color AS ENUM ('red', 'green', 'blue')",
@@ -225,6 +233,8 @@ fn text_replicated_keys_snapshot_in_chunks() {
     up.exec("DELETE FROM i WHERE addr = '10.0.0.1'");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM e"), ["25000|312512498"]);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT count(*), sum(a) FROM i"), ["11999|72005999"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Changes to a table added by ALTER SOURCE REFRESH are replicated even when
@@ -249,6 +259,8 @@ fn refreshed_tables_announced_earlier_are_replicated() {
     up.exec("INSERT INTO b VALUES (2, 2)");
     up.exec("UPDATE b SET v = 10 WHERE id = 1");
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM b ORDER BY id"), ["1|10", "2|2"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One upstream transaction changing rows before and after an ALTER TABLE:
@@ -266,6 +278,8 @@ fn ddl_and_dml_in_one_upstream_transaction() {
     ivm.shutdown();
     let mut ivm = Ivm::start(&dir);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Rows deleted upstream while a table is re-snapshotted after a schema
@@ -273,7 +287,7 @@ fn ddl_and_dml_in_one_upstream_transaction() {
 /// the deletes of keys it had not reached yet used to be skipped.
 #[test]
 fn deletes_during_a_resnapshot_apply() {
-    let (mut up, mut ivm, _dir) = setup(
+    let (mut up, mut ivm, dir) = setup(
         "resnap-delete",
         &["CREATE TABLE t (id int PRIMARY KEY, a int)", "INSERT INTO t SELECT g, g FROM generate_series(1, 12000) g"],
     );
@@ -286,6 +300,8 @@ fn deletes_during_a_resnapshot_apply() {
     let q = "SELECT count(*), count(b), sum(b), sum(id) FROM t";
     assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT id FROM t WHERE id > 11996 ORDER BY id"), ["11997", "12000", "12001", "20000"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Re-snapshotting a table without a primary key (REPLICA IDENTITY FULL)
@@ -293,7 +309,7 @@ fn deletes_during_a_resnapshot_apply() {
 /// of every row.
 #[test]
 fn keyless_tables_resnapshot_without_duplicates() {
-    let (mut up, mut ivm, _dir) = setup(
+    let (mut up, mut ivm, dir) = setup(
         "multiset-schema",
         &["CREATE TABLE m (a int, b text)", "ALTER TABLE m REPLICA IDENTITY FULL", "INSERT INTO m VALUES (1, 'x'), (1, 'x'), (2, 'y')"],
     );
@@ -304,6 +320,8 @@ fn keyless_tables_resnapshot_without_duplicates() {
     let q = "SELECT * FROM m ORDER BY a, b, c";
     assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
     assert_eq!(up.rows(q), ["1|x|5", "1|x|5", "3|z|6"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Wait until `f` returns true (or fail after a timeout).
@@ -352,6 +370,8 @@ fn sink_delivers_exactly_once_across_restarts() {
         up.exec(&format!("DELETE FROM t WHERE id = {}", 10 + round * 10));
         synced(&mut up);
     }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A sink without a key deletes a retracted row by comparing every column;
@@ -373,6 +393,8 @@ fn keyless_sink_with_json_columns() {
     up.exec("DELETE FROM t WHERE id IN (1, 3)");
     up.exec("INSERT INTO t VALUES (4, '{\"b\": 2}')");
     eventually("retractions", || copy(&mut up) == up.client.query("SELECT j::text FROM t ORDER BY 1").unwrap().rows);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A sink's target table has its view's columns: a replacement changing
@@ -396,6 +418,8 @@ fn sinks_keep_their_columns_across_view_replacements() {
     up.exec("INSERT INTO t VALUES (2, 20, 200)");
     let want = vec![vec![Some("1".to_string()), Some("110".to_string())], vec![Some("2".to_string()), Some("220".to_string())]];
     eventually("replacement delivered", || copy(&mut up) == want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Changes produced while a sink cannot connect yet are delivered once it
@@ -424,6 +448,8 @@ fn sink_keeps_changes_while_its_target_is_unreachable() {
     eventually("sink", || {
         later.query("SELECT count(*) FROM v_copy").map(|r| r.rows[0][0].clone()).ok().flatten() == Some("6".to_string())
     });
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Tests driving the engine through its API (`EngineHandle::execute`)
