@@ -291,6 +291,16 @@ impl EngineHandle {
         Ok(rx)
     }
 
+    /// Log the commit of a spooled transaction without waiting (see
+    /// `log_async`).
+    pub fn log_spooled(&self, source: ObjectId, lsn: u64, spool: crate::log::Spooled) -> Result<Receiver<Gsn>> {
+        let (tx, rx) = bounded(1);
+        self.seq
+            .send(SeqMsg::AppendSpooled { source, lsn, spool, ack: Some(tx) })
+            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))?;
+        Ok(rx)
+    }
+
     pub fn shutdown(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
         let _ = self.tx.send(EngineMsg::Shutdown);
@@ -356,6 +366,7 @@ pub fn start(cfg: Config) -> Result<Running> {
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
     let mut writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
+    let _ = shared.spool.set(writer.spool_dir());
     let (env, recovered) = Env::open(
         &cfg.data_dir.join("store"),
         EnvOptions { cache_bytes: cfg.cache_bytes, ..Default::default() },
@@ -368,13 +379,15 @@ pub fn start(cfg: Config) -> Result<Running> {
     let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
     engine.handle = Some(handle.clone());
     engine.start_sinks(&handle)?;
-    // replay the log after the checkpoint
-    let records = crate::log::read_from(&cfg.data_dir.join("log"), engine.processed)?;
-    if !records.is_empty() {
-        log::info!("replaying {} log records after gsn {}", records.len(), engine.processed);
-    }
-    for (gsn, rec) in records {
+    // replay the log after the checkpoint, one record at a time
+    let (from, mut replayed) = (engine.processed, 0u64);
+    for r in crate::log::read_from(&cfg.data_dir.join("log"), engine.processed)? {
+        let (gsn, rec) = r?;
         engine.apply_record(gsn, rec)?;
+        replayed += 1;
+    }
+    if replayed > 0 {
+        log::info!("replayed {replayed} log records after gsn {from}");
     }
     // The checkpoint can be ahead of the log if the log lost records it
     // covers (an unsynced tail with --no-sync): GSNs must continue after
@@ -580,7 +593,7 @@ impl Engine {
                 Some(EngineMsg::Durable(batch)) => {
                     for (gsn, rec) in batch {
                         let dml = match &rec {
-                            LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
+                            LogRecord::Commit { source: 0, lsn, .. } | LogRecord::CommitParts { source: 0, lsn, .. } => Some(*lsn),
                             _ => None,
                         };
                         if let Err(e) = self.apply_record(gsn, rec) {
@@ -722,35 +735,10 @@ impl Engine {
             return Ok(());
         }
         match rec {
-            LogRecord::Commit { source, lsn, changes } => {
-                // local DML is planned when it arrives, but DDL logged before
-                // it (a DROP of its table) applies first: then it applies nothing
-                let dropped = source == 0 && changes.iter().any(|(t, _)| !self.rt.tables.contains_key(t));
-                let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
-                for (table, ch) in changes {
-                    if let Some(n) = self.rt.tables.get(&table) {
-                        by_node.entry(*n).or_default().push(ch);
-                    }
-                }
-                let outputs = self.graph.step(&mut self.env, gsn, by_node)?;
-                self.processed = gsn;
-                self.deliver(gsn, &outputs);
-                if source == 0 {
-                    // local DML: lsn carries the request id
-                    let n = self.dml_counts.remove(&lsn).unwrap_or_default();
-                    let res = if dropped {
-                        Err(SqlError::new(codes::UNDEFINED_TABLE, "the table of this statement was dropped before it could be applied"))
-                    } else {
-                        Ok(ExecResult::Command { tag: n })
-                    };
-                    self.reply_pending(lsn, res);
-                    self.drain_dml_queue();
-                } else if self.catalog.get(source).is_some() {
-                    // (a dropped source's thread may still log a record
-                    // before it notices that it was stopped)
-                    let e = self.source_lsns.entry(source).or_insert(0);
-                    *e = (*e).max(lsn);
-                }
+            LogRecord::Commit { source, lsn, changes } => self.apply_commit(gsn, source, lsn, std::iter::once(Ok(changes)))?,
+            LogRecord::CommitParts { source, lsn, parts, changes } => {
+                let parts = crate::log::read_parts(&self.cfg.data_dir.join("log"), gsn, parts, changes)?;
+                self.apply_commit(gsn, source, lsn, parts)?;
             }
             LogRecord::Ddl { req, sql, extra } => {
                 let res = self.apply_ddl(gsn, &sql, &extra);
@@ -814,6 +802,45 @@ impl Engine {
         }
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
         self.records_since_checkpoint += 1;
+        Ok(())
+    }
+
+    /// Apply a commit whose changes come in batches, in order: one for a
+    /// `Commit` record, one per part of a `CommitParts` record.
+    fn apply_commit(&mut self, gsn: Gsn, source: ObjectId, lsn: u64, batches: impl Iterator<Item = Result<Vec<(ObjectId, TableChange)>>>) -> Result<()> {
+        // local DML is planned when it arrives, but DDL logged before it (a
+        // DROP of its table) applies first: then it applies nothing
+        let mut dropped = false;
+        // (the dataflow steps a GSN with all of its changes: the parts of a
+        // commit are assembled here, read one at a time)
+        let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
+        for batch in batches {
+            for (table, ch) in batch? {
+                match self.rt.tables.get(&table) {
+                    Some(n) => by_node.entry(*n).or_default().push(ch),
+                    None => dropped |= source == 0,
+                }
+            }
+        }
+        let outputs = self.graph.step(&mut self.env, gsn, by_node)?;
+        self.processed = gsn;
+        self.deliver(gsn, &outputs);
+        if source == 0 {
+            // local DML: lsn carries the request id
+            let n = self.dml_counts.remove(&lsn).unwrap_or_default();
+            let res = if dropped {
+                Err(SqlError::new(codes::UNDEFINED_TABLE, "the table of this statement was dropped before it could be applied"))
+            } else {
+                Ok(ExecResult::Command { tag: n })
+            };
+            self.reply_pending(lsn, res);
+            self.drain_dml_queue();
+        } else if self.catalog.get(source).is_some() {
+            // (a dropped source's thread may still log a record
+            // before it notices that it was stopped)
+            let e = self.source_lsns.entry(source).or_insert(0);
+            *e = (*e).max(lsn);
+        }
         Ok(())
     }
 

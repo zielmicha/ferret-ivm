@@ -5,7 +5,7 @@
 use super::api::Shared;
 use super::EngineMsg;
 use crate::error::Result;
-use crate::log::{LogRecord, LogWriter};
+use crate::log::{LogRecord, LogWriter, Spooled};
 use crate::storage::Gsn;
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::Ordering;
@@ -14,6 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub enum SeqMsg {
     Append { rec: LogRecord, ack: Option<Sender<Gsn>> },
+    /// The commit of a transaction a source spooled (`log::Spool`): logged
+    /// as `CommitParts`, with the spool as its parts file.
+    AppendSpooled { source: crate::sql::plan::ObjectId, lsn: u64, spool: Spooled, ack: Option<Sender<Gsn>> },
     Truncate(Gsn),
     Shutdown,
 }
@@ -96,6 +99,15 @@ impl Sequencer {
                         }
                         durable.push((gsn, rec));
                     }
+                    SeqMsg::AppendSpooled { source, lsn, spool, ack } => {
+                        let gsn = next;
+                        next += 1;
+                        let rec = self.writer.append_spooled(gsn, source, lsn, spool)?;
+                        if let Some(a) = ack {
+                            acks.push((a, gsn));
+                        }
+                        durable.push((gsn, rec));
+                    }
                     SeqMsg::Truncate(g) => self.writer.truncate_before(g)?,
                     SeqMsg::Shutdown => shutdown = true,
                 }
@@ -151,7 +163,7 @@ mod tests {
         tx.send(SeqMsg::Shutdown).unwrap();
         t.join().unwrap();
         drop(erx);
-        let ticks = read_from(&dir, 0).unwrap().iter().filter(|(_, r)| matches!(r, LogRecord::Tick { .. })).count();
+        let ticks = read_from(&dir, 0).unwrap().map(|r| r.unwrap()).filter(|(_, r)| matches!(r, LogRecord::Tick { .. })).count();
         assert!(ticks >= 10, "only {ticks} ticks in 300ms at a 5ms interval");
         let _ = std::fs::remove_dir_all(&dir);
     }

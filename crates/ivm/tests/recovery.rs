@@ -212,6 +212,31 @@ fn log_tail_lost_behind_a_checkpoint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A commit larger than a log frame (a statement inserting 3 MB) is logged
+/// as a parts file of bounded frames and a CommitParts record, and is
+/// replayed from them after a crash.
+#[test]
+fn large_commits_replay_from_their_parts() {
+    let dir = tmpdir("parts");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, s text)");
+    exec(&h, "CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n, sum(length(s)) AS l FROM t");
+    exec(&h, "CHECKPOINT");
+    exec(&h, "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(1, 3000) g");
+    exec(&h, "DELETE FROM t WHERE id <= 1000");
+    let parts = || std::fs::read_dir(dir.join("log")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("parts-")).count();
+    assert_eq!(parts(), 1);
+    assert_eq!(rows(&h, "SELECT * FROM c"), ["2000|2000000"]);
+    running.crash();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT * FROM c"), ["2000|2000000"]);
+    assert_eq!(rows(&h, "SELECT count(*), min(id) FROM t"), ["2000|1001"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// AS OF reads use only arrangements whose history covers the read's GSN:
 /// an index built later (it has no history before its creation) used to
 /// answer point queries with nothing, and a view rebuilt by CREATE OR

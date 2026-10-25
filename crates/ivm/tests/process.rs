@@ -67,7 +67,7 @@ fn connect(port: u16) -> pgproto::Client {
 fn checkpoint_covers_the_log(data: &Path) -> bool {
     let (_env, rec) = ivm::storage::Env::open(&data.join("store"), Default::default()).unwrap();
     let gsn = rec.expect("a checkpoint").gsn;
-    ivm::log::read_from(&data.join("log"), gsn).unwrap().is_empty()
+    ivm::log::read_from(&data.join("log"), gsn).unwrap().next().is_none()
 }
 
 /// A listen address that cannot be bound fails at once, with status 1 (it

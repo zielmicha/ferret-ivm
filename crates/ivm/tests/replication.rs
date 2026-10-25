@@ -335,6 +335,31 @@ fn ddl_and_dml_in_one_upstream_transaction() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An upstream transaction larger than what the source holds in memory (6
+/// MB here) is spooled to the log directory as it arrives and logged as
+/// one commit with its parts; it applies as one transaction, also when it
+/// is replayed after a crash.
+#[test]
+fn large_upstream_transactions_are_spooled() {
+    let (mut up, mut ivm, dir) = setup("large-txn", &["CREATE TABLE t (id int PRIMARY KEY, s text)", "INSERT INTO t VALUES (0, 'x')"]);
+    ivm.exec("CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n, sum(length(s)) AS l FROM t");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["1|1"]);
+    ivm.exec("CHECKPOINT");
+    up.exec("BEGIN; INSERT INTO t SELECT g, repeat('y', 1000) FROM generate_series(1, 6000) g; UPDATE t SET s = 'zz' WHERE id = 0; COMMIT");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["6001|6000002"]);
+    let files = |prefix: &str| std::fs::read_dir(dir.join("log")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(prefix)).count();
+    assert_eq!(files("parts-"), 1, "logged as one commit with its parts");
+    assert_eq!(files("spool-"), 0);
+    // replayed from the log after a crash (no checkpoint since the commit)
+    ivm.running.take().unwrap().crash();
+    drop(ivm);
+    let mut ivm = Ivm::start(&dir);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["6001|6000002"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT s FROM t WHERE id = 0"), ["zz"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Rows deleted upstream while a table is re-snapshotted after a schema
 /// change are deleted: the re-snapshot only upserts the rows it reads, and
 /// the deletes of keys it had not reached yet used to be skipped.

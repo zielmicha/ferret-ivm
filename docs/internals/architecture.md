@@ -119,6 +119,15 @@ snapshot requests queued at the engine.
 1. The source thread collects the changes of one upstream transaction and,
    at its commit, sends `SeqMsg::Append { rec: Commit, ack: Some(tx) }` to the
    sequencer without waiting (`log_async`). Several commits can be in flight.
+   It holds at most `log::PART_BYTES` (1 MiB) of a transaction's changes:
+   beyond that it writes them, as they arrive, to a spool file in the log
+   directory (`log::Spool`), and at the commit sends the finished spool
+   instead (`SeqMsg::AppendSpooled`, `log_spooled`), which the sequencer
+   renames to the parts file of the commit's GSN and logs as a
+   `CommitParts` record ([On-disk format](../on-disk-format.md#parts-files)).
+   With protocol version 1, `pgoutput` sends a transaction only once it has
+   committed, so a spool is never aborted; a session that ends in the middle
+   of one deletes it (the upstream sends the transaction again).
 2. The sequencer assigns the next GSN, appends the record, and at the end of
    the batch `fsync`s the log, publishes `durable_gsn`, sends the GSN on each
    `ack` channel, and forwards the batch to the engine as
@@ -131,7 +140,9 @@ snapshot requests queued at the engine.
    which wakes reads waiting for an LSN.
 4. The engine applies the record: the changes go through the dataflow at
    that GSN (`Graph::step`), and the outputs are delivered to subscriptions
-   and sinks.
+   and sinks. A `CommitParts` record's changes are read from its parts file
+   one part at a time (`apply_commit`); the dataflow then steps the GSN with
+   all of them.
 
 Source progress (snapshot bookkeeping) and schema records are logged with
 the blocking `EngineHandle::log`, which returns once the record is durable.
@@ -186,8 +197,12 @@ dataflow so that temporal filters release due events.
 The sequencer processes messages in batches: it blocks for the first message
 (or the tick deadline), adds a tick if one is due, then drains more messages
 without blocking, up to 4096 per batch. All `Append`s of a batch are encoded
-into one buffer, written with one `write`, and made durable with one
-`fdatasync`. Only then are acknowledgements sent
+into one buffer, written with one `write` (or several: the buffer is
+written out whenever it reaches 8 MiB), and made durable with one
+`fdatasync`. A commit with more than `log::PART_BYTES` of changes (local
+DML) is written to its parts file, made durable first, and logged as a
+small `CommitParts` record, so no frame holds more than about 1 MiB of
+changes. Only then are acknowledgements sent
 and the records handed to the engine — no record is applied, acknowledged to
 a source, or answered to a client before it is durable. Under load, batches
 grow and the cost of `fsync` is shared; when idle, a batch is a single
@@ -226,7 +241,7 @@ takes a checkpoint if one is due, and removes cancelled subscriptions.
 
 | Record | Effect |
 |---|---|
-| `Commit` | group the changes by table (changes to tables that no longer exist are skipped), `Graph::step` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
+| `Commit`, `CommitParts` | group the changes by table (changes to tables that no longer exist are skipped; a `CommitParts` record's are read from its parts file, one part at a time), `Graph::step` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); reply |
 | `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
 | `Schema` | rebuild the table in its new shape and re-plan dependent views ([Sources](../user-guide/sources.md#upstream-schema-changes)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged |

@@ -124,6 +124,9 @@ pub struct Shared {
     pub failed: AtomicBool,
     /// Stop without the final checkpoint (simulated crash, for tests).
     pub crash: AtomicBool,
+    /// Where sources spool transactions too large to hold in memory (set
+    /// once the log is open; without it they hold them).
+    pub spool: std::sync::OnceLock<crate::log::SpoolDir>,
 }
 
 impl Shared {

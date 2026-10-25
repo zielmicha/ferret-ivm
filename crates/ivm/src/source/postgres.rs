@@ -11,7 +11,11 @@
 //!   win over chunk rows; outside it, keys beyond the snapshot boundary are
 //!   skipped because a later chunk will capture them;
 //! - the slot is acknowledged as soon as a commit is durable in the
-//!   engine's input log.
+//!   engine's input log;
+//! - a transaction is collected until its commit, in memory up to
+//!   `log::PART_BYTES` of changes and beyond that in a spool file of the
+//!   log directory (`log::Spool`), so that its size is not bounded by
+//!   memory.
 
 use super::{SourceCtl, SourceTable};
 use crate::catalog::SourceDef;
@@ -19,7 +23,7 @@ use crate::coord::ddl::DiscoveredTable;
 use crate::coord::EngineHandle;
 use crate::dataflow::TableChange;
 use crate::error::{codes, Result, SqlError};
-use crate::log::LogRecord;
+use crate::log::{LogRecord, Spool, PART_BYTES};
 use crate::sql::plan::ObjectId;
 use crate::types::encoding::{encode_key, SortSpec};
 use crate::types::text::{format_datum, parse_datum};
@@ -260,7 +264,12 @@ enum ChunkError {
 
 struct Txn {
     xid: u32,
+    /// Changes not written to the spool (all of them while they are few).
     changes: Vec<(ObjectId, TableChange)>,
+    /// Estimated encoded size of `changes`.
+    bytes: usize,
+    /// The earlier changes, once they took `PART_BYTES` (see `spill`).
+    spool: Option<Spool>,
     /// Chunk rows to emit at this transaction's commit (high watermark).
     finish_chunk: bool,
 }
@@ -395,9 +404,35 @@ impl PgSource {
     }
 
     fn handle_message(&mut self, msg: LogicalMessage) -> Result<()> {
+        self.decode_message(msg)?;
+        self.spill()
+    }
+
+    /// Write the open transaction's changes to its spool once they take
+    /// `PART_BYTES`: upstream transactions arrive whole, between Begin and
+    /// Commit (pgoutput protocol version 1 sends only committed ones), and
+    /// can be larger than memory. (Without a spool directory, which only
+    /// tests lack, they are held.)
+    fn spill(&mut self) -> Result<()> {
+        let Some(t) = &mut self.txn else { return Ok(()) };
+        if t.bytes < PART_BYTES {
+            return Ok(());
+        }
+        let Some(dir) = self.engine.shared.spool.get() else { return Ok(()) };
+        let spool = match &mut t.spool {
+            Some(s) => s,
+            None => t.spool.insert(Spool::create(dir)?),
+        };
+        spool.write(&t.changes)?;
+        t.changes = Vec::new();
+        t.bytes = 0;
+        Ok(())
+    }
+
+    fn decode_message(&mut self, msg: LogicalMessage) -> Result<()> {
         match msg {
             LogicalMessage::Begin { xid, .. } => {
-                self.txn = Some(Txn { xid, changes: Vec::new(), finish_chunk: false });
+                self.txn = Some(Txn { xid, changes: Vec::new(), bytes: 0, spool: None, finish_chunk: false });
             }
             LogicalMessage::Relation(rel) => self.handle_relation(rel)?,
             LogicalMessage::Insert { relation_id, new } => {
@@ -558,12 +593,19 @@ impl PgSource {
                         self.unseen.clear();
                     }
                 }
-                if !txn.changes.is_empty() {
-                    self.gauges.commit(txn.changes.len());
-                    let rec = LogRecord::Commit { source: self.id, lsn: end_lsn.0, changes: txn.changes };
+                let n = txn.changes.len() + txn.spool.as_ref().map_or(0, |s| s.changes() as usize);
+                if n > 0 {
+                    self.gauges.commit(n);
                     // pipelined: the sequencer group-commits; durability is
                     // confirmed asynchronously before acknowledging the slot
-                    let rx = self.engine.log_async(rec)?;
+                    let rx = match txn.spool {
+                        // (the spool becomes the commit's parts file)
+                        Some(mut spool) => {
+                            spool.write(&txn.changes)?;
+                            self.engine.log_spooled(self.id, end_lsn.0, spool.finish()?)?
+                        }
+                        None => self.engine.log_async(LogRecord::Commit { source: self.id, lsn: end_lsn.0, changes: txn.changes })?,
+                    };
                     self.inflight.push_back((end_lsn.0, rx));
                 } else {
                     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -601,6 +643,10 @@ impl PgSource {
         let truncate = !t.pk.is_empty();
         if let Some(txn) = &mut self.txn {
             txn.changes.retain(|(c, _)| *c != table);
+            txn.bytes = txn.changes.iter().map(|(_, c)| crate::log::change_len(c)).sum();
+            if let Some(spool) = &mut txn.spool {
+                spool.rewrite(&mut |ch| ch.retain(|(c, _)| *c != table))?;
+            }
         }
         self.state.tables.insert(table, SnapState { truncate, ..Default::default() });
         self.start_copying();
@@ -634,7 +680,10 @@ impl PgSource {
 
     fn push_change(&mut self, table: ObjectId, ch: TableChange) {
         match &mut self.txn {
-            Some(t) => t.changes.push((table, ch)),
+            Some(t) => {
+                t.bytes += crate::log::change_len(&ch);
+                t.changes.push((table, ch));
+            }
             None => log::warn!("change outside a transaction ignored"),
         }
     }
@@ -739,6 +788,10 @@ impl PgSource {
         // decoded in the old shape and must take the new one.
         if let Some(txn) = &mut self.txn {
             reshape_changes(&mut txn.changes, &t, table, &columns, &pk);
+            txn.bytes = txn.changes.iter().map(|(_, c)| crate::log::change_len(c)).sum();
+            if let Some(spool) = &mut txn.spool {
+                spool.rewrite(&mut |ch| reshape_changes(ch, &t, table, &columns, &pk))?;
+            }
         }
         // Re-snapshot: to fill new columns of existing rows, and after a key
         // change from an empty table, as deletes by the old key were lost
@@ -1461,7 +1514,8 @@ mod tests {
     use pgproto::pgoutput::RelationColumn;
 
     /// An engine handle whose sequencer acknowledges every append at once
-    /// and keeps the records.
+    /// and keeps the records (the commit of a spooled transaction as a
+    /// `Commit` with its changes).
     fn fake_engine() -> (EngineHandle, Arc<Mutex<Vec<LogRecord>>>) {
         let (etx, _) = crossbeam_channel::unbounded();
         let (stx, srx) = crossbeam_channel::unbounded::<SeqMsg>();
@@ -1470,16 +1524,25 @@ mod tests {
         std::thread::spawn(move || {
             let mut gsn = 0;
             for m in srx {
-                if let SeqMsg::Append { rec, ack } = m {
-                    gsn += 1;
-                    l2.lock().push(rec);
-                    if let Some(a) = ack {
-                        let _ = a.send(gsn);
-                    }
+                let (rec, ack) = match m {
+                    SeqMsg::Append { rec, ack } => (rec, ack),
+                    SeqMsg::AppendSpooled { source, lsn, spool, ack } => (LogRecord::Commit { source, lsn, changes: spool.read() }, ack),
+                    _ => continue,
+                };
+                gsn += 1;
+                l2.lock().push(rec);
+                if let Some(a) = ack {
+                    let _ = a.send(gsn);
                 }
             }
         });
-        (EngineHandle { tx: etx, seq: stx, shared: Arc::new(Shared::default()) }, log)
+        let shared = Arc::new(Shared::default());
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let base = std::env::var("IVM_TEST_TMP").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("ivm-source-spool-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap();
+        shared.spool.set(crate::log::SpoolDir { dir, sync: false }).unwrap();
+        (EngineHandle { tx: etx, seq: stx, shared }, log)
     }
 
     fn int_cols(names: &[&str]) -> Vec<Column> {
@@ -1898,6 +1961,115 @@ mod tests {
             other => panic!("unexpected records {other:?}"),
         }
         assert!(!src.state.tables[&10].done && src.state.tables[&10].truncate);
+    }
+
+    /// Table 10 (id int, s text) and table 11 (id int), both copied, with
+    /// their Relation messages in an open transaction.
+    fn text_and_int_tables() -> (PgSource, Arc<Mutex<Vec<LogRecord>>>) {
+        let mut t = table(&["id", "s"], vec![0]);
+        t.columns[1] = Column::new("s", ColumnType::new(SqlType::Text));
+        let u = SourceTable { id: 11, upstream: ("public".into(), "u".into()), columns: int_cols(&["id"]), pk: vec![0] };
+        let mut state = done_state(10);
+        state.tables.insert(11, SnapState { done: true, ..Default::default() });
+        let (mut src, log) = source(vec![t, u], state);
+        src.handle_message(begin(5)).unwrap();
+        let LogicalMessage::Relation(mut rel) = relation(&["id", "s"], 1) else { unreachable!() };
+        rel.columns[1].type_oid = 25;
+        src.handle_message(LogicalMessage::Relation(rel)).unwrap();
+        let LogicalMessage::Relation(mut rel_u) = relation(&["id"], 1) else { unreachable!() };
+        (rel_u.id, rel_u.name) = (REL + 1, "u".into());
+        src.handle_message(LogicalMessage::Relation(rel_u)).unwrap();
+        (src, log)
+    }
+
+    fn text_row(id: i32, s: &[u8]) -> LogicalMessage {
+        LogicalMessage::Insert { relation_id: REL, new: vec![TupleValue::Text(id.to_string().into_bytes()), TupleValue::Text(s.to_vec())] }
+    }
+
+    fn int_row(id: i32) -> LogicalMessage {
+        LogicalMessage::Insert { relation_id: REL + 1, new: vec![TupleValue::Text(id.to_string().into_bytes())] }
+    }
+
+    fn logged_changes(log: &Mutex<Vec<LogRecord>>) -> Vec<(ObjectId, TableChange)> {
+        log.lock()
+            .iter()
+            .filter_map(|r| match r {
+                LogRecord::Commit { changes, .. } => Some(changes.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// A transaction larger than memory: its changes beyond `PART_BYTES`
+    /// are spooled as they arrive and logged at its commit, in order. It
+    /// used to be held whole until its commit.
+    #[test]
+    fn large_transactions_are_spooled() {
+        let (mut src, log) = text_and_int_tables();
+        let value = vec![b'v'; 1000];
+        for i in 0..3000 {
+            src.handle_message(text_row(i, &value)).unwrap();
+            let txn = src.txn.as_ref().unwrap();
+            assert!(txn.bytes < PART_BYTES, "{} bytes held after {i} changes", txn.bytes);
+        }
+        assert!(src.txn.as_ref().unwrap().spool.as_ref().is_some_and(|s| s.changes() > 2000));
+        src.handle_message(commit(100)).unwrap();
+        src.drain_acks(true).unwrap();
+        let changes = logged_changes(&log);
+        assert_eq!(changes.len(), 3000);
+        assert!(changes.iter().enumerate().all(|(i, (t, c))| *t == 10 && matches!(c, TableChange::Upsert { row, .. } if row[0] == Datum::Int4(i as i32))));
+        // nothing is left in the spool directory
+        let dir = &src.engine.shared.spool.get().unwrap().dir;
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+    }
+
+    /// Spooled changes take part in what happens later in their
+    /// transaction: a schema change reshapes them, a value that fails its
+    /// table drops that table's changes; and a session that ends before the
+    /// commit leaves no spool behind.
+    #[test]
+    fn spooled_changes_follow_their_transaction() {
+        let value = vec![b'v'; 1000];
+        // a schema change of table 10 (column b added) after 2000 changes
+        let (mut src, log) = text_and_int_tables();
+        for i in 0..2000 {
+            src.handle_message(text_row(i, &value)).unwrap();
+        }
+        assert!(src.txn.as_ref().unwrap().spool.is_some());
+        let LogicalMessage::Relation(mut rel) = relation(&["id", "s", "b"], 1) else { unreachable!() };
+        rel.columns[1].type_oid = 25;
+        src.handle_message(LogicalMessage::Relation(rel)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.drain_acks(true).unwrap();
+        let changes = logged_changes(&log);
+        assert_eq!(changes.len(), 2000);
+        assert!(changes.iter().all(|(_, c)| matches!(c, TableChange::Upsert { row, .. } if row.len() == 3 && row[2].is_null())));
+        // a value of table 10 that does not convert, after spooled changes
+        // of tables 10 and 11
+        let (mut src, log) = text_and_int_tables();
+        for i in 0..2000 {
+            src.handle_message(text_row(i, &value)).unwrap();
+            src.handle_message(int_row(i)).unwrap();
+        }
+        assert!(src.txn.as_ref().unwrap().spool.is_some());
+        src.handle_message(text_row(5000, &[0xe9])).unwrap();
+        src.handle_message(int_row(5000)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        src.drain_acks(true).unwrap();
+        let changes = logged_changes(&log);
+        assert_eq!(changes.len(), 2001);
+        assert!(changes.iter().all(|(t, _)| *t == 11));
+        // the session ends in the middle of a spooled transaction
+        let (mut src, log) = text_and_int_tables();
+        for i in 0..2000 {
+            src.handle_message(text_row(i, &value)).unwrap();
+        }
+        let dir = src.engine.shared.spool.get().unwrap().dir.clone();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        src.txn = None;
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(logged_changes(&log).is_empty());
     }
 
     /// A change to a key beyond the chunks read so far is skipped, because a

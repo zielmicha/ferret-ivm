@@ -192,6 +192,33 @@ pub fn encode_datum(d: &Datum, out: &mut Vec<u8>) {
     }
 }
 
+/// About the length of `encode_datum`'s encoding, without encoding (to
+/// bound batches by size): exact but for numeric and jsonb values.
+pub fn approx_len(d: &Datum) -> usize {
+    fn jsonb(j: &pgfuncs::json::Jsonb) -> usize {
+        use pgfuncs::json::Jsonb;
+        match j {
+            Jsonb::Null | Jsonb::Bool(_) => 5,
+            Jsonb::Number(_) => 12,
+            Jsonb::String(s) => s.len() + 2,
+            Jsonb::Array(v) => 2 + v.iter().map(|e| jsonb(e) + 1).sum::<usize>(),
+            Jsonb::Object(v) => 2 + v.iter().map(|(k, e)| k.len() + 4 + jsonb(e)).sum::<usize>(),
+        }
+    }
+    1 + match d {
+        Datum::Null | Datum::Bool(_) => 0,
+        Datum::Int2(_) | Datum::Int4(_) | Datum::Date(_) | Datum::Oid(_) => 4,
+        Datum::Int8(_) | Datum::Float4(_) | Datum::Float8(_) | Datum::Time(_) | Datum::Timestamp(_) | Datum::TimestampTz(_) => 8,
+        Datum::Numeric(_) => 16,
+        Datum::Text(s) | Datum::Json(s) => s.len() + 3,
+        Datum::Bytea(b) => b.len() + 3,
+        Datum::Interval(_) => 16,
+        Datum::Uuid(_) => 16,
+        Datum::Jsonb(j) => jsonb(j) + 3,
+        Datum::Array(a) => 8 + a.dims.len() * 8 + a.elems.iter().map(approx_len).sum::<usize>(),
+    }
+}
+
 pub fn decode_datum(buf: &mut &[u8]) -> Result<Datum> {
     let tag = get_u8(buf)?;
     Ok(match tag {

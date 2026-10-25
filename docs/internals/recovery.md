@@ -30,10 +30,14 @@ with status 1 at once) and accepts connections only once recovery is done.
 1. **Lock** `LOCK` (exclusive `flock`, retried for up to 2 s: a process
    forked while the lock was held keeps a copy of it until it execs); fail
    (`55006`) if another process holds it.
-2. **Open the log** (`LogWriter::open`): read the newest segment, parse frames
-   until the first one that is incomplete, fails its CRC or does not decode,
-   truncate the file there (`fsync`), and take the last GSN (from the
-   previous segment if the newest one is empty).
+2. **Open the log** (`LogWriter::open`): read the newest segment's frames
+   until the first one that is incomplete or fails its CRC (without
+   decoding them), truncate the file there (`fsync`), and take the last GSN
+   (from the previous segment if the newest one is empty). Delete the spools
+   of upstream transactions that never committed and the parts files of
+   commits above the last GSN: a multi-part commit whose `CommitParts`
+   record is missing is discarded whole
+   ([On-disk format](../on-disk-format.md#parts-files)).
 3. **Open the store** (`Env::open`): read `MANIFEST`, keep the last record
    whose CRC is valid, and truncate a torn tail. Re-open the active segment
    truncated to the recorded length, delete segment files the record does
@@ -76,10 +80,13 @@ with status 1 at once) and accepts connections only once recovery is done.
    text and `extra`, no source is started, and nobody is waiting for
    replies; the sinks receive the replayed changes (a sink created by a
    replayed `CREATE SINK` starts then), and slot drops of replayed
-   `DROP SOURCE`s are recorded. Reading the log (`log::read_from`) refuses
-   invalid data anywhere but at the end of the newest segment, and a gap in
-   the GSNs after the checkpoint, as corruption: replaying around them would
-   silently skip records. A DDL or schema record that fails is only logged,
+   `DROP SOURCE`s are recorded. The log is read one frame at a time
+   (`log::read_from` is an iterator; a `CommitParts` record's parts are read
+   one at a time when it is applied), so what replay holds is bounded by the
+   largest frame, not by the backlog. Reading it refuses invalid data
+   anywhere but at the end of the newest segment, a frame that does not
+   decode, and a gap in the GSNs after the checkpoint, as corruption:
+   replaying around them would silently skip records. A DDL or schema record that fails is only logged,
    but any other record that fails to apply stops the start-up with its
    error.
 9. If the log ends before the checkpoint's GSN (an unsynced tail lost with
