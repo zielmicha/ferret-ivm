@@ -46,6 +46,15 @@ const RECONNECT_MAX: Duration = Duration::from_secs(10);
 const TABLE_RETRY_MIN: Duration = Duration::from_secs(1);
 const TABLE_RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// Delay before retrying a chunk whose snapshot did not see every decoded
+/// transaction yet (see `snapshot_sees_decoded`).
+const CHUNK_WAIT: Duration = Duration::from_millis(100);
+/// Recently decoded transactions remembered (see `PgSource::recent`).
+const RECENT_XIDS: usize = 1024;
+/// Above this many unseen transactions, they are checked against a fresh
+/// snapshot (at most once a second) instead of waiting for a chunk.
+const UNSEEN_MAX: usize = 10_000;
+
 fn qident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -274,6 +283,16 @@ struct PgSource {
     session: Session,
     /// Tables whose snapshot chunk failed (see `maybe_start_chunk`).
     failing: BTreeMap<ObjectId, TableFailure>,
+    /// Transactions decoded while some table is being copied that no
+    /// chunk's snapshot has seen yet (see `snapshot_sees_decoded`).
+    unseen: std::collections::BTreeSet<u32>,
+    /// The last transactions decoded, for `unseen` when a table starts
+    /// (again) to be copied.
+    recent: std::collections::VecDeque<u32>,
+    /// No chunk before this (see `CHUNK_WAIT`).
+    chunk_wait: Option<Instant>,
+    /// When `unseen` was last checked against a fresh snapshot.
+    unseen_checked: Instant,
 }
 
 fn pk_bytes(row: &[Datum], pk: &[usize]) -> Vec<u8> {
@@ -494,6 +513,7 @@ impl PgSource {
                 }
                 self.session.progressed = true;
                 let Some(mut txn) = txn else { return Ok(()) };
+                self.note_decoded(txn.xid);
                 let mut progress = false;
                 if txn.finish_chunk
                     && let Some(ch) = self.chunk.take()
@@ -507,6 +527,9 @@ impl PgSource {
                     st.done = ch.last;
                     progress = true;
                     self.refresh_status();
+                    if !self.copying() {
+                        self.unseen.clear();
+                    }
                 }
                 if !txn.changes.is_empty() {
                     self.gauges.commit(txn.changes.len());
@@ -589,6 +612,7 @@ impl PgSource {
         for t in tables {
             self.tables.insert(t.id, t);
         }
+        self.start_copying();
         let known: Vec<u32> = self.unmapped_rels.values().filter(|r| self.table_of(r).is_some()).map(|r| r.id).collect();
         for id in known {
             if let Some(rel) = self.unmapped_rels.remove(&id) {
@@ -665,6 +689,7 @@ impl PgSource {
         // between then copies the table in its old shape and detects the
         // change again, while the other order would forget the re-snapshot.
         self.state.tables.insert(table, SnapState { truncate: !same_key && !pk.is_empty(), ..Default::default() });
+        self.start_copying();
         if self.chunk.as_ref().is_some_and(|c| c.table == table) {
             self.chunk = None;
             self.refresh_status();
@@ -745,10 +770,25 @@ impl PgSource {
     /// is copied, as for any table not copied yet, and fresh reads of it
     /// keep waiting.
     fn maybe_start_chunk(&mut self) -> Result<()> {
+        if self.unseen.len() > UNSEEN_MAX && self.unseen_checked.elapsed() >= Duration::from_secs(1) {
+            // (no chunk has checked them for a while: a table that cannot
+            // be read, say)
+            let q = match &mut self.query {
+                Some(q) => q,
+                None => self.query.insert(connect(&self.def.conninfo, false)?),
+            };
+            let res = q.simple_query("SELECT pg_current_snapshot()::text")?;
+            if let Some(snap) = res.iter().find_map(|r| r.rows.first()).and_then(|r| r[0].as_deref()).and_then(parse_snapshot) {
+                self.snapshot_sees_decoded(&snap);
+            }
+        }
         if self.chunk.is_some() {
             return Ok(());
         }
         let now = Instant::now();
+        if self.chunk_wait.is_some_and(|w| w > now) {
+            return Ok(());
+        }
         let next = self
             .tables
             .keys()
@@ -788,7 +828,25 @@ impl PgSource {
             max_key_text: None,
             last: true,
         };
-        match read_chunk(q, &t, boundary.as_deref(), &mut chunk) {
+        let read = begin_snapshot(q).map(|snap| chunk.snap = snap);
+        // The chunk can only replace changes the stream skipped (or applied
+        // to rows it will overwrite) if its snapshot contains them. A
+        // transaction becomes visible only after its commit record is
+        // written, which is when it can be decoded: one decoded already can
+        // still be invisible (briefly, or for as long as a synchronous
+        // standby takes to confirm it). Then wait for it.
+        if read.is_ok()
+            && let Some(snap) = &chunk.snap
+            && !self.snapshot_sees_decoded(snap)
+        {
+            let q = self.query.as_mut().unwrap();
+            q.simple_query("ROLLBACK")?;
+            log::debug!("source {}: a chunk's snapshot does not see {} transactions decoded before it; waiting", self.id, self.unseen.len());
+            self.chunk_wait = Some(now + CHUNK_WAIT);
+            return Ok(());
+        }
+        let q = self.query.as_mut().unwrap();
+        match read.and_then(|()| read_chunk(q, &t, boundary.as_deref(), &mut chunk)) {
             Ok(()) => {}
             Err(ChunkError::Session(e)) => return Err(e),
             Err(ChunkError::Table(e)) => {
@@ -848,24 +906,67 @@ impl PgSource {
     fn publish_failures(&self) {
         *self.gauges.table_errors.lock() = self.failing.iter().map(|(t, f)| (*t, f.error.clone())).collect();
     }
+
+    /// Some table still has to be copied.
+    fn copying(&self) -> bool {
+        self.tables.keys().any(|t| !self.state.tables.get(t).is_some_and(|s| s.done))
+    }
+
+    /// A transaction was decoded (at its commit).
+    fn note_decoded(&mut self, xid: u32) {
+        if self.recent.len() == RECENT_XIDS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(xid);
+        if self.copying() {
+            self.unseen.insert(xid);
+        }
+    }
+
+    /// Tables start (again) to be copied: transactions decoded shortly
+    /// before, which they skipped or which changed their rows, must be
+    /// visible to their chunks too.
+    fn start_copying(&mut self) {
+        self.unseen.extend(self.recent.iter().copied());
+    }
+
+    /// Does a chunk's snapshot see every transaction decoded while tables
+    /// are being copied? (Forgets those it sees: later snapshots see them.)
+    ///
+    /// Changes to keys beyond the chunks read so far are skipped (and
+    /// deletes of them applied to whatever is stored), because a later chunk
+    /// reads the rows' current values; a table that starts to be copied
+    /// again is read over the changes the stream applied to it. That holds
+    /// only if those later snapshots contain the decoded transactions.
+    fn snapshot_sees_decoded(&mut self, snap: &(u64, u64, Vec<u64>)) -> bool {
+        self.unseen.retain(|x| !xid_visible(snap, *x));
+        self.unseen_checked = Instant::now();
+        self.unseen.is_empty()
+    }
 }
 
-/// Read a snapshot chunk of `t` after `boundary` into `chunk`: its rows and
-/// the snapshot they were read with, in one REPEATABLE READ transaction.
+/// A server error leaves the connection usable: the table cannot be read.
+/// Others end the session.
+fn chunk_error(q: &Client, e: pgproto::Error) -> ChunkError {
+    if e.kind == pgproto::ErrorKind::Server && q.is_usable() { ChunkError::Table(e.into()) } else { ChunkError::Session(e.into()) }
+}
+
+/// Open a chunk's REPEATABLE READ transaction and take its snapshot, which
+/// the chunk's query uses.
+fn begin_snapshot(q: &mut Client) -> std::result::Result<Option<(u64, u64, Vec<u64>)>, ChunkError> {
+    let res = q.simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text").map_err(|e| chunk_error(q, e))?;
+    Ok(res.iter().find_map(|r| r.rows.first()).and_then(|r| r[0].as_deref()).and_then(parse_snapshot))
+}
+
+/// Read a snapshot chunk of `t` after `boundary` into `chunk`, in the
+/// transaction `begin_snapshot` opened, and end that transaction.
 fn read_chunk(q: &mut Client, t: &SourceTable, boundary: Option<&[String]>, chunk: &mut Chunk) -> std::result::Result<(), ChunkError> {
     let tname = format!("{}.{}", qident(&t.upstream.0), qident(&t.upstream.1));
     // values arrive in text format through the simple query protocol;
     // no casts here, so ORDER BY below refers to the real columns
     let cols = t.columns.iter().map(|c| qident(&c.name)).collect::<Vec<_>>().join(", ");
     if t.pk.is_empty() {
-        let (snap_text, rows) = chunk_query(
-            q,
-            &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; SELECT {cols} FROM {tname}; COMMIT"),
-            t,
-            &mut Vec::new(),
-        )?;
-        chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
-        chunk.multiset = rows;
+        chunk.multiset = chunk_query(q, &format!("SELECT {cols} FROM {tname}; COMMIT"), t, &mut Vec::new())?;
         return Ok(());
     }
     // Chunks must be ordered as the engine orders keys (memcmp of the key
@@ -905,20 +1006,13 @@ fn read_chunk(q: &mut Client, t: &SourceTable, boundary: Option<&[String]>, chun
             format!(" WHERE ({}) > ({})", pk_cols.join(", "), lits.join(", "))
         }
     };
-    // the snapshot tells which commits before the low watermark the chunk
-    // may have missed
     let mut last_pk_text = Vec::new();
-    let (snap_text, rows) = chunk_query(
+    let rows = chunk_query(
         q,
-        &format!(
-            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT pg_current_snapshot()::text; \
-             SELECT {cols} FROM {tname}{where_clause} ORDER BY {} LIMIT {CHUNK_ROWS}; COMMIT",
-            pk_cols.join(", ")
-        ),
+        &format!("SELECT {cols} FROM {tname}{where_clause} ORDER BY {} LIMIT {CHUNK_ROWS}; COMMIT", pk_cols.join(", ")),
         t,
         &mut last_pk_text,
     )?;
-    chunk.snap = parse_snapshot(&snap_text.unwrap_or_default());
     chunk.last = rows.len() < CHUNK_ROWS;
     if !rows.is_empty() {
         chunk.max_key_text = Some(last_pk_text);
@@ -992,24 +1086,18 @@ fn reshape_changes(changes: &mut Vec<(ObjectId, TableChange)>, old: &SourceTable
     });
 }
 
-/// Run a snapshot chunk's statements: the text of pg_current_snapshot()
-/// and the table's rows, parsed from the text values as they arrive (no
-/// strings collected per value). `last_pk_text` receives the text of the
-/// last row's primary key.
+/// Run a snapshot chunk's statements: the table's rows, parsed from the
+/// text values as they arrive (no strings collected per value).
+/// `last_pk_text` receives the text of the last row's primary key.
 fn chunk_query(
     q: &mut Client,
     sql: &str,
     t: &SourceTable,
     last_pk_text: &mut Vec<String>,
-) -> std::result::Result<(Option<String>, Vec<Row>), ChunkError> {
-    let mut snap = None;
+) -> std::result::Result<Vec<Row>, ChunkError> {
     let mut rows = Vec::new();
     let mut err = None;
     q.simple_query_rows(sql, &mut |cols, r| {
-        if snap.is_none() && cols.len() == 1 && cols[0].name == "pg_current_snapshot" {
-            snap = r.get(0).map(|b| String::from_utf8_lossy(b).into_owned());
-            return Ok(());
-        }
         if cols.len() != t.columns.len() {
             return Ok(());
         }
@@ -1039,13 +1127,11 @@ fn chunk_query(
         Ok(())
     })
     .map_err(|e| match err.take() {
-        // a value that does not parse, or a server error that leaves the
-        // connection usable: the table cannot be read
+        // a value that does not parse: the table cannot be read
         Some(e) => ChunkError::Table(e),
-        None if e.kind == pgproto::ErrorKind::Server && q.is_usable() => ChunkError::Table(e.into()),
-        None => ChunkError::Session(e.into()),
+        None => chunk_error(q, e),
     })?;
-    Ok((snap, rows))
+    Ok(rows)
 }
 
 /// Is the (32-bit) transaction id visible in a pg_current_snapshot()?
@@ -1107,6 +1193,10 @@ pub fn run(
         unmapped_rels: HashMap::new(),
         session: Session::default(),
         failing: BTreeMap::new(),
+        unseen: Default::default(),
+        recent: Default::default(),
+        chunk_wait: None,
+        unseen_checked: Instant::now(),
     };
     let mut backoff = RECONNECT_MIN;
     loop {
@@ -1144,6 +1234,7 @@ pub fn run(
                 for x in t {
                     src.tables.insert(x.id, x);
                 }
+                src.start_copying();
             }
             Err(_) => {}
         }
@@ -1198,6 +1289,7 @@ impl PgSource {
         for (id, t) in &self.tables {
             self.state.tables.insert(*id, SnapState { truncate: !t.pk.is_empty(), ..Default::default() });
         }
+        self.start_copying();
         self.chunk = None;
         if let Err(e) = self.log_progress(self.durable_lsn) {
             return e;
@@ -1364,6 +1456,10 @@ mod tests {
             unmapped_rels: HashMap::new(),
             session: Session::default(),
             failing: BTreeMap::new(),
+            unseen: Default::default(),
+            recent: Default::default(),
+            chunk_wait: None,
+            unseen_checked: Instant::now(),
         };
         (src, log)
     }
@@ -1707,6 +1803,58 @@ mod tests {
         let err = src.handle_message(bad).unwrap_err();
         assert_eq!(err.code, codes::CHARACTER_NOT_IN_REPERTOIRE);
         assert!(err.message.contains("column \"s\" of public.t"), "{}", err.message);
+    }
+
+    /// A change to a key beyond the chunks read so far is skipped, because a
+    /// later chunk reads the row's current value. That chunk's snapshot
+    /// must contain the change's transaction, which can be decoded before it
+    /// is visible (its commit record is written first; a synchronous
+    /// standby can keep it invisible for long): the chunk waits for it. It
+    /// used to be read regardless, and the change was lost.
+    #[test]
+    fn chunks_wait_for_transactions_decoded_before_them() {
+        let (mut src, log) = source(vec![table(&["id", "a"], vec![0])], SourceState { slot_created: true, ..Default::default() });
+        src.handle_message(begin(80)).unwrap();
+        src.handle_message(relation(&["id", "a"], 1)).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        let mut ch = chunk_before_low(&[[1, 10], [2, 20]], true);
+        ch.last = false;
+        src.chunk = Some(ch);
+        // beyond the chunk: skipped
+        src.handle_message(begin(150)).unwrap();
+        src.handle_message(insert(&[5, 50])).unwrap();
+        src.handle_message(commit(200)).unwrap();
+        for (xid, tag, end) in [(151, "L:1:10:1", 210), (152, "H:1:10:1", 220)] {
+            src.handle_message(begin(xid)).unwrap();
+            src.handle_message(message(tag)).unwrap();
+            src.handle_message(commit(end)).unwrap();
+        }
+        src.drain_acks(true).unwrap();
+        assert_eq!(replay(&log.lock()).len(), 2, "the chunk's rows only");
+        assert!(!src.state.tables[&10].done);
+        // the next chunk: its snapshot must contain transaction 150
+        assert!(!src.snapshot_sees_decoded(&(140, 145, vec![])), "150 is not visible");
+        assert!(!src.snapshot_sees_decoded(&(140, 160, vec![150])), "150 is still running");
+        assert!(src.snapshot_sees_decoded(&(140, 160, vec![])));
+        assert!(src.unseen.is_empty(), "seen transactions are forgotten");
+    }
+
+    /// Transactions are tracked while a table is being copied, including
+    /// those decoded just before a table starts to be copied again (their
+    /// changes were applied to rows the re-snapshot overwrites).
+    #[test]
+    fn decoded_transactions_are_tracked_while_copying() {
+        let (mut src, _) = source(vec![table(&["id", "a"], vec![0])], done_state(10));
+        src.handle_message(begin(5)).unwrap();
+        src.handle_message(relation(&["id", "a"], 1)).unwrap();
+        src.handle_message(insert(&[1, 1])).unwrap();
+        src.handle_message(commit(100)).unwrap();
+        assert!(src.unseen.is_empty(), "nothing is being copied");
+        // a schema change: the table is copied again
+        src.handle_message(begin(6)).unwrap();
+        src.handle_message(relation(&["id", "a", "b"], 1)).unwrap();
+        src.handle_message(commit(110)).unwrap();
+        assert_eq!(src.unseen.iter().copied().collect::<Vec<_>>(), [5, 6]);
     }
 
     #[test]

@@ -446,6 +446,51 @@ fn an_unreadable_table_does_not_stop_the_others() {
     assert_eq!(ivm.rows("SHOW SOURCES")[0].split('|').nth(5).unwrap(), "streaming");
 }
 
+/// A change decoded while its table is not copied yet is skipped: the
+/// table's chunk reads the row's current value. A transaction can be
+/// decoded before it is visible, though (its commit record is written
+/// first): here it waits for a synchronous standby that never comes, so it
+/// stays invisible until that wait is canceled. A chunk read meanwhile does
+/// not contain the change; it used to be read anyway and the change was
+/// lost. The chunk now waits until its snapshot sees every decoded
+/// transaction.
+#[test]
+fn chunks_see_transactions_decoded_before_them() {
+    let mut up = Upstream::start_with(&["synchronous_standby_names = 'nobody'", "synchronous_commit = local"]);
+    up.exec("CREATE TABLE t (id int PRIMARY KEY, a int)");
+    up.exec("INSERT INTO t SELECT g, g FROM generate_series(1, 100) g");
+    up.exec("CREATE ROLE repl LOGIN REPLICATION");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("decoded-invisible");
+    let mut ivm = Ivm::start(&dir);
+    // t cannot be copied until the role may read it
+    let conninfo = up.conninfo.replace("user=postgres", "user=repl");
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{conninfo}' PUBLICATION 'p'"));
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SOURCES")[0].split('|').nth(5).unwrap().to_string();
+    eventually("the copy to fail", || status(&mut ivm).contains("permission denied"));
+    // committed locally, decoded, but invisible while it waits for the standby
+    let mut writer = connect(&up.conninfo);
+    let pid = writer.query("SELECT pg_backend_pid()").unwrap().rows[0][0].clone().unwrap();
+    writer.simple_query("SET synchronous_commit = on").unwrap();
+    let update = std::thread::spawn(move || writer.simple_query("UPDATE t SET a = -1 WHERE id = 5").map(|_| ()));
+    eventually("the update to wait for the standby", || {
+        up.rows(&format!("SELECT wait_event FROM pg_stat_activity WHERE pid = {pid}")) == ["SyncRep"]
+    });
+    let flushed = up.rows("SELECT pg_current_wal_flush_lsn()").remove(0);
+    eventually("the update to be decoded", || {
+        up.rows(&format!("SELECT confirmed_flush_lsn >= '{flushed}' FROM pg_replication_slots")) == ["t"]
+    });
+    // the next attempt reads t while the update is invisible
+    let retry: u64 = status(&mut ivm).split("retrying every ").nth(1).unwrap().split('s').next().unwrap().parse().unwrap();
+    up.exec("GRANT SELECT ON t TO repl");
+    std::thread::sleep(Duration::from_millis(retry * 1000 + 500));
+    up.exec(&format!("SELECT pg_cancel_backend({pid})"));
+    update.join().unwrap().expect("the update commits");
+    let q = "SELECT * FROM t WHERE id IN (4, 5, 6) ORDER BY id";
+    assert_eq!(up.rows(q), ["4|4", "5|-1", "6|6"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+}
+
 /// The replication slot of the (only) source.
 fn slot_name(ivm: &mut Ivm) -> String {
     ivm.rows("SHOW SOURCES")[0].split('|').nth(2).unwrap().to_string()

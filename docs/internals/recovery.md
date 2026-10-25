@@ -142,7 +142,9 @@ into the WAL around them.
 `PgSource::maybe_start_chunk` runs whenever no upstream transaction is open
 in the stream and no chunk is in flight:
 
-1. Pick the table with the lowest id whose snapshot is not done.
+1. Pick the table with the lowest id whose snapshot is not done (skipping
+   tables whose chunk query failed recently: they are retried after a
+   delay growing from 1 s to 60 s, while the other tables proceed).
 2. On a normal connection, emit the **low watermark**:
    `SELECT pg_logical_emit_message(true, 'ivm', 'L:<source>:<table>:<run>:<seq>')`
    (a transactional message: it appears in the stream at its commit).
@@ -151,14 +153,19 @@ in the stream and no chunk is in flight:
    stream resumes before watermarks of the previous run, and logical
    messages reach every slot of the database, including those of other
    engines.
-3. Read the chunk in one transaction:
+3. Read the chunk in one transaction, in two round trips:
    ```sql
    BEGIN ISOLATION LEVEL REPEATABLE READ;
    SELECT pg_current_snapshot()::text;
+   -- checked: does it see every transaction decoded so far? (below)
    SELECT <columns> FROM <schema>.<table>
      [WHERE (<pk>) > (<boundary>)] ORDER BY <pk> LIMIT 10000;
    COMMIT
    ```
+   If the snapshot does not contain every transaction the stream has
+   decoded while tables are being copied (see
+   [Filtering stream changes](#filtering-stream-changes)), the transaction is
+   rolled back and the chunk retried 100 ms later.
    String key columns use `COLLATE "C"`, so the upstream order matches the
    engine's key order. The rows are kept in memory keyed by their encoded
    primary key; the chunk records its last key (`max_key`), whether it is the
@@ -187,7 +194,7 @@ For every streamed change of key `k` in table `T` (`snapshot_filter`):
 | same, phase *before-low*, the transaction is **not** visible in the chunk's snapshot | apply, and remove `k` from the chunk |
 | same, phase *before-low*, the transaction **is** visible in the chunk's snapshot | skip (the chunk already contains its effect) |
 | otherwise (`k` beyond everything copied so far) | skip: a later chunk will read the row's current value |
-| `TRUNCATE` | apply always, and clear the chunk's rows of that table |
+| `TRUNCATE` | apply always, and clear the chunk's rows of that table (unless the chunk is in phase *before-low* and its snapshot saw the truncation) |
 
 Why this yields a consistent copy (with one exception, below): the chunk's snapshot is taken after the
 low watermark committed, so every transaction that commits after the high
@@ -203,12 +210,21 @@ rows and the boundary move are logged in the same commit, so the engine's
 copy is always a prefix of the key space that agrees with the upstream as of
 the GSN.
 
-The exception, found by reading the code (not reproduced): a `TRUNCATE` that
-committed before the low watermark but is processed while the chunk is in
-flight clears the chunk's rows, although the chunk's snapshot already
-reflects the truncation. Rows inserted after the `TRUNCATE` and visible in
-the snapshot are then skipped by the stream (phase *before-low*, visible)
-and missing from the chunk, so they are never copied.
+"A later chunk reads the row's current value" holds only if that chunk's
+snapshot contains the skipped transaction, and the same race applies: a
+transaction is decoded once its commit record is flushed but becomes visible
+only when it ends, which a synchronous standby can delay for as long as it
+takes to confirm the commit. So the source keeps the ids of the transactions
+it decodes while some table is being copied (`PgSource::unseen`; when a
+table starts to be copied again, also the last 1,024 decoded before, whose
+changes were applied to rows the re-snapshot overwrites), and reads a chunk
+only once its snapshot sees all of them; transactions a snapshot sees are
+forgotten, as later snapshots see them too. If many accumulate without a
+chunk being read (a table that cannot be read), they are checked against a
+fresh `pg_current_snapshot()` at most once a second. Without this check, a
+chunk read while such a transaction was invisible kept the row's old value
+for good (reproduced with an unreachable synchronous standby,
+`chunks_see_transactions_decoded_before_them`).
 
 The 32-bit transaction ids of the stream are compared with the 64-bit
 snapshot by choosing the epoch closest to the snapshot (`xid_visible`).
