@@ -37,7 +37,9 @@ with status 1 at once) and accepts connections only once recovery is done.
 3. **Open the store** (`Env::open`): read `MANIFEST`, keep the last record
    whose CRC is valid, and truncate a torn tail. Re-open the active segment
    truncated to the recorded length, delete segment files the record does
-   not list, and register every tree root as *recovered but not attached*.
+   not list (this discards the nodes written after the record, early by the
+   buffer pool or by an interrupted checkpoint), and register every tree
+   root as *recovered but not attached*.
    A manifest that has contents but no valid record, or a missing manifest
    while segment files hold data, stops the start before anything is
    modified: the checkpoint may have existed, and the log may already be
@@ -133,7 +135,9 @@ fingerprint mismatch only costs a rebuild.
 ## Checkpoints
 
 `Engine::checkpoint` (every `--checkpoint-secs` if anything changed, when
-dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
+dirty memory still exceeds half the cache after a record — the buffer pool
+writes dirty nodes early to keep it below — on `CHECKPOINT`, and on
+shutdown):
 
 1. build `AppState`: the catalog (with its DDL history), the fingerprint →
    tree id and fingerprint → `since` maps of all hydrated arrangements, each
@@ -143,9 +147,9 @@ dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
    in the retention window (at most the last 100,000), and the pending slot
    drops; serialise it as JSON
    ([On-disk format](../on-disk-format.md#checkpoint-application-state-appstate));
-2. `Env::checkpoint(processed_gsn, json)`: write dirty nodes, `fsync`, append
-   the manifest record (the commit point), delete dead segments
-   ([Storage](storage.md#segments-and-checkpoints));
+2. `Env::checkpoint(processed_gsn, json)`: write the remaining dirty nodes,
+   `fsync`, append the manifest record (the commit point), delete dead
+   segments ([Storage](storage.md#segments-and-checkpoints));
 3. `Env::gc(1000)`: relocate live nodes of the oldest sparse segment;
 4. send `Truncate(processed − retention)` to the sequencer, which deletes
    log segments whose records all lie at or before that GSN.

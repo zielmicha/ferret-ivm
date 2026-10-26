@@ -58,21 +58,41 @@ number of loaded children, a CLOCK reference bit, its estimated size, and
 Accessing a child through a `Disk` pointer reads and decodes the frame,
 allocates a slot and replaces the pointer by `Mem(slot)`.
 
-- **Copy-on-write at checkpoint granularity.** Modifying a node marks it
-  dirty; a dirty node has no disk location (its previous on-disk copy becomes
-  garbage). Dirty nodes stay in memory until the next checkpoint writes them,
-  children before parents, to the end of the active segment. On-disk nodes
-  are never overwritten, so the last checkpoint stays intact until the next
-  one is committed.
-- **Eviction.** When the arena's bytes exceed `--cache-mb`, a CLOCK sweep
-  (at most two passes over all slots) evicts clean nodes that have no loaded
-  children, giving a second chance to nodes whose reference bit is set;
-  the parent's pointer reverts to `Disk`. Dirty nodes are never evicted; a
-  checkpoint is forced when they exceed half of the cache.
+- **Copy-on-write.** Modifying a node marks it dirty; a dirty node has no
+  disk location (its previous on-disk copy becomes garbage). A dirty node is
+  written to the end of the active segment once its loaded children are all
+  clean (so that its frame records their locations): by the next
+  checkpoint, or earlier by the buffer pool (below). A written node is clean
+  until it is modified again, when its frame becomes garbage like any
+  replaced node's. On-disk nodes are never overwritten, so the last
+  checkpoint stays intact until the next one is committed; a frame written
+  since is referred to by nothing durable, and a crash discards it (see
+  [Segments and checkpoints](#segments-and-checkpoints)). Writing a node
+  early therefore needs no manifest record: the unit of atomicity (the
+  checkpoint) is not the unit of memory.
+- **Eviction.** A CLOCK sweep (at most two passes over all slots) runs after
+  every read and write while the arena's bytes exceed `--cache-mb` or the
+  dirty bytes exceed half of it. Its candidates are nodes without loaded
+  children; a candidate whose reference bit is set gets a second chance.
+  While the arena is over the cache, a cold candidate is evicted — a dirty
+  one after it is written — and the parent's pointer reverts to `Disk`:
+  dirty and clean nodes compete for the cache alike. Within the cache, cold
+  dirty candidates are only written, while the dirty bytes are over half of
+  it, which bounds what a checkpoint has left to write. Every loaded subtree
+  has candidates at its leaves, so a sweep finds what it needs unless dirty
+  internal nodes hold their clean children in memory; a sweep that ends over
+  a limit records a stall, and sweeps resume only once the arena or the
+  dirty bytes have grown by a sixteenth of the cache (plus a leaf) beyond
+  it, so sweeping costs nothing when there is nothing to evict.
+  `Env::write_back(target)` writes dirty nodes, children before parents,
+  until at most `target` dirty bytes remain: the hook for callers that
+  manage memory or checkpoints themselves.
 
 There is no separate in-memory mode: a tree that fits in the cache is served
 from memory, a larger one degrades gradually as nodes are re-read from the
-segment files (through the operating system's page cache).
+segment files (through the operating system's page cache). The same holds
+for data that is not yet durable: a batch much larger than the cache is
+written out as it goes.
 
 ## Histories
 
@@ -104,7 +124,12 @@ entries in leaves that are not modified stay until then.
 `Env::apply(tree, updates, gsn)` applies a batch of `(entry, weight)`
 changes at one GSN:
 
-1. Sort by entry, add up equal entries, drop zero weights.
+1. Sort by entry, add up equal entries, drop zero weights. A large batch is
+   then applied in runs of consecutive entries whose cost — a leaf's size
+   plus the entry's length per update, as if each dirtied a leaf of its
+   own — stays within a quarter of the cache (at least four leaves), with
+   an eviction sweep after each run: a batch never needs its dirty nodes in
+   memory at once. Each run is applied as follows.
 2. Descend from the root, partitioning the sorted updates among the children
    by binary search on the separators; only children that receive updates
    are visited (and loaded).
@@ -224,13 +249,15 @@ prefix. `EXPLAIN MAINTENANCE` and `SHOW` use tree counts.
 
 ## Segments and checkpoints
 
-Nodes are written only by checkpoints, to the **active segment**
-(`store/seg-<id>.dat`), an append-only file that is rolled over to the next
-id once it reaches 256 MiB. A checkpoint (`Env::checkpoint(gsn, app)`):
+Nodes are written to the **active segment** (`store/seg-<id>.dat`), an
+append-only file that is rolled over to the next id once it reaches
+256 MiB, by checkpoints and by the buffer pool's early writes. Writing a
+node lowers the `min_seg` of the child entry above it to the node's exact
+value, and the entries above that (and the tree's) to it where they were
+higher. A checkpoint (`Env::checkpoint(gsn, app)`):
 
-1. writes every dirty node of every tree, depth-first so that each parent is
-   written after its children and records their new locations; updates each
-   tree's `min_seg`;
+1. writes every remaining dirty node of every tree, depth-first so that
+   each parent is written after its children and records their locations;
 2. `fsync`s the active segment and any segments rolled over since the last
    sync;
 3. appends a checkpoint record — sequence number, GSN, every tree's root
@@ -242,10 +269,14 @@ id once it reaches 256 MiB. A checkpoint (`Env::checkpoint(gsn, app)`):
 
 On open, the last valid manifest record defines the state: the active
 segment is truncated to the recorded length, and segment files the record
-does not mention are deleted. Without a valid record, a store that may have
-had a checkpoint — a non-empty manifest, or no manifest but segment files
-with data — is refused instead, and nothing is modified (an empty manifest,
-left by a crash during the very first checkpoint, opens as a new store).
+does not mention are deleted. This discards every frame written after the
+record — by an interrupted checkpoint, or early by the buffer pool, in the
+active segment beyond its recorded length or in segments started since —
+and nothing durable refers to those frames. Without a valid record, a
+store that may have had a checkpoint — a non-empty manifest, or no
+manifest but segment files with data — is refused instead, and nothing is
+modified (an empty manifest, left by a crash during the very first
+checkpoint, opens as a new store).
 
 Creating the store directory, the manifest or a segment file is followed by
 an `fsync` of the directory that holds it, so that a crash cannot lose the
@@ -257,14 +288,16 @@ renames `MANIFEST.new` over `MANIFEST` and `fsync`s the directory too.
 The environment tracks, for every segment, the bytes written and the bytes
 still referenced (`seg_live`). A node that becomes dirty, is dropped, or is
 released with its tree subtracts its frame length from its segment's live
-bytes.
+bytes — also a frame the buffer pool wrote early, whose node was modified
+again before a checkpoint.
 
 `Env::gc(max_nodes)` (called after every checkpoint with a budget of 1000
 nodes) picks the oldest sealed segment that is less than half live. Every
 child pointer records the oldest segment holding any node of its subtree
 (`min_seg`), so the pass only descends into subtrees that contain nodes of
 the victim (or older) segments; it marks those nodes and their ancestors
-dirty, so that the next checkpoint rewrites them into the active segment.
+dirty, so that the next checkpoint (or the buffer pool) rewrites them into
+the active segment.
 Once a segment has no live bytes it is deleted at the end of a checkpoint.
 The active segment itself is never a victim.
 

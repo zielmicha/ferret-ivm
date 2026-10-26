@@ -2,14 +2,17 @@
 //! (key, value) encodings) holding (GSN, weight) histories, augmented with
 //! monoid summaries per subtree.
 //!
-//! The tree is copy-on-write at checkpoint granularity. Nodes live in a node
-//! arena that acts as the buffer pool: clean nodes are evicted under memory
-//! pressure (CLOCK), dirty nodes stay until the next checkpoint writes them
-//! into the active append-only segment. A checkpoint is: write dirty nodes
-//! bottom-up, fsync, append a manifest record naming the new roots. Sealed
-//! segments are immutable; space is reclaimed by relocating the live nodes of
-//! old segments (found through per-subtree `min_seg` augmentation) and
-//! deleting segments once nothing references them.
+//! The tree is copy-on-write. Nodes live in a node arena that acts as the
+//! buffer pool: clean nodes are evicted under memory pressure (CLOCK), and
+//! dirty nodes are written to the active append-only segment by the
+//! checkpoint or, when they exceed their share of the cache, early by the
+//! pool itself (a written node is clean and can be evicted; nothing refers
+//! to it durably until a checkpoint does). A checkpoint is: write the
+//! remaining dirty nodes bottom-up, fsync, append a manifest record naming
+//! the new roots. Sealed segments are immutable; space is reclaimed by
+//! relocating the live nodes of old segments (found through per-subtree
+//! `min_seg` augmentation) and deleting segments once nothing references
+//! them.
 
 pub mod history;
 mod inspect;
@@ -123,6 +126,8 @@ pub struct EnvStats {
     pub mem_bytes: usize,
     pub segments: Vec<(u32, u64, u64)>,
     pub checkpoint_gsn: Gsn,
+    /// Slots visited by eviction sweeps so far (their cost).
+    pub swept_slots: u64,
 }
 
 pub struct Env {
@@ -137,6 +142,10 @@ pub struct Env {
     /// Bytes of dirty nodes (maintained with the dirty flags).
     dirty_bytes: usize,
     clock_hand: usize,
+    /// (mem_bytes, dirty_bytes) when a sweep last found nothing more to
+    /// evict or write: sweeps resume once either has grown well past it.
+    evict_stall: Option<(usize, usize)>,
+    swept_slots: u64,
     trees: FxHashMap<TreeId, TreeState>,
     next_tree_id: TreeId,
     /// segment id -> (total bytes written, live bytes referenced)
@@ -304,6 +313,8 @@ impl Env {
             mem_bytes: 0,
             dirty_bytes: 0,
             clock_hand: 0,
+            evict_stall: None,
+            swept_slots: 0,
             trees: FxHashMap::default(),
             next_tree_id: 1,
             seg_live: BTreeMap::new(),
@@ -590,14 +601,39 @@ impl Env {
             return Ok(());
         }
         let summ = self.trees.get(&tree).ok_or_else(|| SqlError::internal(format!("no tree {tree}")))?.summarizer.clone();
+        // A large batch is applied in runs of consecutive keys, each dirtying
+        // at most a quarter of the cache (a whole leaf per update at worst),
+        // and the pool makes room between runs: a batch never needs its
+        // dirty nodes to fit in memory at once.
+        let budget = (self.opts.cache_bytes / 4).max(4 * self.opts.leaf_bytes);
+        let mut start = 0;
+        while start < updates.len() {
+            let mut end = start;
+            let mut cost = 0;
+            while end < updates.len() && (end == start || cost + self.opts.leaf_bytes + updates[end].0.len() <= budget) {
+                cost += self.opts.leaf_bytes + updates[end].0.len();
+                end += 1;
+            }
+            if let Err(e) = self.apply_run(tree, &updates[start..end], gsn, &summ) {
+                updates.clear();
+                return Err(e);
+            }
+            self.maybe_evict()?;
+            start = end;
+        }
+        updates.clear();
+        Ok(())
+    }
+
+    /// Apply sorted, consolidated updates (one descent from the root).
+    fn apply_run(&mut self, tree: TreeId, updates: &[(Vec<u8>, i64)], gsn: Gsn, summ: &Arc<dyn Summarizer>) -> Result<()> {
         let root = match self.root_slot(tree)? {
             Some(id) => id,
             None => self.alloc_slot(Node::Leaf(Vec::new()), None, NONE, tree),
         };
         // the tree's summary is replaced below
         let old = std::mem::take(&mut self.trees.get_mut(&tree).unwrap().summary);
-        let parts = self.apply_node(root, updates, gsn, &summ, Some(&old));
-        updates.clear();
+        let parts = self.apply_node(root, updates, gsn, summ, Some(&old));
         let mut parts = match parts {
             Ok(p) => p,
             Err(e) => {
@@ -608,7 +644,7 @@ impl Env {
         let top = match parts.len() {
             0 => None,
             1 => parts.pop(),
-            _ => Some(self.build_root(parts, tree, &summ)?),
+            _ => Some(self.build_root(parts, tree, summ)?),
         };
         let (new_root, summary, min_seg) = match top {
             None => (None, Summary::empty(summ.spec()), u32::MAX),
@@ -623,7 +659,6 @@ impl Env {
         t.root = new_root.map(NodePtr::Mem);
         t.summary = summary;
         t.min_seg = min_seg;
-        self.maybe_evict();
         Ok(())
     }
 
@@ -958,7 +993,7 @@ impl Env {
             match self.node(id) {
                 Node::Leaf(entries) => {
                     let r = entries.binary_search_by(|e| (*e.key).cmp(key)).ok().map(|i| entries[i].hist.clone());
-                    self.maybe_evict();
+                    self.maybe_evict()?;
                     return Ok(r);
                 }
                 Node::Internal(children) => {
@@ -1036,7 +1071,7 @@ impl Env {
                     }
                 }
             }
-            self.maybe_evict();
+            self.maybe_evict()?;
             if !c.buf.is_empty() || c.done {
                 return Ok(());
             }
@@ -1123,7 +1158,7 @@ impl Env {
             };
             for e in &entries[start..] {
                 if !in_range(&e.key) || !f(&e.key, &e.hist)? {
-                    self.maybe_evict();
+                    self.maybe_evict()?;
                     return Ok(());
                 }
             }
@@ -1137,7 +1172,7 @@ impl Env {
             match sep {
                 Some(s) => resume = Some(s),
                 None => {
-                    self.maybe_evict();
+                    self.maybe_evict()?;
                     return Ok(());
                 }
             }
@@ -1154,7 +1189,7 @@ impl Env {
         if let Some(root) = self.root_slot(tree)? {
             self.summary_rec(root, lo, hi, &summ, &mut acc)?;
         }
-        self.maybe_evict();
+        self.maybe_evict()?;
         Ok(acc)
     }
 
@@ -1238,7 +1273,7 @@ impl Env {
         let Some(root) = self.root_slot(tree)? else { return Ok(None) };
         let mut rem = n;
         let r = self.nth_rec(root, lo, hi, &mut rem)?;
-        self.maybe_evict();
+        self.maybe_evict()?;
         Ok(r)
     }
 
@@ -1287,28 +1322,175 @@ impl Env {
     }
 
     // ------------------------------------------------------------------
-    // eviction
+    // eviction and early writes
 
-    fn maybe_evict(&mut self) {
-        if self.mem_bytes <= self.opts.cache_bytes || self.slots.is_empty() {
-            return;
+    /// Dirty bytes the pool keeps in memory even without memory pressure:
+    /// beyond them it writes cold dirty nodes early, which bounds the work
+    /// left to a checkpoint.
+    fn dirty_limit(&self) -> usize {
+        self.opts.cache_bytes / 2
+    }
+
+    /// One CLOCK sweep (at most two passes over the slots) while the arena
+    /// exceeds the cache or the dirty nodes exceed `dirty_limit`. Only nodes
+    /// without loaded children are candidates, and those whose reference bit
+    /// is set get a second chance. A cold candidate is evicted while the
+    /// arena is over the cache, a dirty one after writing it to the active
+    /// segment: dirty and clean nodes compete for the cache alike. Within
+    /// the cache, cold dirty candidates are only written, while the dirty
+    /// bytes are over their limit. Every loaded subtree has candidates at
+    /// its leaves, so a sweep stops early unless dirty internal nodes hold
+    /// their clean children in memory. A sweep that ends over the limits
+    /// records a stall, and the next sweep waits for the arena or the dirty
+    /// bytes to grow well past it, which bounds the cost of sweeping when
+    /// nothing can be done.
+    fn maybe_evict(&mut self) -> Result<()> {
+        let (cache, limit) = (self.opts.cache_bytes, self.dirty_limit());
+        if (self.mem_bytes <= cache && self.dirty_bytes <= limit) || self.slots.is_empty() {
+            return Ok(());
+        }
+        if let Some((mem, dirty)) = self.evict_stall {
+            let slack = cache / 16 + self.opts.leaf_bytes;
+            if self.mem_bytes <= mem + slack && self.dirty_bytes <= dirty + slack {
+                return Ok(());
+            }
+            self.evict_stall = None;
         }
         let n = self.slots.len();
         let mut scanned = 0;
-        while self.mem_bytes > self.opts.cache_bytes && scanned < 2 * n {
+        while (self.mem_bytes > cache || self.dirty_bytes > limit) && scanned < 2 * n {
             let i = self.clock_hand % n;
             self.clock_hand = (i + 1) % n;
             scanned += 1;
+            self.swept_slots += 1;
             let Some(slot) = self.slots[i].as_mut() else { continue };
-            if slot.dirty || slot.loaded_children > 0 || slot.node.is_none() {
+            if slot.loaded_children > 0 || slot.node.is_none() {
                 continue;
             }
             if slot.refbit {
                 slot.refbit = false;
                 continue;
             }
-            self.evict(i as u32);
+            if slot.dirty {
+                if self.mem_bytes <= cache && self.dirty_bytes <= limit {
+                    continue;
+                }
+                // its children are all on disk (none is loaded)
+                self.write_node(i as u32, usize::MAX)?;
+            }
+            if self.mem_bytes > cache {
+                self.evict(i as u32);
+            }
         }
+        if self.mem_bytes > cache || self.dirty_bytes > limit {
+            self.evict_stall = Some((self.mem_bytes, self.dirty_bytes));
+        }
+        Ok(())
+    }
+
+    /// Write dirty nodes early until at most `target` dirty bytes remain
+    /// (or nothing more can be written without evicting clean nodes), as
+    /// the pool does on its own beyond half of the cache. A hook for callers
+    /// that manage memory or checkpoints incrementally: the nodes written
+    /// are clean and evictable, the next checkpoint only writes the rest.
+    /// Returns the dirty bytes left.
+    pub fn write_back(&mut self, target: usize) -> Result<usize> {
+        // children before parents: leaves first, then each level above
+        while self.dirty_bytes > target {
+            let before = self.dirty_bytes;
+            for i in 0..self.slots.len() {
+                if self.dirty_bytes <= target {
+                    break;
+                }
+                let writable = match &self.slots[i] {
+                    Some(Slot { dirty: true, node: Some(node), .. }) => match node {
+                        Node::Leaf(_) => true,
+                        Node::Internal(ch) => {
+                            ch.iter().all(|c| !matches!(c.ptr, NodePtr::Mem(cid) if self.slot(cid).dirty))
+                        }
+                    },
+                    _ => false,
+                };
+                if writable {
+                    self.write_node(i as u32, usize::MAX)?;
+                }
+            }
+            if self.dirty_bytes == before {
+                break;
+            }
+        }
+        self.maybe_evict()?;
+        Ok(self.dirty_bytes)
+    }
+
+    /// Write dirty node `id`, whose loaded children are all clean, to the
+    /// end of the active segment, recording its children's locations; it
+    /// becomes clean (and evictable). Nothing durable refers to the frame
+    /// until a checkpoint record names a root above it: copy-on-write never
+    /// overwrites a node of the last checkpoint, and a crash discards the
+    /// frame with the rest of the segment beyond the recorded length (or
+    /// the segment, if it was started after the checkpoint). If the node is
+    /// modified again, the frame is garbage like any replaced node's.
+    /// `idx` is the node's position in its parent, if known.
+    fn write_node(&mut self, id: u32, idx: usize) -> Result<DiskLoc> {
+        let slot = self.slot(id);
+        debug_assert!(slot.dirty, "writing a clean node");
+        let node = slot.node.as_ref().expect("node taken");
+        let mut locs = Vec::new();
+        let mut min_seg = u32::MAX;
+        if let Node::Internal(children) = node {
+            locs.reserve(children.len());
+            for c in children {
+                locs.push(match c.ptr {
+                    NodePtr::Disk(loc) => loc,
+                    NodePtr::Mem(cid) => self.slot(cid).disk.expect("writing a node above a dirty child"),
+                });
+                min_seg = min_seg.min(c.min_seg);
+            }
+        }
+        let mut buf = Vec::with_capacity(slot.bytes + 16);
+        node.encode(&locs, &mut buf);
+        let loc = self.segs.append(&buf)?;
+        let e = self.seg_live.entry(loc.seg).or_insert((0, 0));
+        e.0 += loc.len as u64;
+        e.1 += loc.len as u64;
+        let min_seg = min_seg.min(loc.seg);
+        let slot = self.slot_mut(id);
+        slot.disk = Some(loc);
+        slot.dirty = false;
+        let (bytes, parent, tree) = (slot.bytes, slot.parent, slot.tree);
+        self.dirty_bytes -= bytes;
+        // The entry above the node covers exactly its subtree; the entries
+        // above that cover the subtree and more, so they can only drop to
+        // `min_seg` (the active segment: no lower unless already lower).
+        let mut child = id;
+        let mut at = parent;
+        let mut hint = idx;
+        let mut exact = true;
+        while at != NONE {
+            let Some(Node::Internal(ch)) = self.slots[at as usize].as_mut().and_then(|s| s.node.as_mut()) else {
+                unreachable!("parent of a loaded node is not a loaded internal node")
+            };
+            let i = match ch.get(hint) {
+                Some(c) if c.ptr == NodePtr::Mem(child) => hint,
+                _ => ch.iter().position(|c| c.ptr == NodePtr::Mem(child)).expect("child pointer"),
+            };
+            if exact {
+                ch[i].min_seg = min_seg;
+            } else if ch[i].min_seg <= min_seg {
+                return Ok(loc);
+            } else {
+                ch[i].min_seg = min_seg;
+            }
+            exact = false;
+            hint = usize::MAX;
+            child = at;
+            at = self.slot(at).parent;
+        }
+        if let Some(t) = self.trees.get_mut(&tree) {
+            t.min_seg = if exact { min_seg } else { t.min_seg.min(min_seg) };
+        }
+        Ok(loc)
     }
 
     fn evict(&mut self, id: u32) {
@@ -1341,21 +1523,16 @@ impl Env {
         let tree_ids = self.tree_ids();
         let mut records = Vec::with_capacity(tree_ids.len());
         for tid in tree_ids {
-            let t = &self.trees[&tid];
-            let rec = match t.root {
-                None => TreeRecord { id: tid, root: None },
-                Some(NodePtr::Disk(loc)) => TreeRecord { id: tid, root: Some((loc, t.summary.clone(), t.min_seg)) },
+            let loc = match self.trees[&tid].root {
+                None => None,
+                Some(NodePtr::Disk(loc)) => Some(loc),
                 Some(NodePtr::Mem(id)) => {
-                    let was_dirty = self.slot(id).dirty;
-                    let (loc, min_seg) = self.flush_node(id)?;
-                    let t = self.trees.get_mut(&tid).unwrap();
-                    if was_dirty {
-                        t.min_seg = min_seg;
-                    }
-                    TreeRecord { id: tid, root: Some((loc, t.summary.clone(), t.min_seg)) }
+                    self.flush_node(id, usize::MAX)?;
+                    self.slot(id).disk
                 }
             };
-            records.push(rec);
+            let t = &self.trees[&tid];
+            records.push(TreeRecord { id: tid, root: loc.map(|l| (l, t.summary.clone(), t.min_seg)) });
         }
         self.segs.sync()?;
         let active = self.segs.active_id();
@@ -1374,6 +1551,8 @@ impl Env {
         };
         self.manifest.append(&rec)?;
         self.checkpoint_gsn = gsn;
+        // every node is clean now
+        self.evict_stall = None;
         // reclaim fully dead sealed segments
         let dead: Vec<u32> = self.seg_live.iter().filter(|(id, (_, l))| **id != active && *l == 0).map(|(id, _)| *id).collect();
         for id in dead {
@@ -1383,48 +1562,28 @@ impl Env {
         Ok(())
     }
 
-    fn flush_node(&mut self, id: u32) -> Result<(DiskLoc, u32)> {
+    /// Write the dirty nodes of the subtree at `id` (at position `idx` in
+    /// its parent), children before parents.
+    fn flush_node(&mut self, id: u32, idx: usize) -> Result<()> {
         if !self.slot(id).dirty {
-            let loc = self.slot(id).disk.unwrap();
-            return Ok((loc, loc.seg));
+            return Ok(());
         }
-        let mut node = self.slot_mut(id).node.take().unwrap();
-        let mut locs = Vec::new();
-        if let Node::Internal(children) = &mut node {
-            locs.reserve(children.len());
-            for c in children.iter_mut() {
-                match c.ptr {
-                    NodePtr::Disk(loc) => locs.push(loc),
-                    NodePtr::Mem(cid) => {
-                        let was_dirty = self.slot(cid).dirty;
-                        let (loc, ms) = self.flush_node(cid)?;
-                        if was_dirty {
-                            c.min_seg = ms;
-                        }
-                        locs.push(loc);
-                    }
-                }
-            }
-        }
-        let mut buf = Vec::with_capacity(node.byte_size() + 16);
-        node.encode(&locs, &mut buf);
-        let loc = self.segs.append(&buf)?;
-        let e = self.seg_live.entry(loc.seg).or_insert((0, 0));
-        e.0 += loc.len as u64;
-        e.1 += loc.len as u64;
-        let min_seg = match &node {
-            Node::Leaf(_) => loc.seg,
-            Node::Internal(ch) => ch.iter().map(|c| c.min_seg).min().unwrap_or(u32::MAX).min(loc.seg),
+        let dirty: Vec<(usize, u32)> = match self.node(id) {
+            Node::Leaf(_) => Vec::new(),
+            Node::Internal(children) => children
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| match c.ptr {
+                    NodePtr::Mem(cid) if self.slot(cid).dirty => Some((i, cid)),
+                    _ => None,
+                })
+                .collect(),
         };
-        let slot = self.slot_mut(id);
-        slot.node = Some(node);
-        slot.disk = Some(loc);
-        if slot.dirty {
-            slot.dirty = false;
-            let bytes = slot.bytes;
-            self.dirty_bytes -= bytes;
+        for (i, cid) in dirty {
+            self.flush_node(cid, i)?;
         }
-        Ok((loc, min_seg))
+        self.write_node(id, idx)?;
+        Ok(())
     }
 
     /// Drop a tree, releasing its nodes.
@@ -1493,7 +1652,7 @@ impl Env {
                 self.relocate(root, victim, &mut budget)?;
             }
         }
-        self.maybe_evict();
+        self.maybe_evict()?;
         Ok(max_nodes - budget)
     }
 
@@ -1544,6 +1703,7 @@ impl Env {
         }
         s.segments = self.seg_live.iter().map(|(id, (t, l))| (*id, *t, *l)).collect();
         s.checkpoint_gsn = self.checkpoint_gsn;
+        s.swept_slots = self.swept_slots;
         s
     }
 

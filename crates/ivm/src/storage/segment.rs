@@ -78,7 +78,8 @@ impl SegmentStore {
         Ok(DiskLoc { seg: self.active_id, off, len })
     }
 
-    fn write_buffer(&mut self) -> Result<()> {
+    /// Hand the pending bytes to the OS (without syncing them).
+    pub(super) fn write_buffer(&mut self) -> Result<()> {
         if !self.buf.is_empty() {
             self.active.write_all_at(&self.buf, self.written_len)?;
             self.written_len += self.buf.len() as u64;

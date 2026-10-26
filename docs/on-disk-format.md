@@ -293,8 +293,11 @@ header. Reading a node reads exactly `len` bytes at `off` and checks that
 `frame.len + 8 == len` and the CRC (`node frame length mismatch`,
 `node checksum mismatch`, SQLSTATE `XX001`).
 
-- Segments are written only by checkpoints, append-only, through a buffer
-  that is written out when it exceeds 4 MiB and at the checkpoint's sync.
+- Segments are written append-only, by checkpoints and by the buffer
+  pool's early writes of dirty nodes (which no manifest record refers to
+  until a checkpoint names a root above them), through a buffer that is
+  written out when it exceeds 4 MiB, before a read of a frame still in it,
+  and at the checkpoint's sync.
 - Before each append, if the active segment holds at least 256 MiB
   (268,435,456 bytes), it is sealed and segment `id + 1` is created (an
   existing file of that name is truncated) and the store directory
@@ -303,9 +306,9 @@ header. Reading a node reads exactly `len` bytes at `off` and checks that
 - On open, the active segment named by the last checkpoint (segment 1 for a
   new store) is opened, created if missing (then the store directory is
   `fsync`ed), and resized to the checkpoint's `active_len` (0 for a new
-  store) — discarding nodes written by an interrupted checkpoint. Every
-  other `seg-*.dat` that the checkpoint's segment table does not list is
-  deleted.
+  store) — discarding nodes written after the checkpoint (early, or by an
+  interrupted checkpoint). Every other `seg-*.dat` that the checkpoint's
+  segment table does not list is deleted.
 
 ### Leaf node
 
@@ -467,7 +470,9 @@ da 03  7b 22 63 61 ...       app: 474 bytes of JSON {"catalog":{"objects":{},"ne
 1. Every tree with a dirty root is written depth-first, children before their
    parent, so that each internal node records the final locations of its
    children; each written frame adds its length to its segment's
-   `total_bytes` and `live_bytes`.
+   `total_bytes` and `live_bytes`. (Nodes the buffer pool wrote earlier,
+   and did not modify since, are clean: their frames are referred to as
+   they are, and are counted in the segment table like any other.)
 2. The active segment and any segments sealed since the last checkpoint are
    `fsync`ed.
 3. The checkpoint record is appended to the manifest.
