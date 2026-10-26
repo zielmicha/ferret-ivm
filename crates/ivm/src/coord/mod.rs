@@ -1101,4 +1101,23 @@ mod tests {
         let g = apply(&mut e, tick(100_000));
         assert_eq!(e.env.checkpoint_gsn(), g, "a long run of ticks");
     }
+
+    /// A checkpoint lets the sequencer delete the input log up to its own
+    /// GSN, whatever the retention: only recovery reads the log, from the
+    /// checkpoint on (the log used to be kept for the retention window too).
+    #[test]
+    fn checkpoints_truncate_the_log_to_their_gsn() {
+        let tmp = crate::testkit::TempDir::new("coord-truncate");
+        let (env, _) = Env::open(&tmp.path().join("store"), EnvOptions::default()).unwrap();
+        let (seq, rx) = unbounded();
+        let cfg = Config { data_dir: tmp.path().to_path_buf(), retention_gsns: 1000, ..Default::default() };
+        let mut e = Engine::new(cfg, env, seq, Arc::new(Shared::default()));
+        e.replaying = false;
+        for gsn in 1..=5 {
+            e.apply_record(gsn, LogRecord::Ddl { req: 0, sql: format!("CREATE TABLE t{gsn} (id int)"), extra: String::new() }).unwrap();
+        }
+        e.checkpoint().unwrap();
+        let truncated: Vec<Gsn> = rx.try_iter().filter_map(|m| if let SeqMsg::Truncate(g) = m { Some(g) } else { None }).collect();
+        assert_eq!(truncated, [5]);
+    }
 }
