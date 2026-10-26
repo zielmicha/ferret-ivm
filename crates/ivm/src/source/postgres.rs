@@ -2222,7 +2222,13 @@ mod tests {
         let (stx, srx) = crossbeam_channel::unbounded::<SeqMsg>();
         let log = Arc::new(Mutex::new(Vec::new()));
         let l2 = log.clone();
+        // the spool directory, removed with the sequencer (once the handle
+        // is dropped)
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let spool = crate::testkit::TempDir::new(&format!("source-spool-{}", N.fetch_add(1, Ordering::Relaxed)));
+        let dir = spool.path().to_path_buf();
         std::thread::spawn(move || {
+            let _spool = spool;
             let mut gsn = 0;
             for m in srx {
                 let (rec, ack) = match m {
@@ -2238,10 +2244,6 @@ mod tests {
             }
         });
         let shared = Arc::new(Shared::default());
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let base = std::env::var("IVM_TEST_TMP").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let dir = base.join(format!("ivm-source-spool-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-        std::fs::create_dir_all(&dir).unwrap();
         shared.spool.set(crate::log::SpoolDir { dir, sync: false }).unwrap();
         (EngineHandle { tx: etx, seq: stx, shared }, log)
     }
