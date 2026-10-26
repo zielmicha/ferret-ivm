@@ -753,15 +753,23 @@ Replacements need more than the new contents:
 - A replaced materialized view (`replace_view`) is switched to its new
   version at the record's GSN *g*; the old version is kept (and maintained)
   until the hydration is done. Its subscribers (same columns) and sinks are
-  held — they get nothing — until then; the thread computes the change from
-  the old to the new contents as of *g* on the fork, right after hydrating,
-  and the engine then delivers it at *g*, followed by the new version's
-  outputs at the records applied since, before releasing the holds and the
-  old version (`finish_replace`). Subscribers and sinks get exactly what an
-  inline replacement at *g* would have given them, at the same GSNs, which
-  sinks need: they are idempotent by GSN. Sinks of a view whose columns
-  changed start over then (they were held too, so that their targets did
-  not get the old version's later changes).
+  held — they get nothing — until then; if there are any, the thread
+  computes the change from the old to the new contents as of *g* on the
+  fork, right after hydrating, and the engine then delivers it at *g*,
+  followed by the new version's outputs at the records applied since,
+  before releasing the holds and the old version (`finish_replace`).
+  Subscribers and sinks get exactly what an inline replacement at *g* would
+  have given them, at the same GSNs, which sinks need: they are idempotent
+  by GSN. Sinks of a view whose columns changed start over then (they were
+  held too, so that their targets did not get the old version's later
+  changes). The change (`Graph::diff_arrangements`) is computed only for
+  such subscribers and sinks, and is empty without reading anything when
+  the new version's read arrangement is the old one (the definition planned
+  to the same dataflow). Two versions whose read arrangements encode rows
+  alike (the same key and columns) are merged in key order, so that only
+  the entries that differ are decoded; others are read a batch at a time
+  into a `DeltaBuf`, which consolidates them (spilling beyond the
+  threshold), so that only the change itself is held in memory.
 - A table rebuilt after an upstream schema change (`apply_schema_change`)
   gets a new, empty Table node at *g*, to which the table's changes are
   routed from then on; the thread first fills its primary index with the

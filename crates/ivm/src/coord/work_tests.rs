@@ -250,6 +250,17 @@ fn view_replacement_reads_only_for_subscribers() {
     diff.sort_by(|a, b| crate::types::datum::exact_row_cmp(&a.0, &b.0));
     assert_eq!(diff, (0..10).map(|i| (vec![int(i), int(i)], -1)).collect::<Vec<_>>());
     assert_eq!(t.rows("d"), vec![vec![int(2990)]]);
+    // versions indexed differently (by all columns, by the group key) are
+    // read a batch at a time and consolidated
+    t.ddl("CREATE MATERIALIZED VIEW c AS SELECT v % 3 AS g, 7::bigint AS n FROM r WHERE v < 3");
+    let ExecResult::Subscribe { rx, .. } = t.subscribe(crate::sql::parser::SubscribeTarget::Name("c".into())) else {
+        panic!("not a subscription")
+    };
+    t.ddl("CREATE OR REPLACE MATERIALIZED VIEW c AS SELECT v % 3 AS g, count(*) AS n FROM r GROUP BY 1");
+    let mut diff: Vec<(Row, i64)> = rx.try_iter().flat_map(|e| if let SubEvent::Data { rows, .. } = e { rows.to_vec() } else { vec![] }).collect();
+    diff.sort_by(|a, b| crate::types::datum::exact_row_cmp(&a.0, &b.0));
+    let want: Vec<(Row, i64)> = (0..3).flat_map(|g| [(vec![int(g), int(7)], -1), (vec![int(g), int(1000)], 1)]).collect();
+    assert_eq!(diff, want);
 }
 
 /// A fresh read of `query` at `as_of`, parked or answered.

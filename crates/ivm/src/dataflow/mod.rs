@@ -777,14 +777,17 @@ impl Graph {
     }
 
     /// The change from the contents of arrangement `old` to those of `new`
-    /// (consolidated). Arrangements that encode rows alike (same key and
-    /// columns) are merged in key order, so that only the entries that
-    /// differ are decoded and kept; others are read and consolidated.
-    pub fn diff_arrangements(&self, env: &mut Env, old: ArrId, new: ArrId) -> Result<Delta> {
-        let (a, b) = (self.arr(old), self.arr(new));
+    /// (consolidated), computed in bounded memory: arrangements that encode
+    /// rows alike (same key and columns) are merged in key order, so that
+    /// only the entries that differ are decoded; others are read a batch at
+    /// a time into a `DeltaBuf`, which consolidates them (in a temporary
+    /// tree once they exceed the spill threshold). Only the difference is
+    /// returned, in memory.
+    pub fn diff_arrangements(&self, env: &mut Env, old: ArrId, new: ArrId, gsn: Gsn) -> Result<Delta> {
         if old == new {
             return Ok(vec![]);
         }
+        let (a, b) = (self.arr(old), self.arr(new));
         let (la, lb) = (&a.layout, &b.layout);
         let fps = |l: &Layout| {
             let mut fp = Vec::new();
@@ -798,20 +801,31 @@ impl Graph {
             && la.payload == lb.payload
             && la.row_len == lb.row_len
             && fps(la) == fps(lb);
-        if !alike {
-            let mut diff = self.scan_arr(env, new, ReadAt::Latest)?;
-            diff.extend(self.scan_arr(env, old, ReadAt::Latest)?.into_iter().map(|(r, w)| (r, -w)));
-            consolidate(&mut diff);
-            return Ok(diff);
-        }
+        let layout = Arc::new(delta::spill_layout(&self.node(b.node).schema));
+        let mut buf = delta::DeltaBuf::new(gsn, vec![delta::Target { arr: None, layout, apply_to: None }]);
+        let r = if alike { self.merge_diff(env, a.tree, b.tree, lb, &mut buf) } else { self.scan_diff(env, old, new, &mut buf) };
+        let d = match r {
+            Ok(()) => buf.into_delta(env)?,
+            Err(e) => {
+                buf.abort(env)?;
+                return Err(e);
+            }
+        };
+        let rows = d.to_vec(env);
+        d.release(env)?;
+        rows
+    }
+
+    /// The entries of trees `a` and `b`, encoded alike by `layout`, merged
+    /// in key order: the rows of those that differ, with the difference.
+    fn merge_diff(&self, env: &mut Env, a: TreeId, b: TreeId, layout: &Layout, out: &mut delta::DeltaBuf) -> Result<()> {
         let (u, v) = (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-        let mut ca = env.cursor(a.tree, u, v);
-        let mut cb = env.cursor(b.tree, u, v);
+        let mut ca = env.cursor(a, u, v);
+        let mut cb = env.cursor(b, u, v);
         let (mut x, mut y) = (env.cursor_next(&mut ca)?, env.cursor_next(&mut cb)?);
-        let mut diff = Vec::new();
         loop {
             let (key, w) = match (&x, &y) {
-                (None, None) => break,
+                (None, None) => return Ok(()),
                 (Some((ka, ha)), Some((kb, hb))) if ka == kb => {
                     let r = (ka.clone(), hb.total() - ha.total());
                     (x, y) = (env.cursor_next(&mut ca)?, env.cursor_next(&mut cb)?);
@@ -835,12 +849,23 @@ impl Graph {
             };
             visited(1);
             if w != 0 {
-                diff.push((lb.decode_row(&key)?, w));
+                out.push(env, layout.decode_row(&key)?, w)?;
             }
         }
-        // (equal rows are equal entries, but consolidation also orders them)
-        consolidate(&mut diff);
-        Ok(diff)
+    }
+
+    /// The rows of arrangement `new` and, negated, those of `old`, a batch
+    /// at a time.
+    fn scan_diff(&self, env: &mut Env, old: ArrId, new: ArrId, out: &mut delta::DeltaBuf) -> Result<()> {
+        for (arr, sign) in [(new, 1), (old, -1)] {
+            self.scan_stream(env, arr, ReadAt::Latest, &mut |env, batch| {
+                for (r, w) in batch {
+                    out.push(env, r, sign * w)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     /// Rows matching a key prefix.

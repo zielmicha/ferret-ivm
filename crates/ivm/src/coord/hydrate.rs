@@ -177,6 +177,10 @@ pub(crate) struct Replaced {
     pub same: bool,
     /// The view's sinks (held meanwhile).
     pub sinks: Vec<ObjectId>,
+    /// Subscribers or sinks follow the new version (`same`, and there are
+    /// some): the change from the old to the new contents is computed for
+    /// them, and only then.
+    pub consumers: bool,
 }
 
 /// A subscription waiting for its query's dataflow to be hydrated.
@@ -226,14 +230,6 @@ struct ForkWork {
     conversions: Vec<Conversion>,
 }
 
-/// The change from the rows of arrangement `old` to those of `new`.
-fn diff_arrangements(graph: &Graph, env: &mut Env, old: ArrId, new: ArrId) -> Result<Delta> {
-    let mut diff = graph.scan_arr(env, new, crate::storage::ReadAt::Latest)?;
-    diff.extend(graph.scan_arr(env, old, crate::storage::ReadAt::Latest)?.into_iter().map(|(r, w)| (r, -w)));
-    crate::dataflow::consolidate(&mut diff);
-    Ok(diff)
-}
-
 /// Hydrate the fork's pending fragment as of `gsn`, then apply forwarded
 /// records until told to finish.
 #[allow(clippy::too_many_arguments)]
@@ -260,7 +256,7 @@ fn run(
     }
     let mut diffs = FxHashMap::default();
     for (view, old, new) in to_diff {
-        diffs.insert(view, diff_arrangements(&graph, &mut env, old, new)?);
+        diffs.insert(view, graph.diff_arrangements(&mut env, old, new, gsn)?);
     }
     // (the old versions of replaced views are not stepped here)
     graph.retain_closure(&roots);
@@ -342,14 +338,13 @@ impl Engine {
             match t {
                 Then::Subscribe(p) => watch.push((p.node, p.snapshot)),
                 Then::Rebuilt(r) => fork_roots.push(r.old_node),
-                Then::Replaced(r) => {
-                    // the old version too, for the change to the new one
+                // (the old version too, for the change to the new one: only
+                // for the subscribers and sinks that follow the new version)
+                Then::Replaced(r) if r.consumers => {
                     fork_roots.push(r.old.node);
                     if let Some(v) = self.rt.views.get(&r.id) {
                         diffs.push((r.id, r.old.arr, v.arr));
-                        if r.same {
-                            watch.push((v.node, false));
-                        }
+                        watch.push((v.node, false));
                     }
                 }
                 _ => {}
@@ -392,8 +387,8 @@ impl Engine {
             Then::Subscribe(p) => self.start_subscription(p, self.processed, None, &[]),
             Then::Replaced(r) => {
                 let diff = match self.rt.views.get(&r.id).map(|v| v.arr) {
-                    Some(new) => diff_arrangements(&self.graph, &mut self.env, r.old.arr, new)?,
-                    None => Vec::new(),
+                    Some(new) if r.consumers => self.graph.diff_arrangements(&mut self.env, r.old.arr, new, self.processed)?,
+                    _ => Vec::new(),
                 };
                 self.finish_replace(*r, self.processed, diff, &[])?;
             }

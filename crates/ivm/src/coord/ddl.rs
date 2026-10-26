@@ -912,7 +912,11 @@ impl Engine {
         // (held until then, also those that start over with new columns:
         // their targets must not get the old version's later changes)
         self.held_sinks.extend(sinks.iter().copied());
-        self.record_then.push(hydrate::Then::Replaced(Box::new(hydrate::Replaced { id, old, old_index_arrs, same, sinks })));
+        // (no change to compute for nobody, nor when the new version is the
+        // old dataflow: the difference of an arrangement with itself)
+        let consumers =
+            same && (!sinks.is_empty() || self.subs.iter().any(|s| s.view == Some(id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire)));
+        self.record_then.push(hydrate::Then::Replaced(Box::new(hydrate::Replaced { id, old, old_index_arrs, same, sinks, consumers })));
         Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
     }
 
