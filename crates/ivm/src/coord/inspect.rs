@@ -1722,7 +1722,7 @@ impl Engine {
             parked,
             pending_requests: self.pending.len(),
             dml_queued: self.dml_queue.len(),
-            dml_inflight: self.dml_inflight.is_some(),
+            dml_inflight: !self.dml_pending.is_empty(),
             sinks,
         }
     }

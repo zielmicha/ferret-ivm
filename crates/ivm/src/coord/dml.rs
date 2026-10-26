@@ -1,6 +1,18 @@
 //! INSERT / UPDATE / DELETE on local tables. Statements are evaluated against
 //! the current state and logged as row changes (not SQL), so replay is
-//! deterministic. DML is serialized: one write is in flight at a time.
+//! deterministic.
+//!
+//! Several statements are in flight at once (their records share the log's
+//! appends and fsyncs): a statement is evaluated against the applied state
+//! as soon as it arrives, and logged, unless it read rows that a statement
+//! logged before it but not applied yet writes — then its result could
+//! differ from the one it gets after that statement, and it waits for it
+//! (queued in arrival order, `dml_queue`) and is evaluated again. Reads and
+//! writes are tracked by table and, where a statement names rows by their
+//! whole primary key, by key (`Touched`). Local tables change only through
+//! these records, so a statement that read nothing that pending ones write
+//! sees what it would see after them: the result is that of evaluating the
+//! statements one after another in log order.
 
 use super::*;
 use crate::catalog::TableDef;
@@ -13,8 +25,73 @@ use crate::sql::plan::Rel;
 use crate::sql::ParamSlot;
 use crate::sql_bail;
 use crate::storage::ReadAt;
-use crate::types::{Datum, Row};
+use crate::types::{Datum, Row, SqlType};
+use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast;
+
+/// Error code of a DML statement that read rows a pending statement writes:
+/// it is queued until that one is applied (never sent to a client).
+pub(crate) const WAIT: &str = "IVMDW";
+
+/// Rows of local tables a statement read or writes: per table, all of them
+/// (None) or those with these primary keys (canonical key encodings); `any`
+/// for a read of a materialized view, which depends on every table.
+#[derive(Default, Debug)]
+pub(crate) struct Touched {
+    tables: FxHashMap<ObjectId, Option<FxHashSet<Vec<u8>>>>,
+    any: bool,
+}
+
+impl Touched {
+    fn add_key(&mut self, table: ObjectId, key: Vec<u8>) {
+        if let Some(keys) = self.tables.entry(table).or_insert_with(|| Some(FxHashSet::default())) {
+            keys.insert(key);
+        }
+    }
+
+    fn add_all(&mut self, table: ObjectId) {
+        self.tables.insert(table, None);
+    }
+
+    /// Do reads `self` see any row that writes `w` change?
+    fn overlaps(&self, w: &Touched) -> bool {
+        if self.any && !w.tables.is_empty() {
+            return true;
+        }
+        self.tables.iter().any(|(t, mine)| match (mine, w.tables.get(t)) {
+            (_, None) => false,
+            (None, Some(_)) | (Some(_), Some(None)) => true,
+            (Some(a), Some(Some(b))) => a.iter().any(|k| b.contains(k)),
+        })
+    }
+}
+
+/// Canonical encoding of primary key values (as lookups by key use them).
+fn key_bytes(key: &[Datum]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for k in key {
+        crate::types::encoding::encode_key(k, Default::default(), &mut b);
+    }
+    b
+}
+
+/// Does a literal compared with a column of type `t` encode as that
+/// column's values do? (As for index ranges of reads.)
+fn literal_of_type(d: &Datum, t: &SqlType) -> bool {
+    matches!(
+        (d, t),
+        (Datum::Int2(_), SqlType::Int2)
+            | (Datum::Int4(_), SqlType::Int4)
+            | (Datum::Int8(_), SqlType::Int8)
+            | (Datum::Text(_), SqlType::Text | SqlType::Varchar | SqlType::Bpchar | SqlType::Name)
+            | (Datum::Numeric(_), SqlType::Numeric)
+            | (Datum::Date(_), SqlType::Date)
+            | (Datum::Timestamp(_), SqlType::Timestamp)
+            | (Datum::TimestampTz(_), SqlType::TimestampTz)
+            | (Datum::Uuid(_), SqlType::Uuid)
+            | (Datum::Bool(_), SqlType::Bool)
+    )
+}
 
 impl Engine {
     pub(crate) fn is_dml(&self, stmt: &Statement) -> bool {
@@ -40,6 +117,9 @@ impl Engine {
 
     /// Current row stored under a primary key.
     fn stored_row(&mut self, table: ObjectId, key: &[Datum]) -> Result<Option<Row>> {
+        if let Some(r) = self.dml_reads.as_mut() {
+            r.add_key(table, key_bytes(key));
+        }
         let node = self.rt.tables[&table];
         let NodeKind::Table { primary, .. } = self.graph.node(node).kind else { unreachable!() };
         let rows = self.graph.lookup(&mut self.env, primary, key, ReadAt::Latest)?;
@@ -79,19 +159,108 @@ impl Engine {
     }
 
     pub(crate) fn execute_dml(&mut self, stmt: &ast::Statement, params: Vec<ParamSlot>, reply: Sender<Result<ExecResult>>) -> Result<Option<ExecResult>> {
-        let (changes, tag) = match stmt {
-            ast::Statement::Insert(ins) => self.plan_insert(ins, params)?,
-            ast::Statement::Update(upd) => self.plan_update(upd, params)?,
-            ast::Statement::Delete(del) => self.plan_delete(del, params)?,
-            _ => sql_bail!(codes::INTERNAL_ERROR, "not DML"),
+        self.dml_reads = Some(Touched::default());
+        let r = match stmt {
+            ast::Statement::Insert(ins) => self.plan_insert(ins, params),
+            ast::Statement::Update(upd) => self.plan_update(upd, params),
+            ast::Statement::Delete(del) => self.plan_delete(del, params),
+            _ => Err(SqlError::new(codes::INTERNAL_ERROR, "not DML")),
         };
+        let reads = self.dml_reads.take().unwrap_or_default();
+        // (an error, or no change, could be a consequence of the stale rows too)
+        if self.dml_pending.iter().any(|(_, w)| reads.overlaps(w)) {
+            return Err(SqlError::new(WAIT, "it reads rows a statement not applied yet writes"));
+        }
+        let (changes, tag) = r?;
         if changes.is_empty() {
             return Ok(Some(ExecResult::Command { tag }));
         }
         let req = self.alloc_req();
         self.dml_counts.insert(req, tag);
+        let writes = self.writes_of(&changes);
+        self.dml_pending.push((req, writes));
         self.submit(LogRecord::Commit { source: 0, lsn: req, changes }, req, reply);
         Ok(None)
+    }
+
+    /// The rows `changes` write.
+    fn writes_of(&self, changes: &[(ObjectId, TableChange)]) -> Touched {
+        let mut w = Touched::default();
+        for (t, ch) in changes {
+            let pk = match self.catalog.get(*t).map(|o| &o.kind) {
+                Some(ObjectKind::Table(def)) if !def.pk.is_empty() => &def.pk,
+                _ => {
+                    w.add_all(*t);
+                    continue;
+                }
+            };
+            match ch {
+                TableChange::Upsert { row, .. } => w.add_key(*t, key_bytes(&pk.iter().map(|c| row[*c].clone()).collect::<Vec<_>>())),
+                TableChange::Delete { key } => w.add_key(*t, key_bytes(key)),
+                _ => w.add_all(*t),
+            }
+        }
+        w
+    }
+
+    /// Record the rows a plan executed for a DML statement reads: a table
+    /// filtered on its whole primary key by constants reads that row, any
+    /// other table all of it, a materialized view everything.
+    pub(crate) fn record_dml_reads(&mut self, rel: &Rel) {
+        fn walk(e: &Engine, rel: &Rel, out: &mut Touched) {
+            match rel {
+                Rel::Get { id, .. } => match e.catalog.get(*id).map(|o| &o.kind) {
+                    Some(ObjectKind::Table(_)) => out.add_all(*id),
+                    _ => out.any = true,
+                },
+                Rel::Filter { input, preds } => match &**input {
+                    Rel::Get { id, .. } if let Some(key) = e.pk_point(*id, preds) => out.add_key(*id, key),
+                    _ => walk(e, input, out),
+                },
+                _ => {
+                    for i in rel.inputs() {
+                        walk(e, i, out);
+                    }
+                }
+            }
+        }
+        let Some(mut out) = self.dml_reads.take() else { return };
+        walk(self, rel, &mut out);
+        self.dml_reads = Some(out);
+    }
+
+    /// The primary key of the one row of local table `table` that `preds`
+    /// (a conjunction) can select, when they equate every key column with a
+    /// constant.
+    fn pk_point(&self, table: ObjectId, preds: &[Expr]) -> Option<Vec<u8>> {
+        let Some(ObjectKind::Table(def)) = self.catalog.get(table).map(|o| &o.kind) else { return None };
+        if def.pk.is_empty() {
+            return None;
+        }
+        let mut conj: Vec<&Expr> = Vec::new();
+        fn flatten<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+            match e {
+                Expr::And(v) => v.iter().for_each(|x| flatten(x, out)),
+                e => out.push(e),
+            }
+        }
+        preds.iter().for_each(|p| flatten(p, &mut conj));
+        let mut key = Vec::with_capacity(def.pk.len());
+        for &c in &def.pk {
+            let ty = &def.columns[c].ty.ty;
+            let v = conj.iter().find_map(|p| {
+                let Expr::Call(call) = p else { return None };
+                if call.args.len() != 2 || crate::expr::func::func_def(call.func).name != "=" {
+                    return None;
+                }
+                match (&call.args[0], &call.args[1]) {
+                    (Expr::Column(x), Expr::Literal(d, _)) | (Expr::Literal(d, _), Expr::Column(x)) if *x == c && literal_of_type(d, ty) => Some(d.clone()),
+                    _ => None,
+                }
+            })?;
+            key.push(v);
+        }
+        Some(key_bytes(&key))
     }
 
     fn plan_insert(&mut self, ins: &ast::Insert, params: Vec<ParamSlot>) -> Result<(Vec<(ObjectId, TableChange)>, String)> {

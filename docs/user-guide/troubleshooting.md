@@ -27,7 +27,9 @@
 - **A view is being hydrated.** Statements that read a view that is still
   being hydrated wait until it is maintained; DDL logged while a view is
   being hydrated waits for it, and so do the changes logged after that DDL.
-- **DML** is serialized: a statement waits for the one before it.
+- **DML** that reads rows a statement logged before it writes (the same
+  primary key, or any row of a table it scans) waits for that statement to
+  be applied.
 - **`SUBSCRIBE` in psql** never prints anything: psql waits for the end of
   the result. Use `COPY (SUBSCRIBE ...) TO STDOUT`.
 

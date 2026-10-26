@@ -146,11 +146,28 @@ against its current state, converts it into row changes, and submits one
 `Commit { source: 0, lsn: <request id>, ... }` record to the sequencer (a
 statement that changes nothing is answered at once, without a record). The
 reply is sent when the record comes back durable and has been applied, so
-the client's next fresh read sees it. Only one DML statement is in flight at
-a time; others queue in the engine (`dml_queue`) and run in order. DDL
-logged before the record applies first: if it dropped the statement's
-table, the record changes nothing and the statement fails (`the table of
-this statement was dropped before it could be applied`), on replay too.
+the client's next fresh read sees it. DDL logged before the record applies
+first: if it dropped the statement's table, the record changes nothing and
+the statement fails (`the table of this statement was dropped before it
+could be applied`), on replay too.
+
+Several DML statements are in flight at once (`coord/dml.rs`): a statement
+is evaluated as soon as it arrives and its record submitted, without waiting
+for the records of earlier statements to be applied, unless it read rows
+that one of those records writes. Its result could then differ from the one
+it gets after that record; it is queued (`dml_queue`, in arrival order,
+behind the first statement waiting) and evaluated again whenever a pending
+DML record has been applied. The rows a statement reads are tracked while it
+is evaluated (`Touched`): the primary keys it looks up (duplicate-key checks
+of `INSERT`, new keys of `UPDATE`); for each table the plan of
+`INSERT ... SELECT`, `UPDATE` or `DELETE` reads, the row with the key that
+its predicates equate every key column with constants, or else every row;
+for a materialized view, every row of every table. The rows a record writes
+are its keys (every row of a table without a primary key). Local tables
+change only through these records, and a statement that read nothing a
+pending record writes sees what it would see after them: the results are
+those of evaluating the statements one after another in log order, and
+replay applies the logged changes, never re-evaluating.
 
 ### DDL
 
@@ -193,7 +210,8 @@ The sequencer processes messages in batches: it blocks for the first message
 (or the tick deadline), adds a tick if one is due, then drains more messages
 without blocking, up to 4096 per batch. All `Append`s of a batch are encoded
 into one buffer, written with one `write`, and made durable with one
-`fdatasync`. Only then are acknowledgements sent
+`fdatasync` (an `AppendAll` — the records the engine submitted in one round
+of messages, see below — counts as its records). Only then are acknowledgements sent
 and the records handed to the engine — no record is applied, acknowledged to
 a source, or answered to a client before it is durable. Under load, batches
 grow and the cost of `fsync` is shared; when idle, a batch is a single
@@ -212,8 +230,9 @@ so it always catches up.
 
 ## The engine loop
 
-The engine thread waits for an `EngineMsg` with a 200 ms timeout and
-handles:
+The engine thread waits for an `EngineMsg` with a 200 ms timeout and then
+handles it and the messages already waiting behind it (up to 256 in a
+round):
 
 | Message | Action |
 |---|---|
@@ -225,7 +244,10 @@ handles:
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
 | `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint after the one being written, if any (not after a simulated crash, which only waits for that one to be written), wait up to 5 s for sources and sinks, exit |
 
-After every message it runs deferred requests (queued DML, woken reads),
+After every round it runs deferred requests (queued DML, woken reads),
+sends the records submitted in the round to the sequencer as one
+`AppendAll` (so that the statements evaluated together share one log append
+and `fdatasync`; `log_batches` in `Shared` counts the sequencer's batches),
 finishes the hydration in progress if it has caught up (then applies the
 records held behind it), finishes the checkpoint being written if it is
 done, begins one if one is due or asked for, and removes cancelled

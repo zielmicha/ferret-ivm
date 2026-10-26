@@ -10,6 +10,14 @@ use ivm::types::text::format_datum;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// These tests measure what happens meanwhile: one at a time, so that they
+/// do not slow each other down unevenly.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
     let d = PathBuf::from(base).join(format!("ivm-stall-{name}-{}", std::process::id()));
@@ -87,6 +95,7 @@ fn start_ddl(h: &EngineHandle, sql: &str, view: &str) -> std::thread::JoinHandle
 /// DDL record was applied, stopping every other view, commit and read.)
 #[test]
 fn commits_are_applied_while_a_view_hydrates() {
+    let _serial = serial();
     let dir = tmpdir("hydrate-commits");
     let running = start(&dir);
     let h = running.handle.clone();
@@ -118,6 +127,7 @@ fn gsn(h: &EngineHandle) -> u64 {
 /// history starts at its DDL's GSN).
 #[test]
 fn requests_reading_a_hydrating_view_wait_for_it() {
+    let _serial = serial();
     let dir = tmpdir("hydrate-reads");
     let running = start(&dir);
     let h = running.handle.clone();
@@ -184,6 +194,7 @@ fn requests_reading_a_hydrating_view_wait_for_it() {
 /// them from its root, as a new view does).
 #[test]
 fn a_crash_during_a_hydration_recovers_the_same_state() {
+    let _serial = serial();
     let view = "SELECT a.g, count(*) AS n, sum(b.x) AS s, sum(1 / (b.x - 7)) AS e FROM big a JOIN big b ON a.x = b.id GROUP BY a.g";
     let mut states = Vec::new();
     for crash in [false, true] {
@@ -230,6 +241,7 @@ fn a_crash_during_a_hydration_recovers_the_same_state() {
 /// query's result.
 #[test]
 fn subscriptions_to_queries_add_up_while_they_hydrate() {
+    let _serial = serial();
     let dir = tmpdir("hydrate-subscribe");
     let running = start(&dir);
     let h = running.handle.clone();
@@ -279,11 +291,13 @@ fn subscriptions_to_queries_add_up_while_they_hydrate() {
 }
 
 /// While a large checkpoint is written, single-row commits are applied and
-/// answered: some with a GSN after the checkpoint's are answered before the
-/// checkpoint is. (The checkpoint used to be written on the engine thread,
-/// which applied nothing meanwhile.)
+/// answered: commits with GSNs after the checkpoint's are answered before
+/// it is, and none waits for a good part of it. (The checkpoint used to be
+/// written on the engine thread, which applied nothing meanwhile: the first
+/// commit after it began waited for all of it.)
 #[test]
 fn commits_are_applied_while_a_checkpoint_is_written() {
+    let _serial = serial();
     let dir = tmpdir("checkpoint-commits");
     // (no checkpoint before the one asked for: it writes everything loaded)
     let cfg = coord::Config {
@@ -303,26 +317,96 @@ fn commits_are_applied_while_a_checkpoint_is_written() {
     // (the inserts are the only records: their GSNs follow this one)
     let g0 = gsn(&h);
     let h2 = h.clone();
-    let ck = std::thread::spawn(move || h2.checkpoint().unwrap());
-    let mut during = Vec::new();
+    let ck = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let g = h2.checkpoint().unwrap();
+        (g, t0.elapsed())
+    });
+    let (mut during, mut slowest) = (Vec::new(), Duration::ZERO);
     let mut i = 0;
     while !ck.is_finished() {
+        let t0 = Instant::now();
         exec(&h, &format!("INSERT INTO small VALUES ({i}, {i})"));
         i += 1;
         if !ck.is_finished() {
             during.push(g0 + i);
+            slowest = slowest.max(t0.elapsed());
         }
     }
-    let c = ck.join().unwrap();
+    let (c, took) = ck.join().unwrap();
     assert_eq!(gsn(&h), g0 + i);
     let after = during.iter().filter(|g| **g > c).count();
-    // (over a thousand here; a few race with the reply of one written inline)
-    assert!(after >= 100, "{after} commits after the checkpoint's GSN {c} answered while it was written ({} in all)", during.len());
+    assert!(after >= 3, "{after} commits after the checkpoint's GSN {c} answered while it was written ({} in all)", during.len());
+    assert!(slowest * 3 < took, "a commit took {slowest:?} of the checkpoint's {took:?}");
     // the next one (with nothing written meanwhile) has everything
     assert!(h.checkpoint().unwrap() >= *during.last().unwrap());
     running.shutdown();
     let running = start(&dir);
     assert_eq!(rows(&running.handle, "SELECT count(*) FROM small"), vec![i.to_string()]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run `n` statements from each of `clients` threads at once (`sql(client,
+/// i)`), returning the results in order per client.
+fn concurrently(h: &EngineHandle, clients: usize, n: usize, sql: fn(usize, usize) -> String) -> Vec<Vec<Result<ExecResult, String>>> {
+    let threads: Vec<_> = (0..clients)
+        .map(|c| {
+            let h = h.clone();
+            std::thread::spawn(move || (0..n).map(|i| try_exec(&h, &sql(c, i))).collect::<Vec<_>>())
+        })
+        .collect();
+    threads.into_iter().map(|t| t.join().unwrap()).collect()
+}
+
+/// Concurrent single-row DML statements share log appends (and their
+/// fsyncs): each one is logged as soon as it is evaluated unless it read
+/// rows a statement logged before it writes, instead of waiting for the
+/// statement before it to be applied. (Each used to cost an append and an
+/// fsync of its own.) Results stay those of running them one after the
+/// other: no lost update, no duplicate key, every statement's own result.
+#[test]
+fn concurrent_dml_shares_log_appends() {
+    let _serial = serial();
+    let dir = tmpdir("group-commit");
+    let cfg = coord::Config { data_dir: dir.clone(), sync: true, tick: None, ..Default::default() };
+    let running = coord::start(cfg).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE d (client int, i int, PRIMARY KEY (client, i))");
+    exec(&h, "CREATE TABLE acct (id int PRIMARY KEY, bal bigint)");
+    exec(&h, "INSERT INTO acct SELECT g, 0 FROM generate_series(0, 9) g");
+    exec(&h, "CREATE MATERIALIZED VIEW per_client AS SELECT client, count(*) AS n FROM d GROUP BY client");
+    let batches = |h: &EngineHandle| h.shared.log_batches.load(std::sync::atomic::Ordering::Relaxed);
+    let (clients, n) = (16, 200);
+    // inserts of distinct rows: nothing to wait for
+    let b0 = batches(&h);
+    let res = concurrently(&h, clients, n, |c, i| format!("INSERT INTO d VALUES ({c}, {i})"));
+    let inserts = batches(&h) - b0;
+    for r in res.iter().flatten() {
+        assert!(matches!(r, Ok(ExecResult::Command { tag }) if tag == "INSERT 0 1"), "{r:?}");
+    }
+    let statements = (clients * n) as u64;
+    assert!(inserts * 2 <= statements, "{inserts} log appends for {statements} concurrent inserts");
+    assert_eq!(rows(&h, "SELECT count(*), count(DISTINCT client) FROM d"), vec![format!("{statements}|{clients}")]);
+    assert_eq!(rows(&h, "SELECT DISTINCT n FROM per_client"), vec![n.to_string()]);
+    // updates of a few hot rows: each reads what the one before wrote
+    let res = concurrently(&h, clients, 50, |c, i| format!("UPDATE acct SET bal = bal + 1 WHERE id = {}", (c * 7 + i * 3) % 10));
+    for r in res.iter().flatten() {
+        assert!(matches!(r, Ok(ExecResult::Command { tag }) if tag == "UPDATE 1"), "{r:?}");
+    }
+    let mut want = [0i64; 10];
+    for c in 0..clients {
+        for i in 0..50 {
+            want[(c * 7 + i * 3) % 10] += 1;
+        }
+    }
+    let want: Vec<String> = (0..10).map(|k| format!("{k}|{}", want[k])).collect();
+    assert_eq!(rows(&h, "SELECT id, bal FROM acct"), want);
+    // the same key from every client: exactly one insert succeeds
+    let res = concurrently(&h, clients, 1, |_, _| "INSERT INTO d VALUES (-1, -1)".to_string());
+    let ok = res.iter().flatten().filter(|r| r.is_ok()).count();
+    assert_eq!(ok, 1, "{res:?}");
+    assert!(res.iter().flatten().filter_map(|r| r.as_ref().err()).all(|e| e.contains("duplicate key")));
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

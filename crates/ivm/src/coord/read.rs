@@ -100,6 +100,9 @@ impl Engine {
             // (the request is parked until the hydration is done)
             return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
         }
+        if self.dml_reads.is_some() {
+            self.record_dml_reads(rel);
+        }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
         let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default() };

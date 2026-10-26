@@ -149,6 +149,10 @@ pub(crate) struct AppState {
 /// most recent ones: the history is part of every checkpoint.
 pub const MAX_HISTORY: usize = 10_000;
 
+/// Most messages the engine handles in one round (before deferred requests,
+/// sending the submitted records, and its other work).
+const MAX_MESSAGES_PER_ROUND: usize = 256;
+
 /// Most clock ticks kept in a checkpoint: a day of ticks at the default
 /// interval. now() in a read as of an older GSN (within a larger retention
 /// window) after a restart is the oldest kept tick's clock.
@@ -167,8 +171,14 @@ pub struct Engine {
     pub(crate) parked: Vec<Parked>,
     pub(crate) subs: Vec<Subscription>,
     pub(crate) next_req: u64,
-    dml_inflight: Option<u64>,
+    /// DML logged but not applied yet, with the rows it writes (`dml.rs`).
+    dml_pending: Vec<(u64, dml::Touched)>,
+    /// DML waiting for pending DML whose rows it read, in arrival order.
     dml_queue: VecDeque<Request>,
+    /// The rows the DML statement being evaluated reads.
+    pub(crate) dml_reads: Option<dml::Touched>,
+    /// Records submitted in this round of messages, not sent yet.
+    outbox: Vec<(u64, LogRecord)>,
     /// Command tags of DML waiting to be applied.
     pub(crate) dml_counts: HashMap<u64, String>,
     /// Requests to run after the current message.
@@ -440,8 +450,10 @@ impl Engine {
             parked: Vec::new(),
             subs: Vec::new(),
             next_req: 1,
-            dml_inflight: None,
+            dml_pending: Vec::new(),
             dml_queue: VecDeque::new(),
+            dml_reads: None,
+            outbox: Vec::new(),
             dml_counts: HashMap::new(),
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),
@@ -596,20 +608,33 @@ impl Engine {
     }
 
     fn run(mut self, rx: Receiver<EngineMsg>, handle: EngineHandle) -> Result<()> {
-        loop {
-            let msg = match rx.recv_timeout(Duration::from_millis(200)) {
+        'run: loop {
+            let first = match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(m) => Some(m),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
                 Err(_) => break,
             };
-            match msg {
-                Some(EngineMsg::Durable(batch)) => {
-                    self.held.extend(batch);
-                    self.apply_durable(&handle)?;
+            // with the messages already waiting, so that the statements
+            // among them are logged together (one log append for all)
+            let mut msgs: VecDeque<Option<EngineMsg>> = VecDeque::from([first]);
+            while msgs.len() < MAX_MESSAGES_PER_ROUND
+                && let Ok(m) = rx.try_recv()
+            {
+                msgs.push_back(Some(m));
+            }
+            for msg in msgs {
+                match msg {
+                    Some(EngineMsg::Durable(batch)) => {
+                        self.held.extend(batch);
+                        self.apply_durable(&handle)?;
+                    }
+                    Some(EngineMsg::Request(req)) => self.handle_request(req, &handle),
+                    Some(EngineMsg::Shutdown) => {
+                        self.flush_outbox();
+                        break 'run;
+                    }
+                    Some(EngineMsg::Wake) | None => self.wake_parked(&handle),
                 }
-                Some(EngineMsg::Request(req)) => self.handle_request(req, &handle),
-                Some(EngineMsg::Shutdown) => break,
-                Some(EngineMsg::Wake) | None => self.wake_parked(&handle),
             }
             while !self.deferred.is_empty() {
                 let reqs = std::mem::take(&mut self.deferred);
@@ -617,6 +642,7 @@ impl Engine {
                     self.handle_request(r, &handle);
                 }
             }
+            self.flush_outbox();
             self.poll_hydration(&handle)?;
             self.poll_checkpoint(false)?;
             self.maybe_checkpoint()?;
@@ -698,16 +724,30 @@ impl Engine {
         r
     }
 
-    /// Submit a record to the sequencer; `reply` is answered when it is applied.
+    /// Submit a record to the sequencer; `reply` is answered when it is
+    /// applied. (Sent at the end of the engine's round of messages, with the
+    /// other statements' records: `flush_outbox`.)
     pub(crate) fn submit(&mut self, rec: LogRecord, req: u64, reply: Sender<Result<ExecResult>>) {
         self.pending.insert(req, reply);
-        if matches!(rec, LogRecord::Commit { source: 0, .. }) {
-            self.dml_inflight = Some(req);
+        self.outbox.push((req, rec));
+        if self.handle.is_none() {
+            self.flush_outbox();
         }
-        if self.seq.send(SeqMsg::Append { rec, ack: None }).is_err()
-            && let Some(r) = self.pending.remove(&req)
-        {
-            let _ = r.send(Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
+    }
+
+    /// Send the submitted records to the sequencer in one message: it
+    /// appends them in one batch, with one write and one `fdatasync`.
+    fn flush_outbox(&mut self) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        let (reqs, recs): (Vec<u64>, Vec<LogRecord>) = std::mem::take(&mut self.outbox).into_iter().unzip();
+        if self.seq.send(SeqMsg::AppendAll(recs)).is_err() {
+            for req in reqs {
+                if let Some(r) = self.pending.remove(&req) {
+                    let _ = r.send(Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
+                }
+            }
         }
     }
 
@@ -715,18 +755,17 @@ impl Engine {
         if let Some(r) = self.pending.remove(&req) {
             let _ = r.send(res);
         }
-        if self.dml_inflight == Some(req) {
-            self.dml_inflight = None;
-        }
+        self.dml_pending.retain(|(r, _)| *r != req);
     }
 
     fn handle_request(&mut self, req: Request, handle: &EngineHandle) {
         match req {
             Request::Execute { ref stmt, .. } if self.is_dml(stmt) => {
-                if self.dml_inflight.is_some() {
-                    self.dml_queue.push_back(req);
-                } else {
+                // (behind DML that is waiting: in arrival order)
+                if self.dml_queue.is_empty() {
                     self.run_execute(req, handle);
+                } else {
+                    self.dml_queue.push_back(req);
                 }
             }
             Request::Checkpoint { reply } => self.request_checkpoint(checkpoint::Waiter::Request(reply)),
@@ -743,7 +782,8 @@ impl Engine {
             Request::Execute { stmt, params, vars, extra, reply } => {
                 // (a statement reading a relation still being hydrated is
                 // parked until it is done: kept to be run again)
-                let retry = self.hydration.is_some().then(|| (stmt.clone(), params.clone(), vars.clone(), extra.clone()));
+                let retry = (self.hydration.is_some() || !self.dml_pending.is_empty())
+                    .then(|| (stmt.clone(), params.clone(), vars.clone(), extra.clone()));
                 // (current_setting() in the statement reads the session's settings)
                 let settings = vars.settings.clone();
                 let r = crate::expr::with_session_settings(settings, || self.execute(*stmt, params, vars, extra, reply.clone(), handle));
@@ -755,6 +795,12 @@ impl Engine {
                     Err(e) if e.code == hydrate::HYDRATING && retry.is_some() => {
                         let (stmt, params, vars, extra) = retry.unwrap();
                         self.parked.push(Parked { wait: Wait::Hydration, req: Request::Execute { stmt, params, vars, extra, reply } });
+                    }
+                    // (it read rows pending DML writes: evaluated again after it,
+                    // first among the DML waiting)
+                    Err(e) if e.code == dml::WAIT && retry.is_some() => {
+                        let (stmt, params, vars, extra) = retry.unwrap();
+                        self.dml_queue.push_front(Request::Execute { stmt, params, vars, extra, reply });
                     }
                     Err(e) => {
                         let _ = reply.send(Err(e));
@@ -879,14 +925,11 @@ impl Engine {
         Ok(())
     }
 
+    /// Evaluate the waiting DML again (some pending DML was applied): from
+    /// the main loop, in order (`handle_request` queues the others again
+    /// behind the first that still has to wait).
     fn drain_dml_queue(&mut self) {
-        // executed from the main loop via handle_request on the next message;
-        // here we only re-enqueue so ordering is preserved
-        if self.dml_inflight.is_none()
-            && let Some(req) = self.dml_queue.pop_front()
-        {
-            self.deferred.push(req);
-        }
+        self.deferred.extend(self.dml_queue.drain(..));
     }
 
     /// The logical clock as of `gsn` (what now() returns in a read at `gsn`).

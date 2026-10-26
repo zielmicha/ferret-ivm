@@ -132,9 +132,12 @@ DELETE FROM table [ [ AS ] alias ] [ WHERE condition ]
 - `now()` and related functions in DML return the **wall-clock time when the
   statement runs**, not the logical clock used by reads; the computed values
   are logged.
-- DML statements are serialized: one is in flight at a time, and the client
-  gets its reply after the change has been applied, so a following read sees
-  it.
+- DML statements from different sessions are logged together (sharing the
+  log's appends and `fsync`s) unless one read rows another, logged before
+  it, writes: it then waits for that one to be applied and is evaluated
+  again. The outcome is that of running the statements one after another in
+  the order they were logged. The client gets its reply after the change
+  has been applied, so a following read sees it.
 - A statement planned while a `DROP` of its table was already logged (but
   not yet applied) applies nothing and fails with SQLSTATE `42P01`
   (`the table of this statement was dropped before it could be applied`).

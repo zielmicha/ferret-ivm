@@ -215,8 +215,8 @@ owning operator in the dataflow graph.
 `SUBSCRIBE` sessions (the operator they follow, the table or materialized
 view subscribed to, or an ad hoc query, which includes a subscription to a
 virtual view; whether progress messages are on), reads waiting for a GSN, an
-LSN (`AS OF AT LEAST LSN`) or a table's snapshot (initial, or a table copied
-again), with their statements, requests waiting for their log record, the
+LSN (`AS OF AT LEAST LSN`), a table's snapshot (initial, or a table copied
+again) or a view's hydration, with their statements, requests waiting for their log record, the
 DML queue, and sinks with status, committed GSN and how far behind the
 engine they are.
 
@@ -507,7 +507,7 @@ they do not apply. Unknown names get `404`.
 `target` names the table or materialized view whose dataflow node the
 subscription follows (one of them when identical views share the node), and
 is null for a subscription to an ad hoc query or to a virtual view (which is
-subscribed as its query); `wait` is `gsn`, `lsn` or `snapshot`.
+subscribed as its query); `wait` is `gsn`, `lsn`, `snapshot` or `hydration` (a statement reading a view still being hydrated).
 
 `/api/errors` returns `{"gsn", "views": [{"id", "name", "code", "message",
 "count"}], "sources": [{"id", "name", "status"}], "sinks": [...], "broken":
