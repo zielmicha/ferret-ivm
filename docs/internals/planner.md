@@ -377,6 +377,18 @@ as of the read's GSN, and the read fails if it touches a broken view
 (`55000`) or a materialized view with error records. Expression errors fail
 the query, as in PostgreSQL.
 
+A read runs on the engine thread with a budget of 50,000 entries that its
+scans may visit (`Env::set_read_budget`; DML is evaluated without one). A
+read that exceeds it is abandoned there and run again on a reader thread
+(`coord/reader.rs`, four of them, started when first needed) against a fork
+of the storage taken at once — every tree as it is after the last applied
+record ([Storage](storage.md#forks)) — and a copy of the part of the graph
+it reads (`Graph::fork_of`): the same read point and plan, hence the same
+result, while the engine goes on applying records and answering other
+statements. The reader thread answers the client. A small read costs no
+fork; a large one costs the engine thread its budget and the fork (one
+reference-count increment per loaded node).
+
 Because the executor and the dataflow share the aggregate, window and
 expression code, a maintained view and the same query run ad hoc compute
 the same values; the self-differential test compares the two, and the

@@ -51,7 +51,8 @@ Things to keep in mind when sizing:
   own (as large as the cache; nodes are shared with the engine's until one
   side modifies them), and keeps the changes of the tables it reads applied
   meanwhile (at most a million records' worth) until it has caught up;
-  aggregation group caches; subscription and sink queues are unbounded. The queue of logged records the engine has yet to
+  a large read runs on a fork too (up to four at a time); aggregation group
+  caches; subscription and sink queues are unbounded. The queue of logged records the engine has yet to
   apply is bounded: when the engine is 10,000 records behind, the log stops
   taking new records until it catches up (sources then pause reading the
   replication stream, and the upstream keeps the WAL).

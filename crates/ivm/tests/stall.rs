@@ -406,3 +406,59 @@ fn concurrent_dml_shares_log_appends() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Large ad hoc reads run off the engine thread (on a fork of the storage
+/// taken when they exceed their budget there): commits keep being applied
+/// and answered while they run, none waiting for a good part of them, and
+/// each returns the table as of one GSN. (Six queued `LIMIT 1` scans used
+/// to hold up a single-row insert for seconds.)
+#[test]
+fn large_reads_do_not_hold_up_commits() {
+    let _serial = serial();
+    let dir = tmpdir("reads");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE wide (id int PRIMARY KEY, g int, pad text)");
+    for lo in (0..600_000).step_by(100_000) {
+        exec(&h, &format!("INSERT INTO wide SELECT i, i % 7, repeat('x', 50) FROM generate_series({lo}, {}) i", lo + 99_999));
+    }
+    exec(&h, "CREATE TABLE small (id int PRIMARY KEY, v int)");
+    let g0 = gsn(&h);
+    let reads: Vec<_> = (0..6)
+        .map(|k| {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                let q = format!("SELECT g, count(*), min(pad), max(id) FROM wide WHERE id % 6 <> {k} GROUP BY g ORDER BY g LIMIT 1");
+                (rows(&h, &q), t0.elapsed())
+            })
+        })
+        .collect();
+    let (mut during, mut slowest) = (0, Duration::ZERO);
+    let mut i = 0;
+    while reads.iter().any(|r| !r.is_finished()) {
+        let t0 = Instant::now();
+        exec(&h, &format!("INSERT INTO wide VALUES ({}, 0, 'y')", 1_000_000 + i));
+        i += 1;
+        if reads.iter().any(|r| !r.is_finished()) {
+            during += 1;
+            slowest = slowest.max(t0.elapsed());
+        }
+    }
+    let results: Vec<(Vec<String>, Duration)> = reads.into_iter().map(|t| t.join().unwrap()).collect();
+    let longest = results.iter().map(|r| r.1).max().unwrap();
+    assert!(during >= 3, "{during} commits answered while the reads ran");
+    assert!(slowest * 3 < longest, "a commit took {slowest:?} of the reads' {longest:?}");
+    // each read saw the table as of some GSN between g0 and the end: all of
+    // the 600,000 rows, plus some of the inserts of group 0
+    for (k, (r, _)) in results.iter().enumerate() {
+        let base = (0..600_000).filter(|x| x % 7 == 0 && x % 6 != k).count();
+        let n: usize = r[0].split('|').nth(1).unwrap().parse().unwrap();
+        assert!(r[0].starts_with("0|") && n >= base && n <= base + i as usize, "read {k}: {r:?} (base {base}, {i} inserts)");
+    }
+    assert_eq!(gsn(&h), g0 + i);
+    let sum = (0..600_000i64).map(|x| x % 7).sum::<i64>();
+    assert_eq!(rows(&h, "SELECT count(*), sum(g) FROM wide"), vec![format!("{}|{sum}", 600_000 + i)]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

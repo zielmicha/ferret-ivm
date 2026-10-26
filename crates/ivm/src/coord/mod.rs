@@ -8,6 +8,7 @@ mod checkpoint;
 mod hydrate;
 pub mod inspect;
 mod read;
+mod reader;
 pub mod seq;
 
 use crate::catalog::{Catalog, ObjectKind};
@@ -179,6 +180,9 @@ pub struct Engine {
     pub(crate) dml_reads: Option<dml::Touched>,
     /// Records submitted in this round of messages, not sent yet.
     outbox: Vec<(u64, LogRecord)>,
+    /// Threads running large reads on forks (`reader.rs`), started when
+    /// first needed.
+    readers: Option<Sender<reader::ReadJob>>,
     /// Command tags of DML waiting to be applied.
     pub(crate) dml_counts: HashMap<u64, String>,
     /// Requests to run after the current message.
@@ -454,6 +458,7 @@ impl Engine {
             dml_queue: VecDeque::new(),
             dml_reads: None,
             outbox: Vec::new(),
+            readers: None,
             dml_counts: HashMap::new(),
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),

@@ -19,11 +19,10 @@
   at once.
 - **`AS OF <gsn>` in the future** waits until the engine reaches that GSN.
 - **The engine thread is busy.** All statements run on one thread: while it
-  applies a large upstream transaction, rebuilds a view
-  (`CREATE OR REPLACE MATERIALIZED VIEW`, an upstream schema change) or runs
-  a long read, every other statement waits. (New views, indexes and
-  subscriptions are hydrated, and checkpoints written, on threads of their
-  own.)
+  applies a large upstream transaction or rebuilds a view
+  (`CREATE OR REPLACE MATERIALIZED VIEW`, an upstream schema change), every
+  other statement waits. (New views, indexes and subscriptions are hydrated,
+  checkpoints written and large reads run on threads of their own.)
 - **A view is being hydrated.** Statements that read a view that is still
   being hydrated wait until it is maintained; DDL logged while a view is
   being hydrated waits for it, and so do the changes logged after that DDL.

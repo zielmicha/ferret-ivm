@@ -40,6 +40,10 @@ use std::sync::Arc;
 
 /// Global sequence number: the engine's single clock.
 pub type Gsn = u64;
+
+/// Error code of a read that visited more entries than its budget
+/// (`Env::set_read_budget`; never sent to a client).
+pub const READ_BUDGET: &str = "IVMRB";
 pub type TreeId = u64;
 
 /// Computes a tree's per-node summaries from leaf entries.
@@ -175,6 +179,8 @@ pub struct Env {
     released: Vec<DiskLoc>,
     /// Node frames read from segments (`segment_reads`).
     reads: u64,
+    /// Entries scans may still visit before failing with `READ_BUDGET`.
+    read_budget: Option<u64>,
 }
 
 /// A node a checkpoint job wrote: its slot and stamp in the parent
@@ -396,6 +402,7 @@ impl Env {
             releasing: Vec::new(),
             released: Vec::new(),
             reads: 0,
+            read_budget: None,
         };
         let recovered = match rec {
             None => None,
@@ -1084,6 +1091,24 @@ impl Env {
         }
     }
 
+    /// Let scans (`for_each`, cursors and what uses them) visit at most `n`
+    /// more entries, then fail with `READ_BUDGET` (None: no limit): a read
+    /// on the engine thread that turns out large is continued elsewhere.
+    pub fn set_read_budget(&mut self, n: Option<u64>) {
+        self.read_budget = n;
+    }
+
+    /// Count `n` entries visited against the read budget.
+    fn spend(&mut self, n: u64) -> Result<()> {
+        if let Some(b) = self.read_budget.as_mut() {
+            if *b < n {
+                return Err(SqlError::new(READ_BUDGET, "the read visited more entries than its budget"));
+            }
+            *b -= n;
+        }
+        Ok(())
+    }
+
     pub fn cursor(&self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Cursor {
         Cursor { tree, lo: own_bound(lo), hi: own_bound(hi), buf: VecDeque::new(), done: false }
     }
@@ -1152,6 +1177,7 @@ impl Env {
                 }
             }
             self.maybe_evict();
+            self.spend(c.buf.len() as u64)?;
             if !c.buf.is_empty() || c.done {
                 return Ok(());
             }
@@ -1236,12 +1262,15 @@ impl Env {
                 Bound::Included(k) => entries.partition_point(|e| &*e.key < k),
                 Bound::Excluded(k) => entries.partition_point(|e| &*e.key <= k),
             };
+            let mut visited = 0u64;
             for e in &entries[start..] {
+                visited += 1;
                 if !in_range(&e.key) || !f(&e.key, &e.hist)? {
                     self.maybe_evict();
-                    return Ok(());
+                    return self.spend(visited);
                 }
             }
+            self.spend(visited)?;
             let sep = match next {
                 Some((pid, ci)) => match self.node(pid) {
                     Node::Internal(ch) if in_range(&ch[ci].sep) => Some(ch[ci].sep.to_vec()),
@@ -1522,6 +1551,7 @@ impl Env {
             releasing: std::mem::take(&mut self.releasing),
             released: Vec::new(),
             reads: 0,
+            read_budget: None,
         };
         Ok(CheckpointJob { env, gsn })
     }
@@ -1728,6 +1758,7 @@ impl Env {
             releasing: Vec::new(),
             released: Vec::new(),
             reads: 0,
+            read_budget: None,
         })
     }
 

@@ -842,28 +842,28 @@ impl Graph {
     /// A copy of the part of the graph needed to hydrate the pending nodes
     /// and arrangements and then step them, for another thread (with a fork
     /// of the storage): them, the nodes owning the pending arrangements, and
-    /// what those read, transitively, with the arrangements their operators
-    /// read and one hydrated arrangement of each node to snapshot it from.
-    /// Operator state is copied, not shared; node ids stay the same.
+    /// what those read, transitively (`fork_of`).
     pub fn fork_pending(&self) -> Graph {
-        let (pnodes, parrs) = self.pending();
+        let (mut roots, parrs) = self.pending();
+        roots.extend(parrs.iter().map(|a| self.arr(*a).node));
+        self.fork_of(&roots)
+    }
+
+    /// A copy of nodes `roots` and what they read, transitively — their
+    /// inputs and the nodes owning the arrangements their operators read —
+    /// with all of those nodes' arrangements, for another thread (with a
+    /// fork of the storage). Operator state is copied, not shared; node and
+    /// arrangement ids stay the same.
+    pub fn fork_of(&self, roots: &[NodeId]) -> Graph {
         let mut keep_nodes: FxHashSet<NodeId> = FxHashSet::default();
-        let mut keep_arrs: FxHashSet<ArrId> = parrs.iter().copied().collect();
-        let mut stack: Vec<NodeId> = pnodes;
-        stack.extend(parrs.iter().map(|a| self.arr(*a).node));
+        let mut stack: Vec<NodeId> = roots.to_vec();
         while let Some(id) = stack.pop() {
             if !keep_nodes.insert(id) {
                 continue;
             }
             let n = self.node(id);
             stack.extend(n.inputs.iter().copied());
-            for a in operator_arrangements(&n.kind) {
-                keep_arrs.insert(a);
-                stack.push(self.arr(a).node);
-            }
-            if let Some(a) = self.any_arrangement(id) {
-                keep_arrs.insert(a);
-            }
+            stack.extend(operator_arrangements(&n.kind).into_iter().map(|a| self.arr(a).node));
         }
         let mut g = Graph { now: self.now, stepped_now: self.stepped_now, topo_dirty: true, ..Graph::default() };
         g.nodes = self
@@ -886,12 +886,12 @@ impl Graph {
                     schema: n.schema.clone(),
                     fp: n.fp.clone(),
                     refs: n.refs,
-                    arrangements: n.arrangements.iter().copied().filter(|a| keep_arrs.contains(a)).collect(),
+                    arrangements: n.arrangements.clone(),
                     hydrated: n.hydrated,
                 })
             })
             .collect();
-        g.arrs = self.arrs.iter().map(|a| a.as_ref().filter(|a| keep_arrs.contains(&a.id)).cloned()).collect();
+        g.arrs = self.arrs.iter().map(|a| a.as_ref().filter(|a| keep_nodes.contains(&a.node)).cloned()).collect();
         g.node_by_fp = g.live_nodes().map(|n| (n.fp.clone(), n.id)).collect();
         g.arr_by_fp = g.live_arrangements().map(|a| (a.fp.clone(), a.id)).collect();
         g.node_errors = self.node_errors.iter().filter(|(id, _)| keep_nodes.contains(id)).map(|(k, v)| (*k, v.clone())).collect();

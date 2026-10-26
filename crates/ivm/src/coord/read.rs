@@ -37,6 +37,48 @@ fn interruption(req: &Request, read: bool) -> Option<SqlError> {
     (read && i.gone()).then(|| SqlError::new(codes::QUERY_CANCELED, "canceling statement: the client is gone"))
 }
 
+/// The result of a read whose plan returned `rows`: consolidated, sorted,
+/// OFFSET/LIMIT applied, multiplicities expanded, visible columns.
+pub(crate) fn finish_read(bq: crate::sql::BoundQuery, mut rows: Rows) -> ExecResult {
+    crate::dataflow::consolidate(&mut rows);
+    rows.retain(|(_, w)| *w > 0);
+    if !bq.order.is_empty() {
+        sort_rows(&mut rows, &bq.order);
+    }
+    // expand multiplicities, apply OFFSET/LIMIT, project visible columns
+    let mut out: Vec<Row> = Vec::new();
+    let mut skipped = 0u64;
+    let limit = bq.limit.unwrap_or(u64::MAX);
+    let mut last: Option<Row> = None;
+    'outer: for (r, w) in rows {
+        for _ in 0..w {
+            if skipped < bq.offset {
+                skipped += 1;
+                continue;
+            }
+            if out.len() as u64 >= limit {
+                // FETCH ... WITH TIES keeps rows tied with the last one
+                let tied = bq.with_ties
+                    && last.as_ref().is_some_and(|l| bq.order.iter().all(|k| l[k.col].sql_cmp(&r[k.col]) == std::cmp::Ordering::Equal));
+                if !tied {
+                    break 'outer;
+                }
+            }
+            out.push(r[..bq.visible].to_vec());
+            last = Some(r.clone());
+        }
+    }
+    let types = bq.column_types();
+    let columns = bq
+        .names
+        .iter()
+        .take(bq.visible)
+        .zip(types)
+        .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
+        .collect();
+    ExecResult::Query { columns, rows: out }
+}
+
 pub fn parse_lsn(s: &str) -> Result<u64> {
     let (hi, lo) = s.split_once('/').ok_or_else(|| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
     let hi = u64::from_str_radix(hi.trim(), 16).map_err(|_| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
@@ -279,44 +321,17 @@ impl Engine {
         self.check_view_errors(&bq.rel)?;
         // now() is the logical clock as of the read, so reads are repeatable
         bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
-        let mut rows = self.execute_rel(&bq.rel, at)?;
-        crate::dataflow::consolidate(&mut rows);
-        rows.retain(|(_, w)| *w > 0);
-        if !bq.order.is_empty() {
-            sort_rows(&mut rows, &bq.order);
-        }
-        // expand multiplicities, apply OFFSET/LIMIT, project visible columns
-        let mut out: Vec<Row> = Vec::new();
-        let mut skipped = 0u64;
-        let limit = bq.limit.unwrap_or(u64::MAX);
-        let mut last: Option<Row> = None;
-        'outer: for (r, w) in rows {
-            for _ in 0..w {
-                if skipped < bq.offset {
-                    skipped += 1;
-                    continue;
-                }
-                if out.len() as u64 >= limit {
-                    // FETCH ... WITH TIES keeps rows tied with the last one
-                    let tied = bq.with_ties
-                        && last.as_ref().is_some_and(|l| bq.order.iter().all(|k| l[k.col].sql_cmp(&r[k.col]) == std::cmp::Ordering::Equal));
-                    if !tied {
-                        break 'outer;
-                    }
-                }
-                out.push(r[..bq.visible].to_vec());
-                last = Some(r.clone());
+        // a read that turns out large goes on off the engine thread
+        self.env.set_read_budget(Some(super::reader::INLINE_READ_ENTRIES));
+        let r = self.execute_rel(&bq.rel, at);
+        self.env.set_read_budget(None);
+        match r {
+            Err(e) if e.code == crate::storage::READ_BUDGET => {
+                self.read_elsewhere(bq, at, vars, reply)?;
+                Ok(None)
             }
+            r => Ok(Some(finish_read(bq, r?))),
         }
-        let types = bq.column_types();
-        let columns = bq
-            .names
-            .iter()
-            .take(bq.visible)
-            .zip(types)
-            .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
-            .collect();
-        Ok(Some(ExecResult::Query { columns, rows: out }))
     }
 
     /// Has every source's LSN frontier reached `lsn` (written `text`)? A

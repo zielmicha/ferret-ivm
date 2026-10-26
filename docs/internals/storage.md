@@ -139,6 +139,11 @@ changes at one GSN:
 | `nth(lo, hi, n)` | find the entry holding the n-th unit of weight in the range by skipping fully covered children by their counts |
 | `tree_count(tree)` | the stored total count |
 
+`set_read_budget(Some(n))` limits the entries the scans (`for_each`,
+`for_each_prefix`, cursors, and everything built on them) may still visit:
+past it they fail with the internal code `IVMRB`, which the engine uses to
+move a large read off its thread ([Planner](planner.md#batch-execution)).
+
 Summaries reflect the **current** weights only; historical reads use the
 histories. (Operators that need a previous aggregate value read it from
 their output arrangement.)
