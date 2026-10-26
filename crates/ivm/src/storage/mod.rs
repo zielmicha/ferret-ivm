@@ -10,6 +10,12 @@
 //! segments are immutable; space is reclaimed by relocating the live nodes of
 //! old segments (found through per-subtree `min_seg` augmentation) and
 //! deleting segments once nothing references them.
+//!
+//! Loaded nodes are shared (`Arc`) and copied on write when shared: a fork
+//! of the environment ([`Env::fork`]) is an independent version of every
+//! tree as of the moment it was taken, readable and writable on another
+//! thread, and a checkpoint is written from such a version of the dirty
+//! nodes ([`Env::begin_checkpoint`]) while the environment goes on.
 
 pub mod history;
 mod inspect;
@@ -87,10 +93,18 @@ impl Default for EnvOptions {
 
 const NONE: u32 = u32::MAX;
 
+#[derive(Clone)]
 struct Slot {
-    node: Option<Node>,
+    /// Shared with forks and checkpoint jobs, which hold the version they
+    /// were taken at: modified through `node_mut` / `take_node`, which copy
+    /// a shared node.
+    node: Option<Arc<Node>>,
     disk: Option<DiskLoc>,
     dirty: bool,
+    /// Modification stamp (`Env::stamp` when the node's contents last
+    /// changed or it became dirty): a checkpoint job's image of a dirty node
+    /// is still current when its stamp is unchanged.
+    version: u64,
     /// In-place leaf edits since the leaf's entries were last compacted.
     edits: u32,
     parent: u32,
@@ -100,6 +114,7 @@ struct Slot {
     bytes: usize,
 }
 
+#[derive(Clone)]
 struct TreeState {
     root: Option<NodePtr>,
     summary: Summary,
@@ -130,7 +145,6 @@ pub struct Env {
     dir: PathBuf,
     opts: EnvOptions,
     segs: SegmentStore,
-    manifest: Manifest,
     slots: Vec<Option<Slot>>,
     free_slots: Vec<u32>,
     mem_bytes: usize,
@@ -144,6 +158,62 @@ pub struct Env {
     frontier: Gsn,
     checkpoint_seq: u64,
     checkpoint_gsn: Gsn,
+    /// The manifest (None in forks, and while a checkpoint job holds it
+    /// with the segment writer).
+    manifest: Option<Manifest>,
+    /// Source of `Slot::version` stamps.
+    stamp: u64,
+    /// Nodes written by `flush_node` (in checkpoint jobs: what the parent
+    /// environment marks clean when the job is done).
+    flushed: Option<Vec<Flushed>>,
+}
+
+/// A node a checkpoint job wrote: its slot and stamp in the parent
+/// environment, its location and the `min_seg` of its subtree.
+struct Flushed {
+    slot: u32,
+    version: u64,
+    loc: DiskLoc,
+    min_seg: u32,
+}
+
+/// A checkpoint in progress (`Env::begin_checkpoint`): a version of the
+/// dirty nodes with the store's append side and manifest.
+pub struct CheckpointJob {
+    env: Env,
+    gsn: Gsn,
+}
+
+/// A written checkpoint, for `Env::finish_checkpoint`.
+pub struct CheckpointDone {
+    segs: SegmentStore,
+    manifest: Manifest,
+    flushed: Vec<Flushed>,
+    deleted: Vec<u32>,
+    seq: u64,
+    gsn: Gsn,
+}
+
+impl CheckpointJob {
+    pub fn gsn(&self) -> Gsn {
+        self.gsn
+    }
+
+    /// Write the nodes, make them durable and commit the checkpoint with the
+    /// application state `app` (on any thread). On an error nothing is
+    /// committed, and the environment cannot take checkpoints any more.
+    pub fn run(mut self, app: &[u8]) -> Result<CheckpointDone> {
+        let deleted = self.env.write_checkpoint(self.gsn, app)?;
+        let env = self.env;
+        Ok(CheckpointDone {
+            segs: env.segs,
+            manifest: env.manifest.expect("checkpoint job without manifest"),
+            flushed: env.flushed.unwrap_or_default(),
+            deleted,
+            seq: env.checkpoint_seq,
+            gsn: env.checkpoint_gsn,
+        })
+    }
 }
 
 /// A stateless range cursor: buffers one leaf at a time and re-seeks from the
@@ -298,7 +368,6 @@ impl Env {
             dir: dir.to_path_buf(),
             opts,
             segs,
-            manifest,
             slots: Vec::new(),
             free_slots: Vec::new(),
             mem_bytes: 0,
@@ -310,6 +379,9 @@ impl Env {
             frontier: 0,
             checkpoint_seq: 0,
             checkpoint_gsn: 0,
+            manifest: Some(manifest),
+            stamp: 0,
+            flushed: None,
         };
         let recovered = match rec {
             None => None,
@@ -420,13 +492,36 @@ impl Env {
         self.slot(id).node.as_ref().expect("node taken")
     }
 
+    /// The node in slot `id` for modification in place: copied first if a
+    /// fork or checkpoint job shares it.
+    fn node_mut(&mut self, id: u32) -> &mut Node {
+        Arc::make_mut(self.slot_mut(id).node.as_mut().expect("node taken"))
+    }
+
+    /// Take the node out of slot `id` (a copy if it is shared).
+    fn take_node(&mut self, id: u32) -> Node {
+        let n = self.slot_mut(id).node.take().expect("node taken");
+        Arc::try_unwrap(n).unwrap_or_else(|n| (*n).clone())
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        self.stamp += 1;
+        self.stamp
+    }
+
     fn alloc_slot(&mut self, node: Node, disk: Option<DiskLoc>, parent: u32, tree: TreeId) -> u32 {
+        self.alloc_slot_arc(Arc::new(node), disk, parent, tree)
+    }
+
+    fn alloc_slot_arc(&mut self, node: Arc<Node>, disk: Option<DiskLoc>, parent: u32, tree: TreeId) -> u32 {
         let bytes = node.byte_size();
         self.mem_bytes += bytes;
         if disk.is_none() {
             self.dirty_bytes += bytes;
         }
-        let slot = Slot { node: Some(node), disk, dirty: disk.is_none(), edits: 0, parent, tree, loaded_children: 0, refbit: true, bytes };
+        let version = self.next_stamp();
+        let slot =
+            Slot { node: Some(node), disk, dirty: disk.is_none(), version, edits: 0, parent, tree, loaded_children: 0, refbit: true, bytes };
         if let Some(id) = self.free_slots.pop() {
             self.slots[id as usize] = Some(slot);
             id
@@ -460,7 +555,10 @@ impl Env {
     }
 
     fn make_dirty(&mut self, id: u32) {
+        let version = self.next_stamp();
         let slot = self.slot_mut(id);
+        // (a new stamp also for a dirty node: it is about to change)
+        slot.version = version;
         if !slot.dirty {
             slot.dirty = true;
             let (bytes, disk) = (slot.bytes, slot.disk.take());
@@ -487,11 +585,13 @@ impl Env {
     /// `put_node` with the node's byte size already known.
     fn put_node_sized(&mut self, id: u32, node: Node, bytes: usize) {
         debug_assert_eq!(bytes, node.byte_size());
+        let version = self.next_stamp();
         let slot = self.slot_mut(id);
         let old = slot.bytes;
         let dirty = slot.dirty;
         slot.bytes = bytes;
-        slot.node = Some(node);
+        slot.version = version;
+        slot.node = Some(Arc::new(node));
         self.mem_bytes = self.mem_bytes + bytes - old;
         if dirty {
             self.dirty_bytes = self.dirty_bytes + bytes - old;
@@ -525,7 +625,7 @@ impl Env {
         };
         let id = self.load(ptr, parent, tree)?;
         if let NodePtr::Disk(_) = ptr
-            && let Some(Node::Internal(ch)) = self.slot_mut(parent).node.as_mut()
+            && let Node::Internal(ch) = self.node_mut(parent)
         {
             ch[idx].ptr = NodePtr::Mem(id);
         }
@@ -548,7 +648,7 @@ impl Env {
     fn compute_summary(&self, id: u32, summ: &Arc<dyn Summarizer>) -> Result<(Summary, u32)> {
         let slot = self.slot(id);
         let own = slot.disk.map(|l| l.seg).unwrap_or(u32::MAX);
-        match slot.node.as_ref().unwrap() {
+        match slot.node.as_deref().unwrap() {
             Node::Leaf(entries) => Ok((leaf_summary(entries, summ)?, own)),
             Node::Internal(children) => {
                 Ok((children_summary(children, summ), children.iter().map(|c| c.min_seg).fold(own, u32::min)))
@@ -560,7 +660,7 @@ impl Env {
     fn node_min_seg(&self, id: u32) -> u32 {
         let slot = self.slot(id);
         let own = slot.disk.map(|l| l.seg).unwrap_or(u32::MAX);
-        match slot.node.as_ref().unwrap() {
+        match slot.node.as_deref().unwrap() {
             Node::Leaf(_) => own,
             Node::Internal(children) => children.iter().map(|c| c.min_seg).fold(own, u32::min),
         }
@@ -677,7 +777,7 @@ impl Env {
         let edits = self.slot(id).edits;
         let old_bytes = self.slot(id).bytes;
         self.make_dirty(id);
-        let node = self.slot_mut(id).node.take().expect("node taken");
+        let node = self.take_node(id);
         match node {
             Node::Leaf(entries) => {
                 let frontier = self.frontier;
@@ -1320,7 +1420,7 @@ impl Env {
             }
         } else if let Some(p) = self.slots[slot.parent as usize].as_mut() {
             p.loaded_children = p.loaded_children.saturating_sub(1);
-            if let Some(Node::Internal(ch)) = p.node.as_mut() {
+            if let Some(Node::Internal(ch)) = p.node.as_mut().map(Arc::make_mut) {
                 for c in ch.iter_mut() {
                     if c.ptr == NodePtr::Mem(id) {
                         c.ptr = NodePtr::Disk(loc);
@@ -1336,8 +1436,143 @@ impl Env {
     // ------------------------------------------------------------------
     // checkpoint, drop, gc
 
-    /// Make all trees durable as of `gsn` together with the application state.
+    /// Make all trees durable as of `gsn` together with the application state
+    /// (`begin_checkpoint`, `CheckpointJob::run` and `finish_checkpoint` in one).
     pub fn checkpoint(&mut self, gsn: Gsn, app: &[u8]) -> Result<()> {
+        let job = self.begin_checkpoint(gsn)?;
+        let done = job.run(app)?;
+        self.finish_checkpoint(done)
+    }
+
+    /// Start a checkpoint of all trees as they are now (at `gsn`): the job
+    /// holds a version of the dirty nodes (shared, copied when this
+    /// environment modifies them later) and the append side of the store,
+    /// and writes them on any thread (`CheckpointJob::run`) while this
+    /// environment goes on; `finish_checkpoint` then marks the nodes it wrote
+    /// clean where they have not changed since. Nothing else may write
+    /// segments meanwhile: a second checkpoint waits for the first.
+    pub fn begin_checkpoint(&mut self, gsn: Gsn) -> Result<CheckpointJob> {
+        if self.manifest.is_none() || !self.segs.writable() {
+            return Err(SqlError::internal("a checkpoint is already in progress"));
+        }
+        // the dirty nodes, and the clean nodes whose locations their images
+        // (and the tree records) need
+        let mut slots: Vec<Option<Slot>> = Vec::with_capacity(self.slots.len());
+        slots.resize_with(self.slots.len(), || None);
+        let (mut mem_bytes, mut dirty_bytes) = (0, 0);
+        let mut copy = |slots: &mut Vec<Option<Slot>>, s: &Slot, i: usize| {
+            if slots[i].is_none() {
+                mem_bytes += s.bytes;
+                if s.dirty {
+                    dirty_bytes += s.bytes;
+                }
+                slots[i] = Some(s.clone());
+            }
+        };
+        for (i, s) in self.slots.iter().enumerate() {
+            let Some(s) = s.as_ref().filter(|s| s.dirty) else { continue };
+            copy(&mut slots, s, i);
+            if let Some(Node::Internal(ch)) = s.node.as_deref() {
+                for c in ch {
+                    if let NodePtr::Mem(cid) = c.ptr {
+                        copy(&mut slots, self.slot(cid), cid as usize);
+                    }
+                }
+            }
+        }
+        for t in self.trees.values() {
+            if let Some(NodePtr::Mem(r)) = t.root {
+                copy(&mut slots, self.slot(r), r as usize);
+            }
+        }
+        let segs = self.segs.lend().expect("checked above");
+        let env = Env {
+            dir: self.dir.clone(),
+            opts: self.opts.clone(),
+            segs,
+            slots,
+            free_slots: Vec::new(),
+            mem_bytes,
+            dirty_bytes,
+            clock_hand: 0,
+            trees: self.trees.clone(),
+            next_tree_id: self.next_tree_id,
+            seg_live: self.seg_live.clone(),
+            frontier: self.frontier,
+            checkpoint_seq: self.checkpoint_seq,
+            checkpoint_gsn: self.checkpoint_gsn,
+            manifest: self.manifest.take(),
+            stamp: self.stamp,
+            flushed: Some(Vec::new()),
+        };
+        Ok(CheckpointJob { env, gsn })
+    }
+
+    /// Take back what a checkpoint job lent and mark the nodes it wrote
+    /// clean, except those modified (or freed) since it began: their images
+    /// are garbage from the start.
+    pub fn finish_checkpoint(&mut self, done: CheckpointDone) -> Result<()> {
+        self.segs.restore(done.segs);
+        self.manifest = Some(done.manifest);
+        // (children before parents)
+        for f in done.flushed {
+            let len = f.loc.len as u64;
+            let e = self.seg_live.entry(f.loc.seg).or_insert((0, 0));
+            e.0 += len;
+            let current = matches!(self.slots.get(f.slot as usize), Some(Some(s)) if s.dirty && s.version == f.version);
+            if !current {
+                continue;
+            }
+            e.1 += len;
+            let slot = self.slot_mut(f.slot);
+            slot.dirty = false;
+            slot.disk = Some(f.loc);
+            let bytes = slot.bytes;
+            self.dirty_bytes -= bytes;
+            self.lower_min_seg(f.slot, f.min_seg);
+        }
+        // dead in the committed checkpoint, hence here too: nothing this
+        // environment references on disk is outside it
+        for id in done.deleted {
+            self.seg_live.remove(&id);
+            self.segs.forget(id);
+        }
+        self.checkpoint_seq = done.seq;
+        self.checkpoint_gsn = done.gsn;
+        let active = self.segs.active_id();
+        self.seg_live.entry(active).or_insert((0, 0));
+        Ok(())
+    }
+
+    /// Lower the `min_seg` recorded for node `id`'s subtree to `ms` (it was
+    /// written there), in its parent's child entry and up the ancestors.
+    fn lower_min_seg(&mut self, mut id: u32, ms: u32) {
+        loop {
+            let (parent, tree) = (self.slot(id).parent, self.slot(id).tree);
+            if parent == NONE {
+                if let Some(t) = self.trees.get_mut(&tree)
+                    && t.root == Some(NodePtr::Mem(id))
+                {
+                    t.min_seg = t.min_seg.min(ms);
+                }
+                return;
+            }
+            let Node::Internal(ch) = self.node(parent) else { return };
+            let Some(i) = ch.iter().position(|c| c.ptr == NodePtr::Mem(id)) else { return };
+            if ch[i].min_seg <= ms {
+                return;
+            }
+            if let Node::Internal(ch) = self.node_mut(parent) {
+                ch[i].min_seg = ms;
+            }
+            id = parent;
+        }
+    }
+
+    /// Write every dirty node, make the segments durable and append the
+    /// checkpoint record (the commit point); then delete sealed segments
+    /// without live nodes. Returns those segments.
+    fn write_checkpoint(&mut self, gsn: Gsn, app: &[u8]) -> Result<Vec<u32>> {
         let tree_ids = self.tree_ids();
         let mut records = Vec::with_capacity(tree_ids.len());
         for tid in tree_ids {
@@ -1372,15 +1607,15 @@ impl Env {
             next_tree_id: self.next_tree_id,
             app: app.to_vec(),
         };
-        self.manifest.append(&rec)?;
+        self.manifest.as_mut().ok_or_else(|| SqlError::internal("no manifest to append to"))?.append(&rec)?;
         self.checkpoint_gsn = gsn;
         // reclaim fully dead sealed segments
         let dead: Vec<u32> = self.seg_live.iter().filter(|(id, (_, l))| **id != active && *l == 0).map(|(id, _)| *id).collect();
-        for id in dead {
+        for &id in &dead {
             self.seg_live.remove(&id);
             self.segs.delete(id)?;
         }
-        Ok(())
+        Ok(dead)
     }
 
     fn flush_node(&mut self, id: u32) -> Result<(DiskLoc, u32)> {
@@ -1388,43 +1623,143 @@ impl Env {
             let loc = self.slot(id).disk.unwrap();
             return Ok((loc, loc.seg));
         }
-        let mut node = self.slot_mut(id).node.take().unwrap();
-        let mut locs = Vec::new();
-        if let Node::Internal(children) = &mut node {
-            locs.reserve(children.len());
-            for c in children.iter_mut() {
-                match c.ptr {
-                    NodePtr::Disk(loc) => locs.push(loc),
-                    NodePtr::Mem(cid) => {
-                        let was_dirty = self.slot(cid).dirty;
-                        let (loc, ms) = self.flush_node(cid)?;
-                        if was_dirty {
-                            c.min_seg = ms;
-                        }
-                        locs.push(loc);
+        // children first: their locations, and the min_seg of the dirty
+        // ones, are part of this node's image
+        let children: Vec<NodePtr> = match self.node(id) {
+            Node::Internal(ch) => ch.iter().map(|c| c.ptr).collect(),
+            Node::Leaf(_) => Vec::new(),
+        };
+        let mut locs = Vec::with_capacity(children.len());
+        let mut min_segs = Vec::new();
+        for (i, ptr) in children.into_iter().enumerate() {
+            match ptr {
+                NodePtr::Disk(loc) => locs.push(loc),
+                NodePtr::Mem(cid) => {
+                    let was_dirty = self.slot(cid).dirty;
+                    let (loc, ms) = self.flush_node(cid)?;
+                    if was_dirty {
+                        min_segs.push((i, ms));
                     }
+                    locs.push(loc);
                 }
             }
         }
+        if !min_segs.is_empty()
+            && let Node::Internal(ch) = self.node_mut(id)
+        {
+            for (i, ms) in min_segs {
+                ch[i].min_seg = ms;
+            }
+        }
+        let node = self.slot(id).node.clone().expect("node taken");
         let mut buf = Vec::with_capacity(node.byte_size() + 16);
         node.encode(&locs, &mut buf);
         let loc = self.segs.append(&buf)?;
         let e = self.seg_live.entry(loc.seg).or_insert((0, 0));
         e.0 += loc.len as u64;
         e.1 += loc.len as u64;
-        let min_seg = match &node {
+        let min_seg = match &*node {
             Node::Leaf(_) => loc.seg,
             Node::Internal(ch) => ch.iter().map(|c| c.min_seg).min().unwrap_or(u32::MAX).min(loc.seg),
         };
         let slot = self.slot_mut(id);
-        slot.node = Some(node);
         slot.disk = Some(loc);
-        if slot.dirty {
-            slot.dirty = false;
-            let bytes = slot.bytes;
-            self.dirty_bytes -= bytes;
+        slot.dirty = false;
+        let (bytes, version) = (slot.bytes, slot.version);
+        self.dirty_bytes -= bytes;
+        if let Some(f) = self.flushed.as_mut() {
+            f.push(Flushed { slot: id, version, loc, min_seg });
         }
         Ok((loc, min_seg))
+    }
+
+    /// An independent version of every tree as of now, for another thread:
+    /// it shares the loaded nodes (copied on write on either side) and the
+    /// open segment files, has a buffer pool of its own and cannot take
+    /// checkpoints. Trees created empty here and filled in a fork can be
+    /// moved back with `adopt_trees`.
+    pub fn fork(&self) -> Result<Env> {
+        Ok(Env {
+            dir: self.dir.clone(),
+            opts: self.opts.clone(),
+            // (only segments holding nodes of this version: others may be
+            // gone, deleted by a checkpoint job in progress)
+            segs: self.segs.fork(self.seg_live.iter().filter(|(_, (_, live))| *live > 0).map(|(id, _)| *id))?,
+            slots: self.slots.clone(),
+            free_slots: self.free_slots.clone(),
+            mem_bytes: self.mem_bytes,
+            dirty_bytes: self.dirty_bytes,
+            clock_hand: 0,
+            trees: self.trees.clone(),
+            next_tree_id: self.next_tree_id,
+            seg_live: self.seg_live.clone(),
+            frontier: self.frontier,
+            checkpoint_seq: self.checkpoint_seq,
+            checkpoint_gsn: self.checkpoint_gsn,
+            manifest: None,
+            stamp: self.stamp,
+            flushed: None,
+        })
+    }
+
+    /// Move trees `ids` from fork `from`, where they were filled, into this
+    /// environment, where they must still be as empty as when the fork was
+    /// taken. Their nodes are moved, not copied.
+    pub fn adopt_trees(&mut self, from: &mut Env, ids: &[TreeId]) -> Result<()> {
+        for &id in ids {
+            if self.trees.get(&id).is_none_or(|t| t.root.is_some()) {
+                return Err(SqlError::internal(format!("tree {id} to adopt is not an empty tree here")));
+            }
+            let t = from.trees.remove(&id).ok_or_else(|| SqlError::internal(format!("no tree {id} to adopt")))?;
+            let root = match t.root {
+                None => None,
+                Some(ptr) => Some(NodePtr::Mem(self.adopt_node(from, ptr, NONE, id)?)),
+            };
+            self.trees.insert(id, TreeState { root, ..t });
+        }
+        Ok(())
+    }
+
+    fn adopt_node(&mut self, from: &mut Env, ptr: NodePtr, parent: u32, tree: TreeId) -> Result<u32> {
+        // (the fork cannot write nodes: a tree filled there is in its memory)
+        let NodePtr::Mem(fid) = ptr else { return Err(SqlError::internal("adopted tree has a node on disk")) };
+        let mut slot = from.slots[fid as usize].take().expect("dangling node slot");
+        from.free_slots.push(fid);
+        from.mem_bytes -= slot.bytes;
+        from.dirty_bytes -= slot.bytes;
+        debug_assert!(slot.dirty);
+        slot.parent = parent;
+        slot.tree = tree;
+        slot.version = self.next_stamp();
+        slot.edits = 0;
+        self.mem_bytes += slot.bytes;
+        self.dirty_bytes += slot.bytes;
+        let children: Vec<NodePtr> = match slot.node.as_deref() {
+            Some(Node::Internal(ch)) => ch.iter().map(|c| c.ptr).collect(),
+            _ => Vec::new(),
+        };
+        slot.loaded_children = children.len() as u32;
+        let id = match self.free_slots.pop() {
+            Some(id) => {
+                self.slots[id as usize] = Some(slot);
+                id
+            }
+            None => {
+                self.slots.push(Some(slot));
+                (self.slots.len() - 1) as u32
+            }
+        };
+        if !children.is_empty() {
+            let mut moved = Vec::with_capacity(children.len());
+            for c in children {
+                moved.push(self.adopt_node(from, c, id, tree)?);
+            }
+            let Node::Internal(ch) = self.node_mut(id) else { unreachable!() };
+            for (c, m) in ch.iter_mut().zip(moved) {
+                c.ptr = NodePtr::Mem(m);
+            }
+        }
+        Ok(id)
     }
 
     /// Drop a tree, releasing its nodes.
@@ -1450,7 +1785,7 @@ impl Env {
             }
             NodePtr::Mem(id) => {
                 let slot = self.slot(id);
-                let ch = match slot.node.as_ref().unwrap() {
+                let ch = match slot.node.as_deref().unwrap() {
                     Node::Internal(ch) => ch.iter().map(|c| c.ptr).collect(),
                     Node::Leaf(_) => vec![],
                 };
@@ -1518,7 +1853,7 @@ impl Env {
             let cid = self.load_child(id, i)?;
             self.relocate(cid, victim, budget)?;
             let ms = self.compute_min_seg(cid);
-            if let Some(Node::Internal(ch)) = self.slot_mut(id).node.as_mut() {
+            if let Node::Internal(ch) = self.node_mut(id) {
                 ch[i].min_seg = ms;
             }
         }
@@ -1528,7 +1863,7 @@ impl Env {
     fn compute_min_seg(&self, id: u32) -> u32 {
         let slot = self.slot(id);
         let own = slot.disk.map(|l| l.seg).unwrap_or(u32::MAX);
-        match slot.node.as_ref().unwrap() {
+        match slot.node.as_deref().unwrap() {
             Node::Leaf(_) => own,
             Node::Internal(ch) => ch.iter().map(|c| c.min_seg).min().unwrap_or(u32::MAX).min(own),
         }

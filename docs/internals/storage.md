@@ -64,6 +64,13 @@ allocates a slot and replaces the pointer by `Mem(slot)`.
   children before parents, to the end of the active segment. On-disk nodes
   are never overwritten, so the last checkpoint stays intact until the next
   one is committed.
+- **Shared nodes.** A slot holds its node behind a reference count (`Arc`),
+  shared with forks of the environment and checkpoint jobs (below). A node
+  that is shared is copied before it is modified — its contents, and also
+  the child pointers that loading and eviction rewrite — so a fork or a
+  checkpoint job keeps the version it was taken with. Each slot carries a
+  modification stamp, renewed whenever the node's contents may change or it
+  becomes dirty.
 - **Eviction.** When the arena's bytes exceed `--cache-mb`, a CLOCK sweep
   (at most two passes over all slots) evicts clean nodes that have no loaded
   children, giving a second chance to nodes whose reference bit is set;
@@ -222,23 +229,59 @@ aggregates need; a group is a key prefix, so its aggregates are one
 at the required ranks. Semijoin presence tests use the count of a key
 prefix. `EXPLAIN MAINTENANCE` and `SHOW` use tree counts.
 
+## Forks
+
+`Env::fork` returns an independent environment holding every tree as it is
+at that moment, for another thread: it shares the loaded nodes (each side
+copies a shared node before modifying it, see above) and holds the segment
+files with live nodes open, so that it can still read nodes whose segments a
+later checkpoint deletes. It has a buffer pool of its own (with the same
+capacity), evicts its own clean nodes, and can be modified — in memory only:
+it cannot take checkpoints. Taking a fork copies the slot table (one
+reference count increment per loaded node), not the nodes.
+
+A tree created empty in the environment before the fork and filled in the
+fork can be moved back with `Env::adopt_trees`: its nodes (all of them in
+the fork's memory, and dirty) are moved into the environment's slots, not
+copied. Hydration off the engine thread is built on this
+([Dataflow](dataflow.md#hydration)).
+
 ## Segments and checkpoints
 
 Nodes are written only by checkpoints, to the **active segment**
 (`store/seg-<id>.dat`), an append-only file that is rolled over to the next
-id once it reaches 256 MiB. A checkpoint (`Env::checkpoint(gsn, app)`):
+id once it reaches 256 MiB. A checkpoint has three parts, which can run on
+different threads:
 
-1. writes every dirty node of every tree, depth-first so that each parent is
-   written after its children and records their new locations; updates each
-   tree's `min_seg`;
-2. `fsync`s the active segment and any segments rolled over since the last
-   sync;
-3. appends a checkpoint record — sequence number, GSN, every tree's root
-   location, summary and `min_seg`, every segment's (total bytes, live
-   bytes), the active segment and its length, the next tree id, and the
-   application state — to `store/MANIFEST` and `fsync`s it. This append is
-   the commit point;
-4. deletes sealed segments without live bytes.
+1. `Env::begin_checkpoint(gsn)` freezes a version of the dirty nodes: a
+   checkpoint job holds them (shared, with their modification stamps), the
+   clean nodes they and the tree roots point to, every tree's root, the
+   segment accounting, and the store's append side and manifest, which the
+   environment lacks until the job is finished (a second checkpoint cannot
+   begin meanwhile). The environment goes on: nodes it modifies are copied
+   from the frozen ones.
+2. `CheckpointJob::run(app)` writes every frozen dirty node, depth-first so
+   that each parent is written after its children and records their new
+   locations, and computes every tree's `min_seg`; `fsync`s the active
+   segment and any segments rolled over since the last sync; appends a
+   checkpoint record — sequence number, GSN, every tree's root location,
+   summary and `min_seg`, every segment's (total bytes, live bytes), the
+   active segment and its length, the next tree id, and the application
+   state — to `store/MANIFEST` and `fsync`s it (this append is the commit
+   point); then deletes sealed segments without live bytes in the committed
+   state.
+3. `Env::finish_checkpoint` takes the append side and manifest back, adds
+   the written bytes to their segments' totals, and marks each written node
+   clean, with its new location, if its slot still holds it unchanged (same
+   stamp); its new `min_seg` is recorded in its parent's child entry and
+   lowered up the ancestors. A written node that was modified (or freed)
+   since the job began stays dirty (or gone): its image is garbage from the
+   start, counted in its segment's total but not as live. Segments the job
+   deleted are forgotten: nothing the environment references on disk lies
+   outside the committed state (its clean nodes were clean when the job
+   began, or were written by it), so they are dead here too.
+
+`Env::checkpoint(gsn, app)` does the three in a row.
 
 On open, the last valid manifest record defines the state: the active
 segment is truncated to the recorded length, and segment files the record
