@@ -457,6 +457,20 @@ fn walk(env: &Env, w: &mut Walk, ptr: NodePtr, parent: u32, tree: TreeId, lo: Op
             assert_eq!(s.tree, tree, "tree of slot {id}");
             assert_eq!(s.dirty, s.disk.is_none(), "a node is dirty iff it has no disk location");
             assert_eq!(s.bytes, s.node.as_ref().unwrap().byte_size(), "cached size of slot {id}");
+            if let (Some(loc), Node::Internal(children)) = (s.disk, s.node.as_ref().unwrap()) {
+                // a clean node's frame (written by a checkpoint or early)
+                // matches it and points at its children's current frames
+                let Node::Internal(on_disk) = read_disk_node(&mut w.files, &env.dir, loc) else { panic!("slot {id}: leaf frame") };
+                assert_eq!(on_disk.len(), children.len(), "children of clean slot {id} vs its frame");
+                for (c, d) in children.iter().zip(&on_disk) {
+                    let cur = match c.ptr {
+                        NodePtr::Disk(l) => l,
+                        NodePtr::Mem(cid) => env.slots[cid as usize].as_ref().unwrap().disk.expect("dirty child of a clean node"),
+                    };
+                    assert_eq!(d.ptr, NodePtr::Disk(cur), "child location in the frame of clean slot {id}");
+                    assert_eq!((&d.sep, d.summary.count), (&c.sep, c.summary.count), "child of clean slot {id} vs its frame");
+                }
+            }
             w.slots += 1;
             (s.node.as_ref().unwrap(), s.disk, Some(id))
         }
@@ -532,6 +546,8 @@ fn check_due(env: &Env, w: &Walk, ptr: NodePtr, recorded: Gsn, actual: Gsn, tree
 /// `legacy`: kind-2 nodes may be present. `compacted_at`: a maintenance pass
 /// without limits ran at this frontier, and nothing was modified since.
 fn check_structure(env: &mut Env, legacy: bool, compacted_at: Option<Gsn>) {
+    // nodes written early may still be buffered
+    env.segs.write_buffer().unwrap();
     let mut w = Walk { live: BTreeMap::new(), tree_live: BTreeMap::new(), slots: 0, files: BTreeMap::new(), legacy, compacted_at };
     for tid in env.tree_ids() {
         let t = &env.trees[&tid];
@@ -853,6 +869,9 @@ impl Harness {
         if variant >= 4 && self.ckpt.durable {
             return self.crash_in_checkpoint(variant == 5);
         }
+        if self.rng.chance(50) {
+            self.crash_after_early_writes();
+        }
         let env = self.env.take().unwrap();
         let active = segment::segment_path(&self.dir, env.segs.active_id());
         let next = segment::segment_path(&self.dir, env.segs.active_id() + 1);
@@ -901,6 +920,31 @@ impl Harness {
         }
         let ckpt = self.ckpt.clone();
         self.recover(ckpt);
+    }
+
+    /// Before a crash: write dirty nodes early (all or some, as memory
+    /// pressure does) and hand them to the OS, perhaps tearing the last of
+    /// them. None of it is part of the last checkpoint, which the crash
+    /// must recover.
+    fn crash_after_early_writes(&mut self) {
+        self.event("crash: after early writes");
+        let env = self.env.as_mut().unwrap();
+        env.segs.write_buffer().unwrap();
+        let (seg, len) = (env.segs.active_id(), env.segs.active_len());
+        let target = if self.rng.chance(50) { 0 } else { self.rng.below(env.dirty_bytes() as u64 + 1) as usize };
+        let env = self.env.as_mut().unwrap();
+        env.write_back(target).unwrap();
+        env.segs.write_buffer().unwrap();
+        let (seg2, len2) = (env.segs.active_id(), env.segs.active_len());
+        if self.rng.chance(50) {
+            // torn: the newest segment ends somewhere among the new frames
+            let from = if seg2 == seg { len } else { 0 };
+            if len2 > from {
+                self.event("crash: torn early writes");
+                let cut = from + self.rng.below(len2 - from);
+                std::fs::OpenOptions::new().write(true).open(segment::segment_path(&self.dir, seg2)).unwrap().set_len(cut).unwrap();
+            }
+        }
     }
 
     /// Crash during a checkpoint: before its manifest record is complete
@@ -1025,6 +1069,8 @@ enum Action {
     Checkpoint,
     /// A maintenance pass with random budgets.
     Gc,
+    /// Write dirty nodes early (`Env::write_back`).
+    WriteBack,
     /// A maintenance pass without limits, between checkpoints.
     GcRound,
     /// Checkpoint, close and reopen.
@@ -1045,6 +1091,7 @@ fn arb_action() -> impl Strategy<Value = (Action, u64)> {
         2 => Just(DropTree),
         9 => Just(Checkpoint),
         2 => Just(Gc),
+        2 => Just(WriteBack),
         1 => Just(GcRound),
         2 => Just(Reopen),
         5 => Just(Crash),
@@ -1072,6 +1119,12 @@ fn run(setup: &Setup, actions: &[(Action, u64)], name: &str) {
                 h.checkpoint()
             }
             Action::Gc => h.maintain(),
+            Action::WriteBack => {
+                let dirty = h.env().dirty_bytes() as u64;
+                let target = if h.rng.chance(50) { 0 } else { h.rng.below(dirty + 1) as usize };
+                let left = h.env().write_back(target).unwrap();
+                assert!(left <= target, "write_back to {target} left {left} dirty bytes");
+            }
             Action::GcRound => h.gc_round(),
             Action::Reopen => {
                 h.event("reopen");
@@ -1232,6 +1285,83 @@ impl HistModel {
         }
         self.0.retain(|_, h| !h.is_empty());
     }
+}
+
+/// Dirty nodes are written early and evicted like clean ones: a batch many
+/// times the cache leaves the buffer pool within the cache, lookups after it
+/// sweep a few slots each (instead of every slot, finding nothing it may
+/// evict), and none of it is durable before a checkpoint.
+#[test]
+fn dirty_data_larger_than_the_cache_is_evictable() {
+    let tmp = TempDir::new("storage-dirty");
+    let opts = EnvOptions { cache_bytes: 256 << 10, leaf_bytes: 2048, internal_bytes: 2048, segment_bytes: 1 << 20 };
+    let (mut env, _) = Env::open(tmp.path(), opts.clone()).unwrap();
+    let a = env.create_tree(Arc::new(CountSummarizer));
+    let b = env.create_tree(Arc::new(CountSummarizer));
+    let key = |i: u64| i.to_be_bytes().to_vec();
+    env.apply(a, &mut (0..20_000).map(|i| (key(i), 1)).collect(), 1).unwrap();
+    env.checkpoint(1, b"one").unwrap();
+    // about 40 times the cache, in random key order, not checkpointed
+    let mut ups: Vec<_> = (0..400_000u64).map(|i| (key(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)), 1)).collect();
+    env.apply(b, &mut ups, 2).unwrap();
+    let bound = opts.cache_bytes + opts.cache_bytes / 16 + opts.leaf_bytes;
+    assert!(env.resident_bytes() <= bound, "{} bytes resident after the batch", env.resident_bytes());
+    assert!(env.dirty_bytes() <= opts.cache_bytes / 2, "{} dirty bytes after the batch", env.dirty_bytes());
+    assert_eq!(env.tree_count(b), 400_000);
+    let swept = env.stats().swept_slots;
+    let mut x = 1u64;
+    for _ in 0..10_000 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        assert_eq!(env.get(a, &key((x >> 11) % 20_000)).unwrap().map(|h| h.total()), Some(1));
+        assert!(env.resident_bytes() <= bound, "{} bytes resident", env.resident_bytes());
+    }
+    let per_get = (env.stats().swept_slots - swept) / 10_000;
+    assert!(per_get <= 16, "{per_get} slots swept per lookup");
+    check_structure(&mut env, false, None);
+    // a crash: the early writes are not part of the checkpoint
+    drop(env);
+    let (mut env, rec) = Env::open(tmp.path(), opts).unwrap();
+    assert_eq!(rec.unwrap().app, b"one");
+    env.attach_tree(a, Arc::new(CountSummarizer)).unwrap();
+    env.attach_tree(b, Arc::new(CountSummarizer)).unwrap();
+    assert_eq!((env.tree_count(a), env.tree_count(b)), (20_000, 0));
+    assert!(env.scan(b, Bound::Unbounded, Bound::Unbounded).unwrap().is_empty());
+    check_structure(&mut env, false, None);
+}
+
+/// A tree built from entries in random order through sorted runs in
+/// temporary trees (with several levels of merging): it holds the sums of
+/// the entries' weights, the buffer pool stays within the cache, and the
+/// temporary trees are gone.
+#[test]
+fn tree_builder_sorts_in_bounded_memory() {
+    let tmp = TempDir::new("storage-builder");
+    let opts = EnvOptions { cache_bytes: 64 << 10, leaf_bytes: 1024, internal_bytes: 1024, segment_bytes: 256 << 10 };
+    let (mut env, _) = Env::open(tmp.path(), opts.clone()).unwrap();
+    let t = env.create_tree(summarizer(Kind::Int));
+    let mut b = TreeBuilder::with_limits(t, 7, 8 << 10, 3);
+    let mut model: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    let mut rng = Rng::new(42);
+    let bound = opts.cache_bytes + opts.cache_bytes / 16 + opts.leaf_bytes;
+    for i in 0..30_000u64 {
+        let u = if i < 5_000 { i } else { rng.below(20_000) };
+        let k = format!("{:03}:{u:05}:{}:", u % 7, INT_VALUES[(u % 8) as usize]).into_bytes();
+        // some entries cancel out across runs
+        let w = if rng.chance(20) { -1 } else { 1 };
+        *model.entry(k.clone()).or_default() += w;
+        b.push(&mut env, k, w).unwrap();
+        assert!(env.resident_bytes() <= bound, "{} bytes resident", env.resident_bytes());
+    }
+    b.finish(&mut env).unwrap();
+    assert!(env.resident_bytes() <= bound, "{} bytes resident", env.resident_bytes());
+    assert_eq!(env.tree_ids(), vec![t], "temporary trees left behind");
+    let all = env.scan(t, Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert!(all.iter().all(|(_, h)| h.0.len() == 1 && h.0[0].0 == 7), "histories other than one change at the builder's GSN");
+    let got: Vec<(Vec<u8>, i64)> = all.into_iter().map(|(k, h)| (k.to_vec(), h.total())).collect();
+    let want: Vec<(Vec<u8>, i64)> = model.into_iter().filter(|(_, w)| *w != 0).collect();
+    assert!(got == want, "built tree differs from the model");
+    env.check_summaries(t).unwrap();
+    check_structure(&mut env, false, None);
 }
 
 /// Random updates with a moving retention frontier, AS OF reads at every

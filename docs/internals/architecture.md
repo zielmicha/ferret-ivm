@@ -132,8 +132,9 @@ snapshot requests queued at the engine.
    is completely copied: not during an initial snapshot or a re-snapshot),
    which wakes reads waiting for an LSN.
 4. The engine applies the record: the changes go through the dataflow at
-   that GSN (`Graph::step`), and the outputs are delivered to subscriptions
-   and sinks.
+   that GSN (`Graph::step_observed`, which returns the rows of the nodes
+   subscriptions and sinks read), and the outputs are delivered to
+   subscriptions and sinks.
 
 Source progress (snapshot bookkeeping) and schema records are logged with
 the blocking `EngineHandle::log`, which returns once the record is durable.
@@ -241,7 +242,7 @@ alone rarely make one due), and removes cancelled subscriptions.
 
 | Record | Effect |
 |---|---|
-| `Commit` | group the changes by table (changes to tables that no longer exist are skipped), `Graph::step` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
+| `Commit` | group the changes by table (changes to tables that no longer exist are skipped), `Graph::step_observed` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); write the catalog's changes into the metadata tree at the record's GSN (`persist_meta`); reply |
 | `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
 | `Schema` | rebuild the table in its new shape and re-plan dependent views ([Sources](../user-guide/sources.md#upstream-schema-changes)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |

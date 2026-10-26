@@ -773,7 +773,8 @@ impl Engine {
                         by_node.entry(*n).or_default().push(ch);
                     }
                 }
-                let outputs = self.graph.step(&mut self.env, gsn, by_node)?;
+                let observed = self.delivered_nodes();
+                let outputs = self.graph.step_observed(&mut self.env, gsn, by_node, observed)?;
                 self.processed = gsn;
                 self.deliver(gsn, outputs);
                 if source == 0 {
@@ -851,7 +852,8 @@ impl Engine {
                     self.ticks.pop_front();
                 }
                 // temporal filters release the events that became due
-                let outputs = self.graph.step(&mut self.env, gsn, FxHashMap::default())?;
+                let observed = self.delivered_nodes();
+                let outputs = self.graph.step_observed(&mut self.env, gsn, FxHashMap::default(), observed)?;
                 self.processed = gsn;
                 changed = !outputs.is_empty();
                 self.deliver(gsn, outputs);
@@ -877,6 +879,12 @@ impl Engine {
     pub(crate) fn clock_at(&self, gsn: Gsn) -> i64 {
         let i = self.ticks.partition_point(|(g, _)| *g <= gsn);
         if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
+    }
+
+    /// Nodes whose rows `deliver` hands on (subscriptions and sinks); of the
+    /// other nodes it only needs the error records.
+    fn delivered_nodes(&self) -> rustc_hash::FxHashSet<NodeId> {
+        self.subs.iter().map(|s| s.node).chain(self.sink_handles.values().map(|s| s.node)).collect()
     }
 
     /// Route outputs to views (errors), subscriptions and sinks. Each node's

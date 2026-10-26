@@ -11,8 +11,8 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 
 | Knob | Default | Trade-off |
 |---|---|---|
-| `--memory-mb` | 2048 | The memory budget: the buffer pool of index nodes, the aggregation group caches, the records waiting to be applied and the changes queued for subscriptions and sinks together ([Memory](#memory)). The buffer pool gets what the others leave; clean index nodes beyond its share are evicted (CLOCK) and re-read from segment files on demand. Working sets that fit run from memory; larger ones degrade gradually. `--cache-mb` is an older name of this flag (it used to size the buffer pool alone, counted in serialized bytes: about a quarter of the memory it took). |
-| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
+| `--memory-mb` | 2048 | The memory budget: the buffer pool of index nodes, the aggregation group caches, the records waiting to be applied and the changes queued for subscriptions and sinks together ([Memory](#memory)). The buffer pool gets what the others leave; index nodes beyond its share are evicted (CLOCK) and re-read from segment files on demand — modified (dirty) nodes are written to the segment files first, and are also written once they exceed half of the pool's share, ahead of the next checkpoint (which makes them durable). Working sets that fit run from memory; larger ones degrade gradually — also large transactions and view hydration, which build their results through the pool. `--cache-mb` is an older name of this flag (it used to size the buffer pool alone, counted in serialized bytes: about a quarter of the memory it took). |
+| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash (dirty memory stays within half of the pool's share either way). A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
 | `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes and more clock ticks. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
 | `--no-sync` | off | Skips `fsync` of the input log. Only for tests and benchmarks; see [Durability](#durability-and---no-sync). |
@@ -32,6 +32,10 @@ Fixed internal parameters (not configurable):
 | unacknowledged commits per source | 10,000 |
 | initial-snapshot chunk | 10,000 rows |
 | maintenance pass budget (compaction, and relocation, each) | 8 MiB plus the bytes checkpoints wrote for updates since the previous pass |
+| sort buffer when building or updating an index in bulk (hydration, large changes) | an eighth of the buffer pool's share, within 1 MiB and 64 MiB |
+| change (delta) of a view or operator kept in memory per GSN, and changes of a table applied at once | an eighth of the buffer pool's share, within 1 MiB and 256 MiB (larger ones go to temporary trees) |
+| rows per hydration batch | 1,024 (or 1 MiB of index entries) |
+| join rows looked up at once | about 8 MiB |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
 | clock ticks kept | those of the retention window |
@@ -50,9 +54,14 @@ Things to keep in mind when sizing:
   sequencer, one thread per source, sink and client session, and three
   threads for the web UI when it is enabled).
 - **Memory**: see [below](#memory). Outside the budget: hydration of a
-  new view holds snapshots of intermediate results, an ad-hoc query's
-  result is built in memory, and each session, source and sink thread has
-  its own buffers.
+  new view holds a few batches of rows, a sort buffer per index it builds
+  and about 16 MiB of join rows in flight; applying a commit holds the
+  changes of operators with consumers still to run up to an eighth of the
+  pool's share each, and sort buffers for the indexes it updates in bulk (a
+  window partition or a recursive query's result is computed whole); a
+  large commit's log record itself, and the rows delivered to subscriptions
+  and sinks, are in memory whole; an ad-hoc query's result is built in
+  memory, and each session, source and sink thread has its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
 

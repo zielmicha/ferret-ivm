@@ -10,6 +10,7 @@
 //! retracts it when it expires; future events wait in an arrangement ordered
 //! by time, and each step releases the events that are due.
 
+use super::delta::{NodeDelta, StepOut};
 use super::*;
 use crate::error::codes;
 use crate::expr::func::func_def;
@@ -234,12 +235,20 @@ fn schedule(layout: &Layout, now: i64, row: &[Datum], w: i64, (lo, hi): (i64, i6
     Ok(now >= lo)
 }
 
-pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &Delta, gsn: Gsn, out: &mut Output) -> Result<()> {
+pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let now = g.now;
     let ev = g.arr(p.events);
     let layout = ev.layout.clone();
     let tree = ev.tree;
+    // event changes, applied as they accumulate: the due events are read
+    // first, and new ones lie after them
     let mut ups: Vec<(Vec<u8>, i64)> = Vec::new();
+    let flush = |env: &mut Env, ups: &mut Vec<(Vec<u8>, i64)>, all: bool| {
+        if ups.len() >= super::ops::BATCH_ROWS * 16 || (all && !ups.is_empty()) {
+            env.apply(tree, ups, gsn)?;
+        }
+        Ok::<(), SqlError>(())
+    };
     // events that are due: everything at or before now
     let bound = crate::types::encoding::prefix_successor(&layout.encode_prefix(&[Datum::Int8(now)]));
     let hi = match &bound {
@@ -254,56 +263,74 @@ pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &Delta, gsn: Gsn,
         }
         let r = layout.decode_row(&k)?;
         let sign = if matches!(r[1], Datum::Int2(0)) { 1 } else { -1 };
-        out.data.push((r[2..].to_vec(), sign * w));
+        out.push(env, r[2..].to_vec(), sign * w)?;
         ups.push((k.into_vec(), -w));
+        flush(env, &mut ups, false)?;
     }
     // changed rows
-    for (row, w) in delta {
-        match validity(&p.preds, row) {
-            Ok(Some(iv)) => {
-                if schedule(&layout, now, row, *w, iv, &mut ups)? {
-                    out.data.push((row.clone(), *w));
+    delta.for_each_batch(env, &mut |env, batch| {
+        for (row, w) in batch {
+            match validity(&p.preds, row) {
+                Ok(Some(iv)) => {
+                    if schedule(&layout, now, row, *w, iv, &mut ups)? {
+                        out.push(env, row.clone(), *w)?;
+                    }
                 }
+                Ok(None) => {}
+                Err(e) if super::reduce::is_data_error(&e) => out.err(err_record(&e), *w),
+                Err(e) => return Err(e),
             }
-            Ok(None) => {}
-            Err(e) if super::reduce::is_data_error(&e) => out.errs.push((err_record(&e), *w)),
-            Err(e) => return Err(e),
         }
-    }
-    env.apply(tree, &mut ups, gsn)
+        flush(env, &mut ups, false)
+    })?;
+    flush(env, &mut ups, true)
 }
 
-/// Rows of the input valid now.
-pub fn snapshot(g: &Graph, p: &TemporalPlan, input: Output, out: &mut Output) {
-    out.errs = input.errs;
-    for (row, w) in input.data {
+/// Rows of the input valid now (a batch of the input's snapshot).
+pub fn snapshot(g: &Graph, env: &mut Env, p: &TemporalPlan, input: Delta, out: &mut super::ops::SnapOut) -> Result<()> {
+    for (row, w) in input {
         match validity(&p.preds, &row) {
             Ok(Some((lo, hi))) => {
                 if lo <= g.now && g.now < hi {
-                    out.data.push((row, w));
+                    out.push(env, row, w)?;
                 }
             }
             Ok(None) => {}
-            Err(e) => out.errs.push((err_record(&e), w)),
+            Err(e) => out.err(err_record(&e), w),
         }
     }
+    Ok(())
 }
 
-/// Build the pending events of a new operator from its input's contents.
-pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: &Output, gsn: Gsn) -> Result<()> {
+/// Build the pending events of a new operator from the contents of its
+/// input node (streamed, the events sorted in bounded memory).
+pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: NodeId, gsn: Gsn) -> Result<()> {
     if g.arr(p.events).hydrated {
         return Ok(());
     }
     let ev = g.arr(p.events);
     let layout = ev.layout.clone();
-    let tree = ev.tree;
-    let mut ups = Vec::new();
-    for (row, w) in &input.data {
-        if let Ok(Some(iv)) = validity(&p.preds, row) {
-            schedule(&layout, g.now, row, *w, iv, &mut ups)?;
+    let mut events = crate::storage::TreeBuilder::new(env, ev.tree, gsn);
+    let now = g.now;
+    let r = super::ops::snapshot_stream(g, env, input, &mut |env, batch| {
+        let mut ups = Vec::new();
+        for (row, w) in &batch {
+            if let Ok(Some(iv)) = validity(&p.preds, row) {
+                schedule(&layout, now, row, *w, iv, &mut ups)?;
+            }
+        }
+        for (e, w) in ups {
+            events.push(env, e, w)?;
+        }
+        Ok(())
+    });
+    match r {
+        Ok(_) => events.finish(env)?,
+        Err(e) => {
+            events.abort(env)?;
+            return Err(e);
         }
     }
-    env.apply(tree, &mut ups, gsn)?;
     let ev = g.arrs[p.events].as_mut().unwrap();
     ev.hydrated = true;
     ev.since = gsn;

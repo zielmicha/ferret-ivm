@@ -52,7 +52,9 @@ with status 1 at once) and accepts connections only once recovery is done.
 3. **Open the store** (`Env::open`): read `MANIFEST`, keep the last record
    whose CRC is valid, and truncate a torn tail. Re-open the active segment
    truncated to the recorded length, delete segment files the record does
-   not list, and register every tree root as *recovered but not attached*.
+   not list (this discards the nodes written after the record, early by the
+   buffer pool or by an interrupted checkpoint), and register every tree
+   root as *recovered but not attached*.
    A manifest that has contents but no valid record, or a missing manifest
    while segment files hold data, stops the start before anything is
    modified: the checkpoint may have existed, and the log may already be
@@ -158,9 +160,10 @@ fingerprint mismatch only costs a rebuild.
 
 A checkpoint is taken on `CHECKPOINT`, on shutdown, and when one is due
 (`Engine::maybe_checkpoint`, after every message the engine handles): every
-`--checkpoint-secs`, or as soon as the memory of dirty nodes exceeds half of
-the buffer pool's share of the memory budget (they cannot be evicted until
-a checkpoint writes them), once something durable changed since the last
+`--checkpoint-secs`, or as soon as the memory of dirty nodes still exceeds
+half of the buffer pool's share of the memory budget after a message (the
+pool writes dirty nodes early to keep them below that), once something
+durable changed since the last
 one — a record was applied other than a clock tick that changed nothing but
 the clock (a tick that releases temporal-filter events counts), or the last
 checkpoint's maintenance pass left space to reclaim for lack of budget
@@ -183,8 +186,8 @@ otherwise, once it has reclaimed what its passes found.
    underfull nodes, relocate the live nodes of sparse segments, in every
    tree the metadata tree included
    ([Storage](storage.md#space-reclamation));
-3. `Env::checkpoint(processed_gsn, header)`: write dirty nodes (those the
-   maintenance pass rewrote too), `fsync`, append the manifest record — the
+3. `Env::checkpoint(processed_gsn, header)`: write the remaining dirty
+   nodes (those the maintenance pass rewrote too), `fsync`, append the manifest record — the
    trees, the segments, the header naming the metadata tree and each tree's
    live bytes per segment, tens of bytes per tree — (the commit point),
    delete dead segments

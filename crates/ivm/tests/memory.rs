@@ -1,19 +1,29 @@
-//! Memory accounting of the buffer pool against the allocations it really
-//! makes, measured by a counting allocator (per thread, so that tests
-//! running in parallel do not disturb each other).
+//! Memory: the buffer pool's accounting against the allocations it really
+//! makes, and bounds on what work on data much larger than the pool takes,
+//! measured by a counting allocator.
+//!
+//! The allocator counts per thread, so that the accounting tests can run in
+//! parallel without disturbing each other, and for the whole process, for
+//! the bounds of an engine's work, which runs on threads of its own. The
+//! bound tests hold `EXCLUSIVE` for writing, the others for reading, so that
+//! nothing else allocates while a bound is measured.
 //!
 //! The pool used to count estimated serialized bytes: an 8-byte key with
 //! one version was 18 bytes, while in memory it is a 56-byte entry plus the
 //! key's heap block, so 128 MiB of accounted cache took over 500 MiB; and a
 //! full scan loaded the whole tree before evicting anything.
 
+use ivm::coord::api::{ExecResult, SessionVars};
+use ivm::coord::{self, EngineHandle};
 use ivm::storage::{AggKind, CountSummarizer, Env, EnvOptions, Summarizer, Summary};
+use ivm::types::text::format_datum;
 use ivm::types::Datum;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ops::Bound;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 struct Counting;
 
@@ -22,29 +32,51 @@ thread_local! {
     static LIVE: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
 }
 
+/// Bytes allocated and not freed by the process, and its high-water mark.
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Held for writing by the tests measuring the whole process.
+static EXCLUSIVE: RwLock<()> = RwLock::new(());
+
 fn count(delta: isize) {
     let _ = LIVE.try_with(|c| {
         let (live, peak) = c.get();
         c.set((live + delta, peak.max(live + delta)));
     });
+    if delta >= 0 {
+        let now = CURRENT.fetch_add(delta as usize, Ordering::Relaxed) + delta as usize;
+        PEAK.fetch_max(now, Ordering::Relaxed);
+    } else {
+        CURRENT.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+    }
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        count(l.size() as isize);
-        unsafe { System.alloc(l) }
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            count(l.size() as isize);
+        }
+        p
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        count(l.size() as isize);
-        unsafe { System.alloc_zeroed(l) }
+        let p = unsafe { System.alloc_zeroed(l) };
+        if !p.is_null() {
+            count(l.size() as isize);
+        }
+        p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) };
         count(-(l.size() as isize));
-        unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        count(new as isize - l.size() as isize);
-        unsafe { System.realloc(p, l, new) }
+        let q = unsafe { System.realloc(p, l, new) };
+        if !q.is_null() {
+            count(new as isize - l.size() as isize);
+        }
+        q
     }
 }
 
@@ -55,7 +87,7 @@ fn live() -> isize {
     LIVE.with(|c| c.get().0)
 }
 
-/// Restart the high-water mark at the current live bytes.
+/// Restart this thread's high-water mark at its current live bytes.
 fn reset_peak() {
     LIVE.with(|c| c.set((c.get().0, c.get().0)));
 }
@@ -63,6 +95,14 @@ fn reset_peak() {
 fn peak() -> isize {
     LIVE.with(|c| c.get().1)
 }
+
+/// The process's heap in use, and its peak since the last call.
+fn heap() -> (usize, usize) {
+    let now = CURRENT.load(Ordering::Relaxed);
+    (now, PEAK.swap(now, Ordering::Relaxed))
+}
+
+const MB: usize = 1 << 20;
 
 fn dir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
@@ -136,6 +176,7 @@ fn assert_close(what: &str, (accounted, allocated): (usize, usize)) {
 /// apiece before; a quarter of what they take).
 #[test]
 fn narrow_entries_are_accounted_at_their_size_in_memory() {
+    let _shared = EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
     let r = loaded("narrow", 200_000, 1, big_cache(), || Arc::new(CountSummarizer), |i| i.to_be_bytes().to_vec());
     assert_close("narrow entries", r);
 }
@@ -143,6 +184,7 @@ fn narrow_entries_are_accounted_at_their_size_in_memory() {
 /// Histories longer than two changes leave their entry for a heap block.
 #[test]
 fn long_histories_are_accounted() {
+    let _shared = EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
     let r = loaded("history", 50_000, 5, big_cache(), || Arc::new(CountSummarizer), |i| i.to_be_bytes().to_vec());
     assert_close("entries with five versions", r);
 }
@@ -152,6 +194,7 @@ fn long_histories_are_accounted() {
 /// the internal nodes a large part of the tree.
 #[test]
 fn wide_entries_and_summaries_are_accounted() {
+    let _shared = EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
     let opts = EnvOptions { leaf_bytes: 2 << 10, internal_bytes: 4 << 10, ..big_cache() };
     let key = |i: u64| format!("{i:020}{}", "x".repeat(280)).into_bytes();
     let r = loaded("wide", 20_000, 1, opts, || Arc::new(MaxKey), key);
@@ -179,6 +222,7 @@ impl Summarizer for WideFloatSum {
 /// every child pointer owns a heap block for them, which the pool counts.
 #[test]
 fn spilled_float_sums_are_accounted() {
+    let _shared = EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
     // leaves of a few entries: the child pointers hold most of the memory
     let opts = EnvOptions { leaf_bytes: 64, internal_bytes: 1 << 10, ..big_cache() };
     let r = loaded("float-sums", 50_000, 1, opts, || Arc::new(WideFloatSum), |i| i.to_be_bytes().to_vec());
@@ -190,6 +234,7 @@ fn spilled_float_sums_are_accounted() {
 /// 1.5 GB during one scan).
 #[test]
 fn a_full_scan_stays_within_the_cache() {
+    let _shared = EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
     let d = dir("scan");
     let cache = 2 << 20;
     let opts = EnvOptions { cache_bytes: cache, ..Default::default() };
@@ -240,6 +285,7 @@ fn a_full_scan_stays_within_the_cache() {
 /// another tree that were in the pool are still there.
 #[test]
 fn a_scan_keeps_the_working_set() {
+    let _shared = EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
     let d = dir("working-set");
     let cache = 2 << 20;
     let opts = EnvOptions { cache_bytes: cache, ..Default::default() };
@@ -274,4 +320,102 @@ fn a_scan_keeps_the_working_set() {
     assert!(env.stats().mem_bytes <= cache, "the pool holds {} bytes", env.stats().mem_bytes);
     drop(env);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+fn try_exec(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {
+    let stmt = ivm::sql::parse_statement(sql).map_err(|e| format!("parse: {e}"))?;
+    h.execute(stmt, vec![], SessionVars::default(), String::new()).map_err(|e| format!("{} {}", e.code, e.message))
+}
+
+fn exec(h: &EngineHandle, sql: &str) {
+    try_exec(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
+    match try_exec(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        ExecResult::Query { rows, .. } => rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect(),
+        other => panic!("{sql}: {other:?}"),
+    }
+}
+
+#[test]
+fn memory_stays_within_the_cache() {
+    let _exclusive = EXCLUSIVE.write().unwrap_or_else(|e| e.into_inner());
+    let dir = dir("bounds");
+    let cache = 4 * MB;
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, memory_bytes: cache, ..Default::default() };
+    let running = coord::start(cfg).expect("engine starts");
+    let h = running.handle.clone();
+    hydration(&h, cache);
+    large_commit(&h, cache);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Hydrating views of a table about ten times the buffer pool, and views
+/// several times larger still (a filter, joins with fan-out, aggregates)
+/// peaks within the pool and a constant. (Hydration used to hold the whole
+/// snapshot, every encoded entry and the dirty tree: 135 to 370 MiB here.)
+fn hydration(h: &EngineHandle, cache: usize) {
+    exec(h, "CREATE TABLE t (id bigint PRIMARY KEY, k bigint, s text)");
+    let n = 200_000;
+    for i in (0..n).step_by(20_000) {
+        exec(h, &format!("INSERT INTO t SELECT g, g % 50000, repeat('s', 150) || g FROM generate_series({i}, {}) g", i + 19_999));
+    }
+    exec(h, "CHECKPOINT");
+    // (the first join builds the index on t (k) the others use)
+    let views = [
+        ("filter", "SELECT id, k, s FROM t WHERE k >= 0", "200000"),
+        ("fanout", "SELECT a.k, b.s FROM t a JOIN t b ON a.k = b.k", "800000"),
+        ("join", "SELECT a.id AS aid, b.id AS bid, a.s FROM t a JOIN t b ON a.k = b.k AND a.id <> b.id", "600000"),
+        ("agg", "SELECT k, count(*) AS c, max(s) AS m FROM t GROUP BY k", "50000"),
+        ("joinagg", "SELECT a.k, count(*) AS c, max(b.s) AS m FROM t a JOIN t b ON a.k = b.k GROUP BY a.k", "50000"),
+    ];
+    for (name, q, count) in views {
+        let (before, _) = heap();
+        exec(h, &format!("CREATE MATERIALIZED VIEW {name} AS {q}"));
+        let (_, peak) = heap();
+        let used = peak.saturating_sub(before);
+        assert!(used < cache + 40 * MB, "hydrating {name} used {} MiB above {} MiB", used / MB, before / MB);
+        assert_eq!(rows(h, &format!("SELECT count(*) FROM {name}")), [count], "{name}");
+    }
+    // the views are maintained as usual afterwards
+    exec(h, "UPDATE t SET k = k + 1 WHERE id < 10");
+    assert_eq!(rows(h, "SELECT count(*) FROM filter WHERE k >= 1 AND id < 10"), ["10"]);
+    assert_eq!(rows(h, "SELECT sum(c) FROM joinagg"), rows(h, "SELECT count(*) FROM t a JOIN t b ON a.k = b.k"));
+    assert_eq!(rows(h, "SELECT sum(c) FROM agg"), ["200000"]);
+}
+
+/// A commit many times the buffer pool, into a table with views (a filter,
+/// a join, an aggregate), costs the dataflow no more than the pool and a
+/// constant beyond what the same commit costs into a table without views
+/// (the statement and the log record themselves, outside the dataflow).
+/// The deltas used to be held in memory, all of them until the end of the
+/// GSN.
+fn large_commit(h: &EngineHandle, cache: usize) {
+    exec(h, "CREATE TABLE plain (id bigint PRIMARY KEY, k bigint, s text)");
+    exec(h, "CREATE TABLE q (id bigint PRIMARY KEY, k bigint, s text)");
+    exec(h, "CREATE TABLE d (k bigint PRIMARY KEY, name text)");
+    exec(h, "INSERT INTO d SELECT g, 'name' || g FROM generate_series(0, 999) g");
+    exec(h, "CREATE MATERIALIZED VIEW qf AS SELECT id, k, s FROM q WHERE k >= 0");
+    exec(h, "CREATE MATERIALIZED VIEW qj AS SELECT q.id, d.name, q.s FROM q JOIN d ON q.k = d.k");
+    exec(h, "CREATE MATERIALIZED VIEW qa AS SELECT k, count(*) AS c, max(s) AS m FROM q GROUP BY k");
+    exec(h, "CHECKPOINT");
+    let insert = |t: &str| {
+        let (before, _) = heap();
+        exec(h, &format!("INSERT INTO {t} SELECT g, g % 1000, repeat('s', 300) || g FROM generate_series(1, 150000) g"));
+        let (_, peak) = heap();
+        peak.saturating_sub(before)
+    };
+    let alone = insert("plain");
+    let with_views = insert("q");
+    assert!(
+        with_views < alone + cache + 40 * MB,
+        "the commit used {} MiB with views, {} MiB without",
+        with_views / MB,
+        alone / MB
+    );
+    assert_eq!(rows(h, "SELECT count(*), sum(k) FROM qf"), rows(h, "SELECT count(*), sum(k) FROM q"));
+    assert_eq!(rows(h, "SELECT count(*) FROM qj"), ["150000"]);
+    assert_eq!(rows(h, "SELECT count(*), sum(c) FROM qa"), ["1000|150000"]);
 }

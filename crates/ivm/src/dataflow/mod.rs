@@ -11,6 +11,7 @@
 //! alongside rows and retract when the offending rows retract.
 
 pub mod agg;
+pub mod delta;
 pub mod join;
 pub mod layout;
 pub mod lower;
@@ -29,7 +30,7 @@ use crate::types::encoding::SortSpec;
 use crate::types::{ColumnType, Row};
 use layout::{Layout, LayoutSummarizer};
 use mfp::Mfp;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -183,6 +184,8 @@ pub struct Graph {
     /// Memory of the group caches of all `Reduce`s, against their share of
     /// the memory budget (`reduce::trim_caches`).
     pub group_caches: Arc<crate::memory::CacheMeter>,
+    /// Per node, the index by all columns its spilled outputs are kept in.
+    spill_layouts: parking_lot::Mutex<FxHashMap<NodeId, Arc<Layout>>>,
 }
 
 /// Error state that must survive restarts, by node fingerprint: the error
@@ -624,6 +627,7 @@ impl Graph {
         self.node_by_fp.remove(&node.fp);
         let errs = self.node_errors.remove(&id);
         self.forget_mirrored_errors(id, &node, errs);
+        self.spill_layouts.get_mut().remove(&id);
         self.counters.remove(&id);
         self.topo_dirty = true;
         // arrangements used by this operator
@@ -663,6 +667,42 @@ impl Graph {
         Ok(out)
     }
 
+    /// Rows of an arrangement with weights as of `at`, handed to `sink` in
+    /// batches of at most `ops::BATCH_ROWS` rows and about 1 MiB of entries.
+    pub fn scan_stream(&self, env: &mut Env, arr: ArrId, at: ReadAt, sink: &mut ops::RowSink) -> Result<()> {
+        let a = self.arr(arr);
+        let layout = &a.layout;
+        let mut from: Option<Vec<u8>> = None;
+        loop {
+            let lo = match &from {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut batch = Vec::new();
+            let mut bytes = 0;
+            let mut last = None;
+            env.for_each(a.tree, lo, std::ops::Bound::Unbounded, &mut |k, h| {
+                let w = h.weight(at);
+                if w != 0 {
+                    batch.push((layout.decode_row(k)?, w));
+                    bytes += k.len();
+                    if batch.len() >= ops::BATCH_ROWS || bytes >= 1 << 20 {
+                        last = Some(k.to_vec());
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if !batch.is_empty() {
+                sink(env, batch)?;
+            }
+            match last {
+                Some(k) => from = Some(k),
+                None => return Ok(()),
+            }
+        }
+    }
+
     /// Rows matching a key prefix.
     pub fn lookup(&self, env: &mut Env, arr: ArrId, key: &[crate::types::Datum], at: ReadAt) -> Result<Delta> {
         let a = self.arr(arr);
@@ -681,10 +721,13 @@ impl Graph {
 
     /// Full contents of a node as of the latest processed time (consolidated).
     pub fn snapshot(&self, env: &mut Env, node: NodeId) -> Result<Output> {
-        let mut cache = FxHashMap::default();
-        let mut out = ops::owned(ops::snapshot_node(self, env, node, &mut cache)?);
-        consolidate(&mut out.data);
-        Ok(out)
+        let mut data = Vec::new();
+        let errs = ops::snapshot_stream(self, env, node, &mut |_, batch| {
+            data.extend(batch);
+            Ok(())
+        })?;
+        consolidate(&mut data);
+        Ok(Output { data, errs })
     }
 
     /// The node's first hydrated arrangement, if any.
@@ -846,14 +889,140 @@ impl Graph {
 
     /// Process one GSN. `changes` holds base table changes keyed by table node.
     /// Returns the output of every node that produced something.
-    pub fn step(
+    pub fn step(&mut self, env: &mut Env, gsn: Gsn, changes: FxHashMap<NodeId, Vec<TableChange>>) -> Result<FxHashMap<NodeId, Output>> {
+        let all = self.live_nodes().map(|n| n.id).collect();
+        self.step_observed(env, gsn, changes, all)
+    }
+
+    /// `step`, returning the rows only of the `observed` nodes (and the
+    /// error records of every node that has some).
+    pub fn step_observed(
         &mut self,
         env: &mut Env,
         gsn: Gsn,
-        mut changes: FxHashMap<NodeId, Vec<TableChange>>,
+        changes: FxHashMap<NodeId, Vec<TableChange>>,
+        observed: FxHashSet<NodeId>,
     ) -> Result<FxHashMap<NodeId, Output>> {
-        let order: Vec<NodeId> = self.topo().to_vec();
+        let mut input = self.step_begin(gsn, observed);
+        for (node, ch) in changes {
+            if let Err(e) = self.step_feed(env, &mut input, node, ch) {
+                input.abort(env)?;
+                return Err(e);
+            }
+        }
+        self.step_finish(env, input)
+    }
+
+    /// Start processing a GSN, whose base-table changes are then fed in
+    /// batches (`step_feed`) before the GSN is propagated (`step_finish`),
+    /// which returns the rows of the `observed` nodes.
+    pub fn step_begin(&self, gsn: Gsn, observed: FxHashSet<NodeId>) -> StepInput {
+        // consumers that will run, per node
+        let mut readers: FxHashMap<NodeId, usize> = FxHashMap::default();
+        for n in self.live_nodes().filter(|n| n.hydrated) {
+            for i in &n.inputs {
+                *readers.entry(*i).or_default() += 1;
+            }
+        }
+        StepInput { gsn, tables: FxHashMap::default(), readers, observed }
+    }
+
+    /// Feed changes of table node `node` at the GSN of `input`, in their
+    /// order (a table's changes may come in several batches). They are
+    /// applied in chunks of about `spill_bytes`, each to the table's
+    /// primary index before the next chunk reads it, so the dataflow never
+    /// holds a commit's changes as a whole. The table's delta is
+    /// accumulated (spilling when large) for `step_finish`, which applies
+    /// it to the table's other arrangements; if nothing reads it, a large
+    /// one goes to them directly, through `TreeBuilder`s.
+    pub fn step_feed(&self, env: &mut Env, input: &mut StepInput, node: NodeId, changes: Vec<TableChange>) -> Result<()> {
+        let n = self.node(node);
+        if !n.hydrated || changes.is_empty() {
+            return Ok(());
+        }
+        let NodeKind::Table { primary, .. } = n.kind else { return Err(SqlError::internal("changes fed to a node that is not a table")) };
+        let started = std::time::Instant::now();
+        let gsn = input.gsn;
+        let read = input.readers.get(&node).is_some_and(|r| *r > 0) || input.observed.contains(&node);
+        let fed = input.tables.entry(node).or_insert_with(|| {
+            // the primary index is updated as the changes are fed
+            let targets = self.delta_targets(node, Some(primary));
+            FedTable {
+                out: if read { delta::DeltaBuf::new(gsn, targets) } else { delta::DeltaBuf::direct(gsn, targets) },
+                carry: ops::TableCarry::default(),
+                in_rows: 0,
+                out_rows: 0,
+                nanos: 0,
+            }
+        });
+        fed.in_rows += changes.len();
+        let budget = delta::spill_bytes(env);
+        let mut changes = changes.into_iter().peekable();
+        while changes.peek().is_some() {
+            let mut chunk = Vec::new();
+            let mut bytes = 0;
+            while (chunk.is_empty() || bytes < budget)
+                && let Some(ch) = changes.next()
+            {
+                bytes += match &ch {
+                    TableChange::Upsert { row, .. } | TableChange::Insert { row } | TableChange::Remove { row } => row_bytes(row),
+                    TableChange::Delete { key } => row_bytes(key),
+                    TableChange::Truncate => 0,
+                };
+                chunk.push(ch);
+            }
+            ops::table_step(self, env, n, chunk, &mut fed.carry, &mut |env, delta| {
+                let arr = self.arr(primary);
+                if arr.hydrated {
+                    let mut ups = Vec::with_capacity(delta.len());
+                    for (row, w) in &delta {
+                        ups.push((arr.layout.encode_row(row)?, *w));
+                    }
+                    env.apply(arr.tree, &mut ups, gsn)?;
+                }
+                fed.out_rows += delta.len();
+                fed.out.extend_consolidated(env, delta)
+            })?;
+        }
+        fed.nanos += started.elapsed().as_nanos() as u64;
+        Ok(())
+    }
+
+    /// Propagate the GSN of `input` through the graph. Returns the outputs
+    /// of the nodes that produced something: the rows of the observed
+    /// nodes, the error records of all. A node's output is consolidated, and
+    /// spilled into a temporary tree when large, which its consumers read
+    /// in batches; it is freed once its consumers have run (a node nobody
+    /// reads applies a large output to its arrangements as it goes).
+    pub fn step_finish(&mut self, env: &mut Env, input: StepInput) -> Result<FxHashMap<NodeId, Output>> {
+        let StepInput { gsn, mut tables, mut readers, observed } = input;
+        let mut deltas: FxHashMap<NodeId, delta::NodeDelta> = FxHashMap::default();
         let mut outputs: FxHashMap<NodeId, Output> = FxHashMap::default();
+        let r = self.propagate(env, gsn, &mut tables, &mut readers, &observed, &mut deltas, &mut outputs);
+        if let Err(e) = r {
+            for (_, fed) in tables.drain() {
+                fed.abort(env)?;
+            }
+            for (_, d) in deltas.drain() {
+                d.release(env)?;
+            }
+            return Err(e);
+        }
+        Ok(outputs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propagate(
+        &mut self,
+        env: &mut Env,
+        gsn: Gsn,
+        tables: &mut FxHashMap<NodeId, FedTable>,
+        readers: &mut FxHashMap<NodeId, usize>,
+        observed: &FxHashSet<NodeId>,
+        deltas: &mut FxHashMap<NodeId, delta::NodeDelta>,
+        outputs: &mut FxHashMap<NodeId, Output>,
+    ) -> Result<()> {
+        let order: Vec<NodeId> = self.topo().to_vec();
         let time_moved = self.now != self.stepped_now;
         self.stepped_now = self.now;
         for id in order {
@@ -861,42 +1030,95 @@ impl Graph {
             if !node.hydrated {
                 continue;
             }
-            let (started, in_rows);
-            let out = if let NodeKind::Table { .. } = node.kind {
-                match changes.remove(&id) {
-                    Some(ch) => {
-                        (started, in_rows) = (std::time::Instant::now(), ch.len());
-                        ops::table_step(self, env, node, ch, gsn)?
+            let inputs = node.inputs.clone();
+            let ran = if let NodeKind::Table { .. } = node.kind {
+                match tables.remove(&id) {
+                    Some(fed) => {
+                        let started = std::time::Instant::now();
+                        let (in_rows, out_rows, nanos) = (fed.in_rows, fed.out_rows, fed.nanos);
+                        // (the primary index was updated as the changes were fed)
+                        let out = fed.out.into_delta(env)?;
+                        if let Err(e) = out.apply(env, gsn) {
+                            out.release(env)?;
+                            return Err(e);
+                        }
+                        Some((out, in_rows, out_rows, nanos + started.elapsed().as_nanos() as u64))
                     }
-                    None => continue,
+                    None => None,
                 }
             } else {
                 let timed = time_moved && matches!(node.kind, NodeKind::Temporal(_));
-                if !timed && !node.inputs.iter().any(|i| outputs.get(i).is_some_and(|o| !o.is_empty())) {
-                    continue;
+                if !timed && !node.inputs.iter().any(|i| deltas.get(i).is_some_and(|o| !o.is_empty())) {
+                    None
+                } else {
+                    let empty = delta::NodeDelta::default();
+                    let ins: Vec<&delta::NodeDelta> = node.inputs.iter().map(|i| deltas.get(i).unwrap_or(&empty)).collect();
+                    let started = std::time::Instant::now();
+                    let in_rows = ins.iter().map(|o| o.rows.len()).sum();
+                    // a node nobody reads hands a large output to its arrangements directly
+                    let targets = self.delta_targets(id, None);
+                    let rows = if readers.get(&id).is_some_and(|r| *r > 0) || observed.contains(&id) {
+                        delta::DeltaBuf::new(gsn, targets)
+                    } else {
+                        delta::DeltaBuf::direct(gsn, targets)
+                    };
+                    let out = ops::step_node(self, env, node, &ins, gsn, deltas, rows)?;
+                    if !out.is_empty() {
+                        self.add_errors(id, &out.errs);
+                        if let Err(e) = out.apply(env, gsn) {
+                            out.release(env)?;
+                            return Err(e);
+                        }
+                    }
+                    let out_rows = out.rows.len();
+                    Some((out, in_rows, out_rows, started.elapsed().as_nanos() as u64))
                 }
-                let empty = Output::default();
-                let inputs: Vec<&Output> = node.inputs.iter().map(|i| outputs.get(i).unwrap_or(&empty)).collect();
-                (started, in_rows) = (std::time::Instant::now(), inputs.iter().map(|o| o.data.len()).sum());
-                ops::step_node(self, env, node, &inputs, gsn, &outputs)?
             };
-            if out.is_empty() {
-                self.count_step(id, in_rows, 0, started);
-                continue;
+            if let Some((out, in_rows, out_rows, nanos)) = ran {
+                self.count_step(id, in_rows, out_rows, nanos);
+                if !out.is_empty() {
+                    let st = self.stats.entry(id).or_default();
+                    st.ticks += 1;
+                    st.rows += out_rows as u64;
+                    deltas.insert(id, out);
+                }
             }
-            self.add_errors(id, &out.errs);
-            self.apply_to_arrangements(env, id, &out.data, gsn)?;
-            self.count_step(id, in_rows, out.data.len(), started);
-            let st = self.stats.entry(id).or_default();
-            st.ticks += 1;
-            st.rows += out.data.len() as u64;
-            outputs.insert(id, out);
+            // outputs whose consumers have all run
+            for i in inputs {
+                let n = readers.get_mut(&i).expect("reader count");
+                *n -= 1;
+                if *n == 0
+                    && let Some(d) = deltas.remove(&i)
+                {
+                    retire(env, i, d, outputs, observed)?;
+                }
+            }
         }
-        Ok(outputs)
+        for (id, d) in std::mem::take(deltas) {
+            retire(env, id, d, outputs, observed)?;
+        }
+        Ok(())
     }
 
-    fn count_step(&mut self, id: NodeId, in_rows: usize, out_rows: usize, started: std::time::Instant) {
-        let nanos = started.elapsed().as_nanos() as u64;
+    /// The encodings a node's delta is kept in, and the trees it is applied
+    /// to: its hydrated arrangements (`applied`, if any, is up to date
+    /// already), or an index by all columns for a node without any.
+    fn delta_targets(&self, node: NodeId, applied: Option<ArrId>) -> Vec<delta::Target> {
+        let mut targets: Vec<delta::Target> = self
+            .node(node)
+            .arrangements
+            .iter()
+            .filter(|a| self.arr(**a).hydrated)
+            .map(|&a| delta::Target { arr: Some(a), layout: self.arr(a).layout.clone(), apply_to: (Some(a) != applied).then_some(self.arr(a).tree) })
+            .collect();
+        if targets.is_empty() {
+            let layout = self.spill_layouts.lock().entry(node).or_insert_with(|| Arc::new(delta::spill_layout(&self.node(node).schema))).clone();
+            targets.push(delta::Target { arr: None, layout, apply_to: None });
+        }
+        targets
+    }
+
+    fn count_step(&mut self, id: NodeId, in_rows: usize, out_rows: usize, nanos: u64) {
         for c in [self.counters.entry(id).or_default(), &mut self.step_totals] {
             c.steps += 1;
             c.in_rows += in_rows as u64;
@@ -905,100 +1127,56 @@ impl Graph {
         }
     }
 
-    fn apply_to_arrangements(&self, env: &mut Env, node: NodeId, delta: &Delta, gsn: Gsn) -> Result<()> {
-        if delta.is_empty() {
-            return Ok(());
-        }
-        for &a in &self.node(node).arrangements {
-            let arr = self.arr(a);
-            if !arr.hydrated {
-                continue;
-            }
-            let mut ups = Vec::with_capacity(delta.len());
-            for (row, w) in delta {
-                ups.push((arr.layout.encode_row(row)?, *w));
-            }
-            env.apply(arr.tree, &mut ups, gsn)?;
-        }
-        Ok(())
-    }
-
     // ------------------------------------------------------------------ hydration
 
     /// Bring every new node and arrangement up to date as of `gsn`, computing
     /// their contents from existing state (never from the sources). The
     /// error records in their contents are kept per node (`errors_of`).
+    /// Memory stays bounded: a node's snapshot is streamed into its new
+    /// arrangements a batch at a time, and each arrangement is built by an
+    /// external sort (`TreeBuilder`).
     pub fn hydrate(&mut self, env: &mut Env, gsn: Gsn) -> Result<()> {
         let order: Vec<NodeId> = self.topo().to_vec();
-        let mut cache: ops::SnapCache = FxHashMap::default();
-        // snapshots are cached only while a node still to be hydrated may
-        // read them (large views would otherwise hold every intermediate)
-        let needs = |g: &Graph, id: NodeId| {
-            !g.node(id).hydrated || g.node(id).arrangements.iter().any(|a| !g.arr(*a).hydrated)
-        };
-        let mut readers: FxHashMap<NodeId, usize> = FxHashMap::default();
-        for &id in &order {
-            if needs(self, id) {
-                for i in &self.node(id).inputs {
-                    *readers.entry(*i).or_default() += 1;
-                }
-            }
-        }
         for id in order {
             let needs_node = !self.node(id).hydrated;
-            let pending_arrs: Vec<ArrId> =
-                self.node(id).arrangements.iter().copied().filter(|a| !self.arr(*a).hydrated).collect();
-            if !needs_node && pending_arrs.is_empty() {
-                continue;
-            }
             if needs_node {
                 // stateful operators initialize their own arrangements here
-                ops::hydrate_node(self, env, id, gsn, &mut cache)?;
+                ops::hydrate_node(self, env, id, gsn)?;
             }
             let pending_arrs: Vec<ArrId> =
                 self.node(id).arrangements.iter().copied().filter(|a| !self.arr(*a).hydrated).collect();
             if !pending_arrs.is_empty() {
-                let snap = match cache.get(&id) {
-                    Some(s) => s.clone(),
-                    None => {
-                        let s = ops::snapshot_node(self, env, id, &mut cache)?;
-                        cache.insert(id, s.clone());
-                        s
+                let layouts: Vec<Arc<Layout>> = pending_arrs.iter().map(|a| self.arr(*a).layout.clone()).collect();
+                let mut builders: Vec<crate::storage::TreeBuilder> =
+                    pending_arrs.iter().map(|a| crate::storage::TreeBuilder::new(env, self.arr(*a).tree, gsn)).collect();
+                // the rows go to every new arrangement, in their key orders
+                let r = ops::snapshot_stream(self, env, id, &mut |env, batch| {
+                    for (b, layout) in builders.iter_mut().zip(&layouts) {
+                        for (row, w) in &batch {
+                            b.push(env, layout.encode_row(row)?, *w)?;
+                        }
+                    }
+                    Ok(())
+                });
+                let errs = match r {
+                    Ok(errs) => errs,
+                    Err(e) => {
+                        for b in builders {
+                            b.abort(env)?;
+                        }
+                        return Err(e);
                     }
                 };
+                delta::finish_all(env, builders)?;
                 for a in pending_arrs {
-                    let arr = self.arr(a);
-                    // Entries are applied in key order, in batches that each
-                    // cover a key range: unordered batches would each touch
-                    // (and rewrite) every leaf.
-                    let mut ups = Vec::with_capacity(snap.data.len());
-                    for (row, w) in &snap.data {
-                        ups.push((arr.layout.encode_row(row)?, *w));
-                    }
-                    ups.sort_unstable_by(|x, y| x.0.cmp(&y.0));
-                    while !ups.is_empty() {
-                        let mut batch = ups.split_off(ups.len().saturating_sub(100_000));
-                        env.apply(arr.tree, &mut batch, gsn)?;
-                    }
                     let a = self.arrs[a].as_mut().unwrap();
                     a.hydrated = true;
                     a.since = gsn;
                 }
                 // the arrangement holds the rows; the errors are kept here
-                self.set_errors(id, &snap.errs);
-            } else if needs_node && let Some(s) = cache.get(&id) {
-                let errs = s.errs.clone();
                 self.set_errors(id, &errs);
             }
             self.node_mut(id).hydrated = true;
-            // drop snapshots nobody further down will read (including those
-            // of intermediate nodes computed along the way)
-            for i in self.node(id).inputs.clone() {
-                if let Some(n) = readers.get_mut(&i) {
-                    *n = n.saturating_sub(1);
-                }
-            }
-            cache.retain(|k, _| readers.get(k).copied().unwrap_or(0) > 0);
         }
         Ok(())
     }
@@ -1017,6 +1195,55 @@ impl Graph {
     pub fn arrangement_at(&self, node: NodeId, at: ReadAt) -> Option<ArrId> {
         self.node(node).arrangements.iter().copied().find(|a| self.arr(*a).covers(at))
     }
+}
+
+/// Base-table changes of one GSN, fed in batches (`Graph::step_feed`).
+pub struct StepInput {
+    gsn: Gsn,
+    tables: FxHashMap<NodeId, FedTable>,
+    /// Consumers that will run, per node.
+    readers: FxHashMap<NodeId, usize>,
+    observed: FxHashSet<NodeId>,
+}
+
+impl StepInput {
+    /// Drop what was accumulated (after a failure).
+    pub fn abort(self, env: &mut Env) -> Result<()> {
+        for (_, fed) in self.tables {
+            fed.abort(env)?;
+        }
+        Ok(())
+    }
+}
+
+/// A table node's changes fed so far at a GSN: its primary index is up to
+/// date, its delta accumulated (and, if nothing reads it and it is large,
+/// applied to its other arrangements).
+struct FedTable {
+    out: delta::DeltaBuf,
+    carry: ops::TableCarry,
+    in_rows: usize,
+    out_rows: usize,
+    nanos: u64,
+}
+
+impl FedTable {
+    fn abort(self, env: &mut Env) -> Result<()> {
+        self.out.abort(env)
+    }
+}
+
+/// Hand a node's output over to the caller of `step` if it is observed or
+/// has error records, and free its rows.
+fn retire(env: &mut Env, id: NodeId, mut d: delta::NodeDelta, outputs: &mut FxHashMap<NodeId, Output>, observed: &FxHashSet<NodeId>) -> Result<()> {
+    let errs = std::mem::take(&mut d.errs);
+    if observed.contains(&id) {
+        let data = d.to_vec(env)?;
+        outputs.insert(id, Output { data, errs });
+    } else if !errs.is_empty() {
+        outputs.insert(id, Output { data: Vec::new(), errs });
+    }
+    d.release(env)
 }
 
 /// Resolves ids to fingerprints while fingerprinting operator plans.
@@ -1062,6 +1289,23 @@ pub fn operator_arrangements(kind: &NodeKind) -> Vec<ArrId> {
         NodeKind::Temporal(p) => vec![p.events],
         _ => vec![],
     }
+}
+
+/// Estimated memory of a row (its values and what they point to, shared or
+/// not), for bounding batches.
+pub fn row_bytes(row: &[crate::types::Datum]) -> usize {
+    use crate::types::Datum;
+    std::mem::size_of_val(row)
+        + 24
+        + row
+            .iter()
+            .map(|d| match d {
+                Datum::Text(s) | Datum::Json(s) => s.len() + 16,
+                Datum::Bytea(b) => b.len() + 16,
+                Datum::Numeric(_) | Datum::Jsonb(_) | Datum::Array(_) => 64,
+                _ => 0,
+            })
+            .sum::<usize>()
 }
 
 /// Consolidate a delta: sort rows by exact identity, sum weights, drop zeros.

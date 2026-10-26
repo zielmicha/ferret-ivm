@@ -4,7 +4,7 @@ Maintained views run as a dataflow graph of incremental operators. This
 chapter describes the data model, the graph, how a GSN is processed, every
 operator, and hydration. Code: `crates/ivm/src/dataflow/` (`mod.rs`,
 `ops.rs`, `join.rs`, `reduce.rs`, `agg.rs`, `window.rs`, `temporal.rs`,
-`tablefunc.rs`, `mfp.rs`, `layout.rs`, `lower.rs`).
+`tablefunc.rs`, `mfp.rs`, `layout.rs`, `lower.rs`, `delta.rs`).
 
 ## Collections and deltas
 
@@ -14,18 +14,36 @@ Every collection — a base table, an intermediate result, a view — is a
 weight 3 for three identical rows; intermediate collections may contain
 negative weights transiently (an anti-join is `input − semijoin`).
 
-Operators exchange **deltas**: `Vec<(Row, i64)>`, the change of a collection
-at one GSN. An update is a retraction (`-1` of the old row) plus an insertion
-(`+1` of the new one).
+Operators exchange **deltas**, the change of a collection at one GSN: rows
+with weights. An update is a retraction (`-1` of the old row) plus an
+insertion (`+1` of the new one).
 
 Every operator's output delta is **consolidated** before it is handed on:
 rows are sorted by *exact identity* (`exact_row_cmp`, which distinguishes
 representations such as `1.0` and `1.00`, `-0` and `0`, `'1 mon'` and
 `'30 days'`), equal rows are merged by adding their weights, and zero weights
-are dropped (a keyed table's delta is consolidated by construction, see
-[Table](#table)). Consequently no consumer — operator, subscriber or sink —
-ever sees a change that cancels within a GSN, and a GSN's changes appear
+are dropped. Consequently no consumer — operator, subscriber or sink — ever
+sees a change that cancels within a GSN, and a GSN's changes appear
 atomically.
+
+A node's delta at a GSN (`delta::NodeDelta`) is held in memory
+(`delta::Rows::Mem`, a `Vec<(Row, i64)>`) while its rows' estimated size
+(`row_bytes`) stays within the *spill threshold*, an eighth of the cache
+(within 1 and 256 MiB; `IVM_DELTA_SPILL_BYTES` overrides it, and the tests
+run with 0, which spills every delta). A larger one is **spilled**
+(`delta::Rows::Tree`) into temporary storage trees, one per *target*: each
+hydrated arrangement of the node, in the arrangement's encoding, or, for a
+node without arrangements, an index by all columns (the encoding of a full
+index). Equal rows — and only exactly equal ones — encode equally there and
+become one entry whose weights add up, so each tree is the consolidated
+delta, sorted by the arrangement's entry key; the trees are built through
+`TreeBuilder`s ([Storage](storage.md#loading-unordered-entries)) and merged
+into the arrangements in key order. Operators produce their output into a
+`DeltaBuf`, which consolidates it in memory or spills it as it grows.
+Consumers read a delta in batches of 1,024 rows (`for_each_batch`), or by
+key range in the encoding of any of the node's arrangements
+(`for_each_entry`: binary search in the in-memory rows sorted by that
+encoding, or a range of the spilled tree), until they have all run.
 
 Alongside the data, every operator outputs **error records**
 (`ErrDelta = Vec<((sqlstate, message), i64)>`): expression errors with the
@@ -92,25 +110,49 @@ reference as `shared`.
 
 ## Processing a GSN
 
-`Graph::step(env, gsn, changes)` runs for every `Commit` record (with the
-changes grouped by table node) and every `Tick` record (with no changes):
+A GSN is processed for every `Commit` record (with the changes grouped by
+table node) and every `Tick` record (with no changes), in two phases:
+`Graph::step_begin(gsn, observed)`, then `step_feed` with each table's
+changes (a table's changes may come in several batches, in their order),
+then `step_finish`; `Graph::step_observed(env, gsn, changes, observed)` does
+all three. `observed` names the nodes whose rows the caller needs (the
+engine passes the nodes of subscriptions and sinks).
 
-1. Visit nodes in topological order, skipping nodes that are not hydrated.
-2. A `Table` node runs if the commit changes its table; it turns the logged
-   changes into a delta (below).
-3. Any other node runs if one of its inputs produced output at this GSN — or,
-   for a temporal filter, if the clock moved since the previous step.
-4. The node's output delta is applied to **all of its arrangements at
-   `gsn`** before any consumer runs, and its error records are added to the
-   node's accumulated ones.
-5. Consumers read arrangements through their (GSN, weight) histories either
+1. **Feeding** a table's changes: they are applied in chunks of about the
+   spill threshold (by `row_bytes`). `ops::table_step` turns a chunk into a
+   delta against the stored rows (below), which is applied to the table's
+   primary index at once, so that the next chunk reads the table as this
+   one left it; the deltas of the chunks add up to the commit's, which is
+   accumulated in a `DeltaBuf` (spilled in the encodings of the table's
+   arrangements, the primary index included) and applied to the table's
+   other arrangements when the table node is propagated. If nothing will
+   read the table's delta (no hydrated consumer, not observed), a large
+   one goes to those arrangements directly, through `TreeBuilder`s.
+2. **Propagating**: visit nodes in topological order, skipping nodes that
+   are not hydrated. A `Table` node that was fed completes its
+   arrangements and hands on its accumulated delta. Any other node runs if
+   one of its inputs produced output at this GSN — or, for a temporal
+   filter, if the clock moved since the previous step — reading its inputs'
+   deltas in batches.
+3. The node's output delta is applied to **all of its arrangements at
+   `gsn`** before any consumer runs (a spilled one by merging its trees),
+   and its error records are added to the node's accumulated ones. The
+   output of a node that nothing reads goes to its arrangements directly
+   once it exceeds the spill threshold (through `TreeBuilder`s), rather
+   than into temporary trees first.
+4. Consumers read arrangements through their (GSN, weight) histories either
    *before* the current GSN (`ReadAt::Before(gsn)`) or *after* it
    (`ReadAt::Latest`), so an operator can compute "old" and "new" results of
    the same key and emit the difference.
+5. A node's output is freed as soon as all its consumers have run: handed
+   to the caller as `Output` (its rows only if the node is observed, its
+   error records always) and its temporary trees dropped. So only the
+   outputs of nodes with consumers still to run are alive at a time, and
+   each is in memory only while small.
 
-The outputs of all nodes are returned to the engine, which merges the error
-records of each view's root into the view's error counts and forwards the
-data deltas of subscribed nodes to subscriptions and sinks.
+The engine merges the error records of each view's root into the view's
+error counts and forwards the data deltas of subscribed nodes to
+subscriptions and sinks (a spilled one read into memory for that).
 
 ## Arrangements and layouts
 
@@ -178,10 +220,11 @@ new one.
 
 ### Table
 
-`ops::table_step` turns a commit's `TableChange`s for one table into a delta
-against the stored rows. For a table with a primary key, every touched key
-gets its stored row (a prefix lookup in the primary index, which does not
-yet contain this GSN) and its final state after all changes of the commit:
+`ops::table_step` turns a chunk of a commit's `TableChange`s for one table
+into a delta against the stored rows. For a table with a primary key, every
+touched key gets its stored row (a prefix lookup in the primary index, which
+holds the commit's earlier chunks but nothing else of this GSN) and its
+final state after all changes of the chunk:
 
 - `Upsert(row, unchanged)` sets the key's row; columns listed in `unchanged`
   (unchanged TOASTed values) are copied from the key's previous row (stored,
@@ -191,16 +234,21 @@ yet contain this GSN) and its final state after all changes of the commit:
   Without either they become NULL (with a warning in the log);
 - `Delete(key)` removes it; `Insert`/`Remove` behave like upsert/delete;
 - `Truncate` removes every stored row and everything touched before it in
-  the commit.
+  the commit: the delta of the changes before it is emitted (applied to the
+  primary index), and then every row the index holds is retracted, a batch
+  at a time.
 
 The output is `−stored, +final` for each touched key whose row changed (by
 exact comparison), so an upsert that does not change the row produces
-nothing; rows of different keys always differ, so the delta needs no further
-consolidation. Because before-images come from the stored row, sources never
-need `REPLICA IDENTITY FULL` for tables with a key. For a multiset table (no
-key), `Insert`/`Upsert` add one instance, `Remove`/`Delete` remove one, and
-`Truncate` retracts the stored contents and discards the changes before it
-in the commit (changes after it are applied as usual).
+nothing; rows of different keys always differ, so a chunk's delta needs no
+further consolidation (the chunks' deltas are consolidated together, which
+cancels a key's intermediate rows). The row the last change of a chunk
+deleted carries over to the next chunk. Because before-images come from the
+stored row, sources never need `REPLICA IDENTITY FULL` for tables with a
+key. For a multiset table (no key), `Insert`/`Upsert` add one instance,
+`Remove`/`Delete` remove one, and `Truncate` retracts the stored contents,
+which include the changes before it in the commit (changes after it are
+applied as usual).
 
 ### Mfp (map, filter, project)
 
@@ -266,9 +314,15 @@ extended along *i*'s path. Input *j* is read *after* the GSN if `j < i` and
   below).
 - When all inputs are bound, the joined row goes to the output.
 - For hydration, the join drives the path of its smallest regular input
-  (by index size) over that input's snapshot; the MFPs of the other regular
-  inputs are evaluated over their contents too, so that their expression
-  errors are counted once per row, as the steps count them.
+  (by index size) over that input's snapshot, in chunks of about 8 MiB of
+  rows (estimated by `row_bytes`); the MFPs of the other regular inputs are
+  evaluated over their contents too, so that their expression errors are
+  counted once per row, as the steps count them.
+- A path is extended depth first in chunks: a lookup step takes at most
+  8 MiB of its frontier at a time, hands its output on in chunks of 8 MiB,
+  and reads a key's matches in batches of 1,024 rows (or 1 MiB of entries),
+  so the rows in flight stay bounded whatever the fan-out. Within a chunk,
+  rows are looked up in key order (rows with equal keys share a lookup).
 
 Lookup order is chosen per path by the planner ([Planner](planner.md#delta-join-planning)):
 the next input is the one with the most equality conditions to the bound
@@ -326,11 +380,14 @@ first entry in index order). Ordered aggregates additionally scan the group.
 Percentiles read the values at the required ranks with `Env::nth`; when the
 `ORDER BY` column sorts NULLs first (`DESC`, `NULLS FIRST`), they skip the
 group's NULL entries first. If old and new rows differ (by exact
-comparison), `−old, +new` is emitted.
+comparison), `−old, +new` is emitted. (A spilled input delta's groups are
+collected as their key prefixes, through a temporary tree if they exceed
+the spill threshold, and each group is summarised from the index.)
 
 - **Group cache**: the summaries (and key values) of recently touched groups
   are kept in memory. A small change to a large group is folded into the
-  cached summary instead of summarising the range again. When folding is
+  cached summary instead of summarising the range again (not from a spilled
+  delta). When folding is
   not exact — a `min`/`max` loses its extreme, or the group key has types with
   several representations and a row is retracted or arrives in another
   representation — the group is summarised from the index. Disabled for
@@ -362,6 +419,11 @@ comparison), `−old, +new` is emitted.
   result is rounded once. Variance and standard deviation are computed from
   exact sums of squares. Maintaining a summary therefore never fails on
   data. See [Storage](storage.md#summaries).
+
+Distinct, SetOp, TopK and Window (below), like a `Reduce` with a spilled
+input, work on the changed values, groups or partitions as a sorted set of
+key prefixes (`delta::KeySet`), kept in memory or, beyond the spill
+threshold, in a temporary tree, and visited in key order.
 
 ### Distinct
 
@@ -429,35 +491,44 @@ See [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal
 
 `Graph::hydrate(env, gsn)` brings every node and arrangement that is not yet
 hydrated up to date as of `gsn`, computing their contents **from existing
-state, never from the sources**:
+state, never from the sources**, in memory bounded by the buffer pool and
+a constant:
 
 1. Visit nodes in topological order. For a node that is not hydrated,
    operators with private state initialise it (the temporal filter computes
-   its pending events from its input's snapshot).
-2. If the node has arrangements that are not hydrated, compute the node's
-   *snapshot* — its full contents, rows and error records — and write its
-   rows into each of them at `gsn`: they are encoded as the arrangement's
-   entries, sorted by key and applied in batches of 100,000 that each cover
-   one key range (so a batch rewrites only the leaves of its range). The
-   arrangement's `since` becomes `gsn`. A snapshot (`ops::snapshot_node`)
-   is read from any hydrated arrangement of the node if there is one, with
-   the node's accumulated error records; otherwise it is computed from the
-   inputs' snapshots: a table from its primary index, an `Mfp` by evaluating
-   its input's snapshot, a join by driving one path, a `Reduce` group by
-   group from its input index (seeking from one group's key prefix to the
-   next, and rebuilding the operator's error state), and so on. Every
-   operator's snapshot includes its inputs' error records, as its steps
-   pass them on. Snapshots of row-wise operators (`Mfp`, `Union`, `Negate`,
-   `FlatMap`, `DeltaJoin`, `TemporalFilter`) are passed on unconsolidated:
-   arrangements consolidate entries as they apply them, and
-   `Graph::snapshot` consolidates its result.
-3. The error records of each hydrated node's snapshot become the node's
+   its pending events from its input's snapshot, loading them into its
+   event index through a `TreeBuilder`).
+2. If the node has arrangements that are not hydrated, stream the node's
+   *snapshot* — its full contents, rows and error records — into them at
+   `gsn`: each batch of rows is encoded as each arrangement's entries and
+   pushed to a `TreeBuilder` per arrangement, which loads entries arriving
+   in any order through sorted runs ([Storage](storage.md#loading-unordered-entries)),
+   so that each leaf is written once and at most a buffer of entries is in
+   memory. The arrangement's `since` becomes `gsn`.
+3. A snapshot (`ops::snapshot_stream`) is produced in batches of at most
+   1,024 rows: read from any hydrated arrangement of the node if there is
+   one (`Graph::scan_stream`, batches also bounded by 1 MiB of entries),
+   with the node's accumulated error records; otherwise computed from the
+   inputs' snapshots, a batch at a time: a table from its primary index, an
+   `Mfp` by evaluating its input's batches, a join by driving one path (see
+   [DeltaJoin](#deltajoin)), a `Reduce` group by group from its input index
+   (seeking from one group's key prefix to the next, and rebuilding the
+   operator's error state), a `TopK` likewise, a `SetOp` by merging both
+   input indexes in key order, and so on. Every operator's snapshot
+   includes its inputs' error records, as its steps pass them on. (A window
+   partition and a recursive query's result are computed whole, in
+   memory.) Snapshots are not consolidated: arrangements consolidate
+   entries as they apply them, and `Graph::snapshot` consolidates its
+   result.
+4. The error records of each hydrated node's snapshot become the node's
    error records (`Graph::errors_of`). A new or replaced materialized view
    takes its root's: when the root already existed (an identical view, or
    a view over another materialized view), those are the records the node
    has accumulated, so the view starts with the errors already present.
-4. Snapshots are cached only while a node still to be hydrated will read
-   them, so large intermediate results are freed early.
+
+Nothing is cached between readers: a node with an arrangement is read from
+it (nodes are hydrated before their readers), and a node without one is
+recomputed from its inputs for each reader, a batch at a time.
 
 Hydration is the common path of `CREATE MATERIALIZED VIEW`, `CREATE INDEX`,
 `SUBSCRIBE (query)`, `CREATE OR REPLACE MATERIALIZED VIEW` (and the
