@@ -130,7 +130,7 @@ changes at one GSN:
 | `for_each(lo, hi, f)` / `for_each_prefix(p, f)` | call `f` with each entry of the range in key order, where it lies in its leaf (nothing is copied), until `f` returns false. One leaf at a time: after a leaf it descends again from the root with the next separator as its new lower bound, so it never pins nodes and tolerates eviction between leaves. A key prefix `p` is the range `[p, successor(p))`. The dataflow's lookups and scans use these |
 | `scan` / `scan_prefix` | `for_each` collecting copies of the entries |
 | `cursor(lo, hi)` | a stateless range cursor with the same descent that buffers one leaf's entries at a time (for callers that interleave other work between entries) |
-| `range_summary(lo, hi)` | combine the stored summaries of children that lie entirely inside the range and recurse into the (at most two per level) partially covered children, folding leaf entries at the edges: O(log n) nodes. The whole-tree summary is stored |
+| `range_summary(lo, hi)` | combine the stored summaries of children that lie entirely inside the range and recurse into the (at most two per level) partially covered children, folding leaf entries at the edges: O(log n) nodes. The whole-tree summary is stored. A `min`/`max` that the result holds as a prefix is then resolved to the value ([below](#wide-min-and-max-values)) |
 | `nth(lo, hi, n)` | find the entry holding the n-th unit of weight in the range by skipping fully covered children by their counts |
 | `tree_count(tree)` | the stored total count |
 
@@ -151,7 +151,7 @@ subtree (`storage::Summary`): the sum of the current weights of its entries
 | `SumInt`, `SumSqInt` | `SumInt(i128)` | weighted sum (of squares) of an integer argument |
 | `SumNumeric`, `SumSqNumeric` | `SumNumeric(NumSum)` | exact `numeric` sum (not limited to numeric's range) |
 | `SumFloat`, `SumSqFloat` | `SumFloat(FloatSum)` | exact float sum (a normalized dyadic rational) |
-| `Min`, `Max` | `Min(Option<Datum>)`, `Max(Option<Datum>)` | extreme value among entries with positive weight |
+| `Min`, `Max` | `Min(Option<Datum>)`, `Max(Option<Datum>)`; in node summaries also `MinPrefix`, `MaxPrefix` | extreme value among entries with positive weight; a node summary holds a value whose key encoding is longer than 128 bytes as the first 128 bytes of that encoding |
 
 The summarizer of an arrangement (`LayoutSummarizer`) decodes the columns of
 an entry that the aggregate argument expressions read (the others are
@@ -174,7 +174,10 @@ below, its summary is computed from its entries once.)
   value keeps it — unless the removed value could have been the extreme, or a
   new value ties with it in a different representation (where the leftmost
   one must win). In those cases the node's summary is recomputed from its
-  children (or its leaf entries).
+  children (or its leaf entries). For an extreme held as a prefix (see
+  below), a value with the same prefix that is added keeps the prefix
+  (either way the extreme has it), and one that is removed could have been
+  the extreme.
 
 An incrementally maintained summary is always identical — including the
 representation of `min`/`max` values and the scale of `numeric` sums — to
@@ -182,6 +185,54 @@ one recomputed from scratch; `Env::check_summaries` verifies this in the
 model tests. Ties between equal `min`/`max` candidates resolve to the
 leftmost entry in key order, so the result is a function of the contents
 only.
+
+### Wide `min` and `max` values
+
+Every state of a node summary has a size bounded independently of the data
+(counts; sums, see below), except a `min`/`max` value, which is as wide as
+the widest value of its column. A node summary therefore holds a value
+whose key encoding ([On-disk format](../on-disk-format.md#order-preserving-key-encoding),
+ascending) is longer than 128 bytes (`summary::EXTREME_PREFIX`) as a
+`WideExtreme` (states `MinPrefix`, `MaxPrefix`): the first 128 bytes of that
+encoding and, when every entry of the subtree whose value has this prefix
+has the same value, the SHA-256 of that value's exact (codec) encoding
+(`same`). The key encoding orders like the values and no encoding is a
+prefix of another, so prefixes order like the values, except that equal
+prefixes may stand for different values; a value that fits never ties with
+a prefix. Equal values have one key encoding, so they are all held as
+values or all as the same prefix, and the leftmost representation only
+matters between values.
+
+Combining and maintaining summaries works on this form exactly, and the
+result is a function of the subtree's contents like the value: the prefix
+of the extreme is the extreme of the prefixes, and `same` survives
+combining subtrees with the same prefix when they have the same hash. A
+leaf summary with a wide extreme takes a second pass over the leaf's
+entries, comparing those whose value has the prefix with the extreme
+(`summary::WideExtremes`); an entry update that makes a wide value the
+extreme bounds the summary at once (`Summary::bound_extremes`), one that
+adds a value with the prefix hashes it, and one that removes such a value
+recomputes the summary.
+
+`range_summary` folds the entries in the leaves at the range's edges
+plainly, apart from the stored summaries of the subtrees inside the range,
+which it combines. A prefix in the latter needs resolving only where it can
+be the range's extreme: an edge value that is better excludes it, and an
+edge value that ties it while the subtrees' `same` is its hash is it.
+Otherwise `Env::resolve_extremes` descends into the subtrees inside the
+range whose stored extreme has the prefix and folds the leaves it reaches:
+the extreme is the leftmost best of those entries. With `same`, the first
+entry with the prefix has the value, so one path is visited and a range
+summary stays O(log n); without (values sharing their first 128 encoded
+bytes with the extreme), every subtree whose extreme has the prefix is
+visited. The group cache of a `Reduce` keeps resolved values, so changes it
+can fold in do not resolve again. (The shortcut takes values with the same
+prefix and SHA-256 to be equal; everything else compares values.)
+
+A wide value read from a node written before prefixes existed (states 6
+and 7, see [On-disk format](../on-disk-format.md#summary)) becomes a prefix
+without `same`, which is always safe (only the shortcut is lost) until the
+node's summary is next recomputed.
 
 ### Exact sums
 

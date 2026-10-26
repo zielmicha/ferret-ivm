@@ -101,7 +101,11 @@ fn compute_group(
         Some(h) => Bound::Excluded(h.as_slice()),
         None => Bound::Unbounded,
     };
-    let summary = if prefix.is_empty() { env.tree_summary(tree) } else { env.range_summary(tree, lo, hib)? };
+    let summary = if prefix.is_empty() {
+        env.range_summary(tree, Bound::Unbounded, Bound::Unbounded)?
+    } else {
+        env.range_summary(tree, lo, hib)?
+    };
     let ng = p.group_key.len();
     if ng > 0 && summary.count == 0 {
         return Ok((Ok(None), None));

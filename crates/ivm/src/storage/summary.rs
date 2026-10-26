@@ -9,17 +9,42 @@
 //! leftmost one ambiguous) is a node's summary recomputed from its contents.
 //! An incrementally maintained summary is always identical to a recomputed
 //! one.
+//!
+//! States stay small whatever the data: a float sum is a normalized dyadic
+//! rational, usually inline, and a node summary represents a MIN/MAX value
+//! too wide for it by a prefix of its key encoding ([`EXTREME_PREFIX`]),
+//! which range queries resolve to the value from the entries.
 
 use crate::error::{Result, SqlError};
 use crate::types::codec::{self, get_ivarint, get_u8, get_uvarint, put_ivarint, put_uvarint};
 use crate::types::Datum;
 use crate::types::datum::exact_cmp;
+use crate::types::encoding::{encode_key, SortSpec, TAG_VALUE};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{Signed, ToPrimitive, Zero};
 use pgnumeric::Numeric;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::cmp::Ordering;
+
+/// Bytes of a MIN/MAX value's key encoding that a node summary holds at
+/// most. A value whose encoding is longer is represented there by the first
+/// `EXTREME_PREFIX` bytes of it ([`WideExtreme`]): the key encoding orders
+/// like the values and no encoding is a prefix of another, so such prefixes
+/// order like the values too, except that equal prefixes may stand for
+/// different values.
+pub const EXTREME_PREFIX: usize = 128;
+
+/// A MIN/MAX value too wide for a node summary, as the summary holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WideExtreme {
+    /// The first [`EXTREME_PREFIX`] bytes of the value's key encoding.
+    pub prefix: Box<[u8]>,
+    /// The SHA-256 of the value's exact (codec) encoding when every entry
+    /// that the summary covers and whose value has `prefix` has that value,
+    /// which is then found at the first such entry; `None` when they differ.
+    pub same: Option<[u8; 32]>,
+}
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Summary {
@@ -50,27 +75,19 @@ impl Summary {
             self.count += n.count;
         }
         for i in 0..self.aggs.len() {
-            match &mut self.aggs[i] {
-                AggState::Min(cur) | AggState::Max(cur) => {
-                    let less = matches!(old.aggs[i], AggState::Min(_));
-                    // leftmost extreme of the replacement nodes
-                    let mut b: Option<&Datum> = None;
+            match extreme_kind(&self.aggs[i]) {
+                Some(less) => {
+                    // the extreme of the replacement nodes together
+                    let mut b = extreme_state(less, None);
                     for n in new {
-                        if let AggState::Min(Some(v)) | AggState::Max(Some(v)) = &n.aggs[i]
-                            && b.is_none_or(|bv| better(less, v, bv))
-                        {
-                            b = Some(v);
-                        }
+                        b.combine(&n.aggs[i]);
                     }
-                    let a = match &old.aggs[i] {
-                        AggState::Min(v) | AggState::Max(v) => v.as_ref(),
-                        _ => None,
-                    };
-                    if !replace_extreme(less, cur, a, b) {
+                    if !replace_extreme(less, &mut self.aggs[i], old.aggs[i].ext(), b.ext()) {
                         return false;
                     }
                 }
-                st => {
+                None => {
+                    let st = &mut self.aggs[i];
                     st.subtract(&old.aggs[i]);
                     for n in new {
                         st.combine(&n.aggs[i]);
@@ -97,6 +114,26 @@ impl Summary {
             })
     }
 
+    /// Replace every MIN/MAX value too wide for a node summary by its prefix
+    /// (see [`EXTREME_PREFIX`]): the form in which node summaries hold them.
+    /// The result claims that no other value covered by the summary shares
+    /// the prefix (`WideExtreme::same`), so this must be applied whenever a
+    /// value may have become the extreme: after each entry folded or
+    /// updated, once an extreme is wide.
+    pub fn bound_extremes(&mut self) {
+        for a in &mut self.aggs {
+            let wide = match a {
+                AggState::Min(Some(v)) | AggState::Max(Some(v)) => {
+                    wide_prefix(v).map(|prefix| WideExtreme { prefix, same: Some(value_hash(v)) })
+                }
+                _ => None,
+            };
+            if let Some(w) = wide {
+                *a = prefix_state(matches!(a, AggState::Min(_)), w);
+            }
+        }
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
         put_ivarint(out, self.count);
         put_uvarint(out, self.aggs.len() as u64);
@@ -118,6 +155,52 @@ impl Summary {
             aggs.push(AggState::decode(buf)?);
         }
         Ok(Summary { count, aggs })
+    }
+}
+
+/// Puts a summary folded from entries into the form node summaries hold
+/// when some MIN/MAX value is too wide for it (`Summary::bound_extremes`
+/// after each entry would do, but hashes every value tying a prefix): shown
+/// the summary of each entry alone, it notes whether another value shares a
+/// wide extreme's prefix.
+pub struct WideExtremes {
+    /// (agg index, prefix, another value has it)
+    wide: Vec<(usize, Box<[u8]>, bool)>,
+}
+
+impl WideExtremes {
+    /// None when no MIN/MAX value of `s` is too wide for a node summary.
+    pub fn of(s: &Summary) -> Option<WideExtremes> {
+        let wide: Vec<_> = (0..s.aggs.len())
+            .filter_map(|i| match &s.aggs[i] {
+                AggState::Min(Some(v)) | AggState::Max(Some(v)) => wide_prefix(v).map(|p| (i, p, false)),
+                _ => None,
+            })
+            .collect();
+        (!wide.is_empty()).then_some(WideExtremes { wide })
+    }
+
+    /// Account for an entry of `s`, whose summary alone is `entry`.
+    pub fn note(&mut self, s: &Summary, entry: &Summary) {
+        for (i, p, mixed) in &mut self.wide {
+            if let (AggState::Min(Some(m)) | AggState::Max(Some(m)), AggState::Min(Some(v)) | AggState::Max(Some(v))) =
+                (&s.aggs[*i], &entry.aggs[*i])
+                && !*mixed
+                && exact_cmp(v, m) != Ordering::Equal
+                && key_starts_with(v, p)
+            {
+                *mixed = true;
+            }
+        }
+    }
+
+    pub fn apply(self, s: &mut Summary) {
+        for (i, prefix, mixed) in self.wide {
+            if let AggState::Min(Some(v)) | AggState::Max(Some(v)) = &s.aggs[i] {
+                let w = WideExtreme { prefix, same: (!mixed).then(|| value_hash(v)) };
+                s.aggs[i] = prefix_state(matches!(s.aggs[i], AggState::Min(_)), w);
+            }
+        }
     }
 }
 
@@ -194,14 +277,14 @@ impl AggKind {
                 let x = v.as_f64().ok_or_else(|| SqlError::internal("SumSqFloat on non-float"))?;
                 s.add_square(x, w);
             }
-            (AggKind::Min, AggState::Min(m)) => {
-                if w > 0 && m.as_ref().is_none_or(|cur| v.sql_cmp(cur) == Ordering::Less) {
-                    *m = Some(v.clone());
-                }
-            }
-            (AggKind::Max, AggState::Max(m)) => {
-                if w > 0 && m.as_ref().is_none_or(|cur| v.sql_cmp(cur) == Ordering::Greater) {
-                    *m = Some(v.clone());
+            (AggKind::Min | AggKind::Max, st) if extreme_kind(st) == Some(*self == AggKind::Min) => {
+                let less = *self == AggKind::Min;
+                if w > 0 {
+                    match st.ext().map(|cur| ext_cmp(Ext::Val(v), cur)) {
+                        Some(Ordering::Equal) => join_tie(st, Ext::Val(v)),
+                        Some(o) if o != best(less) => {}
+                        _ => *st = extreme_state(less, Some(Ext::Val(v))),
+                    }
                 }
             }
             (k, s) => return Err(SqlError::internal(format!("agg kind/state mismatch {k:?} {s:?}"))),
@@ -221,51 +304,207 @@ impl AggKind {
             self.add(state, v, after - before)?;
             return Ok(true);
         };
-        let (AggState::Min(cur) | AggState::Max(cur)) = state else {
-            return Err(SqlError::internal("agg kind/state mismatch"));
-        };
         let less = *self == AggKind::Min;
+        if extreme_kind(state) != Some(less) {
+            return Err(SqlError::internal("agg kind/state mismatch"));
+        }
         let (was, is) = (before > 0, after > 0);
         if was == is {
             return Ok(true);
         }
         Ok(if is {
-            replace_extreme(less, cur, None, Some(v))
+            replace_extreme(less, state, None, Some(Ext::Val(v)))
         } else {
-            replace_extreme(less, cur, Some(v), None)
+            replace_extreme(less, state, Some(Ext::Val(v)), None)
         })
     }
 }
 
-/// `a` sorts strictly before `b` for MIN (`less`) or after it for MAX.
-fn better(less: bool, a: &Datum, b: &Datum) -> bool {
-    let o = a.sql_cmp(b);
-    if less { o == Ordering::Less } else { o == Ordering::Greater }
+/// The extreme of a MIN/MAX state: a value, or the key-encoding prefix that
+/// stands for a wide value in a node summary.
+#[derive(Clone, Copy, Debug)]
+enum Ext<'a> {
+    Val(&'a Datum),
+    Prefix(&'a WideExtreme),
 }
 
-/// Update the extreme `cur` of a range (the leftmost of its best values)
-/// when a part of the range whose extreme was `old` now has extreme `new`.
-/// False when the result depends on positions or values not at hand.
-fn replace_extreme(less: bool, cur: &mut Option<Datum>, old: Option<&Datum>, new: Option<&Datum>) -> bool {
-    let Some(m) = cur.as_ref() else {
+/// The order of the extremes `a` and `b`. `Equal` means SQL-equal values
+/// (which may differ in representation) or, when a prefix is involved, the
+/// same prefix (which may stand for different values). A value whose key
+/// encoding fits in a prefix never ties with one.
+fn ext_cmp(a: Ext, b: Ext) -> Ordering {
+    match (a, b) {
+        (Ext::Val(x), Ext::Val(y)) => x.sql_cmp(y),
+        (Ext::Prefix(p), Ext::Prefix(q)) => p.prefix.cmp(&q.prefix),
+        (Ext::Val(x), Ext::Prefix(q)) => key_prefix(x, q.prefix.len()).as_slice().cmp(&q.prefix),
+        (Ext::Prefix(p), Ext::Val(y)) => (*p.prefix).cmp(key_prefix(y, p.prefix.len()).as_slice()),
+    }
+}
+
+/// The order of a better value: smaller for MIN (`less`), larger for MAX.
+fn best(less: bool) -> Ordering {
+    if less { Ordering::Less } else { Ordering::Greater }
+}
+
+/// `Some(true)` for a MIN state, `Some(false)` for a MAX state.
+fn extreme_kind(st: &AggState) -> Option<bool> {
+    match st {
+        AggState::Min(_) | AggState::MinPrefix(_) => Some(true),
+        AggState::Max(_) | AggState::MaxPrefix(_) => Some(false),
+        _ => None,
+    }
+}
+
+fn extreme_state(less: bool, e: Option<Ext>) -> AggState {
+    match (less, e) {
+        (true, None) => AggState::Min(None),
+        (false, None) => AggState::Max(None),
+        (true, Some(Ext::Val(v))) => AggState::Min(Some(v.clone())),
+        (false, Some(Ext::Val(v))) => AggState::Max(Some(v.clone())),
+        (true, Some(Ext::Prefix(p))) => AggState::MinPrefix(Box::new(p.clone())),
+        (false, Some(Ext::Prefix(p))) => AggState::MaxPrefix(Box::new(p.clone())),
+    }
+}
+
+fn prefix_state(less: bool, w: WideExtreme) -> AggState {
+    if less { AggState::MinPrefix(Box::new(w)) } else { AggState::MaxPrefix(Box::new(w)) }
+}
+
+/// `WideExtreme::same` of an extreme.
+fn same_of(e: Ext) -> Option<[u8; 32]> {
+    match e {
+        Ext::Val(v) => Some(value_hash(v)),
+        Ext::Prefix(w) => w.same,
+    }
+}
+
+/// The hash identifying a value exactly (representation included).
+fn value_hash(v: &Datum) -> [u8; 32] {
+    let mut enc = Vec::new();
+    codec::encode_datum(v, &mut enc);
+    pgfuncs::text::sha256(&enc).try_into().unwrap()
+}
+
+/// Account in a prefix `st` for another extreme `e` with the same prefix
+/// (of a part of the range it covers, which has no other such values); a
+/// value keeps its place against an equal one, the leftmost.
+fn join_tie(st: &mut AggState, e: Ext) {
+    if let AggState::MinPrefix(w) | AggState::MaxPrefix(w) = st
+        && w.same.is_some()
+        && w.same != same_of(e)
+    {
+        w.same = None;
+    }
+}
+
+/// The first `n` bytes of `v`'s (ascending) key encoding.
+fn key_prefix(v: &Datum, n: usize) -> Vec<u8> {
+    let mut k = Vec::new();
+    match v {
+        // strings encode byte by byte, as bytea does: n bytes suffice
+        Datum::Text(s) | Datum::Json(s) if s.len() > n => encode_key(&Datum::Bytea(s.as_bytes()[..n].into()), SortSpec::ASC, &mut k),
+        Datum::Bytea(b) if b.len() > n => encode_key(&Datum::Bytea(b[..n].into()), SortSpec::ASC, &mut k),
+        _ => encode_key(v, SortSpec::ASC, &mut k),
+    }
+    k.truncate(n);
+    k
+}
+
+/// Whether `v`'s key encoding starts with `p` (without encoding all of a
+/// long string).
+fn key_starts_with(v: &Datum, p: &[u8]) -> bool {
+    let b: &[u8] = match v {
+        Datum::Text(s) | Datum::Json(s) => s.as_bytes(),
+        Datum::Bytea(b) => b,
+        _ => return key_prefix(v, p.len()) == p,
+    };
+    // as `encode_key`: the tag, the bytes with zeros escaped, a terminator
+    let enc = std::iter::once(TAG_VALUE)
+        .chain(b.iter().flat_map(|&c| [c, 0xFF].into_iter().take(if c == 0 { 2 } else { 1 })))
+        .chain([0, 0]);
+    let mut want = p.iter();
+    for x in enc {
+        match want.next() {
+            None => return true,
+            Some(&y) if y != x => return false,
+            _ => {}
+        }
+    }
+    want.next().is_none()
+}
+
+/// The prefix standing for `v` in a node summary, if `v`'s key encoding is
+/// longer than [`EXTREME_PREFIX`].
+fn wide_prefix(v: &Datum) -> Option<Box<[u8]>> {
+    let wide = match v {
+        // a string encodes as its bytes (zeros escaped) plus three bytes
+        Datum::Text(s) | Datum::Json(s) => encoded_str_len(s.as_bytes()) > EXTREME_PREFIX,
+        Datum::Bytea(b) => encoded_str_len(b) > EXTREME_PREFIX,
+        Datum::Numeric(_) | Datum::Jsonb(_) | Datum::Array(_) => {
+            let mut k = Vec::new();
+            encode_key(v, SortSpec::ASC, &mut k);
+            k.len() > EXTREME_PREFIX
+        }
+        // fixed-size types are short
+        _ => false,
+    };
+    wide.then(|| key_prefix(v, EXTREME_PREFIX).into_boxed_slice())
+}
+
+fn encoded_str_len(b: &[u8]) -> usize {
+    // (zeros, escaped to two bytes, decide only for lengths in between)
+    if b.len() > EXTREME_PREFIX || 2 * b.len() + 3 <= EXTREME_PREFIX {
+        return 3 + b.len();
+    }
+    3 + b.len() + b.iter().filter(|&&c| c == 0).count()
+}
+
+/// Update the extreme `cur` (a MIN if `less`, else a MAX) of a range — the
+/// leftmost of its best values, or the prefix standing for it — when a part
+/// of the range whose extreme was `old` now has extreme `new`. False when
+/// the result depends on positions or values not at hand.
+fn replace_extreme(less: bool, cur: &mut AggState, old: Option<Ext>, new: Option<Ext>) -> bool {
+    let Some(m) = cur.ext() else {
         // nothing else in the range has a value
-        *cur = new.cloned();
+        *cur = extreme_state(less, new);
         return true;
     };
     // An `old` equal to `m` in another representation proves that `m` comes
     // from a part further left, which this change does not touch.
-    let left_of_part = matches!(old, Some(a) if a.sql_cmp(m) == Ordering::Equal && exact_cmp(a, m) != Ordering::Equal);
+    let left_of_part = matches!((old, m), (Some(Ext::Val(a)), Ext::Val(m))
+        if a.sql_cmp(m) == Ordering::Equal && exact_cmp(a, m) != Ordering::Equal);
+    let old_may_be = matches!(old, Some(a) if may_be(a, m));
     if let Some(b) = new {
-        if better(less, b, m) {
-            *cur = Some(b.clone());
+        let o = ext_cmp(b, m);
+        if o == best(less) {
+            *cur = extreme_state(less, Some(b));
             return true;
         }
-        if b.sql_cmp(m) == Ordering::Equal {
-            return exact_cmp(b, m) == Ordering::Equal || left_of_part;
+        if o == Ordering::Equal {
+            return match (b, m) {
+                (Ext::Val(b), Ext::Val(m)) => exact_cmp(b, m) == Ordering::Equal || left_of_part,
+                // The extreme keeps the prefix. Whether the values with it
+                // are all the same is known unless the part had some before
+                // (and they were not all `b`'s).
+                (b, Ext::Prefix(w)) if !old_may_be || (w.same.is_some() && w.same == same_of(b)) => {
+                    join_tie(cur, b);
+                    true
+                }
+                _ => false,
+            };
         }
     }
     // `new` is worse (or absent): `m` survives unless `old` may have been it
-    !matches!(old, Some(a) if exact_cmp(a, m) == Ordering::Equal)
+    !old_may_be
+}
+
+/// The extreme `a` of a part may be the extreme `m` of the range: the same
+/// value exactly, or a value with `m`'s prefix.
+fn may_be(a: Ext, m: Ext) -> bool {
+    match (a, m) {
+        (Ext::Val(a), Ext::Val(m)) => exact_cmp(a, m) == Ordering::Equal,
+        _ => ext_cmp(a, m) == Ordering::Equal,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -276,6 +515,12 @@ pub enum AggState {
     SumFloat(Box<FloatSum>),
     Min(Option<Datum>),
     Max(Option<Datum>),
+    /// In a node summary, a MIN whose value is too wide to be held there:
+    /// the first [`EXTREME_PREFIX`] bytes of the value's key encoding.
+    /// `Env::range_summary` resolves it to the value.
+    MinPrefix(Box<WideExtreme>),
+    /// The same for a MAX.
+    MaxPrefix(Box<WideExtreme>),
 }
 
 impl PartialEq for Datum {
@@ -297,25 +542,27 @@ thread_local! {
 
 impl AggState {
     pub fn combine(&mut self, other: &AggState) {
+        if let Some(less) = extreme_kind(self) {
+            let Some(b) = other.ext().filter(|_| extreme_kind(other) == Some(less)) else { return };
+            match self.ext().map(|a| (ext_cmp(b, a), matches!(a, Ext::Val(_)))) {
+                // a value tying a prefix may not be the extreme (nor the
+                // only value with it): only the prefix is certain
+                Some((Ordering::Equal, true)) => {
+                    if let Ext::Prefix(w) = b {
+                        *self = prefix_state(less, WideExtreme { prefix: w.prefix.clone(), same: None });
+                    }
+                }
+                Some((Ordering::Equal, false)) => join_tie(self, b),
+                Some((o, _)) if o != best(less) => {}
+                _ => *self = other.clone(),
+            }
+            return;
+        }
         match (self, other) {
             (AggState::Count(a), AggState::Count(b)) => *a += b,
             (AggState::SumInt(a), AggState::SumInt(b)) => *a += b,
             (AggState::SumNumeric(a), AggState::SumNumeric(b)) => a.combine(b, 1),
             (AggState::SumFloat(a), AggState::SumFloat(b)) => a.combine(b),
-            (AggState::Min(a), AggState::Min(b)) => {
-                if let Some(bv) = b
-                    && a.as_ref().is_none_or(|av| bv.sql_cmp(av) == Ordering::Less)
-                {
-                    *a = Some(bv.clone());
-                }
-            }
-            (AggState::Max(a), AggState::Max(b)) => {
-                if let Some(bv) = b
-                    && a.as_ref().is_none_or(|av| bv.sql_cmp(av) == Ordering::Greater)
-                {
-                    *a = Some(bv.clone());
-                }
-            }
             _ => {}
         }
     }
@@ -328,6 +575,58 @@ impl AggState {
             (AggState::SumNumeric(a), AggState::SumNumeric(b)) => a.combine(b, -1),
             (AggState::SumFloat(a), AggState::SumFloat(b)) => a.subtract(b),
             _ => {}
+        }
+    }
+
+    /// Whether this is a MIN/MAX held as a prefix (see `Summary::bound_extremes`).
+    pub fn is_prefix(&self) -> bool {
+        matches!(self, AggState::MinPrefix(_) | AggState::MaxPrefix(_))
+    }
+
+    /// For a prefix standing for the extreme of a range, whether a subtree
+    /// whose summary has the state `sub` may hold an entry of the range with
+    /// that prefix: a subtree inside the range (`inside`) only if its own
+    /// extreme is that prefix, one extending beyond it only if its extreme
+    /// is not worse.
+    pub fn may_hold_extreme(&self, sub: &AggState, inside: bool) -> bool {
+        let (Some(less), Some(p @ Ext::Prefix(_)), Some(s)) = (extreme_kind(self), self.ext(), sub.ext()) else {
+            return false;
+        };
+        let o = ext_cmp(s, p);
+        if inside { o == Ordering::Equal } else { o != best(less).reverse() }
+    }
+
+    /// For a prefix standing for the extreme of the subtrees inside a range,
+    /// settle it against `edges`, the extreme of the range's other entries
+    /// (a value), where that tells the range's extreme: the subtrees cannot
+    /// hold it (the prefix is dropped), or their entries with the prefix are
+    /// all `edges`' value (which replaces it). True when it must be resolved
+    /// from the subtrees.
+    pub fn settle_with(&mut self, edges: &AggState) -> bool {
+        let (Some(less), Some(p @ Ext::Prefix(w)), Some(e @ Ext::Val(_))) = (extreme_kind(self), self.ext(), edges.ext()) else {
+            return true;
+        };
+        match ext_cmp(e, p) {
+            o if o == best(less) => *self = extreme_state(less, None),
+            Ordering::Equal if w.same.is_some() && w.same == same_of(e) => *self = edges.clone(),
+            _ => return true,
+        }
+        false
+    }
+
+    /// For a prefix standing for the extreme of a range whose entries with
+    /// that prefix all have the same value (`WideExtreme::same`): whether
+    /// `found`, the extreme of some entries of the range, is that value.
+    pub fn found_in(&self, found: &AggState) -> bool {
+        matches!((self.ext(), found.ext()), (Some(Ext::Prefix(w)), Some(Ext::Val(v)))
+            if w.same.is_some() && key_starts_with(v, &w.prefix))
+    }
+
+    fn ext(&self) -> Option<Ext<'_>> {
+        match self {
+            AggState::Min(Some(v)) | AggState::Max(Some(v)) => Some(Ext::Val(v)),
+            AggState::MinPrefix(p) | AggState::MaxPrefix(p) => Some(Ext::Prefix(p)),
+            _ => None,
         }
     }
 
@@ -357,6 +656,17 @@ impl AggState {
                 out.push(7);
                 codec::encode_datum(d.as_ref().unwrap_or(&Datum::Null), out);
             }
+            AggState::MinPrefix(w) | AggState::MaxPrefix(w) => {
+                out.push(if matches!(self, AggState::MinPrefix(_)) { 9 } else { 10 });
+                codec::put_bytes(out, &w.prefix);
+                match &w.same {
+                    Some(h) => {
+                        out.push(1);
+                        out.extend_from_slice(h);
+                    }
+                    None => out.push(0),
+                }
+            }
         }
     }
 
@@ -368,6 +678,9 @@ impl AggState {
             AggState::Min(None) | AggState::Max(None) => 1,
             AggState::Min(Some(Datum::Text(s) | Datum::Json(s))) | AggState::Max(Some(Datum::Text(s) | Datum::Json(s))) => {
                 1 + uvarint_len(s.len() as u64) + s.len()
+            }
+            AggState::MinPrefix(w) | AggState::MaxPrefix(w) => {
+                uvarint_len(w.prefix.len() as u64) + w.prefix.len() + 1 + if w.same.is_some() { 32 } else { 0 }
             }
             _ => {
                 return SCRATCH.with(|b| {
@@ -381,6 +694,14 @@ impl AggState {
     }
 
     fn decode(buf: &mut &[u8]) -> Result<AggState> {
+        // A MIN/MAX value too wide for a node summary, written before
+        // prefixes replaced such values, becomes its prefix (with other
+        // values possibly sharing it: `same` is unknown).
+        let extreme = |less: bool, d: Datum| match wide_prefix(&d) {
+            _ if d.is_null() => extreme_state(less, None),
+            Some(prefix) => prefix_state(less, WideExtreme { prefix, same: None }),
+            None => extreme_state(less, Some(Ext::Val(&d))),
+        };
         Ok(match get_u8(buf)? {
             1 => AggState::Count(get_ivarint(buf)?),
             2 => {
@@ -393,15 +714,24 @@ impl AggState {
             }
             4 => AggState::SumNumeric(Box::new(NumSum::decode(buf)?)),
             5 => AggState::SumFloat(Box::new(FloatSum::decode_fixed(buf)?)),
-            6 => {
-                let d = codec::decode_datum(buf)?;
-                AggState::Min(if d.is_null() { None } else { Some(d) })
-            }
-            7 => {
-                let d = codec::decode_datum(buf)?;
-                AggState::Max(if d.is_null() { None } else { Some(d) })
-            }
+            6 => extreme(true, codec::decode_datum(buf)?),
+            7 => extreme(false, codec::decode_datum(buf)?),
             8 => AggState::SumFloat(Box::new(FloatSum::decode(buf)?)),
+            t @ (9 | 10) => {
+                let prefix: Box<[u8]> = codec::get_bytes(buf)?.into();
+                if prefix.len() != EXTREME_PREFIX {
+                    return Err(SqlError::corrupt("bad MIN/MAX prefix length"));
+                }
+                let same = match get_u8(buf)? {
+                    0 => None,
+                    _ => {
+                        let h: [u8; 32] = buf.get(..32).ok_or_else(|| SqlError::corrupt("truncated summary"))?.try_into().unwrap();
+                        *buf = &buf[32..];
+                        Some(h)
+                    }
+                };
+                prefix_state(t == 9, WideExtreme { prefix, same })
+            }
             t => return Err(SqlError::corrupt(format!("bad agg state tag {t}"))),
         })
     }

@@ -371,24 +371,35 @@ m × aggstate
 | 2 | `SumInt` | 16 bytes, `i128 LE` (two's complement) |
 | 4 | `SumNumeric` | finite sum as a [compact numeric](#compact-numeric-encoding) (not limited to numeric's range, see below); `uvarint s`, `s × (uvarint display_scale, ivarint count)`; `ivarint nan`; `ivarint pos_inf`; `ivarint neg_inf` |
 | 5 | `SumFloat` (read only) | `u8 sign` (0 = zero, 1 = positive, 2 = negative), `bytes magnitude` (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = sign × magnitude × 2^−1074. Written by earlier versions; decoded into the state that tag 8 encodes |
-| 6 | `Min` | one [codec datum](#row-codec); NULL (tag 0) means "no value" |
-| 7 | `Max` | same |
+| 6 | `Min` | one [codec datum](#row-codec); NULL (tag 0) means "no value". A value whose key encoding is longer than 128 bytes is held as tag 9 instead |
+| 7 | `Max` | same, with tag 10 |
 | 8 | `SumFloat` | `ivarint exp`, `uvarint h`, `h >> 1` bytes magnitude (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = (−1 if `h & 1`) × magnitude × 2^exp |
+| 9 | `MinPrefix` | `bytes` of length 128: the first 128 bytes of the ascending [key encoding](#order-preserving-key-encoding) (`0x02` and the value bytes) of the minimum, a value whose key encoding is longer; `u8 same` (0 or 1); if 1, 32 bytes: the SHA-256 of the minimum's codec datum, present when every entry of the subtree whose value has this prefix has that value |
+| 10 | `MaxPrefix` | same, of the maximum |
 
 Tag 3 is unused. The aggregate states are positional: their meaning (which
 `AggKind` and which argument expression) comes from the arrangement's layout,
 which is derived from the catalog when the dataflow is planned; it is not
 stored in the tree.
 
-A float sum (tag 8) has one encoding per value: it is normalized, the
-magnitude odd and without high zero bytes, or the finite value 0, encoded
-as `exp` 0, `h` 0 and no bytes. Every finite sum of doubles is a multiple of 2^−1074 (squares are
-truncated to that grid), so `exp` ≥ −1074; decoding normalizes and
-rejects an `exp` below that or a value beyond 2^65536 (`bad float sum in
-summary`). The sum of the values 1 to 10 (55 × 2^0) is the state
-`08 00 02 37 00 00 00`; the sum of 0.1 and 0.2 (0x26666666666667 ×
-2^−55) is `08 6d 0e 67 66 66 66 66 66 26 00 00 00`; and two NaNs (the
-finite part 0) `08 00 00 04 00 00`.
+Float sums and `min`/`max` states have one encoding per value:
+
+- `SumFloat` (tag 8) is normalized: the magnitude is odd and has no high
+  zero bytes, or the finite value is 0, encoded as `exp` 0, `h` 0 and no
+  bytes. Every finite sum of doubles is a multiple of 2^−1074 (squares are
+  truncated to that grid), so `exp` ≥ −1074; decoding normalizes and
+  rejects an `exp` below that or a value beyond 2^65536 (`bad float sum in
+  summary`). The sum of the values 1 to 10 (55 × 2^0) is the state
+  `08 00 02 37 00 00 00`; the sum of 0.1 and 0.2 (0x26666666666667 ×
+  2^−55) is `08 6d 0e 67 66 66 66 66 66 26 00 00 00`; and two NaNs (the
+  finite part 0) `08 00 00 04 00 00`.
+- A `min`/`max` value is held as a value (tags 6, 7) when its key encoding
+  has at most 128 bytes, else as the prefix (tags 9, 10; other lengths fail
+  to decode, `bad MIN/MAX prefix length`), with the hash exactly when the
+  entries with the prefix all have the value. Equal values have one key
+  encoding, so they take the same form; the codec datum keeps the value's
+  exact representation. A wider value under tag 6 or 7, written by earlier
+  versions, decodes as tag 9 or 10 without the hash.
 
 The finite part of a `SumNumeric` state is the exact sum of its subtree's
 terms (the arguments, or for `SumSqNumeric` their squares, times their
@@ -929,7 +940,7 @@ Consequences of code changes for an existing data directory:
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag truncates the newest log segment at the first such record (see above), losing it and everything after it |
 | `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#checkpoint-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array.) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
-| summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tag 8 (float sums as normalized dyadic rationals) was added later: data written before it decodes (tag 5, as described [above](#summary)), data written since fails to decode in earlier versions (`bad agg state tag`) |
+| summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tags 8–10 (float sums as normalized dyadic rationals, `min`/`max` prefixes) were added later: data written before them decodes (tag 5, and tags 6 and 7 with wide values, as described [above](#summary)), data written since fails to decode in earlier versions (`bad agg state tag`) |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
 | inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again, and the rebuilt arrangements' history (`arr_since`) starts at the checkpoint the engine restarted from: `AS OF` reads that need them at earlier GSNs fail |
 | semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
@@ -938,7 +949,9 @@ Consequences of code changes for an existing data directory:
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
 Data directories written by earlier versions of the engine are compatible:
-the formats have only gained fields with defaults. New functions (registered
+the formats have only gained fields with defaults, and summary state
+encodings that are written instead of older ones still read (float sums,
+wide `min`/`max` values; [Summary](#summary)). New functions (registered
 among the existing ones, which renumbers the later ones) and planner fixes
 did change the fingerprints of many views' arrangements (for example joins
 on computed keys, whose keys are materialized in an `Mfp` node, semijoins

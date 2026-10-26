@@ -228,9 +228,11 @@ fn route(children: &[Child], key: &[u8]) -> usize {
     children[1..].partition_point(|c| &*c.sep <= key)
 }
 
-/// Children overlapping [lo, hi), with whether each is fully inside. Only
-/// the first and last can be partial; children are found by binary search.
-fn overlapping(children: &[Child], lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Vec<(usize, bool)> {
+/// Children overlapping [lo, hi), with whether each is fully inside, of a
+/// node whose keys lie in the range `node` (`None`: unbounded or unknown,
+/// so that its first or last child counts as partial). Only the first and
+/// last can be partial; children are found by binary search.
+fn overlapping(children: &[Child], lo: Bound<&[u8]>, hi: Bound<&[u8]>, node: KeyRange) -> Vec<(usize, bool)> {
     let n = children.len();
     let start = match lo {
         Bound::Unbounded => 0,
@@ -246,8 +248,8 @@ fn overlapping(children: &[Child], lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Vec<(u
     for i in start..end.max(start) {
         let edge = i == start || i + 1 == end;
         let full = !edge || {
-            let clo = if i == 0 { None } else { Some(&*children[i].sep) };
-            let chi = if i + 1 < n { Some(&*children[i + 1].sep) } else { None };
+            let clo = if i == 0 { node.0 } else { Some(&*children[i].sep) };
+            let chi = if i + 1 < n { Some(&*children[i + 1].sep) } else { node.1 };
             if disjoint(lo, hi, clo, chi) {
                 continue;
             }
@@ -256,6 +258,18 @@ fn overlapping(children: &[Child], lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Vec<(u
         out.push((i, full));
     }
     out
+}
+
+/// A key range [lo, hi) of a subtree; `None`: unbounded or unknown.
+type KeyRange<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+type OwnedKeyRange = (Option<Box<[u8]>>, Option<Box<[u8]>>);
+
+/// The key range of child `i` of a node whose range is `node`, owned (to be
+/// passed down while the node is borrowed again).
+fn child_range(children: &[Child], i: usize, node: KeyRange) -> OwnedKeyRange {
+    let lo = if i == 0 { node.0 } else { Some(&*children[i].sep) };
+    let hi = if i + 1 < children.len() { Some(&*children[i + 1].sep) } else { node.1 };
+    (lo.map(Into::into), hi.map(Into::into))
 }
 
 impl Env {
@@ -397,6 +411,8 @@ impl Env {
         self.checkpoint_gsn
     }
 
+    /// The stored summary of the whole tree (MIN/MAX values too wide for
+    /// node summaries as prefixes; `range_summary` resolves them).
     pub fn tree_summary(&self, tree: TreeId) -> Summary {
         self.trees.get(&tree).map(|t| t.summary.clone()).unwrap_or_else(|| Summary::empty(&[]))
     }
@@ -1144,18 +1160,120 @@ impl Env {
         }
     }
 
-    /// Summary over the entries in [lo, hi) (current weights).
+    /// Summary over the entries in [lo, hi) (current weights), with the
+    /// MIN/MAX values that node summaries hold as prefixes resolved.
     pub fn range_summary(&mut self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Result<Summary> {
         let summ = self.trees.get(&tree).ok_or_else(|| SqlError::internal(format!("no tree {tree}")))?.summarizer.clone();
-        let mut acc = Summary::empty(summ.spec());
-        if matches!((lo, hi), (Bound::Unbounded, Bound::Unbounded)) {
-            return Ok(self.tree_summary(tree));
+        let empty = || Summary::empty(summ.spec());
+        let mut parts = RangeParts { left: empty(), inside: empty(), right: empty(), past_left: false };
+        let all = matches!((lo, hi), (Bound::Unbounded, Bound::Unbounded));
+        if all {
+            parts.inside = self.tree_summary(tree);
+        } else if let Some(root) = self.root_slot(tree)? {
+            self.summary_rec(root, lo, hi, (None, None), &summ, &mut parts)?;
         }
-        if let Some(root) = self.root_slot(tree)? {
-            self.summary_rec(root, lo, hi, &summ, &mut acc)?;
-        }
+        self.resolve_extremes(tree, lo, hi, &summ, &mut parts)?;
         self.maybe_evict();
+        if all {
+            return Ok(parts.inside);
+        }
+        let RangeParts { left: mut acc, inside, right, .. } = parts;
+        acc.combine(&inside);
+        acc.combine(&right);
         Ok(acc)
+    }
+
+    /// Replace the prefixes standing for wide MIN/MAX values in the
+    /// summary of the subtrees inside a range by the values, where they can
+    /// be the range's extreme. Such an extreme is the leftmost best value
+    /// among those subtrees' entries with that prefix, and only subtrees
+    /// whose own extreme has the prefix can hold one: when the entries with
+    /// it all have the same value, the first one found is it, so the path to
+    /// it is all that is visited.
+    fn resolve_extremes(
+        &mut self,
+        tree: TreeId,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        summ: &Arc<dyn Summarizer>,
+        parts: &mut RangeParts,
+    ) -> Result<()> {
+        let mut targets = Vec::new();
+        for i in 0..parts.inside.aggs.len() {
+            if parts.inside.aggs[i].is_prefix() {
+                let mut edges = parts.left.aggs[i].clone();
+                edges.combine(&parts.right.aggs[i]);
+                if parts.inside.aggs[i].settle_with(&edges) {
+                    targets.push(i);
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut found = Summary::empty(summ.spec());
+        let mut done = vec![false; targets.len()];
+        let all = matches!((lo, hi), (Bound::Unbounded, Bound::Unbounded));
+        if let Some(root) = self.root_slot(tree)? {
+            self.resolve_rec(root, lo, hi, (None, None), all, summ, &parts.inside, &targets, &mut done, &mut found)?;
+        }
+        for i in targets {
+            if found.aggs[i].is_prefix() || matches!(found.aggs[i], AggState::Min(None) | AggState::Max(None)) {
+                return Err(SqlError::internal(format!("no entry for MIN/MAX prefix {:?}", parts.inside.aggs[i])));
+            }
+            parts.inside.aggs[i] = found.aggs[i].clone();
+        }
+        Ok(())
+    }
+
+    /// Fold into `found`, in key order, the entries below node `id` (with
+    /// keys in `node`, a subtree inside [lo, hi) if `inside`) that are in
+    /// subtrees inside the range and may hold the extremes `want.aggs[t]`
+    /// (`t` in `targets`, not `done`).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_rec(
+        &mut self,
+        id: u32,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        node: KeyRange,
+        inside: bool,
+        summ: &Arc<dyn Summarizer>,
+        want: &Summary,
+        targets: &[usize],
+        done: &mut [bool],
+        found: &mut Summary,
+    ) -> Result<()> {
+        let items = match self.node(id) {
+            // the entries at the range's edges are summarized apart
+            Node::Leaf(_) if !inside => return Ok(()),
+            Node::Leaf(entries) => {
+                for e in entries {
+                    summ.add_entry(found, &e.key, e.hist.total())?;
+                    let mut all = true;
+                    for (d, &t) in done.iter_mut().zip(targets) {
+                        *d = *d || want.aggs[t].found_in(&found.aggs[t]);
+                        all &= *d;
+                    }
+                    if all {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+            Node::Internal(children) if inside => (0..children.len()).map(|i| (i, true)).collect(),
+            Node::Internal(children) => overlapping(children, lo, hi, node),
+        };
+        for (i, full) in items {
+            let Node::Internal(children) = self.node(id) else { unreachable!() };
+            let sub = &children[i].summary;
+            if targets.iter().zip(done.iter()).any(|(&t, &d)| !d && want.aggs[t].may_hold_extreme(&sub.aggs[t], full)) {
+                let (clo, chi) = child_range(children, i, node);
+                let cid = self.load_child(id, i)?;
+                self.resolve_rec(cid, lo, hi, (clo.as_deref(), chi.as_deref()), full, summ, want, targets, done, found)?;
+            }
+        }
+        Ok(())
     }
 
     /// Verify that every stored summary equals one recomputed from the
@@ -1184,13 +1302,18 @@ impl Env {
         Ok(())
     }
 
+    /// Fold the entries of [lo, hi) below node `id`, with keys in `node`,
+    /// into `parts`: the subtrees that lie inside the range are combined, and
+    /// only the (at most two per level) partially covered children are
+    /// descended into, down to the leaves at the range's edges.
     fn summary_rec(
         &mut self,
         id: u32,
         lo: Bound<&[u8]>,
         hi: Bound<&[u8]>,
+        node: KeyRange,
         summ: &Arc<dyn Summarizer>,
-        acc: &mut Summary,
+        parts: &mut RangeParts,
     ) -> Result<()> {
         match self.node(id) {
             Node::Leaf(entries) => {
@@ -1201,6 +1324,7 @@ impl Env {
                 };
                 let end = start + entries[start..].partition_point(|e| below_hi(&e.key, hi));
                 let entries = &entries[start..end];
+                let acc = if parts.past_left { &mut parts.right } else { &mut parts.left };
                 if summ.spec().is_empty() {
                     acc.count += entries.iter().map(|e| e.hist.total()).sum::<i64>();
                 } else {
@@ -1211,14 +1335,16 @@ impl Env {
             Node::Internal(children) => {
                 // (child, fully contained); visited in key order so that ties
                 // between MIN/MAX candidates resolve to the leftmost
-                let items = overlapping(children, lo, hi);
+                let items = overlapping(children, lo, hi, node);
                 for (i, full) in items {
+                    let Node::Internal(children) = self.node(id) else { unreachable!() };
                     if full {
-                        let Node::Internal(children) = self.node(id) else { unreachable!() };
-                        acc.combine(&children[i].summary);
+                        parts.inside.combine(&children[i].summary);
+                        parts.past_left = true;
                     } else {
+                        let (clo, chi) = child_range(children, i, node);
                         let cid = self.load_child(id, i)?;
-                        self.summary_rec(cid, lo, hi, summ, acc)?;
+                        self.summary_rec(cid, lo, hi, (clo.as_deref(), chi.as_deref()), summ, parts)?;
                     }
                 }
                 Ok(())
@@ -1270,7 +1396,7 @@ impl Env {
             }
             Node::Internal(children) => {
                 let plan: Vec<(usize, bool, i64)> =
-                    overlapping(children, lo, hi).into_iter().map(|(i, full)| (i, full, children[i].summary.count)).collect();
+                    overlapping(children, lo, hi, (None, None)).into_iter().map(|(i, full)| (i, full, children[i].summary.count)).collect();
                 for (i, full, count) in plan {
                     if full && count <= *rem {
                         *rem -= count.max(0);
@@ -1592,6 +1718,18 @@ fn split_by_bytes<T>(items: Vec<T>, target: usize, size: fn(&T) -> usize, min_it
 }
 
 /// Shortest key `s` with `a < s <= b` (for `a < b`): B+tree suffix truncation.
+/// A range summary being computed: the entries at the range's edges folded
+/// plainly, before and after the stored summaries of the subtrees inside the
+/// range, combined.
+struct RangeParts {
+    left: Summary,
+    inside: Summary,
+    right: Summary,
+    /// A subtree inside the range has been combined: later entries are right
+    /// of it.
+    past_left: bool,
+}
+
 /// The nodes an update leaves in place of one (usually just that one).
 type Parts = smallvec::SmallVec<[Part; 1]>;
 
@@ -1609,12 +1747,24 @@ impl Part {
     }
 }
 
+/// Summary of leaf entries in the form node summaries hold: when a MIN/MAX
+/// value is too wide for node summaries, the entries are summarized again
+/// one by one, to see whether other values share its prefix
+/// (`WideExtremes`).
 fn leaf_summary(entries: &[LeafEntry], summ: &Arc<dyn Summarizer>) -> Result<Summary> {
     let mut s = Summary::empty(summ.spec());
     if summ.spec().is_empty() {
         s.count = entries.iter().map(|e| e.hist.total()).sum();
-    } else {
-        summ.add_entries(&mut s, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
+        return Ok(s);
+    }
+    summ.add_entries(&mut s, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
+    if let Some(mut wide) = summary::WideExtremes::of(&s) {
+        for e in entries {
+            let mut one = Summary::empty(summ.spec());
+            summ.add_entry(&mut one, &e.key, e.hist.total())?;
+            wide.note(&s, &one);
+        }
+        wide.apply(&mut s);
     }
     Ok(s)
 }
@@ -1641,6 +1791,7 @@ fn summary_after(
                 exact = false;
                 break;
             }
+            s.bound_extremes();
         }
         if exact {
             return Ok(s);

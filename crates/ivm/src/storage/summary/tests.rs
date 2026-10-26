@@ -358,3 +358,163 @@ fn float_sum_states_are_small() {
     assert!(encode_state(&s).len() <= 20, "{} bytes", encode_state(&s).len());
     assert!(encode_state(&sq).len() <= 32, "{} bytes", encode_state(&sq).len());
 }
+
+// ---------------------------------------------------------------------------
+// MIN/MAX prefixes
+
+fn text(s: String) -> Datum {
+    Datum::text_owned(s)
+}
+
+/// Strings around the prefix length, many sharing longer prefixes.
+fn arb_text() -> impl Strategy<Value = Datum> {
+    let stem = prop::sample::select(vec!["", "a", "b", "ab"]);
+    (stem, 0usize..3, 100usize..400, prop::sample::select(vec!["", "a", "b", "z", "aa"]))
+        .prop_map(|(stem, rep, len, tail)| text(format!("{stem}{}{tail}", ["x", "y", "\u{e9}"][rep].repeat(len / [1, 1, 2][rep]))))
+}
+
+/// A wide numeric in several representations (display scales).
+fn wide_numeric(digits: usize, last: u8, scale_extra: usize) -> Datum {
+    let s = format!("1.{}{}{}", "0".repeat(digits), last, "0".repeat(scale_extra));
+    Datum::numeric(Numeric::parse(&s).unwrap())
+}
+
+fn bounded(v: &Datum, less: bool) -> AggState {
+    let mut s = Summary { count: 1, aggs: vec![extreme_state(less, Some(Ext::Val(v)))] };
+    s.bound_extremes();
+    s.aggs.pop().unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(crate::testkit::proptest_cases(512)))]
+
+    /// Prefixes order like their values, except for ties between equal
+    /// prefixes; values that fit are kept and never tie with a prefix.
+    #[test]
+    fn prefixes_order_like_values(a in arb_text(), b in arb_text()) {
+        for less in [true, false] {
+            let (pa, pb) = (bounded(&a, less), bounded(&b, less));
+            let o = ext_cmp(pa.ext().unwrap(), pb.ext().unwrap());
+            let sql = a.sql_cmp(&b);
+            match (pa.is_prefix(), pb.is_prefix()) {
+                (false, false) => prop_assert_eq!(o, sql),
+                (true, true) => prop_assert!(o == sql || o == Ordering::Equal),
+                _ => prop_assert_eq!(o, sql),
+            }
+            if pb.is_prefix() {
+                // a value compares with a prefix through its own prefix
+                prop_assert_eq!(ext_cmp(Ext::Val(&a), pb.ext().unwrap()), o);
+            }
+            if let AggState::MinPrefix(p) | AggState::MaxPrefix(p) = &pa {
+                prop_assert_eq!(p.prefix.len(), EXTREME_PREFIX);
+            }
+        }
+    }
+}
+
+proptest! {
+    /// The prefix test on strings matches their key encoding.
+    #[test]
+    fn key_prefix_tests_match_encoding(a in prop::collection::vec(prop::sample::select(vec![0u8, 1, b'a', 0xFF]), 0..12), b in prop::collection::vec(prop::sample::select(vec![0u8, 1, b'a', 0xFF]), 0..12), n in 0usize..20) {
+        let (va, vb) = (Datum::bytea(a), Datum::bytea(b));
+        let full = |v: &Datum| {
+            let mut k = Vec::new();
+            encode_key(v, SortSpec::ASC, &mut k);
+            k
+        };
+        let p = key_prefix(&vb, n);
+        prop_assert_eq!(&p[..], &full(&vb)[..n.min(full(&vb).len())]);
+        prop_assert_eq!(key_starts_with(&va, &p), full(&va).starts_with(&p));
+    }
+}
+
+/// A node's MIN/MAX maintained through child replacements and entry updates
+/// equals one recomputed from its entries, for wide values with long common
+/// prefixes and equal values in different representations.
+#[test]
+fn bounded_extremes_maintained_exactly() {
+    let values: Vec<Datum> = (0..6)
+        .map(|i| text(format!("{}{}", "p".repeat(200), i % 3)))
+        .chain((0..4).map(|i| text(format!("{}{i}", "q".repeat(EXTREME_PREFIX - 4)))))
+        .chain([text("a".into()), text("z".into())])
+        .chain((0..4).map(|i| wide_numeric(300, 1 + (i % 2) as u8, i / 2)))
+        .collect();
+    let numeric = |v: &Datum| matches!(v, Datum::Numeric(_));
+    assert!(values.iter().filter(|v| numeric(v)).all(|v| bounded(v, true).is_prefix()));
+    let mut rng = crate::testkit::Rng::new(3);
+    for kind in [AggKind::Min, AggKind::Max] {
+        for family in [false, true] {
+            // children: a few entries each, (value, weight)
+            let pool: Vec<&Datum> = values.iter().filter(|v| numeric(v) == family).collect();
+            let mut children: Vec<Vec<(Datum, i64)>> = vec![vec![]; 4];
+            let summary_of = |entries: &[(Datum, i64)]| {
+                let mut s = Summary::empty(&[kind]);
+                for (v, w) in entries {
+                    s.count += w;
+                    kind.add(&mut s.aggs[0], v, *w).unwrap();
+                    s.bound_extremes();
+                }
+                s
+            };
+            let node_of = |children: &[Vec<(Datum, i64)>]| summary_of(&children.concat());
+            let mut node = node_of(&children);
+            let mut stored: Vec<Summary> = children.iter().map(|c| summary_of(c)).collect();
+            for _ in 0..3000 {
+                let c = rng.index(children.len());
+                let old_child = stored[c].clone();
+                // update one entry of the child incrementally
+                let mut new_child = old_child.clone();
+                let (v, before, after) = if !children[c].is_empty() && rng.chance(50) {
+                    let i = rng.index(children[c].len());
+                    let (v, w) = children[c].remove(i);
+                    (v, w, 0)
+                } else {
+                    let v = pool[rng.index(pool.len())].clone();
+                    let pos = rng.index(children[c].len() + 1);
+                    children[c].insert(pos, (v.clone(), 1));
+                    (v, 0, 1)
+                };
+                new_child.count += after - before;
+                let ok = kind.update(&mut new_child.aggs[0], &v, before, after).unwrap();
+                new_child.bound_extremes();
+                let recomputed = summary_of(&children[c]);
+                if ok {
+                    assert!(new_child.exact_eq(&recomputed), "{kind:?} entry update: {new_child:?} vs {recomputed:?}");
+                }
+                stored[c] = recomputed;
+                if !node.replace_child(&old_child, &[&stored[c]]) {
+                    node = Summary::empty(&[kind]);
+                    for s in &stored {
+                        node.combine(s);
+                    }
+                }
+                let want = node_of(&children);
+                assert!(node.exact_eq(&want), "{kind:?} node: {node:?} vs {want:?}");
+            }
+        }
+    }
+}
+
+/// Values too wide for node summaries, written before prefixes existed,
+/// decode as their prefixes.
+#[test]
+fn wide_extremes_of_the_earlier_encoding_decode_as_prefixes() {
+    let wide = text("w".repeat(1000));
+    for (tag, less) in [(6u8, true), (7, false)] {
+        let mut buf = vec![tag];
+        codec::encode_datum(&wide, &mut buf);
+        let st = AggState::decode(&mut buf.as_slice()).unwrap();
+        // (whether other values share the prefix is not known)
+        let (AggState::MinPrefix(w) | AggState::MaxPrefix(w)) = &st else { panic!("{st:?}") };
+        assert!(w.same.is_none() && extreme_kind(&st) == Some(less));
+        let (AggState::MinPrefix(b) | AggState::MaxPrefix(b)) = bounded(&wide, less) else { unreachable!() };
+        assert_eq!(w.prefix, b.prefix);
+        let mut enc = Vec::new();
+        st.encode(&mut enc);
+        assert_eq!(enc.len(), st.encoded_len());
+        assert_eq!(AggState::decode(&mut enc.as_slice()).unwrap(), st);
+    }
+    let narrow = text("n".repeat(EXTREME_PREFIX - 3));
+    assert_eq!(bounded(&narrow, true), AggState::Min(Some(narrow.clone())));
+    assert!(bounded(&text("n".repeat(EXTREME_PREFIX - 2)), true).is_prefix());
+}

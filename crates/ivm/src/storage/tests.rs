@@ -2,8 +2,8 @@
 //! in-memory model of every tree's (key, GSN, weight) history.
 //!
 //! The operations are weighted inserts and deletes on several trees (plain
-//! counts, and numeric / float / integer summaries over a value embedded in
-//! the key) at increasing GSNs, retention frontier advances, tree creation
+//! counts, and numeric / float / integer / text summaries over a value
+//! embedded in the key) at increasing GSNs, retention frontier advances, tree creation
 //! and drops, checkpoints, GC, clean reopens and simulated crashes:
 //! - no final checkpoint;
 //! - garbage after the durable end of the manifest or of the active segment,
@@ -49,9 +49,11 @@ enum Kind {
     Numeric,
     Float,
     Int,
+    /// MIN/MAX of strings, many wider than node summaries hold.
+    Text,
 }
 
-const KINDS: [Kind; 4] = [Kind::Count, Kind::Numeric, Kind::Float, Kind::Int];
+const KINDS: [Kind; 5] = [Kind::Count, Kind::Numeric, Kind::Float, Kind::Int, Kind::Text];
 
 /// Values in several representations of equal numbers, specials and NULLs.
 const NUMERIC_VALUES: &[&str] = &[
@@ -61,6 +63,39 @@ const NUMERIC_VALUES: &[&str] = &[
 const FLOAT_VALUES: &[&str] =
     &["0", "-0", "1.5", "-2.25", "0.1", "3", "1e308", "-1e308", "5e-324", "NULL", "NaN", "inf", "-inf"];
 const INT_VALUES: &[&str] = &["0", "1", "-1", "42", "1000000", "-1099511627776", "1099511627776", "NULL"];
+
+/// Numerics too wide for node summaries, equal ones in several
+/// representations.
+static WIDE_NUMERIC_VALUES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    let z = "0".repeat(300);
+    [format!("1.{z}1"), format!("1.{z}10"), format!("-1.{z}1"), format!("-1.{z}100"), format!("2.{z}")]
+        .into_iter()
+        .map(|s| &*s.leak())
+        .collect()
+});
+
+/// Strings around the length of MIN/MAX values that node summaries hold
+/// (whose key encoding adds three bytes), many sharing longer prefixes.
+static TEXT_VALUES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    let (n, p) = (summary::EXTREME_PREFIX, "p".repeat(200));
+    [
+        "a".to_string(),
+        format!("{p}0"),
+        format!("{p}1"),
+        "q".repeat(n - 4) + "0",
+        "q".repeat(n - 3) + "0",
+        format!("{p}2"),
+        p.clone(),
+        "m".to_string(),
+        "p".repeat(n - 1) + "z",
+        "q".repeat(n - 3) + "1",
+        "o".repeat(3000),
+        "NULL".to_string(),
+    ]
+    .into_iter()
+    .map(|s| &*s.leak())
+    .collect()
+});
 
 fn value_of(kind: Kind, key: &[u8]) -> Datum {
     let s = std::str::from_utf8(key).expect("utf8 key");
@@ -72,6 +107,7 @@ fn value_of(kind: Kind, key: &[u8]) -> Datum {
         Kind::Numeric => Datum::numeric(pgnumeric::Numeric::parse(text).unwrap()),
         Kind::Float => Datum::Float8(text.parse().unwrap()),
         Kind::Int => Datum::Int8(text.parse().unwrap()),
+        Kind::Text => Datum::text_owned(text.to_string()),
         Kind::Count => unreachable!(),
     }
 }
@@ -112,6 +148,7 @@ fn summarizer(kind: Kind) -> Arc<dyn Summarizer> {
         Kind::Numeric => vec![SumNumeric, Min, Max, CountNonNull, SumSqNumeric],
         Kind::Float => vec![SumFloat, SumSqFloat, Min, Max],
         Kind::Int => vec![SumInt, SumSqInt, Max, CountNonNull, Min],
+        Kind::Text => vec![Min, CountNonNull, Max],
     };
     Arc::new(ValueSummarizer { kind, spec })
 }
@@ -258,6 +295,18 @@ fn fold(m: &TreeModel, lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> Summary {
     s
 }
 
+/// The whole tree's summary in the form stored for it (MIN/MAX values too
+/// wide for node summaries as prefixes, which need the entries one by one).
+fn stored_fold(m: &TreeModel) -> Summary {
+    let summ = summarizer(m.kind);
+    let mut s = Summary::empty(summ.spec());
+    for (k, w) in m.current() {
+        summ.add_entry(&mut s, k, w).unwrap();
+        s.bound_extremes();
+    }
+    s
+}
+
 /// Retained times worth reading at: the frontier, `now` and a few between.
 fn sample_times(rng: &mut Rng, frontier: Gsn, now: Gsn) -> Vec<ReadAt> {
     let mut v = vec![ReadAt::Latest, ReadAt::AsOf(now), ReadAt::AsOf(frontier)];
@@ -308,7 +357,10 @@ fn verify_tree(env: &mut Env, rng: &mut Rng, id: TreeId, m: &TreeModel, frontier
     // summaries: stored ones are exact, and range queries equal a fold
     env.check_summaries(id).unwrap_or_else(|e| panic!("{}", ctx(&e.to_string())));
     let whole = fold(m, &Bound::Unbounded, &Bound::Unbounded);
-    assert!(env.tree_summary(id).exact_eq(&whole), "{}", ctx(&format!("tree summary {:?} vs {whole:?}", env.tree_summary(id))));
+    let stored = stored_fold(m);
+    assert!(env.tree_summary(id).exact_eq(&stored), "{}", ctx(&format!("tree summary {:?} vs {stored:?}", env.tree_summary(id))));
+    let got = env.range_summary(id, Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert!(got.exact_eq(&whole), "{}", ctx(&format!("whole range summary {got:?} vs {whole:?}")));
     for _ in 0..3 {
         let (lo, hi) = (random_bound(rng, m), random_bound(rng, m));
         let got = env.range_summary(id, borrow_bound(&lo), borrow_bound(&hi)).unwrap();
@@ -512,9 +564,11 @@ fn gen_key(rng: &mut Rng, m: &TreeModel) -> Vec<u8> {
         k.extend((0..n).map(|i| [0x00, 0xFF, 0x01, b'a', 0xFE][(u as usize + i) % 5]));
         return k;
     }
-    let values = match m.kind {
+    let values: &[&str] = match m.kind {
+        Kind::Numeric if rng.chance(5) => &WIDE_NUMERIC_VALUES,
         Kind::Numeric => NUMERIC_VALUES,
         Kind::Float => FLOAT_VALUES,
+        Kind::Text => &TEXT_VALUES,
         _ => INT_VALUES,
     };
     // specials and NULLs less often
@@ -1216,3 +1270,90 @@ fn time_travel_crashes_and_gc_against_model() {
     }
 }
 
+
+/// MIN and MAX of the text after an 8-byte key prefix.
+struct WideTextSummarizer;
+
+impl Summarizer for WideTextSummarizer {
+    fn spec(&self) -> &[AggKind] {
+        &[AggKind::Min, AggKind::Max]
+    }
+    fn add_entry(&self, acc: &mut Summary, key: &[u8], weight: i64) -> Result<()> {
+        acc.count += weight;
+        let v = Datum::text_owned(String::from_utf8(key[8..].to_vec()).unwrap());
+        AggKind::Min.add(&mut acc.aggs[0], &v, weight)?;
+        AggKind::Max.add(&mut acc.aggs[1], &v, weight)
+    }
+}
+
+/// Node summaries hold prefixes of wide MIN/MAX values, so internal nodes
+/// stay within their target size and a one-row change rewrites little,
+/// while range summaries still return the values. (With the values
+/// themselves in the summaries and 8 bytes counted per state, 4 KiB values
+/// made internal nodes of megabytes, two thirds as large as the data, and a
+/// checkpoint after a one-row insert wrote 2.25 MiB.)
+#[test]
+fn wide_extremes_keep_internal_nodes_small() {
+    let tmp = TempDir::new("storage-wide-extremes");
+    let (mut env, _) = Env::open(&tmp.path().join("store"), EnvOptions::default()).unwrap();
+    let tree = env.create_tree(Arc::new(WideTextSummarizer));
+    let entry = |i: u64, c: u8| {
+        let mut k = i.to_be_bytes().to_vec();
+        k.extend(std::iter::repeat_n(c, 4096));
+        k
+    };
+    let n = 6000u64;
+    for chunk in 0..n / 1000 {
+        let mut ups: Vec<(Vec<u8>, i64)> =
+            (chunk * 1000..(chunk + 1) * 1000).map(|i| (entry(i, b'a' + (i * 7 % 26) as u8), 1)).collect();
+        env.apply(tree, &mut ups, chunk + 1).unwrap();
+    }
+    env.checkpoint(10, b"").unwrap();
+    let written = |env: &Env| env.stats().segments.iter().map(|s| s.1).sum::<u64>();
+    let (mut leaf_bytes, mut internal_bytes, mut largest) = (0u64, 0u64, 0u32);
+    for s in env.slots.iter().flatten() {
+        let len = s.disk.unwrap().len;
+        if s.node.as_ref().unwrap().is_leaf() {
+            leaf_bytes += len as u64;
+        } else {
+            internal_bytes += len as u64;
+            largest = largest.max(len);
+        }
+    }
+    assert!(largest as usize <= env.opts.internal_bytes + 64, "internal node of {largest} bytes");
+    assert!(internal_bytes * 20 < leaf_bytes, "internal nodes {internal_bytes} bytes for {leaf_bytes} of leaves");
+    let before = written(&env);
+    let mut ups = vec![(entry(n / 2, b'z'), 1)];
+    env.apply(tree, &mut ups, 11).unwrap();
+    env.checkpoint(11, b"").unwrap();
+    let one_row = written(&env) - before;
+    assert!(one_row < 4 * (16 << 10), "a one-row insert wrote {one_row} bytes");
+    // range summaries resolve the prefixes to the values
+    let summ = WideTextSummarizer;
+    for (lo, hi) in [(0, n + 1), (17, 18), (100, 2100), (n / 2, n / 2 + 1), (3, n - 3)] {
+        let (lo_k, hi_k) = (lo.to_be_bytes(), hi.to_be_bytes());
+        let got = env.range_summary(tree, Bound::Included(&lo_k), Bound::Excluded(&hi_k)).unwrap();
+        let mut want = Summary::empty(summ.spec());
+        for (k, h) in env.scan(tree, Bound::Included(&lo_k), Bound::Excluded(&hi_k)).unwrap() {
+            summ.add_entry(&mut want, &k, h.total()).unwrap();
+        }
+        assert!(matches!(&got.aggs[1], AggState::Max(Some(Datum::Text(t))) if t.len() == 4096));
+        assert!(got.exact_eq(&want), "[{lo}, {hi}): {got:?}");
+    }
+    let whole = env.range_summary(tree, Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert!(matches!(&whole.aggs[0], AggState::Min(Some(Datum::Text(t))) if t.starts_with("aaaa")));
+    assert!(env.tree_summary(tree).aggs.iter().all(AggState::is_prefix));
+    // Each of the 26 values occurs some 230 times. Equal values with a
+    // prefix are found at their first entry: after a reopen (nothing
+    // loaded), a range summary loads its path and one path to each extreme.
+    drop(env);
+    let (mut env, _) = Env::open(&tmp.path().join("store"), EnvOptions::default()).unwrap();
+    env.attach_tree(tree, Arc::new(WideTextSummarizer)).unwrap();
+    let got = env.range_summary(tree, Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert!(got.exact_eq(&whole));
+    let depth = 3;
+    assert!(env.stats().loaded_nodes <= 2 * depth, "{} nodes loaded", env.stats().loaded_nodes);
+    let (lo_k, hi_k) = (1000u64.to_be_bytes(), 3000u64.to_be_bytes());
+    env.range_summary(tree, Bound::Included(&lo_k), Bound::Excluded(&hi_k)).unwrap();
+    assert!(env.stats().loaded_nodes <= 8 * depth, "{} nodes loaded", env.stats().loaded_nodes);
+}
