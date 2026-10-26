@@ -542,9 +542,7 @@ fn check_due(env: &Env, w: &Walk, ptr: NodePtr, recorded: Gsn, actual: Gsn, tree
 /// without limits ran at this frontier, and nothing was modified since.
 fn check_structure(env: &mut Env, legacy: bool, compacted_at: Option<Gsn>) {
     // nodes written early may still be buffered
-    if env.segs.writable() {
-        env.segs.write_buffer().unwrap();
-    }
+    env.segs.write_buffer().unwrap();
     let mut w = Walk { live: BTreeMap::new(), tree_live: BTreeMap::new(), slots: 0, legacy, compacted_at };
     for tid in env.tree_ids() {
         let t = &env.trees[&tid];
@@ -581,8 +579,12 @@ fn check_structure(env: &mut Env, legacy: bool, compacted_at: Option<Gsn>) {
 }
 
 /// Segment files on disk match the accounting (call when no checkpoint is in
-/// progress). `after_checkpoint`: dead segments must be gone.
-fn check_segment_files(env: &Env, after_checkpoint: bool) {
+/// progress). `after_checkpoint`: dead segments must be gone (unless a fork
+/// that wrote to them pins them).
+fn check_segment_files(env: &mut Env, after_checkpoint: bool) {
+    // (what forks appended, and what is still buffered)
+    env.count_foreign();
+    env.segs.write_buffer().unwrap();
     let mut files = BTreeMap::new();
     for e in std::fs::read_dir(&env.dir).unwrap() {
         let e = e.unwrap();
@@ -596,7 +598,7 @@ fn check_segment_files(env: &Env, after_checkpoint: bool) {
         if *live > 0 || *seg == active {
             assert_eq!(files.get(seg), Some(total), "size of segment file {seg}");
         }
-        if after_checkpoint && *seg != active {
+        if after_checkpoint && *seg != active && !env.segs.pinned(*seg) {
             assert!(*live > 0, "dead segment {seg} survived a checkpoint");
         }
     }
@@ -784,12 +786,18 @@ impl Harness {
         }
     }
 
-    /// Write dirty nodes early (`Env::write_back`), all or some.
+    /// Write dirty nodes early (`Env::write_back`), all or some (while a
+    /// checkpoint is written, not the nodes frozen in it, nor their
+    /// ancestors).
     fn write_back(&mut self) {
         let dirty = self.env().dirty_bytes() as u64;
         let target = if self.rng.chance(50) { 0 } else { self.rng.below(dirty + 1) as usize };
         let left = self.env().write_back(target).unwrap();
-        assert!(left <= target, "write_back to {target} left {left} dirty bytes");
+        if self.env().frozen_at.is_none() {
+            assert!(left <= target, "write_back to {target} left {left} dirty bytes");
+        } else if left < dirty as usize {
+            self.event("early writes while a checkpoint is written");
+        }
     }
 
     fn fork(&mut self) {
@@ -810,14 +818,14 @@ impl Harness {
         self.event("check fork");
         let i = self.rng.index(self.forks.len());
         let (mut f, mut model, mut frontier, now) = self.forks.remove(i);
-        // (not its segment accounting, which no checkpoint uses: it counts the
-        // nodes of trees dropped before it was taken as live)
+        let legacy = self.legacy;
+        // (its segment accounting too: what it writes counts as its trees')
         let verify = |f: &mut Env, rng: &mut Rng, model: &Model, frontier: Gsn, now: Gsn| {
             assert_eq!(f.tree_ids(), model.keys().copied().collect::<Vec<_>>(), "tree set of a fork");
             for (id, m) in model {
                 verify_tree(f, rng, *id, m, frontier, now);
             }
-            check_structure(f, false, None);
+            check_structure(f, legacy, None);
         };
         verify(&mut f, &mut self.rng, &model, frontier, now);
         let ids: Vec<TreeId> = model.keys().copied().collect();
@@ -828,6 +836,9 @@ impl Harness {
                 apply_op(&mut f, &mut model, &mut frontier, &Op::Apply { tree: id, ups, gsn: now + 1 + k as u64 });
             }
             verify(&mut f, &mut self.rng, &model, frontier, now + 3);
+        }
+        if f.trees.values().any(|t| t.seg_live.keys().any(|s| f.segs.pinned(*s))) {
+            self.event("fork wrote nodes");
         }
         drop(f);
         self.verify();
@@ -857,6 +868,9 @@ impl Harness {
             apply_op(&mut f, &mut single, &mut fr, &op);
             m = single.remove(&id).unwrap();
             ops.push(op);
+        }
+        if !f.trees[&id].seg_live.is_empty() {
+            self.event("adopt: a tree the fork wrote nodes of");
         }
         self.env().adopt_trees(&mut f, &[id]).unwrap();
         drop(f);
@@ -898,7 +912,7 @@ impl Harness {
         self.event("background checkpoint");
         self.env().finish_checkpoint(done).unwrap();
         self.ckpt = frozen;
-        check_segment_files(self.env.as_ref().unwrap(), false);
+        check_segment_files(self.env.as_mut().unwrap(), false);
         self.verify();
     }
 
@@ -932,7 +946,7 @@ impl Harness {
         self.env().checkpoint(gsn, &app).unwrap();
         self.ckpt = Ckpt { durable: true, gsn, app, model: self.model.clone(), frontier: self.frontier };
         self.since.clear();
-        check_segment_files(self.env.as_ref().unwrap(), true);
+        check_segment_files(self.env.as_mut().unwrap(), true);
     }
 
     /// One maintenance pass without limits must compact every leaf whose
@@ -1164,6 +1178,8 @@ impl Harness {
 
     /// Drop every tree: all space must be reclaimed.
     fn finish(&mut self) {
+        // (forks pin the segments they wrote to)
+        self.forks.clear();
         for _ in 0..3 {
             self.gc_round();
         }
@@ -1296,6 +1312,9 @@ fn run(setup: &Setup, actions: &[(Action, u64)], name: &str) {
     }
     h.verify();
     h.finish();
+    if std::env::var("IVM_MODEL_EVENTS").is_ok() {
+        eprintln!("EVENTS {:?}", h.events);
+    }
 }
 
 fn shrinking_config(cases: u32) -> ProptestConfig {

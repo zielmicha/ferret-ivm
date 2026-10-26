@@ -1,28 +1,33 @@
 //! Immutable, append-only segment files holding serialized nodes.
 //!
 //! Each checkpoint appends the nodes dirtied since the previous one to the
-//! active segment; sealed segments never change, which makes continuous
-//! incremental backup a matter of copying new files.
+//! active segment (as do early writes of dirty nodes); sealed segments never
+//! change, which makes continuous incremental backup a matter of copying
+//! new files.
 
 use super::node::DiskLoc;
 use crate::error::{Result, SqlError};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const FRAME_HEADER: usize = 8; // u32 len, u32 crc
 
-/// The segment files of a store: shared read access (`SegmentReader`) and,
-/// while no checkpoint job holds it, the append side (`SegmentWriter`).
+/// The segment files of a store as one environment sees them: read access
+/// (`SegmentReader`) and the append side (`SharedWriter`), which every
+/// version of the store shares — the environment, its checkpoint job and
+/// its forks append to the same active segment, each frame in one piece.
 pub struct SegmentStore {
     reader: Arc<SegmentReader>,
-    writer: Option<SegmentWriter>,
-    /// The active segment (also while a checkpoint job holds the writer,
-    /// which may roll over to newer ones).
-    active_id: u32,
+    writer: Arc<SharedWriter>,
+    /// In a fork: the segments it appended to, pinned against deletion until
+    /// it is dropped (its trees may be adopted, frames and all).
+    pins: Option<BTreeSet<u32>>,
 }
 
 /// Read access to segment files by location. Files are opened on first use
@@ -33,22 +38,42 @@ struct SegmentReader {
     files: Mutex<FxHashMap<u32, Arc<File>>>,
 }
 
+/// The append side shared by every version of a store.
+struct SharedWriter {
+    /// The active segment and how much of it is in its file
+    /// (`id << 40 | length`): frames before that are read from the file,
+    /// the others from the append buffer.
+    written: AtomicU64,
+    w: Mutex<SegmentWriter>,
+}
+
 /// Appends node frames to the active segment and rolls over to the next.
 struct SegmentWriter {
     dir: PathBuf,
     active_id: u32,
-    active: File,
-    /// Length durably flushed to the OS (written).
+    active: Arc<File>,
+    /// Length handed to the OS (written).
     written_len: u64,
     /// Pending bytes not yet written.
     buf: Vec<u8>,
     max_segment_bytes: u64,
     /// Segments rolled since the last sync that still need fsync.
-    unsynced: Vec<File>,
+    unsynced: Vec<Arc<File>>,
+    /// Segments forks appended to, with the number of forks pinning each.
+    pinned: BTreeMap<u32, usize>,
+    /// Bytes forks appended per segment, not yet counted in the totals of
+    /// the environment they were forked from (`take_foreign`).
+    foreign: BTreeMap<u32, u64>,
+    /// Lengths of the segments this process sealed (rolled over from).
+    sealed: BTreeMap<u32, u64>,
 }
 
 pub fn segment_path(dir: &Path, id: u32) -> PathBuf {
     dir.join(format!("seg-{id:08}.dat"))
+}
+
+fn pack(id: u32, len: u64) -> u64 {
+    (id as u64) << 40 | len
 }
 
 impl SegmentStore {
@@ -62,114 +87,129 @@ impl SegmentStore {
         if created {
             File::open(dir)?.sync_all()?;
         }
-        let writer = SegmentWriter {
+        let w = SegmentWriter {
             dir: dir.to_path_buf(),
             active_id,
-            active: f,
+            active: Arc::new(f),
             written_len: active_len,
             buf: Vec::new(),
             max_segment_bytes,
             unsynced: Vec::new(),
+            pinned: BTreeMap::new(),
+            foreign: BTreeMap::new(),
+            sealed: BTreeMap::new(),
         };
+        let writer = Arc::new(SharedWriter { written: AtomicU64::new(pack(active_id, active_len)), w: Mutex::new(w) });
         let reader = Arc::new(SegmentReader { dir: dir.to_path_buf(), files: Mutex::new(FxHashMap::default()) });
-        Ok(SegmentStore { reader, writer: Some(writer), active_id })
+        Ok(SegmentStore { reader, writer, pins: None })
     }
 
     pub fn active_id(&self) -> u32 {
-        self.active_id
-    }
-
-    fn writer(&mut self) -> Result<&mut SegmentWriter> {
-        self.writer.as_mut().ok_or_else(|| SqlError::internal("segment files are being written by a checkpoint"))
-    }
-
-    pub fn active_len(&self) -> u64 {
-        self.writer.as_ref().map(|w| w.written_len + w.buf.len() as u64).unwrap_or(0)
+        (self.writer.written.load(Ordering::Acquire) >> 40) as u32
     }
 
     /// Append a node payload; returns its location.
     pub fn append(&mut self, payload: &[u8]) -> Result<DiskLoc> {
-        let w = self.writer()?;
-        let loc = w.append(payload)?;
-        self.active_id = loc.seg;
+        let mut w = self.writer.w.lock();
+        let loc = w.append(payload, &self.writer.written)?;
+        if let Some(pins) = &mut self.pins {
+            *w.foreign.entry(loc.seg).or_default() += loc.len as u64;
+            if pins.insert(loc.seg) {
+                *w.pinned.entry(loc.seg).or_default() += 1;
+            }
+        }
         Ok(loc)
     }
 
-    /// Make everything appended so far durable.
-    pub fn sync(&mut self) -> Result<()> {
-        self.writer()?.sync()
-    }
-
-    /// Is the append side here (not lent to a checkpoint job)?
-    pub fn writable(&self) -> bool {
-        self.writer.is_some()
-    }
-
-    /// A store with this one's files and its append side, which this one
-    /// lacks until `restore` (for a checkpoint job).
-    pub fn lend(&mut self) -> Result<Option<SegmentStore>> {
-        let Some(mut writer) = self.writer.take() else { return Ok(None) };
-        // (frames written early stay readable here from their files)
-        writer.write_buffer()?;
-        Ok(Some(SegmentStore { reader: self.reader.clone(), writer: Some(writer), active_id: self.active_id }))
-    }
-
-    /// Take the append side back from a store made by `lend` (it may have
-    /// rolled over to newer segments).
-    pub fn restore(&mut self, mut lent: SegmentStore) {
-        if let Some(w) = lent.writer.take() {
-            self.active_id = w.active_id;
-            self.writer = Some(w);
+    /// Make everything appended so far (by any version of the store)
+    /// durable; returns the active segment and the length of it that is,
+    /// with the lengths of the segments sealed in this process (every
+    /// version's appends counted). The files are synced outside the lock:
+    /// others go on appending meanwhile, after that length.
+    pub fn sync(&self) -> Result<(u32, u64, BTreeMap<u32, u64>)> {
+        let (files, active, durable) = {
+            let mut w = self.writer.w.lock();
+            w.write_buffer(&self.writer.written)?;
+            (std::mem::take(&mut w.unsynced), w.active.clone(), (w.active_id, w.written_len, w.sealed.clone()))
+        };
+        for f in files {
+            f.sync_data()?;
         }
+        active.sync_data()?;
+        Ok(durable)
     }
 
-    /// Read access for a fork of the environment: the files of segments
-    /// `ids` stay open in it, so it can read its nodes after a checkpoint
-    /// of the parent deleted their segments. (Those already gone held only
-    /// nodes of dropped trees, which a checkpoint job released.)
+    /// Another view of this store, with its read access and append side
+    /// (for a checkpoint job).
+    pub fn share(&self) -> SegmentStore {
+        SegmentStore { reader: self.reader.clone(), writer: self.writer.clone(), pins: None }
+    }
+
+    /// The store as a fork of the environment sees it: the files of
+    /// segments `ids` stay open in it, so it can read its nodes after a
+    /// checkpoint of the environment deleted their segments, and the
+    /// segments it appends to are pinned until it is dropped.
     pub fn fork(&self, ids: impl IntoIterator<Item = u32>) -> Result<SegmentStore> {
         let mut files = FxHashMap::default();
         for id in ids {
-            if let Ok(f) = self.reader.file(id) {
-                files.insert(id, f);
-            }
+            files.insert(id, self.reader.file(id)?);
         }
         let reader = Arc::new(SegmentReader { dir: self.reader.dir.clone(), files: Mutex::new(files) });
-        Ok(SegmentStore { reader, writer: None, active_id: self.active_id })
+        Ok(SegmentStore { reader, writer: self.writer.clone(), pins: Some(BTreeSet::new()) })
     }
 
     pub fn read(&self, loc: DiskLoc) -> Result<Vec<u8>> {
-        // (a frame written early may still be in the append buffer)
-        if let Some(w) = &self.writer
-            && loc.seg == w.active_id
-            && loc.off >= w.written_len
-        {
-            let at = (loc.off - w.written_len) as usize;
-            return check_frame(w.buf[at..at + loc.len as usize].to_vec(), loc);
+        let written = self.writer.written.load(Ordering::Acquire);
+        let (seg, len) = ((written >> 40) as u32, written & ((1 << 40) - 1));
+        if loc.seg == seg && loc.off + loc.len as u64 > len {
+            // (a frame written early may still be in the append buffer)
+            let w = self.writer.w.lock();
+            if loc.seg == w.active_id && loc.off >= w.written_len {
+                let at = (loc.off - w.written_len) as usize;
+                return check_frame(w.buf[at..at + loc.len as usize].to_vec(), loc);
+            }
         }
         self.reader.read(loc)
     }
 
     /// Hand the pending bytes to the OS (without syncing them).
-    pub(super) fn write_buffer(&mut self) -> Result<()> {
-        self.writer()?.write_buffer()
+    #[cfg(test)]
+    pub(super) fn write_buffer(&self) -> Result<()> {
+        self.writer.w.lock().write_buffer(&self.writer.written)
     }
 
-    pub fn delete(&mut self, id: u32) -> Result<()> {
-        if id == self.active_id {
-            return Ok(());
+    /// The length of the active segment, written or pending.
+    #[cfg(test)]
+    pub(super) fn active_len(&self) -> u64 {
+        let w = self.writer.w.lock();
+        w.written_len + w.buf.len() as u64
+    }
+
+    /// Delete sealed segment `id`, unless it is the active one or a fork
+    /// pins it; returns whether it did.
+    pub fn delete(&self, id: u32) -> Result<bool> {
+        let mut w = self.writer.w.lock();
+        if id == w.active_id || w.pinned.contains_key(&id) {
+            return Ok(false);
         }
+        w.sealed.remove(&id);
         self.reader.files.lock().remove(&id);
         let p = segment_path(&self.reader.dir, id);
         if p.exists() {
             std::fs::remove_file(p)?;
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Close a segment that a checkpoint job deleted.
-    pub fn forget(&self, id: u32) {
-        self.reader.files.lock().remove(&id);
+    /// Does a fork pin segment `id`?
+    #[cfg(test)]
+    pub(super) fn pinned(&self, id: u32) -> bool {
+        self.writer.w.lock().pinned.contains_key(&id)
+    }
+
+    /// Bytes that forks appended since the last call, per segment.
+    pub fn take_foreign(&self) -> BTreeMap<u32, u64> {
+        std::mem::take(&mut self.writer.w.lock().foreign)
     }
 
     /// Segment ids present on disk.
@@ -189,10 +229,26 @@ impl SegmentStore {
     }
 }
 
+impl Drop for SegmentStore {
+    fn drop(&mut self) {
+        if let Some(pins) = self.pins.take().filter(|p| !p.is_empty()) {
+            let mut w = self.writer.w.lock();
+            for id in pins {
+                if let Some(n) = w.pinned.get_mut(&id) {
+                    *n -= 1;
+                    if *n == 0 {
+                        w.pinned.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl SegmentWriter {
-    fn append(&mut self, payload: &[u8]) -> Result<DiskLoc> {
+    fn append(&mut self, payload: &[u8], written: &AtomicU64) -> Result<DiskLoc> {
         if self.written_len + self.buf.len() as u64 >= self.max_segment_bytes {
-            self.roll()?;
+            self.roll(written)?;
         }
         let off = self.written_len + self.buf.len() as u64;
         let len = (payload.len() + FRAME_HEADER) as u32;
@@ -200,45 +256,41 @@ impl SegmentWriter {
         self.buf.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
         self.buf.extend_from_slice(payload);
         if self.buf.len() > 4 << 20 {
-            self.write_buffer()?;
+            self.write_buffer(written)?;
         }
         Ok(DiskLoc { seg: self.active_id, off, len })
     }
 
-    fn write_buffer(&mut self) -> Result<()> {
+    fn write_buffer(&mut self, written: &AtomicU64) -> Result<()> {
         if !self.buf.is_empty() {
             self.active.write_all_at(&self.buf, self.written_len)?;
             self.written_len += self.buf.len() as u64;
             self.buf.clear();
+            written.store(pack(self.active_id, self.written_len), Ordering::Release);
         }
         Ok(())
     }
 
-    fn roll(&mut self) -> Result<()> {
-        self.write_buffer()?;
+    fn roll(&mut self, written: &AtomicU64) -> Result<()> {
+        self.write_buffer(written)?;
         let old = std::mem::replace(
             &mut self.active,
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(segment_path(&self.dir, self.active_id + 1))?,
+            Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(segment_path(&self.dir, self.active_id + 1))?,
+            ),
         );
         self.unsynced.push(old);
+        self.sealed.insert(self.active_id, self.written_len);
         self.active_id += 1;
         self.written_len = 0;
+        written.store(pack(self.active_id, 0), Ordering::Release);
         // the new file must exist after a crash once a checkpoint refers to it
         File::open(&self.dir)?.sync_all()?;
-        Ok(())
-    }
-
-    fn sync(&mut self) -> Result<()> {
-        self.write_buffer()?;
-        for f in std::mem::take(&mut self.unsynced) {
-            f.sync_data()?;
-        }
-        self.active.sync_data()?;
         Ok(())
     }
 }

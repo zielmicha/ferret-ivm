@@ -142,6 +142,9 @@ struct Slot {
     /// The node's memory (`Node::mem_size`) plus the slot's: what the
     /// buffer pool's accounting counts.
     mem: usize,
+    /// In a fork: the node is still the one the environment it was forked
+    /// from holds (`Env::fork`), not the fork's own.
+    inherited: bool,
 }
 
 #[derive(Clone)]
@@ -224,6 +227,14 @@ pub struct Env {
     read_bytes: u64,
     /// Entries scans may still visit before failing with `READ_BUDGET`.
     read_budget: Option<u64>,
+    /// While a checkpoint job is in progress: the stamp when it began.
+    /// Dirty nodes stamped no later are frozen in the job, which writes
+    /// them; the pool does not write them early.
+    frozen_at: Option<u64>,
+    /// In a fork: memory (and dirty memory) of the inherited nodes, shared
+    /// with the environment it was forked from, which its buffer pool
+    /// does not count against its target.
+    inherited: (usize, usize),
 }
 
 /// A node a checkpoint job wrote: its slot and stamp in the parent
@@ -245,12 +256,12 @@ pub struct CheckpointJob {
 
 /// A written checkpoint, for `Env::finish_checkpoint`.
 pub struct CheckpointDone {
-    segs: SegmentStore,
     manifest: Manifest,
     flushed: Vec<Flushed>,
     /// Bytes the job wrote for nodes the engine modified (`fg_appended`).
     fg_appended: u64,
-    deleted: Vec<u32>,
+    /// Sealed segments without live bytes in the committed checkpoint.
+    dead: Vec<u32>,
     seq: u64,
     gsn: Gsn,
 }
@@ -264,14 +275,13 @@ impl CheckpointJob {
     /// application state `app` (on any thread). On an error nothing is
     /// committed, and the environment cannot take checkpoints any more.
     pub fn run(mut self, app: &[u8]) -> Result<CheckpointDone> {
-        let deleted = self.env.write_checkpoint(self.gsn, app)?;
-        let env = self.env;
+        let dead = self.env.write_checkpoint(self.gsn, app)?;
+        let env = &mut self.env;
         Ok(CheckpointDone {
-            segs: env.segs,
-            manifest: env.manifest.expect("checkpoint job without manifest"),
-            flushed: env.flushed.unwrap_or_default(),
+            manifest: env.manifest.take().expect("checkpoint job without manifest"),
+            flushed: env.flushed.take().unwrap_or_default(),
             fg_appended: env.fg_appended,
-            deleted,
+            dead,
             seq: env.checkpoint_seq,
             gsn: env.checkpoint_gsn,
         })
@@ -467,6 +477,8 @@ impl Env {
             reads: 0,
             read_bytes: 0,
             read_budget: None,
+            frozen_at: None,
+            inherited: (0, 0),
         };
         let recovered = match rec {
             None => None,
@@ -672,6 +684,7 @@ impl Env {
     /// fork or checkpoint job shares it. (Changing what the node owns is
     /// the caller's to account; changing what its image holds, its stamp.)
     fn node_mut(&mut self, id: u32) -> &mut Node {
+        self.own(id);
         if self.slot(id).node.as_ref().is_some_and(|n| Arc::strong_count(n) > 1) {
             let copy = (**self.slot(id).node.as_ref().unwrap()).clone();
             self.slot_mut(id).node = Some(Arc::new(copy));
@@ -683,6 +696,7 @@ impl Env {
     /// Take the node out of slot `id` (a copy if it is shared; the slot's
     /// memory is then the copy's, which may own blocks of other capacities).
     fn take_node(&mut self, id: u32) -> Node {
+        self.own(id);
         let n = self.slot_mut(id).node.take().expect("node taken");
         match Arc::try_unwrap(n) {
             Ok(n) => n,
@@ -691,6 +705,21 @@ impl Env {
                 let mem = n.mem_size() + SLOT_BYTES;
                 self.set_mem(id, mem);
                 n
+            }
+        }
+    }
+
+    /// In a fork: the node in slot `id` is about to change, or nobody else
+    /// holds it any more; either way it is the fork's own from now on, and
+    /// its memory counts against the fork's target.
+    fn own(&mut self, id: u32) {
+        let slot = self.slot_mut(id);
+        if slot.inherited {
+            slot.inherited = false;
+            let (mem, dirty) = (slot.mem, slot.dirty);
+            self.inherited.0 -= mem;
+            if dirty {
+                self.inherited.1 -= mem;
             }
         }
     }
@@ -737,6 +766,7 @@ impl Env {
             bytes,
             by_maint: false,
             mem,
+            inherited: false,
         };
         if let Some(id) = self.free_slots.pop() {
             self.slots[id as usize] = Some(slot);
@@ -748,6 +778,7 @@ impl Env {
     }
 
     fn free_slot(&mut self, id: u32) {
+        self.own(id);
         let slot = self.slots[id as usize].take().expect("double free");
         if let Some(loc) = slot.disk {
             self.dec_live(slot.tree, loc);
@@ -790,6 +821,7 @@ impl Env {
     }
 
     fn make_dirty(&mut self, id: u32) {
+        self.own(id);
         let version = self.next_stamp();
         let slot = self.slot_mut(id);
         // (a new stamp also for a dirty node: it is about to change)
@@ -814,6 +846,7 @@ impl Env {
     fn put_node_sized(&mut self, id: u32, node: Node, bytes: usize, heap: usize) {
         debug_assert_eq!(bytes, node.byte_size());
         debug_assert_eq!(heap, node.heap_size());
+        self.own(id);
         let mem = node.mem_base() + heap + SLOT_BYTES;
         let version = self.next_stamp();
         let slot = self.slot_mut(id);
@@ -2045,21 +2078,28 @@ impl Env {
     /// records a stall, and the next sweep waits for the arena or the dirty
     /// bytes to grow well past it, which bounds the cost of sweeping when
     /// nothing can be done.
+    ///
+    /// Not candidates: dirty nodes frozen in a checkpoint job (which writes
+    /// them; they are clean once it is finished), and in a fork the nodes
+    /// it inherited, which it shares with the environment it was forked
+    /// from and does not count — unless nobody else holds one any more,
+    /// when it becomes the fork's own.
     fn maybe_evict(&mut self) -> Result<()> {
         let (cache, limit) = (self.opts.cache_bytes, self.dirty_limit());
-        if (self.mem_bytes <= cache && self.dirty_bytes <= limit) || self.slots.is_empty() {
+        let over = |e: &Env| e.mem_bytes - e.inherited.0 > cache || e.dirty_bytes - e.inherited.1 > limit;
+        if !over(self) || self.slots.is_empty() {
             return Ok(());
         }
         if let Some((mem, dirty)) = self.evict_stall {
             let slack = cache / 16 + self.opts.leaf_bytes;
-            if self.mem_bytes <= mem + slack && self.dirty_bytes <= dirty + slack {
+            if self.mem_bytes - self.inherited.0 <= mem + slack && self.dirty_bytes - self.inherited.1 <= dirty + slack {
                 return Ok(());
             }
             self.evict_stall = None;
         }
         let n = self.slots.len();
         let mut scanned = 0;
-        while (self.mem_bytes > cache || self.dirty_bytes > limit) && scanned < 2 * n {
+        while over(self) && scanned < 2 * n {
             let i = self.clock_hand % n;
             self.clock_hand = (i + 1) % n;
             scanned += 1;
@@ -2068,43 +2108,57 @@ impl Env {
             if slot.loaded_children > 0 || slot.node.is_none() {
                 continue;
             }
+            if slot.inherited {
+                if slot.node.as_ref().is_some_and(|n| Arc::strong_count(n) > 1) {
+                    continue;
+                }
+                self.own(i as u32);
+            }
+            let slot = self.slots[i].as_mut().unwrap();
             if slot.refbit {
                 slot.refbit = false;
                 continue;
             }
             if slot.dirty {
-                // (not while a checkpoint job holds the segment writer)
-                if (self.mem_bytes <= cache && self.dirty_bytes <= limit) || !self.segs.writable() {
+                if (self.mem_bytes - self.inherited.0 <= cache && self.dirty_bytes - self.inherited.1 <= limit) || self.frozen(i as u32) {
                     continue;
                 }
                 // its children are all on disk (none is loaded)
                 self.write_node(i as u32, usize::MAX)?;
             }
-            if self.mem_bytes > cache {
+            if self.mem_bytes - self.inherited.0 > cache {
                 self.evict(i as u32);
             }
         }
-        if self.mem_bytes > cache || self.dirty_bytes > limit {
-            self.evict_stall = Some((self.mem_bytes, self.dirty_bytes));
+        if over(self) {
+            self.evict_stall = Some((self.mem_bytes - self.inherited.0, self.dirty_bytes - self.inherited.1));
         }
         Ok(())
+    }
+
+    /// Is the dirty node in slot `id` frozen in the checkpoint job in
+    /// progress (dirty when it began, unchanged since)?
+    fn frozen(&self, id: u32) -> bool {
+        self.frozen_at.is_some_and(|f| self.slot(id).version <= f)
     }
 
     /// Write dirty nodes early, children before parents, until at most
     /// `target` dirty bytes remain, as the pool does on its own beyond half
     /// of the cache. A hook for callers that manage memory or checkpoints
     /// incrementally: the nodes written are clean and evictable, the next
-    /// checkpoint only writes the rest. Returns the dirty bytes left.
+    /// checkpoint only writes the rest. Returns the dirty bytes left (more
+    /// than `target` only while a checkpoint job is writing the rest, or
+    /// in a fork, where its inherited nodes are not written).
     pub fn write_back(&mut self, target: usize) -> Result<usize> {
         // children before parents: leaves first, then each level above
-        while self.dirty_bytes > target && self.segs.writable() {
+        while self.dirty_bytes > target {
             let before = self.dirty_bytes;
             for i in 0..self.slots.len() {
                 if self.dirty_bytes <= target {
                     break;
                 }
                 let writable = match &self.slots[i] {
-                    Some(Slot { dirty: true, node: Some(node), .. }) => match &**node {
+                    Some(Slot { dirty: true, inherited: false, node: Some(node), .. }) if !self.frozen(i as u32) => match &**node {
                         Node::Leaf(_) => true,
                         Node::Internal(ch) => {
                             ch.iter().all(|c| !matches!(c.ptr, NodePtr::Mem(cid) if self.slot(cid).dirty))
@@ -2234,6 +2288,7 @@ impl Env {
     }
 
     fn evict(&mut self, id: u32) {
+        self.own(id);
         let slot = self.slots[id as usize].take().unwrap();
         let loc = slot.disk.expect("evicting node without disk location");
         if slot.parent == NONE {
@@ -2268,15 +2323,18 @@ impl Env {
 
     /// Start a checkpoint of all trees as they are now (at `gsn`): the job
     /// holds a version of the dirty nodes (shared, copied when this
-    /// environment modifies them later) and the append side of the store,
-    /// and writes them on any thread (`CheckpointJob::run`) while this
-    /// environment goes on; `finish_checkpoint` then marks the nodes it wrote
-    /// clean where they have not changed since. Nothing else may write
-    /// segments meanwhile: a second checkpoint waits for the first.
+    /// environment modifies them later) and the manifest, and writes them
+    /// on any thread (`CheckpointJob::run`) while this environment goes on
+    /// — also writing other dirty nodes early, to the same active segment
+    /// (the append side is shared); `finish_checkpoint` then marks the
+    /// nodes it wrote clean where they have not changed since. A second
+    /// checkpoint waits for the first.
     pub fn begin_checkpoint(&mut self, gsn: Gsn) -> Result<CheckpointJob> {
-        if self.manifest.is_none() || !self.segs.writable() {
+        if self.manifest.is_none() {
             return Err(SqlError::internal("a checkpoint is already in progress"));
         }
+        // (the totals of segments forks wrote to, for the record)
+        self.count_foreign();
         // the dirty nodes, and the clean nodes whose locations their images
         // (and the tree records) need
         let mut slots: Vec<Option<Slot>> = Vec::with_capacity(self.slots.len());
@@ -2307,7 +2365,8 @@ impl Env {
                 copy(&mut slots, self.slot(r), r as usize);
             }
         }
-        let segs = self.segs.lend()?.expect("checked above");
+        let segs = self.segs.share();
+        self.frozen_at = Some(self.stamp);
         let env = Env {
             dir: self.dir.clone(),
             opts: self.opts.clone(),
@@ -2334,17 +2393,29 @@ impl Env {
             reads: 0,
             read_bytes: 0,
             read_budget: None,
+            frozen_at: None,
+            inherited: (0, 0),
         };
         Ok(CheckpointJob { env, gsn })
     }
 
-    /// Take back what a checkpoint job lent and mark the nodes it wrote
-    /// clean, except those modified (or freed) since it began: their images
-    /// are garbage from the start. A node marked clean is accounted as it
-    /// would have been had it been written here (`write_node`).
+    /// Count the bytes forks appended in the segments' totals.
+    fn count_foreign(&mut self) {
+        for (seg, bytes) in self.segs.take_foreign() {
+            self.seg_live.entry(seg).or_insert((0, 0)).0 += bytes;
+        }
+    }
+
+    /// Take back the manifest and mark the nodes the job wrote clean,
+    /// except those modified (or freed) since it began: their images are
+    /// garbage from the start. A node marked clean is accounted as it would
+    /// have been had it been written here (`write_node`). Then delete the
+    /// sealed segments dead in the committed checkpoint that are dead here
+    /// too (and not pinned by a fork): this environment may have written
+    /// to them or adopted trees with nodes in them since the job began.
     pub fn finish_checkpoint(&mut self, done: CheckpointDone) -> Result<()> {
-        self.segs.restore(done.segs);
         self.manifest = Some(done.manifest);
+        self.frozen_at = None;
         self.fg_appended += done.fg_appended;
         // (children before parents)
         for f in done.flushed {
@@ -2363,22 +2434,23 @@ impl Env {
             self.dirty_bytes -= mem;
             self.set_child_space(parent, f.slot, usize::MAX, f.min_seg, f.due);
         }
-        // dead in the committed checkpoint, hence here too: nothing this
-        // environment references on disk is outside it
-        for id in done.deleted {
-            self.seg_live.remove(&id);
-            self.segs.forget(id);
+        for id in done.dead {
+            if self.seg_live.get(&id).is_none_or(|(_, live)| *live == 0) && self.segs.delete(id)? {
+                self.seg_live.remove(&id);
+            }
         }
         self.checkpoint_seq = done.seq;
         self.checkpoint_gsn = done.gsn;
+        // the nodes written can be evicted
+        self.evict_stall = None;
         let active = self.segs.active_id();
         self.seg_live.entry(active).or_insert((0, 0));
         Ok(())
     }
 
     /// Write every dirty node, make the segments durable and append the
-    /// checkpoint record (the commit point); then delete sealed segments
-    /// without live nodes. Returns those segments.
+    /// checkpoint record (the commit point). Returns the sealed segments
+    /// without live nodes in it.
     fn write_checkpoint(&mut self, gsn: Gsn, app: &[u8]) -> Result<Vec<u32>> {
         let tree_ids = self.tree_ids();
         let mut records = Vec::with_capacity(tree_ids.len());
@@ -2400,10 +2472,18 @@ impl Env {
             records.push(TreeRecord { id: tid, root: loc.map(|l| (l, t.summary.clone(), t.min_seg)) });
             space.push(TreeSpace { due: t.due, segs: t.seg_live.iter().map(|(s, l)| (*s, *l)).collect() });
         }
-        self.segs.sync()?;
-        let active = self.segs.active_id();
-        let active_len = self.segs.active_len();
+        // (what others appended meanwhile and is synced too lies beyond
+        // what the record names, as any frame after a checkpoint does)
+        let (active, active_len, sealed) = self.segs.sync()?;
         self.seg_live.entry(active).or_insert((0, 0));
+        // the totals of the segments written in this process are their
+        // lengths, also of what the environment and its forks appended to
+        // them since the job began
+        for (seg, len) in sealed.into_iter().chain([(active, active_len)]) {
+            if let Some(e) = self.seg_live.get_mut(&seg) {
+                e.0 = len;
+            }
+        }
         // live bytes per segment as the checkpoint has them: without the
         // nodes of temporary trees
         let mut segments = self.seg_live.clone();
@@ -2428,13 +2508,7 @@ impl Env {
         };
         self.manifest.as_mut().ok_or_else(|| SqlError::internal("no manifest to append to"))?.append(&rec)?;
         self.checkpoint_gsn = gsn;
-        // reclaim fully dead sealed segments
-        let dead: Vec<u32> = self.seg_live.iter().filter(|(id, (_, l))| **id != active && *l == 0).map(|(id, _)| *id).collect();
-        for &id in &dead {
-            self.seg_live.remove(&id);
-            self.segs.delete(id)?;
-        }
-        Ok(dead)
+        Ok(segments.iter().filter(|(id, (_, l))| **id < active && *l == 0).map(|(id, _)| *id).collect())
     }
 
     /// Write the dirty nodes of the subtree at `id` (at position `idx` in
@@ -2500,22 +2574,26 @@ impl Env {
     }
 
     /// An independent version of every tree as of now, for another thread:
-    /// it shares the loaded nodes (copied on write on either side) and the
-    /// open segment files, has a buffer pool of its own and cannot take
-    /// checkpoints. Trees created empty here and filled in a fork can be
-    /// moved back with `adopt_trees`.
-    pub fn fork(&mut self) -> Result<Env> {
-        // (frames written early must be in their files for the fork to read)
-        if self.segs.writable() {
-            self.segs.write_buffer()?;
+    /// it shares the loaded nodes (copied on write on either side), the
+    /// open segment files and the append side, has a buffer pool of its own
+    /// and cannot take checkpoints. Its pool counts only its own nodes
+    /// against its target: those it loads, creates or modifies, and those
+    /// it inherited that nobody else holds any more; it writes and evicts
+    /// them like any pool (the segments it writes to are pinned until it is
+    /// dropped). Trees created empty here and filled in a fork can be moved
+    /// back with `adopt_trees`.
+    pub fn fork(&self) -> Result<Env> {
+        let mut slots = self.slots.clone();
+        for s in slots.iter_mut().flatten() {
+            s.inherited = true;
         }
         Ok(Env {
             dir: self.dir.clone(),
             opts: self.opts.clone(),
             // (segments holding nodes: others may be gone, deleted by a
-            // checkpoint job in progress)
+            // checkpoint finished since they died)
             segs: self.segs.fork(self.seg_live.iter().filter(|(_, (_, live))| *live > 0).map(|(id, _)| *id))?,
-            slots: self.slots.clone(),
+            slots,
             free_slots: self.free_slots.clone(),
             mem_bytes: self.mem_bytes,
             dirty_bytes: self.dirty_bytes,
@@ -2537,13 +2615,19 @@ impl Env {
             reads: 0,
             read_bytes: 0,
             read_budget: None,
+            frozen_at: None,
+            inherited: (self.mem_bytes, self.dirty_bytes),
         })
     }
 
     /// Move trees `ids` from fork `from`, where they were filled, into this
     /// environment, where they must still be as empty as when the fork was
-    /// taken. Their nodes are moved, not copied.
+    /// taken. Their loaded nodes are moved, not copied, dirty or clean;
+    /// those the fork wrote (all of them in the fork's own segments, which
+    /// it pins) count as live here from now on.
     pub fn adopt_trees(&mut self, from: &mut Env, ids: &[TreeId]) -> Result<()> {
+        // (the totals of the segments the fork wrote to first)
+        self.count_foreign();
         for &id in ids {
             if self.trees.get(&id).is_none_or(|t| t.root.is_some()) {
                 return Err(SqlError::internal(format!("tree {id} to adopt is not an empty tree here")));
@@ -2551,32 +2635,45 @@ impl Env {
             let t = from.trees.remove(&id).ok_or_else(|| SqlError::internal(format!("no tree {id} to adopt")))?;
             let root = match t.root {
                 None => None,
-                Some(ptr) => Some(NodePtr::Mem(self.adopt_node(from, ptr, NONE, id)?)),
+                Some(NodePtr::Disk(loc)) => Some(NodePtr::Disk(loc)),
+                Some(NodePtr::Mem(fid)) => Some(NodePtr::Mem(self.adopt_node(from, fid, NONE, id))),
             };
+            for (seg, live) in &t.seg_live {
+                self.seg_live.entry(*seg).or_insert((0, 0)).1 += live;
+            }
             self.trees.insert(id, TreeState { root, ..t });
         }
         Ok(())
     }
 
-    fn adopt_node(&mut self, from: &mut Env, ptr: NodePtr, parent: u32, tree: TreeId) -> Result<u32> {
-        // (the fork cannot write nodes: a tree filled there is in its memory)
-        let NodePtr::Mem(fid) = ptr else { return Err(SqlError::internal("adopted tree has a node on disk")) };
+    fn adopt_node(&mut self, from: &mut Env, fid: u32, parent: u32, tree: TreeId) -> u32 {
+        from.own(fid);
         let mut slot = from.slots[fid as usize].take().expect("dangling node slot");
         from.free_slots.push(fid);
         from.mem_bytes -= slot.mem;
-        from.dirty_bytes -= slot.mem;
-        debug_assert!(slot.dirty);
+        if slot.dirty {
+            from.dirty_bytes -= slot.mem;
+        }
         slot.parent = parent;
         slot.tree = tree;
         slot.version = self.next_stamp();
         slot.edits = 0;
         self.mem_bytes += slot.mem;
-        self.dirty_bytes += slot.mem;
-        let children: Vec<NodePtr> = match slot.node.as_deref() {
-            Some(Node::Internal(ch)) => ch.iter().map(|c| c.ptr).collect(),
+        if slot.dirty {
+            self.dirty_bytes += slot.mem;
+        }
+        let loaded: Vec<(usize, u32)> = match slot.node.as_deref() {
+            Some(Node::Internal(ch)) => ch
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| match c.ptr {
+                    NodePtr::Mem(cid) => Some((i, cid)),
+                    NodePtr::Disk(_) => None,
+                })
+                .collect(),
             _ => Vec::new(),
         };
-        slot.loaded_children = children.len() as u32;
+        slot.loaded_children = loaded.len() as u32;
         let id = match self.free_slots.pop() {
             Some(id) => {
                 self.slots[id as usize] = Some(slot);
@@ -2587,17 +2684,17 @@ impl Env {
                 (self.slots.len() - 1) as u32
             }
         };
-        if !children.is_empty() {
-            let mut moved = Vec::with_capacity(children.len());
-            for c in children {
-                moved.push(self.adopt_node(from, c, id, tree)?);
+        if !loaded.is_empty() {
+            let mut moved = Vec::with_capacity(loaded.len());
+            for (i, cid) in loaded {
+                moved.push((i, self.adopt_node(from, cid, id, tree)));
             }
             let Node::Internal(ch) = self.node_mut(id) else { unreachable!() };
-            for (c, m) in ch.iter_mut().zip(moved) {
-                c.ptr = NodePtr::Mem(m);
+            for (i, m) in moved {
+                ch[i].ptr = NodePtr::Mem(m);
             }
         }
-        Ok(id)
+        id
     }
 
     // ------------------------------------------------------------------

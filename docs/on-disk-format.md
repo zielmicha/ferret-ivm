@@ -325,22 +325,26 @@ header. Reading a node reads exactly `len` bytes at `off` and checks that
 `frame.len + 8 == len` and the CRC (`node frame length mismatch`,
 `node checksum mismatch`, SQLSTATE `XX001`).
 
-- Segments are written append-only, by checkpoints and by the buffer
-  pool's early writes of dirty nodes (which no manifest record refers to
-  until a checkpoint names a root above them), through a buffer that is
-  written out when it exceeds 4 MiB, before a read of a frame still in it,
-  and at the checkpoint's sync.
+- Segments are written append-only, by checkpoints and by the early writes
+  of dirty nodes — the engine's buffer pool's, also while a checkpoint is
+  being written, and those of forks of the store (hydrations), whose trees
+  are adopted with their frames — which no manifest record refers to until
+  a checkpoint names a root above them. All writers share one append side:
+  frames are appended whole, one after another, through a buffer that is
+  written out when it exceeds 4 MiB and at the checkpoint's sync (a frame
+  still in it is read from it).
 - Before each append, if the active segment holds at least 256 MiB
   (268,435,456 bytes), it is sealed and segment `id + 1` is created (an
   existing file of that name is truncated) and the store directory
   `fsync`ed. Sealed segments are never modified; they are `fsync`ed at the
-  next sync and deleted whole once no live node remains in them.
+  next sync and deleted whole once no live node remains in them (see
+  [Garbage collection and retention](#garbage-collection-and-retention)).
 - On open, the active segment named by the last checkpoint (segment 1 for a
   new store) is opened, created if missing (then the store directory is
   `fsync`ed), and resized to the checkpoint's `active_len` (0 for a new
   store) — discarding nodes written after the checkpoint (early, or by an
   interrupted checkpoint). Every other `seg-*.dat` that the checkpoint's
-  segment table does not list is deleted.
+  segment table does not list is deleted (segments started since).
 
 ### Leaf node
 
@@ -590,9 +594,17 @@ segments each tree has nodes in).
    modify since, are clean: their frames are referred to as they are, and
    are counted in the segment table like any other.)
 2. The active segment and any segments sealed since the last checkpoint are
-   `fsync`ed.
+   `fsync`ed. The record's `active_seg` and `active_len` are what this
+   sync covered; each segment's `total_bytes` is its length (also counting
+   frames others appended while the checkpoint was being written, garbage
+   in it), and frames appended after the sync lie beyond `active_len` or in
+   segments the record does not list.
 3. The checkpoint record is appended to the manifest.
-4. Sealed segments whose `live_bytes` is 0 are deleted.
+4. Sealed segments whose `live_bytes` is 0 are deleted — once the running
+   engine has taken the checkpoint as written, and only those that hold no
+   live node for it either (it may have written to them, or adopted a fork's
+   tree with nodes in them, since the checkpoint was begun) and that no
+   fork still writing to them pins.
 
 Creating a segment file (the first one, and each new active segment) is
 followed by an `fsync` of the store directory, so that a checkpoint never
@@ -1098,7 +1110,9 @@ checkpoint of a running engine).
   space section the same live bytes per tree. A node frame stops being live
   when its node is modified (dirty), dropped, or released with its tree.
 - **Deletion**: after each checkpoint, sealed segments with zero live bytes
-  are deleted. The active segment is never deleted or collected.
+  in it are deleted, unless the running engine still holds live nodes in
+  them or a fork pins them (see [Checkpoint procedure](#checkpoint-procedure)).
+  The active segment is never deleted or collected.
 - **Compaction**: compacting a history at frontier *f* merges its elements
   at or before *f* into one stamped with the latest of their GSNs, dropped
   if their weights add up to 0; an entry left without elements is removed.

@@ -223,12 +223,15 @@ records and answering requests:
 4. `CheckpointJob::run(header)`: write the frozen dirty nodes, `fsync`,
    append the manifest record — the trees, the segments, the header naming
    the metadata tree and each tree's live bytes per segment, tens of bytes
-   per tree — (the commit point), delete dead segments.
+   per tree — (the commit point). The engine's buffer pool, and forks
+   hydrating, go on writing other nodes early meanwhile, to the same active
+   segment.
 
 Back on the engine thread, once it is written (the thread sends `Wake`):
 
 5. `Env::finish_checkpoint`: mark the written nodes that did not change
-   meanwhile clean;
+   meanwhile clean, and delete the segments dead in the checkpoint that are
+   dead in the engine's state too and that no fork pins;
 6. send `Truncate(checkpoint GSN)` to the sequencer, which deletes log
    segments whose records all lie at or before the checkpoint: recovery
    replays the log after the checkpoint, and nothing else reads the log

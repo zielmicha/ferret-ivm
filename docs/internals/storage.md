@@ -429,18 +429,28 @@ prefix. `EXPLAIN MAINTENANCE` and `SHOW` use tree counts.
 at that moment, for another thread: it shares the loaded nodes (each side
 copies a shared node before modifying it, see above) and holds the segment
 files with live nodes open, so that it can still read nodes whose segments a
-later checkpoint deletes (frames written early are handed to the OS
-first). It has a buffer pool of its own (with the same target), evicts its
-own clean nodes, and can be modified — in memory only: it has no append
-side, so it cannot take checkpoints or write nodes early. Taking a fork
-copies the slot table (one reference count increment per loaded node), not
-the nodes.
+later checkpoint deletes. It can be modified, and it shares the store's
+append side, so its buffer pool works like any other: it writes dirty nodes
+early and evicts them, and a large hydration in a fork stays within its
+pool. Its pool counts only the fork's own nodes against its target — those
+it loads, creates, copies or modifies, and the ones it inherited that
+nobody else holds any more (the environment modified or evicted its
+version): the nodes still shared with the environment cost the fork
+nothing, and it neither writes nor evicts them (it would only write the
+environment's dirty nodes again). The bytes it appends are added to the
+environment's segment totals (`count_foreign`, before a checkpoint, a
+maintenance pass or an adoption), and every segment it appends to is
+pinned — not deleted, also once dead — until it is dropped. It cannot take
+checkpoints. Taking a fork copies the slot table (one reference count
+increment per loaded node), not the nodes.
 
 A tree created empty in the environment before the fork and filled in the
-fork can be moved back with `Env::adopt_trees`: its nodes (all of them in
-the fork's memory, and dirty) are moved into the environment's slots, not
-copied. Hydration off the engine thread is built on this
-([Dataflow](dataflow.md#hydration)).
+fork can be moved back with `Env::adopt_trees`: its loaded nodes, dirty or
+written, are moved into the environment's slots, not copied, and those on
+disk stay where the fork wrote them, now counting as live in the
+environment (their segments are pinned until then). Hydration off the
+engine thread is built on this
+([Dataflow](dataflow.md#hydration-off-the-engine-thread)).
 
 ## Segments and checkpoints
 
@@ -459,22 +469,28 @@ different threads:
 1. `Env::begin_checkpoint(gsn)` freezes a version of the dirty nodes: a
    checkpoint job holds them (shared, with their modification stamps), the
    clean nodes they and the tree roots point to, every tree's root, the
-   segment accounting, and the store's append side and manifest, which the
-   environment lacks until the job is finished (a second checkpoint cannot
-   begin meanwhile, and the buffer pool writes nothing early). The
-   environment goes on: nodes it modifies are copied from the frozen ones.
+   segment accounting, and the manifest, which the environment lacks until
+   the job is finished (a second checkpoint cannot begin meanwhile). The
+   append side is shared: the environment goes on, and nodes it modifies
+   are copied from the frozen ones; its pool goes on writing dirty nodes
+   early, to the same active segment, except the frozen ones (stamped
+   before the job began), which the job is writing (were both to write one,
+   a frozen parent marked clean by the job would refer to the job's frame
+   of a child the environment counts at another).
 2. `CheckpointJob::run(app)` writes every frozen dirty node of every tree
    (temporary trees aside, below), depth-first so that each parent is
    written after its children and records their locations, `min_seg` and
    `due`, and updates each tree's `min_seg` and `due`; `fsync`s the active
-   segment and any segments rolled over since the last sync; appends a
-   checkpoint record — sequence number, GSN, every tree's root location,
-   summary and `min_seg`, every segment's (total bytes, live bytes), the
+   segment and any segments rolled over since the last sync (outside the
+   append side's lock: the record names the length that sync covered, and
+   frames others append meanwhile lie beyond it); appends a checkpoint
+   record — sequence number, GSN, every tree's root location, summary and
+   `min_seg`, every segment's (total bytes, its length; live bytes), the
    active segment and its length, the next tree id, the application state
    (a header of a few bytes naming the metadata tree), and every tree's
    `due` and live bytes per segment — to `store/MANIFEST` and `fsync`s it
-   (this append is the commit point); then deletes sealed segments without
-   live bytes in the committed state.
+   (this append is the commit point). It returns the sealed segments
+   without live bytes in the committed state.
 3. `Env::finish_checkpoint` takes the append side and manifest back, and
    marks each written node clean, with its new location, if its slot still
    holds it unchanged (same stamp): it is then accounted as if written
@@ -483,11 +499,11 @@ different threads:
    ancestors), and the bytes the job wrote for the engine's updates count
    towards the next maintenance pass. A written node that was modified (or
    freed) since the job began stays dirty (or gone): its image is garbage
-   from the start, counted in its segment's total but not as live.
-   Segments the job deleted are forgotten: nothing the environment
-   references on disk lies outside the committed state (its clean nodes
-   were clean when the job began, or were written by it), so they are dead
-   here too.
+   from the start, counted in its segment's total but not as live. Then the
+   segments dead in the committed state are deleted if they are dead here
+   too — the environment may have written live frames to them, or adopted a
+   fork's tree with nodes in them, since the job began — and no fork pins
+   them.
 
 `Env::checkpoint(gsn, app)` does the three in a row.
 
