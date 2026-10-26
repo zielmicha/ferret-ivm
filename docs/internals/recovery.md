@@ -108,10 +108,10 @@ with status 1 at once) and accepts connections only once recovery is done.
    is `FORMAT` written; a crash in between finds a format-1 record (before
    the checkpoint's commit) or a current one (after it) at the next start,
    and migrates again or only writes `FORMAT`
-   ([Compatibility](../on-disk-format.md#migrating-format-1)). **Start** the sources (with their logged state
-   and resume LSN), the pending slot drops, the sequencer (whose next GSN is
-   the log's last GSN + 1), and the engine thread; then the server starts
-   accepting connections.
+   ([Compatibility](../on-disk-format.md#migrating-format-1)). **Start** the
+   sources (with their logged state and resume LSN), the pending slot drops,
+   the sequencer (whose next GSN is the log's last GSN + 1), and the engine
+   thread; then the server starts accepting connections.
 
 A data directory without a checkpoint replays the whole log from GSN 1 (the
 log is only truncated after checkpoints).

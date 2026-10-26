@@ -125,10 +125,10 @@ marked broken ([Recovery](operations.md#recovery)). What still keeps a data
 directory from starting: a missing or damaged manifest or segment file, a
 damaged or deleted input-log segment holding records after the last
 checkpoint, a data directory or checkpoint written by an incompatible (or
-newer) version ([Compatibility](../on-disk-format.md#compatibility)), and a log record
-other than DDL that fails to apply again during replay (a bug: such a
-record was skipped while the engine ran, and fails again on replay unless
-a checkpoint was taken after it).
+newer) version ([Compatibility](../on-disk-format.md#compatibility)), and a
+log record other than DDL that fails to apply again during replay (a bug:
+such a record was skipped while the engine ran, and fails again on replay
+unless a checkpoint was taken after it).
 
 Either restore a copy of the data directory taken before the problem, or
 start over with an empty data directory (and drop the old replication slots

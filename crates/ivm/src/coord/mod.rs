@@ -115,7 +115,7 @@ pub(crate) enum Wait {
 }
 
 /// DDL statements kept in the catalog history (`ivm.catalog_history`), the
-/// most recent ones (the engine keeps them in memory).
+/// most recent ones (kept in memory and in the metadata tree).
 pub const MAX_HISTORY: usize = 10_000;
 
 /// Clock ticks that change nothing but the clock only cost replay time: they
