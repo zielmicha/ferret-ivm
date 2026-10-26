@@ -11,7 +11,8 @@
 //! trees (`Env::adopt_trees`, which moves their nodes) and the fragment is
 //! maintained with the rest from the next record on. Its contents are
 //! exactly those an inline hydration at *g* followed by the same steps
-//! would have produced, and its arrangements' history starts at *g*.
+//! would have produced. (The version read is the fork, never the trees'
+//! history; the catch-up comes from the forwarded changes.)
 //!
 //! Meanwhile the engine applies records (the views that exist go on being
 //! maintained), but stops at the next DDL or schema record until the
@@ -100,9 +101,8 @@ pub(crate) struct PendingSub {
 }
 
 enum ToFork {
-    /// A Commit's or Tick's dataflow input: table changes, the clock, and
-    /// the retention frontier after it.
-    Step { gsn: Gsn, changes: FxHashMap<NodeId, Vec<TableChange>>, now: i64, frontier: Gsn },
+    /// A Commit's or Tick's dataflow input: table changes and the clock.
+    Step { gsn: Gsn, changes: FxHashMap<NodeId, Vec<TableChange>>, now: i64 },
     Finish,
 }
 
@@ -144,10 +144,9 @@ fn run(
     let mut steps = Vec::new();
     loop {
         match rx.recv() {
-            Ok(ToFork::Step { gsn, changes, now, frontier }) => {
+            Ok(ToFork::Step { gsn, changes, now }) => {
                 graph.now = now;
                 let out = graph.step(&mut env, gsn, changes)?;
-                env.set_frontier(frontier);
                 if !watch.is_empty() {
                     steps.push((gsn, watch.iter().filter_map(|(n, _)| out.get(n).map(|o| (*n, o.clone()))).collect()));
                 }
@@ -237,7 +236,6 @@ impl Engine {
     /// half the speed of maintaining everything including the new
     /// fragment, which is what it will have to do once it is live).
     pub(crate) fn forward_to_hydration(&mut self, gsn: Gsn, by_node: &FxHashMap<NodeId, Vec<TableChange>>) -> Result<()> {
-        let frontier = gsn.saturating_sub(self.cfg.retention_gsns.max(1));
         let now = self.graph.now;
         let Some(h) = self.hydration.as_mut() else { return Ok(()) };
         let target = if h.hydrated.load(Ordering::Acquire) {
@@ -258,7 +256,7 @@ impl Engine {
         drop(g);
         let changes = by_node.iter().filter(|(n, _)| h.tables.contains(n)).map(|(n, c)| (*n, c.clone())).collect();
         // (a hydration that failed reports it when polled)
-        let _ = h.tx.send(ToFork::Step { gsn, changes, now, frontier });
+        let _ = h.tx.send(ToFork::Step { gsn, changes, now });
         h.forwarded = gsn;
         Ok(())
     }

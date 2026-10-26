@@ -107,8 +107,7 @@ DDL record and the checkpoints:
 - A checkpoint taken between *g* and *p* holds the object in the catalog,
   but not its trees (they are not hydrated in the engine), and not a view's
   error counts. Recovery from it rebuilds the object as of the checkpoint
-  GSN and the view takes its root's error records, as a new view does; the
-  rebuilt arrangements' history starts at the checkpoint instead of at *g*.
+  GSN and the view takes its root's error records, as a new view does.
 - A crash before a checkpoint after *g* replays the DDL record, which
   hydrates inline as of *g*; the records after it are replayed as usual.
 

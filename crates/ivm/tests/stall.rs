@@ -121,10 +121,9 @@ fn gsn(h: &EngineHandle) -> u64 {
 
 /// Requests that read a view still being hydrated wait for it (they would
 /// otherwise read it empty); commits that do not read it do not wait; DDL
-/// logged meanwhile is applied after it. Views created over it, an index
-/// on it and a subscription to it all see its full contents, and reads as
-/// of GSNs applied while it was hydrating see the contents then (its
-/// history starts at its DDL's GSN).
+/// logged meanwhile is applied after it. Reads, DML and a subscription
+/// issued while it hydrates, views created over it and an index on it all
+/// see its full contents, including a commit applied meanwhile.
 #[test]
 fn requests_reading_a_hydrating_view_wait_for_it() {
     let _serial = serial();
@@ -179,9 +178,6 @@ fn requests_reading_a_hydrating_view_wait_for_it() {
     assert_eq!(rows(&h, "SELECT total FROM over_slow"), vec![n.clone()]);
     assert_eq!(results[4], vec!["CREATE INDEX".to_string()]);
     assert_eq!(rows(&h, "SELECT count(*) FROM slow WHERE n = 1"), vec!["1"]);
-    // as of a GSN applied while it was hydrating
-    assert_eq!(rows(&h, &format!("SELECT sum(n) FROM slow AS OF {g0}")), vec![BIG.to_string()]);
-    assert_eq!(rows(&h, &format!("SELECT sum(n) FROM slow AS OF {g1}")), vec![n]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

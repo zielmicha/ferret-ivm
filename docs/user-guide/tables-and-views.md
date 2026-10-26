@@ -186,8 +186,7 @@ and answering other statements. The statement returns once the view is
 maintained like the others, so a large view takes about as long as one scan
 of its inputs. Until then the view is listed (with no rows), statements
 reading it wait for it, and DDL logged after it waits too (the changes
-logged after that DDL with it); its history for `AS OF` reads starts at the
-statement's GSN. `CREATE INDEX` works the same way.
+logged after that DDL with it). `CREATE INDEX` works the same way.
 
 Errors found while binding and planning the query (unknown columns,
 unsupported constructs, non-deterministic functions, a column list that is

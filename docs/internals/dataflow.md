@@ -468,7 +468,7 @@ snapshot it from; operator error state copied, not shared), and hands both
 to a thread of its own (`ivm-hydrate`). That thread runs `Graph::hydrate` as
 of *g* there — the same computation as inline — and then applies every
 `Commit` and `Tick` record after *g*: the engine forwards each one's table
-changes (of the fork's tables), the clock and the retention frontier before
+changes (of the fork's tables) and the clock before
 applying it itself, and the thread runs `Graph::step` on its copy of the
 graph, which steps the new fragment and the existing nodes it reads. Once the
 thread has hydrated the fragment, the engine makes it catch up: before
@@ -478,11 +478,12 @@ of maintaining everything including the new fragment, which it will have to
 do once it is live). When the thread is at most 100 records behind, the
 engine waits for it to apply them and adopts the new trees
 (`Env::adopt_trees`, which moves their nodes) and the new nodes' state —
-hydration flags, `since` (= *g*), error records and per-group error state
+hydration flags, error records and per-group error state
 (`Graph::adopt_hydrated`); from the next record on the fragment is stepped
 by the engine with the rest. Its contents are exactly those of an inline
-hydration at *g* followed by the same steps, and its arrangements' history
-starts at *g*.
+hydration at *g* followed by the same steps. The version of the inputs it
+reads is the fork, not the trees' history, and the catch-up comes from the
+forwarded changes, not from the log.
 
 Meanwhile:
 
@@ -496,8 +497,8 @@ Meanwhile:
   applied since, as if it had been running from *g*).
 - Requests that read a relation still being hydrated — reads of the view,
   DML reading it, `SUBSCRIBE` to it — are parked (`Wait::Hydration`) and run
-  again once it is live (a fresh read then reads at a newer GSN; a read
-  `AS OF` a GSN at or after *g* reads that GSN, which its history covers).
+  again once it is live (a fresh read then reads the latest state, which
+  includes everything up to the GSN it waited for).
   A `SUBSCRIBE` to a query waits for the hydration in progress to be done
   before its own begins.
 - A checkpoint saves the view or index in the catalog without its trees
