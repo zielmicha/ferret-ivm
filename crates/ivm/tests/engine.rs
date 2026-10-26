@@ -616,6 +616,97 @@ fn replacing_a_view_leaves_subscriptions_to_its_twin_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Reads that stop at their LIMIT — in the order of an arrangement that is
+/// the ORDER BY (also within an equality on a key prefix, under computed
+/// columns, and AS OF an earlier GSN), or keeping only the top rows of
+/// another order — return what sorting the whole result returns. The
+/// reference queries order by `+ 0` expressions, which no arrangement is in.
+#[test]
+fn limited_reads_match_sorts() {
+    let dir = tmpdir("limited-reads");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v text)");
+    let mut rng = Rng(0x0BAD_5EED_1234_5678);
+    let vals: Vec<String> = (1..=2000)
+        .map(|i| {
+            let g = if i % 50 == 0 { "NULL".to_string() } else { rng.below(20).to_string() };
+            format!("({i}, {g}, 'v{}')", rng.below(1000))
+        })
+        .collect();
+    exec(&h, &format!("INSERT INTO t VALUES {}", vals.join(", ")));
+    exec(&h, "CREATE INDEX t_g ON t (g, id)");
+    // (in the ORDER BY clause, and an equality that an index could serve)
+    let slow = |q: &str| {
+        let (head, tail) = q.split_once(" ORDER BY ").unwrap();
+        let tail = tail.replace("id", "id + 0").replace("g ", "g + 0 ").replace("g,", "g + 0,").replace("v ", "v || '' ");
+        format!("{} ORDER BY {tail}", head.replace("g = ", "g + 0 = "))
+    };
+    let mut n = 0;
+    for q in [
+        "SELECT * FROM t ORDER BY id LIMIT 7",
+        "SELECT id, v FROM t ORDER BY id OFFSET 13 LIMIT 5",
+        "SELECT id FROM t WHERE id > 1500 ORDER BY id LIMIT 3",
+        "SELECT id, v FROM t WHERE g = 3 ORDER BY id LIMIT 4",
+        "SELECT g, id FROM t ORDER BY g, id LIMIT 9",
+        "SELECT g, id FROM t ORDER BY g, id OFFSET 1990 LIMIT 20",
+        "SELECT g, id FROM t ORDER BY g NULLS FIRST, id LIMIT 6",
+        "SELECT g, id FROM t ORDER BY g DESC, id LIMIT 5",
+        "SELECT id, id * 2 AS d FROM t ORDER BY id LIMIT 3",
+        "SELECT v, id FROM t ORDER BY v DESC, id LIMIT 8",
+        "SELECT t.id, u.v FROM t JOIN t u ON u.id = t.id + 1 ORDER BY t.id LIMIT 4",
+    ] {
+        let (fast, reference) = (rows(&h, q), rows(&h, &slow(q)));
+        assert_eq!(fast, reference, "{q}");
+        n += fast.len();
+    }
+    // with ties, the set of rows is determined
+    for q in ["SELECT g, id FROM t ORDER BY g FETCH FIRST 3 ROWS WITH TIES", "SELECT g, id FROM t ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES"] {
+        let (mut fast, mut reference) = (rows(&h, q), rows(&h, &slow(q)));
+        fast.sort();
+        reference.sort();
+        assert_eq!(fast, reference, "{q}");
+        assert!(fast.len() > 3, "{q}: {fast:?}");
+    }
+    // without ORDER BY, any rows that pass
+    assert_eq!(rows(&h, "SELECT id FROM t WHERE v LIKE 'v1%' LIMIT 5").len(), 5);
+    assert_eq!(rows(&h, "SELECT * FROM t LIMIT 0"), Vec::<String>::new());
+    assert_eq!(n, 64);
+    // as of an earlier GSN
+    let gsn: u64 = rows(&h, "SHOW GSN")[0].parse().unwrap();
+    exec(&h, "DELETE FROM t WHERE id % 2 = 0");
+    let q = format!("SELECT id, g FROM t ORDER BY id LIMIT 6 AS OF {gsn}");
+    assert_eq!(rows(&h, &q), rows(&h, &slow(&q)));
+    assert_eq!(rows(&h, &q).len(), 6);
+    assert_eq!(rows(&h, "SELECT id FROM t ORDER BY id LIMIT 2"), ["1", "3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A subscription's snapshot comes in chunks read from the arrangement
+/// (it used to be built whole on the engine thread and sent as one event).
+#[test]
+fn subscription_snapshots_come_in_chunks() {
+    let dir = tmpdir("sub-chunks");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int)");
+    exec(&h, "INSERT INTO t SELECT g, g % 7 FROM generate_series(1, 25000) g");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO t") else { panic!("not a subscription") };
+    let mut sizes = Vec::new();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)).expect("an event") {
+            SubEvent::Data { rows, .. } => sizes.push(rows.len()),
+            SubEvent::Progress { .. } => break,
+            SubEvent::Error(e) => panic!("subscription failed: {e}"),
+        }
+    }
+    assert_eq!(sizes.iter().sum::<usize>(), 25000);
+    assert!(sizes.len() >= 3 && sizes.iter().all(|n| *n <= 10_000), "{sizes:?}");
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Reads through arrangements (key ranges, column subsets, index lookups
 /// for joins) return what a plain scan returns. The reference queries hide
 /// the columns behind `+ 0`, which no index can serve.

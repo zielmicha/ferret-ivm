@@ -1,5 +1,12 @@
 //! Batch execution of logical plans against arrangements (point-in-time
 //! reads, including time travel via MVCC histories, and WITH RECURSIVE).
+//!
+//! Reads stream: `run_query` hands a query's result rows on as they are
+//! produced, scans stop once a LIMIT is reached (in the arrangement's order
+//! when it is the ORDER BY), ORDER BY with LIMIT keeps only the rows that
+//! can still be in the result, and only operators that need their whole
+//! input (joins' build sides, DISTINCT, set operations, window functions,
+//! recursion, sorts) hold it.
 
 use crate::dataflow::agg::AggSpec;
 use crate::dataflow::ops::RecursivePlan;
@@ -8,6 +15,7 @@ use crate::error::{codes, Result, SqlError};
 use crate::expr::func::func_def;
 use crate::expr::Expr;
 use crate::sql::plan::{JoinKind, Rel, SetOpKind, SortKey};
+use crate::sql::BoundQuery;
 use crate::storage::{AggKind, Env, ReadAt, Summary};
 use crate::types::encoding::{self, SortSpec};
 use crate::types::{Datum, Row, SqlType};
@@ -17,12 +25,18 @@ use std::ops::Bound;
 
 pub type Rows = Vec<(Row, i64)>;
 
+/// Receives the rows of a streamed read; false ends the read (it has what
+/// it needs).
+pub type RowSink<'s> = dyn FnMut(Row, i64) -> Result<bool> + 's;
+
 pub struct ExecCtx<'a> {
     pub g: &'a Graph,
     pub env: &'a mut Env,
     pub at: ReadAt,
     pub objects: &'a dyn Fn(u64) -> Option<NodeId>,
     pub rec: FxHashMap<u64, Rows>,
+    /// Arrangement entries the scans of base relations visited.
+    pub visited: u64,
 }
 
 const MAX_RECURSION: usize = 1_000_000;
@@ -103,9 +117,11 @@ impl<'a> ExecCtx<'a> {
             }
             Rel::Join { left, right, kind, on } => self.join(left, right, *kind, on),
             Rel::Aggregate { input, group, aggs } => {
-                let rows = self.execute(input)?;
+                // (the input is aggregated as it is read, not collected)
                 let in_schema = input.schema();
-                aggregate(rows, group, aggs, &in_schema)
+                let mut agg = Aggregator::new(group, aggs, &in_schema);
+                self.stream(input, &mut |r, w| agg.push(r, w).map(|_| true))?;
+                agg.finish()
             }
             Rel::Distinct { input } => {
                 let mut rows = self.execute(input)?;
@@ -174,7 +190,17 @@ impl<'a> ExecCtx<'a> {
                 Ok(out)
             }
             Rel::TopK { input, group, order, limit, offset, with_ties } => {
-                let rows = self.execute(input)?;
+                let rows = if group.is_empty() {
+                    // only the rows that can be in the result are kept
+                    let mut top = TopN::new(order, limit.map(|l| l.saturating_add(*offset)), *with_ties);
+                    self.stream(input, &mut |r, w| {
+                        top.push(r, w);
+                        Ok(true)
+                    })?;
+                    top.finish()
+                } else {
+                    self.execute(input)?
+                };
                 Ok(topk(rows, group, order, *limit, *offset, *with_ties))
             }
             Rel::Window { input, funcs } => {
@@ -228,9 +254,10 @@ impl<'a> ExecCtx<'a> {
 
     /// The arrangement and key range of `node` to read for rows passing
     /// `preds`: equalities with constants on a key prefix, optionally
-    /// followed by a range on the next key column. None when no predicate
-    /// narrows any arrangement.
-    fn index_range(&self, node: NodeId, preds: &[Expr]) -> Option<(usize, Vec<u8>, Option<Vec<u8>>)> {
+    /// followed by a range on the next key column; and the number of key
+    /// columns the equalities fix. None when no predicate narrows any
+    /// arrangement.
+    fn index_range(&self, node: NodeId, preds: &[Expr]) -> Option<KeyRange> {
         let mut conj: Vec<&Expr> = Vec::new();
         fn flatten<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
             match e {
@@ -302,6 +329,7 @@ impl<'a> ExecCtx<'a> {
             }
         }
         let (arr, vals, lo, hi) = best?;
+        let fixed = vals.len();
         let layout = &self.g.arr(arr).layout;
         let prefix = layout.encode_prefix(&vals);
         let bound_key = |d: &Datum| {
@@ -319,7 +347,7 @@ impl<'a> ExecCtx<'a> {
             Some((d, false)) => Some(bound_key(d)),
             None => encoding::prefix_successor(&prefix),
         };
-        Some((arr, lo_key, hi_key))
+        Some((arr, lo_key, hi_key, fixed))
     }
 
     /// Read a base relation (a table or materialized view) through its
@@ -327,29 +355,48 @@ impl<'a> ExecCtx<'a> {
     /// the columns the projection and the predicates need. None when the
     /// relation has no arrangement to read.
     fn scan_base(&mut self, b: &BaseAccess) -> Result<Option<Rows>> {
+        let mut out = Vec::new();
+        let r = self.scan_base_into(b, &mut |r, w| {
+            out.push((r, w));
+            Ok(true)
+        })?;
+        Ok(r.map(|_| out))
+    }
+
+    /// `scan_base`, handing the rows to `sink` as they are read. Whether the
+    /// scan ran to its end, or None when there is no arrangement to read.
+    fn scan_base_into(&mut self, b: &BaseAccess, sink: &mut RowSink) -> Result<Option<bool>> {
         let Some(node) = (self.objects)(b.id) else { return Ok(None) };
         let (arr, lo_key, hi_key) = match self.index_range(node, &b.preds) {
-            Some(r) => r,
+            Some((a, lo, hi, _)) => (a, lo, hi),
             // (the general path reports reads before an arrangement's history)
             None => match self.g.arrangement_at(node, self.at) {
                 Some(a) => (a, Vec::new(), None),
                 None => return Ok(None),
             },
         };
+        self.scan_range(b, arr, &lo_key, hi_key.as_deref(), sink).map(Some)
+    }
+
+    /// The rows of `b` in arrangement `arr` from key `lo` to before `hi`, in
+    /// the arrangement's order, handed to `sink`; whether the scan ran to
+    /// its end.
+    fn scan_range(&mut self, b: &BaseAccess, arr: usize, lo: &[u8], hi: Option<&[u8]>, sink: &mut RowSink) -> Result<bool> {
         let a = self.g.arr(arr);
         let layout = &a.layout;
         let plan = b.cols.as_ref().and_then(|cols| {
             let needed: Vec<usize> = cols.iter().copied().chain(b.preds.iter().flat_map(|p| p.column_set())).collect();
             layout.decode_plan(&needed)
         });
-        let hi = match &hi_key {
-            Some(h) => Bound::Excluded(h.as_slice()),
+        let hi = match hi {
+            Some(h) => Bound::Excluded(h),
             None => Bound::Unbounded,
         };
         let (at, preds, cols) = (self.at, &b.preds, &b.cols);
         let distinct = cols.as_ref().is_some_and(|c| c.iter().enumerate().all(|(i, x)| !c[..i].contains(x)));
-        let mut out = Vec::new();
-        self.env.for_each(a.tree, Bound::Included(&lo_key), hi, &mut |k, h| {
+        let (mut visited, mut done) = (0u64, true);
+        self.env.for_each(a.tree, Bound::Included(lo), hi, &mut |k, h| {
+            visited += 1;
             let w = h.weight(at);
             if w <= 0 {
                 return Ok(true);
@@ -360,21 +407,225 @@ impl<'a> ExecCtx<'a> {
                     return Ok(true);
                 }
             }
-            out.push((
-                match cols {
-                    // distinct columns are moved out of the decoded row
-                    Some(cols) if distinct => cols.iter().map(|c| std::mem::replace(&mut r[*c], Datum::Null)).collect(),
-                    Some(cols) => cols.iter().map(|c| r[*c].clone()).collect(),
-                    None => r,
-                },
-                w,
-            ));
+            let row = match cols {
+                // distinct columns are moved out of the decoded row
+                Some(cols) if distinct => cols.iter().map(|c| std::mem::replace(&mut r[*c], Datum::Null)).collect(),
+                Some(cols) => cols.iter().map(|c| r[*c].clone()).collect(),
+                None => r,
+            };
+            done = sink(row, w)?;
+            Ok(done)
+        })?;
+        self.visited += visited;
+        Ok(done)
+    }
+
+    /// Run `rel`, handing its rows to `sink` as they are produced: base
+    /// relations are read through their arrangements, and filters,
+    /// projections, maps, set-returning functions, UNION ALL and the probe
+    /// side of joins pass rows on as they come, so a read ends as soon as
+    /// `sink` has what it needs. Other operators compute their result first
+    /// (`execute`). Returns whether the read ran to its end.
+    pub fn stream(&mut self, rel: &Rel, sink: &mut RowSink) -> Result<bool> {
+        if matches!(rel, Rel::Get { .. } | Rel::Filter { .. } | Rel::Project { .. })
+            && let Some(b) = base_access(rel)
+            && let Some(done) = self.scan_base_into(&b, sink)?
+        {
+            return Ok(done);
+        }
+        match rel {
+            Rel::Map { input, exprs } => self.stream(input, &mut |mut r, w| {
+                for e in exprs {
+                    let v = e.eval(&r)?;
+                    r.push(v);
+                }
+                sink(r, w)
+            }),
+            Rel::Filter { input, preds } => self.stream(input, &mut |r, w| {
+                for p in preds {
+                    if !p.eval_pred(&r)? {
+                        return Ok(true);
+                    }
+                }
+                sink(r, w)
+            }),
+            Rel::Project { input, cols } => self.stream(input, &mut |r, w| sink(cols.iter().map(|c| r[*c].clone()).collect(), w)),
+            Rel::UnionAll { inputs } => {
+                for i in inputs {
+                    if !self.stream(i, sink)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Rel::Negate { input } => self.stream(input, &mut |r, w| sink(r, -w)),
+            Rel::FlatMap { input, funcs, ordinality, .. } => self.stream(input, &mut |r, w| {
+                for extra in crate::dataflow::tablefunc::eval(funcs, &r, *ordinality)? {
+                    let mut row = r.clone();
+                    row.extend(extra);
+                    if !sink(row, w)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }),
+            Rel::Join { left, right, kind, on } => self.join_into(left, right, *kind, on, sink),
+            _ => {
+                for (r, w) in self.execute(rel)? {
+                    if !sink(r, w)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// The result rows of a query — its plan with ORDER BY, OFFSET, LIMIT
+    /// and WITH TIES applied, without the hidden sort columns — handed to
+    /// `out` in order as they are found (false from `out` ends the read). A
+    /// read without ORDER BY stops once it has its LIMIT; one whose ORDER
+    /// BY is the order of an arrangement it can read scans that in order
+    /// and stops too; otherwise ORDER BY with LIMIT keeps only the rows that
+    /// can still be in the result, and ORDER BY alone sorts the result.
+    pub fn run_query(&mut self, q: &BoundQuery, out: &mut dyn FnMut(Row) -> Result<bool>) -> Result<()> {
+        let mut emit = Emitter::new(q, out);
+        if has_negate(&q.rel) {
+            // negative weights cancel positive ones: consolidated first
+            let mut rows = self.execute(&q.rel)?;
+            consolidate(&mut rows);
+            rows.retain(|(_, w)| *w > 0);
+            if !q.order.is_empty() {
+                sort_rows(&mut rows, &q.order);
+            }
+            for (r, w) in rows {
+                if !emit.push(r, w)? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+        if q.order.is_empty() {
+            self.stream(&q.rel, &mut |r, w| emit.push(r, w))?;
+            return Ok(());
+        }
+        if let Some(read) = self.ordered_read(&q.rel, &q.order) {
+            self.scan_range(&read.base, read.arr, &read.lo, read.hi.as_deref(), &mut |mut r, w| {
+                for layer in &read.layers {
+                    match layer {
+                        Rel::Map { exprs, .. } => {
+                            for e in exprs {
+                                let v = e.eval(&r)?;
+                                r.push(v);
+                            }
+                        }
+                        Rel::Filter { preds, .. } => {
+                            for p in preds {
+                                if !p.eval_pred(&r)? {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        Rel::Project { cols, .. } => r = cols.iter().map(|c| r[*c].clone()).collect(),
+                        _ => unreachable!("ordered_read layers"),
+                    }
+                }
+                emit.push(r, w)
+            })?;
+            return Ok(());
+        }
+        let mut top = TopN::new(&q.order, q.limit.map(|l| l.saturating_add(q.offset)), q.with_ties);
+        self.stream(&q.rel, &mut |r, w| {
+            top.push(r, w);
             Ok(true)
         })?;
-        Ok(Some(out))
+        for (r, w) in top.finish() {
+            if !emit.push(r, w)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// How to read `rel` in `order` from an arrangement: the base relation
+    /// under maps, filters and projections applied to each row on the way
+    /// up (`layers`, innermost first; the order's columns must come from
+    /// the base relation), and an arrangement range whose key order, after
+    /// the key columns its equalities fix, is `order`. None if there is
+    /// none, or if an equality narrows the read to another index (reading
+    /// that and sorting is cheaper).
+    fn ordered_read<'r>(&self, rel: &'r Rel, order: &[SortKey]) -> Option<OrderedRead<'r>> {
+        let mut layers = Vec::new();
+        let mut cols: Vec<usize> = order.iter().map(|k| k.col).collect();
+        let mut r = rel;
+        let base = loop {
+            if let Some(b) = base_access(r) {
+                break b;
+            }
+            let input = match r {
+                Rel::Map { input, exprs } => {
+                    // (a computed copy of a column, as sort keys are, is that column)
+                    let n = input.arity();
+                    let resolve = |mut c: usize| {
+                        while c >= n {
+                            match exprs.get(c - n) {
+                                Some(Expr::Column(k)) if *k < c => c = *k,
+                                _ => return None,
+                            }
+                        }
+                        Some(c)
+                    };
+                    cols = cols.iter().map(|c| resolve(*c)).collect::<Option<_>>()?;
+                    input
+                }
+                Rel::Filter { input, .. } => input,
+                Rel::Project { input, cols: p } => {
+                    cols = cols.iter().map(|c| p[*c]).collect();
+                    input
+                }
+                _ => return None,
+            };
+            layers.push(r);
+            r = input;
+        };
+        layers.reverse();
+        let node = (self.objects)(base.id)?;
+        let schema = &self.g.node(node).schema;
+        let arity = base.cols.as_ref().map_or(schema.len(), |c| c.len());
+        if cols.iter().any(|c| *c >= arity) {
+            return None;
+        }
+        let keys: Vec<(usize, SortSpec)> = cols.iter().zip(order).map(|(c, k)| (base.cols.as_ref().map_or(*c, |b| b[*c]), k.spec)).collect();
+        let in_order = |a: usize, fixed: usize| {
+            let l = &self.g.arr(a).layout;
+            keys.iter().enumerate().all(|(i, (c, spec))| {
+                let j = fixed + i;
+                j < l.key.len() && matches!(l.key[j], Expr::Column(k) if k == *c) && l.specs[j] == *spec && l.key_types[j] == schema[*c].ty
+            })
+        };
+        let (arr, lo, hi) = match self.index_range(node, &base.preds) {
+            Some((a, lo, hi, fixed)) if in_order(a, fixed) => (a, lo, hi),
+            Some((_, _, _, fixed)) if fixed > 0 => return None,
+            _ => {
+                let a = self.g.node(node).arrangements.iter().copied().find(|a| self.g.arr(*a).covers(self.at) && in_order(*a, 0))?;
+                (a, Vec::new(), None)
+            }
+        };
+        Some(OrderedRead { base, arr, lo, hi, layers })
     }
 
     fn join(&mut self, left: &Rel, right: &Rel, kind: JoinKind, on: &[Expr]) -> Result<Rows> {
+        let mut out = Vec::new();
+        self.join_into(left, right, kind, on, &mut |r, w| {
+            out.push((r, w));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// `join`, handing the joined rows to `sink` as they are found; whether
+    /// it ran to its end.
+    fn join_into(&mut self, left: &Rel, right: &Rel, kind: JoinKind, on: &[Expr], sink: &mut RowSink) -> Result<bool> {
         let nl = left.arity();
         let nr = right.arity();
         let l = self.execute(left)?;
@@ -404,9 +655,9 @@ impl<'a> ExecCtx<'a> {
         }
         // a few left rows probe an index of the right side instead of scanning it
         if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Semi | JoinKind::Anti)
-            && let Some(rows) = self.index_join(&l, left, right, kind, &equi, &residual)?
+            && let Some(done) = self.index_join(&l, left, right, kind, &equi, &residual, sink)?
         {
-            return Ok(rows);
+            return Ok(done);
         }
         let r = self.execute(right)?;
         // hash the right side
@@ -426,7 +677,6 @@ impl<'a> ExecCtx<'a> {
                 table.entry(key_bytes(&kv)).or_default().push(i);
             }
         }
-        let mut out = Vec::new();
         let mut right_matched = vec![false; r.len()];
         for (lrow, lw) in &l {
             let mut kv = Vec::with_capacity(equi.len());
@@ -457,20 +707,29 @@ impl<'a> ExecCtx<'a> {
                         right_matched[i] = true;
                         match kind {
                             JoinKind::Semi | JoinKind::Anti => break,
-                            _ => out.push((joined, lw * rw)),
+                            _ => {
+                                if !sink(joined, lw * rw)? {
+                                    return Ok(false);
+                                }
+                            }
                         }
                     }
                 }
             }
-            match kind {
-                JoinKind::Semi if matched => out.push((lrow.clone(), *lw)),
-                JoinKind::Anti if !matched => out.push((lrow.clone(), *lw)),
+            let unmatched = match kind {
+                JoinKind::Semi if matched => Some(lrow.clone()),
+                JoinKind::Anti if !matched => Some(lrow.clone()),
                 JoinKind::Left | JoinKind::Full if !matched => {
                     let mut joined = lrow.clone();
                     joined.extend(std::iter::repeat_n(Datum::Null, nr));
-                    out.push((joined, *lw));
+                    Some(joined)
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(row) = unmatched
+                && !sink(row, *lw)?
+            {
+                return Ok(false);
             }
         }
         if matches!(kind, JoinKind::Right | JoinKind::Full) {
@@ -478,17 +737,20 @@ impl<'a> ExecCtx<'a> {
                 if !right_matched[i] {
                     let mut joined: Row = std::iter::repeat_n(Datum::Null, nl).collect();
                     joined.extend(rrow.iter().cloned());
-                    out.push((joined, *rw));
+                    if !sink(joined, *rw)? {
+                        return Ok(false);
+                    }
                 }
             }
         }
-        Ok(out)
+        Ok(true)
     }
 
     /// Join `l` (the rows of `left`) with `right`, a base relation (possibly
     /// filtered), by looking up each left row's key in an arrangement of the
-    /// right relation keyed by columns it is equated with. None when there is
-    /// no such arrangement or the left side is not small compared to it.
+    /// right relation keyed by columns it is equated with, handing the
+    /// joined rows to `sink`. None when there is no such arrangement or the
+    /// left side is not small compared to it; else whether it ran to its end.
     #[allow(clippy::too_many_arguments)]
     fn index_join(
         &mut self,
@@ -498,7 +760,8 @@ impl<'a> ExecCtx<'a> {
         kind: JoinKind,
         equi: &[(Expr, Expr, bool)],
         residual: &[Expr],
-    ) -> Result<Option<Rows>> {
+        sink: &mut RowSink,
+    ) -> Result<Option<bool>> {
         let Some(b) = base_access(right) else { return Ok(None) };
         if equi.is_empty() {
             return Ok(None);
@@ -546,7 +809,6 @@ impl<'a> ExecCtx<'a> {
             layout.decode_plan(&needed)
         });
         let nr = right.arity();
-        let mut out = Vec::new();
         for (lrow, lw) in l {
             let mut kv = Vec::with_capacity(used.len());
             for &i in &used {
@@ -596,22 +858,31 @@ impl<'a> ExecCtx<'a> {
                     matched = true;
                     match kind {
                         JoinKind::Semi | JoinKind::Anti => break,
-                        _ => out.push((joined, lw * rw)),
+                        _ => {
+                            if !sink(joined, lw * rw)? {
+                                return Ok(Some(false));
+                            }
+                        }
                     }
                 }
             }
-            match kind {
-                JoinKind::Semi if matched => out.push((lrow.clone(), *lw)),
-                JoinKind::Anti if !matched => out.push((lrow.clone(), *lw)),
+            let unmatched = match kind {
+                JoinKind::Semi if matched => Some(lrow.clone()),
+                JoinKind::Anti if !matched => Some(lrow.clone()),
                 JoinKind::Left if !matched => {
                     let mut joined = lrow.clone();
                     joined.extend(std::iter::repeat_n(Datum::Null, nr));
-                    out.push((joined, *lw));
+                    Some(joined)
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(row) = unmatched
+                && !sink(row, *lw)?
+            {
+                return Ok(Some(false));
             }
         }
-        Ok(Some(out))
+        Ok(Some(true))
     }
 
     fn recursive(&mut self, id: u64, base: &Rel, step: &Rel, distinct: bool) -> Result<Rows> {
@@ -698,6 +969,10 @@ fn base_access(rel: &Rel) -> Option<BaseAccess> {
     }
 }
 
+/// An arrangement, the key range to read in it (from, before), and the
+/// number of its key columns that equalities fix.
+type KeyRange = (usize, Vec<u8>, Option<Vec<u8>>, usize);
+
 /// An arrangement with the values of the equalities on a prefix of its key,
 /// and the lower and upper bound (inclusive?) on the next key column.
 type IndexRange<'a> = (usize, Vec<Datum>, Option<&'a Datum>, Option<(&'a Datum, bool)>);
@@ -758,7 +1033,7 @@ fn literal_matches(d: &Datum, t: &SqlType) -> bool {
 pub fn eval_recursive(g: &Graph, env: &mut Env, p: &RecursivePlan) -> Result<Rows> {
     let sources = p.sources.clone();
     let objects = move |oid: u64| sources.iter().find(|(o, _)| *o == oid).map(|(_, n)| *n);
-    let mut ctx = ExecCtx { g, env, at: ReadAt::Latest, objects: &objects, rec: FxHashMap::default() };
+    let mut ctx = ExecCtx { g, env, at: ReadAt::Latest, objects: &objects, rec: FxHashMap::default(), visited: 0 };
     let mut rows = ctx.recursive(p.rec_id, &p.base, &p.step, p.distinct)?;
     consolidate(&mut rows);
     Ok(rows)
@@ -841,131 +1116,291 @@ fn topk(rows: Rows, group: &[usize], order: &[SortKey], limit: Option<u64>, offs
     out
 }
 
-/// Hash aggregation.
-pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall], in_schema: &[crate::types::ColumnType]) -> Result<Rows> {
-    let specs: Vec<AggSpec> = aggs
-        .iter()
-        .map(|a| AggSpec {
-            func: a.func,
-            arg: a.args.first().copied(),
-            arg2: a.args.get(1).copied(),
-            filter: a.filter,
-            arg_type: a.args.first().map(|c| in_schema[*c].ty.clone()).unwrap_or(SqlType::Int8),
-            ret: a.ret.clone(),
-            fraction: a.fraction,
-        })
-        .collect();
-    let mut kinds: Vec<(AggKind, Expr)> = Vec::new();
-    let mut slots = Vec::new();
-    for s in &specs {
-        let mut sl = Vec::new();
-        for k in s.summaries() {
-            sl.push(kinds.len());
-            kinds.push(k);
+/// A group of a hash aggregation.
+struct AggGroup {
+    key_row: Row,
+    summary: Summary,
+    rows: Rows,
+}
+
+/// Hash aggregation, fed one row at a time.
+struct Aggregator<'a> {
+    group: &'a [usize],
+    aggs: &'a [crate::sql::plan::AggCall],
+    specs: Vec<AggSpec>,
+    kinds: Vec<(AggKind, Expr)>,
+    slots: Vec<Vec<usize>>,
+    spec_kinds: Vec<AggKind>,
+    any_ordered: bool,
+    groups: FxHashMap<Vec<u8>, AggGroup>,
+    order_keys: Vec<Vec<u8>>,
+    /// distinct aggregates: dedupe (group, args) first
+    distinct_seen: Vec<FxHashMap<Vec<u8>, ()>>,
+    /// the group key of each row is encoded into one reused buffer; only a
+    /// new group allocates
+    k: Vec<u8>,
+}
+
+impl<'a> Aggregator<'a> {
+    fn new(group: &'a [usize], aggs: &'a [crate::sql::plan::AggCall], in_schema: &[crate::types::ColumnType]) -> Aggregator<'a> {
+        let specs: Vec<AggSpec> = aggs
+            .iter()
+            .map(|a| AggSpec {
+                func: a.func,
+                arg: a.args.first().copied(),
+                arg2: a.args.get(1).copied(),
+                filter: a.filter,
+                arg_type: a.args.first().map(|c| in_schema[*c].ty.clone()).unwrap_or(SqlType::Int8),
+                ret: a.ret.clone(),
+                fraction: a.fraction,
+            })
+            .collect();
+        let mut kinds: Vec<(AggKind, Expr)> = Vec::new();
+        let mut slots = Vec::new();
+        for s in &specs {
+            let mut sl = Vec::new();
+            for k in s.summaries() {
+                sl.push(kinds.len());
+                kinds.push(k);
+            }
+            slots.push(sl);
         }
-        slots.push(sl);
+        let spec_kinds: Vec<AggKind> = kinds.iter().map(|(k, _)| *k).collect();
+        let any_ordered = specs.iter().any(|s| s.func.is_ordered());
+        let distinct_seen = specs.iter().map(|_| FxHashMap::default()).collect();
+        Aggregator { group, aggs, specs, kinds, slots, spec_kinds, any_ordered, groups: FxHashMap::default(), order_keys: Vec::new(), distinct_seen, k: Vec::new() }
     }
-    let spec_kinds: Vec<AggKind> = kinds.iter().map(|(k, _)| *k).collect();
-    let any_ordered = specs.iter().any(|s| s.func.is_ordered());
-    struct G {
-        key_row: Row,
-        summary: Summary,
-        rows: Rows,
-    }
-    let mut groups: FxHashMap<Vec<u8>, G> = FxHashMap::default();
-    let mut order_keys: Vec<Vec<u8>> = Vec::new();
-    // distinct aggregates: dedupe (group, args) first
-    let mut distinct_seen: Vec<FxHashMap<Vec<u8>, ()>> = specs.iter().map(|_| FxHashMap::default()).collect();
-    // the group key of each row is encoded into one reused buffer; only a
-    // new group allocates
-    let mut k: Vec<u8> = Vec::new();
-    for (r, w) in rows {
+
+    fn push(&mut self, r: Row, w: i64) -> Result<()> {
         if w == 0 {
-            continue;
+            return Ok(());
         }
+        let (group, aggs, k) = (self.group, self.aggs, &mut self.k);
         k.clear();
         for c in group {
-            encoding::encode_key(&r[*c], SortSpec::ASC, &mut k);
+            encoding::encode_key(&r[*c], SortSpec::ASC, k);
         }
-        let g = match groups.get_mut(k.as_slice()) {
+        let g = match self.groups.get_mut(k.as_slice()) {
             Some(g) => g,
             None => {
-                order_keys.push(k.clone());
+                self.order_keys.push(k.clone());
                 let key_row = group.iter().map(|c| r[*c].clone()).collect();
-                groups.entry(k.clone()).or_insert(G { key_row, summary: Summary::empty(&spec_kinds), rows: vec![] })
+                self.groups.entry(k.clone()).or_insert(AggGroup { key_row, summary: Summary::empty(&self.spec_kinds), rows: vec![] })
             }
         };
         g.summary.count += w;
-        for i in 0..specs.len() {
-            let w_eff = if aggs[i].distinct {
+        for (i, agg) in aggs.iter().enumerate() {
+            let w_eff = if agg.distinct {
                 // the FILTER applies before duplicates are removed
-                if let Some(f) = aggs[i].filter
+                if let Some(f) = agg.filter
                     && !matches!(r[f], Datum::Bool(true))
                 {
                     continue;
                 }
-                let args: Vec<Datum> = aggs[i].args.iter().map(|c| r[*c].clone()).collect();
+                let args: Vec<Datum> = agg.args.iter().map(|c| r[*c].clone()).collect();
                 let mut dk = k.clone();
                 dk.extend(key_bytes(&args));
-                if distinct_seen[i].insert(dk, ()).is_some() {
+                if self.distinct_seen[i].insert(dk, ()).is_some() {
                     continue;
                 }
                 1
             } else {
                 w
             };
-            for &slot in &slots[i] {
-                let (kind, e) = &kinds[slot];
+            for &slot in &self.slots[i] {
+                let (kind, e) = &self.kinds[slot];
                 match e {
                     Expr::Column(c) => kind.add(&mut g.summary.aggs[slot], &r[*c], w_eff)?,
                     e => kind.add(&mut g.summary.aggs[slot], &e.eval(&r)?, w_eff)?,
                 }
             }
         }
-        if any_ordered {
+        if self.any_ordered {
             g.rows.push((r, w));
         }
+        Ok(())
     }
-    if group.is_empty() && groups.is_empty() {
-        order_keys.push(vec![]);
-        groups.insert(vec![], G { key_row: vec![], summary: Summary::empty(&spec_kinds), rows: vec![] });
-    }
-    let mut out = Vec::with_capacity(groups.len());
-    for k in order_keys {
-        let mut g = groups.remove(&k).unwrap();
-        if !group.is_empty() && g.summary.count <= 0 {
-            continue;
+
+    fn finish(mut self) -> Result<Rows> {
+        let (group, aggs) = (self.group, self.aggs);
+        if group.is_empty() && self.groups.is_empty() {
+            self.order_keys.push(vec![]);
+            self.groups.insert(vec![], AggGroup { key_row: vec![], summary: Summary::empty(&self.spec_kinds), rows: vec![] });
         }
-        let mut row = g.key_row.clone();
-        for (i, s) in specs.iter().enumerate() {
-            let v = if s.func.is_ordered() && aggs[i].distinct {
-                // the FILTER applies before duplicates are removed, and the
-                // group's rows stay intact for the other aggregates
-                let a = &aggs[i].args;
-                let mut seen = FxHashMap::default();
-                let mut rs: Rows = g
-                    .rows
-                    .iter()
-                    .filter(|(r, _)| aggs[i].filter.is_none_or(|f| matches!(r[f], Datum::Bool(true))))
-                    .filter(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none())
-                    .map(|(r, _)| (r.clone(), 1))
-                    .collect();
-                sort_rows(&mut rs, &aggs[i].order);
-                s.finalize_ordered(&mut rs.into_iter())?
-            } else if s.func.is_ordered() {
-                let mut rs = std::mem::take(&mut g.rows);
-                sort_rows(&mut rs, &aggs[i].order);
-                let v = s.finalize_ordered(&mut rs.iter().cloned())?;
-                g.rows = rs;
-                v
-            } else {
-                s.finalize(&g.summary, &slots[i])?
-            };
-            row.push(v);
+        let mut out = Vec::with_capacity(self.groups.len());
+        for k in std::mem::take(&mut self.order_keys) {
+            let mut g = self.groups.remove(&k).unwrap();
+            if !group.is_empty() && g.summary.count <= 0 {
+                continue;
+            }
+            let mut row = g.key_row.clone();
+            for (i, s) in self.specs.iter().enumerate() {
+                let v = if s.func.is_ordered() && aggs[i].distinct {
+                    // the FILTER applies before duplicates are removed, and the
+                    // group's rows stay intact for the other aggregates
+                    let a = &aggs[i].args;
+                    let mut seen = FxHashMap::default();
+                    let mut rs: Rows = g
+                        .rows
+                        .iter()
+                        .filter(|(r, _)| aggs[i].filter.is_none_or(|f| matches!(r[f], Datum::Bool(true))))
+                        .filter(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none())
+                        .map(|(r, _)| (r.clone(), 1))
+                        .collect();
+                    sort_rows(&mut rs, &aggs[i].order);
+                    s.finalize_ordered(&mut rs.into_iter())?
+                } else if s.func.is_ordered() {
+                    let mut rs = std::mem::take(&mut g.rows);
+                    sort_rows(&mut rs, &aggs[i].order);
+                    let v = s.finalize_ordered(&mut rs.iter().cloned())?;
+                    g.rows = rs;
+                    v
+                } else {
+                    s.finalize(&g.summary, &self.slots[i])?
+                };
+                row.push(v);
+            }
+            out.push((row, 1));
         }
-        out.push((row, 1));
+        Ok(out)
     }
-    Ok(out)
+}
+
+/// The first `keep` rows (counting multiplicities) of a stream in `order`
+/// — and with ties those tied with the last of them — in that order: rows
+/// that can no longer be among them are dropped as the stream goes, so
+/// ORDER BY with LIMIT holds about twice the LIMIT. Without `keep`, the
+/// whole stream sorted.
+struct TopN<'o> {
+    order: &'o [SortKey],
+    keep: Option<u64>,
+    with_ties: bool,
+    rows: Rows,
+    /// Rows kept by the last pruning (more than `keep` with ties): the
+    /// next one is due when the rows have doubled.
+    kept: usize,
+}
+
+impl<'o> TopN<'o> {
+    fn new(order: &'o [SortKey], keep: Option<u64>, with_ties: bool) -> TopN<'o> {
+        TopN { order, keep, with_ties, rows: Vec::new(), kept: 0 }
+    }
+
+    fn push(&mut self, r: Row, w: i64) {
+        if w <= 0 {
+            return;
+        }
+        self.rows.push((r, w));
+        if let Some(k) = self.keep
+            && self.rows.len() >= 2 * (k.min(1 << 40) as usize).max(self.kept).max(512)
+        {
+            self.prune(k);
+            self.kept = self.rows.len();
+        }
+    }
+
+    fn prune(&mut self, k: u64) {
+        sort_rows(&mut self.rows, self.order);
+        let mut n = 0u64;
+        let mut cut = self.rows.len();
+        for i in 0..self.rows.len() {
+            if n >= k {
+                let tied = self.with_ties && i > 0 && compare_rows(&self.rows[i - 1].0, &self.rows[i].0, self.order) == Ordering::Equal;
+                if !tied {
+                    cut = i;
+                    break;
+                }
+            }
+            n = n.saturating_add(self.rows[i].1 as u64);
+        }
+        self.rows.truncate(cut);
+    }
+
+    fn finish(mut self) -> Rows {
+        match self.keep {
+            Some(k) => self.prune(k),
+            None => sort_rows(&mut self.rows, self.order),
+        }
+        self.rows
+    }
+}
+
+/// OFFSET, LIMIT and WITH TIES over a query's rows in result order:
+/// multiplicities expanded, hidden sort columns removed, rows handed on.
+struct Emitter<'q> {
+    order: &'q [SortKey],
+    visible: usize,
+    offset: u64,
+    limit: u64,
+    with_ties: bool,
+    skipped: u64,
+    sent: u64,
+    /// The ORDER BY values of the last row sent (for WITH TIES).
+    last: Option<Vec<Datum>>,
+    out: &'q mut dyn FnMut(Row) -> Result<bool>,
+}
+
+impl<'q> Emitter<'q> {
+    fn new(q: &'q BoundQuery, out: &'q mut dyn FnMut(Row) -> Result<bool>) -> Emitter<'q> {
+        Emitter {
+            order: &q.order,
+            visible: q.visible,
+            offset: q.offset,
+            limit: q.limit.unwrap_or(u64::MAX),
+            with_ties: q.with_ties,
+            skipped: 0,
+            sent: 0,
+            last: None,
+            out,
+        }
+    }
+
+    /// Hand on `w` copies of `r`; false once no more rows can be sent.
+    fn push(&mut self, r: Row, w: i64) -> Result<bool> {
+        let mut r = Some(r);
+        for i in 0..w.max(0) {
+            if self.skipped < self.offset {
+                self.skipped += 1;
+                continue;
+            }
+            let row = r.as_ref().unwrap();
+            if self.sent >= self.limit {
+                // FETCH ... WITH TIES keeps rows tied with the last one
+                let tied = self.with_ties
+                    && self.last.as_ref().is_some_and(|l| self.order.iter().zip(l).all(|(k, v)| v.sql_cmp(&row[k.col]) == Ordering::Equal));
+                if !tied {
+                    return Ok(false);
+                }
+            }
+            if self.with_ties {
+                self.last = Some(self.order.iter().map(|k| row[k.col].clone()).collect());
+            }
+            let mut row = if i + 1 == w { r.take().unwrap() } else { row.clone() };
+            row.truncate(self.visible);
+            self.sent += 1;
+            if !(self.out)(row)? {
+                return Ok(false);
+            }
+        }
+        Ok(self.sent < self.limit || self.with_ties)
+    }
+}
+
+/// A base relation read in the order of an arrangement (`ordered_read`):
+/// its rows go through `layers` (maps, filters and projections).
+struct OrderedRead<'r> {
+    base: BaseAccess,
+    arr: usize,
+    lo: Vec<u8>,
+    hi: Option<Vec<u8>>,
+    layers: Vec<&'r Rel>,
+}
+
+
+/// Can the plan produce negative weights (which must cancel positive ones
+/// before the result is read)?
+fn has_negate(rel: &Rel) -> bool {
+    matches!(rel, Rel::Negate { .. }) || rel.inputs().into_iter().any(has_negate)
 }
 
 fn window(rows: Rows, funcs: &[crate::sql::plan::WindowCall], schema: &[crate::types::ColumnType]) -> Result<Rows> {
@@ -1015,4 +1450,34 @@ fn window(rows: Rows, funcs: &[crate::sql::plan::WindowCall], schema: &[crate::t
         i = j;
     }
     Ok(cur)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ORDER BY with LIMIT keeps about twice the rows it needs while it
+    /// reads (it used to collect and sort all of them), also when ties make
+    /// it keep more.
+    #[test]
+    fn top_n_keeps_what_can_be_in_the_result() {
+        let order = [SortKey { col: 0, spec: SortSpec::ASC }];
+        let mut top = TopN::new(&order, Some(10), false);
+        for i in (0..100_000).rev() {
+            top.push(vec![Datum::Int4(i), Datum::Int4(i % 3)], 1);
+            assert!(top.rows.len() <= 1024, "{} rows held", top.rows.len());
+        }
+        let rows = top.finish();
+        assert_eq!(rows.iter().map(|(r, _)| r[0].clone()).collect::<Vec<_>>(), (0..10).map(Datum::Int4).collect::<Vec<_>>());
+        // the first row of three tie groups, with ties: one group whole
+        let order = [SortKey { col: 1, spec: SortSpec::ASC }];
+        let mut top = TopN::new(&order, Some(1), true);
+        for i in 0..100_000 {
+            top.push(vec![Datum::Int4(i), Datum::Int4(i % 3)], 1);
+            assert!(top.rows.len() <= 2 * 33_334 + 2);
+        }
+        let rows = top.finish();
+        assert_eq!(rows.len(), 33_334);
+        assert!(rows.iter().all(|(r, _)| r[1] == Datum::Int4(0)));
+    }
 }

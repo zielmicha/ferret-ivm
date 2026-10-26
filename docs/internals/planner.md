@@ -369,13 +369,34 @@ arrangements at a given `ReadAt`:
 - aggregation is hash aggregation using the same aggregate definitions and
   summary arithmetic as `Reduce`, window functions the same partition
   computation as `Window`, `WITH RECURSIVE` semi-naive iteration;
-- results are consolidated; the engine then sorts, applies
-  `OFFSET`/`LIMIT`/`WITH TIES` and projects the visible columns.
+- a query's result is produced by `ExecCtx::run_query`, which streams:
+  base relation reads, filters, projections, maps, set-returning functions,
+  `UNION ALL` and the probe side of joins hand each row on as it is found
+  (`ExecCtx::stream`, with a sink that returns false once it has what it
+  needs), and aggregation consumes its input as it is read; the other
+  operators compute their result first. Without `ORDER BY`, rows are
+  handed on as they come and the scan stops once `OFFSET` + `LIMIT` rows
+  are out. With `ORDER BY`, a read whose plan is a base relation read
+  under maps, filters and projections, by an arrangement whose key order —
+  after the key columns its equalities fix — is the `ORDER BY` (same
+  columns, direction, null placement and key type; a computed copy of a
+  column counts as the column), scans that arrangement in order and stops
+  the same way (`ordered_read`; an equality that narrows another
+  arrangement wins, and that one is read and sorted). Otherwise the rows go
+  through `TopN`, which keeps the first `OFFSET` + `LIMIT` (and their
+  ties), pruning whenever it holds twice that, and sorts at the end (all
+  rows without `LIMIT`). A plan with `Negate` is consolidated before its
+  rows are read. Multiplicities are expanded, `OFFSET`/`LIMIT`/`WITH TIES`
+  applied and the hidden sort columns truncated as the rows go out
+  (`Emitter`). The engine sends them to the session in chunks of 1,024 rows
+  or about 256 KB (`coord/read.rs`: a result of one chunk as
+  `ExecResult::Query`, a larger one as `ExecResult::Rows`, whose later
+  chunks follow on a channel; a closed channel ends the read).
 
 Before a read runs, `now()` and its relatives are bound to the logical clock
 as of the read's GSN, and the read fails if it touches a broken view
 (`55000`) or a materialized view with error records. Expression errors fail
-the query, as in PostgreSQL.
+the query, as in PostgreSQL (after the chunks already sent, if any).
 
 Because the executor and the dataflow share the aggregate, window and
 expression code, a maintained view and the same query run ad hoc compute

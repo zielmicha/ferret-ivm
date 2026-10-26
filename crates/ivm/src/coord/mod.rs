@@ -216,19 +216,20 @@ impl EngineHandle {
         }
     }
 
+    /// Run a statement; a streamed result (`ExecResult::Rows`) is collected.
     pub fn execute(&self, stmt: crate::sql::parser::Statement, params: Vec<crate::sql::ParamSlot>, vars: SessionVars, extra: String) -> Result<ExecResult> {
         let (tx, rx) = bounded(1);
         self.tx
             .send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params, vars, extra, reply: tx }))
             .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
-        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?
+        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))??.collected()
     }
 
     /// `execute`, giving up when `alive` returns false (polled every 200 ms
     /// while the statement runs or waits): the request is then marked
     /// `gone` in its session's interrupts, so that the engine drops it if
     /// it is still waiting (a parked read), and the call fails with
-    /// IO_ERROR.
+    /// IO_ERROR. A query's rows may come streamed (`ExecResult::Rows`).
     pub fn execute_while(
         &self,
         stmt: crate::sql::parser::Statement,
@@ -1069,6 +1070,7 @@ pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &Err
 mod tests {
     use super::*;
     use crate::sql::parser::SubscribeTarget;
+    use crate::types::Datum;
 
     /// An engine on a scratch store without its threads: statements are
     /// applied by calling it directly, and nothing is logged.
@@ -1101,5 +1103,66 @@ mod tests {
         assert!(err.message.contains("has no dataflow"), "{}", err.message);
         assert_eq!((e.graph.live_nodes().count(), e.graph.live_arrangements().count()), (nodes, arrs));
         assert!(e.subs.is_empty());
+    }
+
+    /// A query's result rows and the arrangement entries its scans visited.
+    fn read(e: &mut Engine, sql: &str) -> (Vec<String>, u64) {
+        let q = crate::sql::parser::parse_single_query(sql).unwrap();
+        let bq = crate::sql::plan_query(&e.catalog, &q, vec![]).unwrap();
+        let mut rows = Vec::new();
+        let visited = e
+            .read_query(&bq, crate::storage::ReadAt::Latest, &mut |r| {
+                rows.push(r.iter().map(crate::types::text::format_datum).collect::<Vec<_>>().join("|"));
+                Ok(true)
+            })
+            .unwrap();
+        (rows, visited)
+    }
+
+    /// Ad hoc reads stop scanning once they have their LIMIT, also in the
+    /// order of an arrangement that is the ORDER BY (with or without an
+    /// equality on a key prefix); they used to read, consolidate and sort
+    /// the whole relation before applying the LIMIT. Other orders keep only
+    /// the rows that can be in the result while they scan.
+    #[test]
+    fn limits_stop_scans_early() {
+        let tmp = crate::testkit::TempDir::new("coord-limit-pushdown");
+        let mut e = engine(tmp.path());
+        e.apply_ddl(1, "CREATE TABLE t (id int PRIMARY KEY, g int, v text)", "").unwrap();
+        e.apply_ddl(2, "CREATE INDEX t_g ON t (g, id)", "").unwrap();
+        let t = e.catalog.by_name("t").unwrap().id;
+        let row = |i: i32| vec![Datum::Int4(i), Datum::Int4(i % 10), Datum::text(&format!("v{i}"))];
+        let n = 100_000;
+        let changes = (0..n as i32).map(|i| (t, TableChange::Upsert { row: row(i), unchanged: vec![] })).collect();
+        e.apply_record(3, LogRecord::Commit { source: 0, lsn: 1, changes }).unwrap();
+        let (rows, visited) = read(&mut e, "SELECT * FROM t LIMIT 1");
+        assert_eq!((rows.len(), visited), (1, 1));
+        let (rows, visited) = read(&mut e, "SELECT id, v FROM t ORDER BY id LIMIT 3");
+        assert_eq!(rows, ["0|v0", "1|v1", "2|v2"]);
+        assert_eq!(visited, 3);
+        let (rows, visited) = read(&mut e, "SELECT id FROM t ORDER BY id OFFSET 10 LIMIT 2");
+        assert_eq!((rows, visited), (vec!["10".to_string(), "11".to_string()], 12));
+        // the index on (g, id) is in id order within g = 3
+        let (rows, visited) = read(&mut e, "SELECT id FROM t WHERE g = 3 ORDER BY id LIMIT 2");
+        assert_eq!((rows, visited), (vec!["3".to_string(), "13".to_string()], 2));
+        // (through computed columns, the ORDER BY column hidden)
+        let (rows, visited) = read(&mut e, "SELECT v || '!' FROM t ORDER BY id LIMIT 2");
+        assert_eq!((rows, visited), (vec!["v0!".to_string(), "v1!".to_string()], 2));
+        let (rows, visited) = read(&mut e, "SELECT g, id FROM t ORDER BY g, id LIMIT 2");
+        assert_eq!((rows, visited), (vec!["0|0".to_string(), "0|10".to_string()], 2));
+        // a filter the arrangement does not serve: until the first match
+        let (rows, visited) = read(&mut e, "SELECT id FROM t WHERE v = 'v50' LIMIT 1");
+        assert_eq!((rows, visited), (vec!["50".to_string()], 51));
+        // another order: every row is read, the top ones kept
+        let (rows, visited) = read(&mut e, "SELECT id FROM t ORDER BY id DESC LIMIT 2");
+        assert_eq!((rows, visited), (vec!["99999".to_string(), "99998".to_string()], n));
+        let (rows, _) = read(&mut e, "SELECT g, id FROM t ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES");
+        assert_eq!(rows.len(), 10_000);
+        assert!(rows.iter().all(|r| r.starts_with("9|")));
+        let (rows, _) = read(&mut e, "SELECT id FROM t ORDER BY v LIMIT 3");
+        assert_eq!(rows, ["0", "1", "10"]);
+        // aggregates read their input as it is scanned
+        let (rows, visited) = read(&mut e, "SELECT count(*), max(id) FROM t");
+        assert_eq!((rows, visited), (vec!["100000|99999".to_string()], n));
     }
 }

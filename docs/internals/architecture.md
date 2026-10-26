@@ -75,7 +75,9 @@ Communication uses `crossbeam` channels (unbounded, except one-shot reply
 channels of capacity 1) and a small block of shared state
 (`coord::api::Shared`). The engine's queue of durable batches is bounded by
 the sequencer's backpressure ([below](#group-commit)); the queues to
-subscriptions and sinks are not. The web UI keeps at most 16 of its
+subscriptions and sinks, and those carrying a query's result chunks to its
+session, are not (the engine thread never waits for a client; a sink
+bounds what it keeps itself). The web UI keeps at most 16 of its
 snapshot requests queued at the engine.
 
 | Shared field | Meaning |
@@ -227,7 +229,7 @@ handles:
 | Message | Action |
 |---|---|
 | `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
-| `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
+| `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed (their rows sent to the session in chunks as they are found) or parked; `SUBSCRIBE` is registered (its snapshot sent in chunks); `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
 | `Request(SinkSnapshot)` | a sink thread resynchronizes its target: read its relation at the last applied GSN and send it through the sink's channel in chunks of 10,000 rows (from the arrangement, chunk by chunk), after the changes sent so far ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)) |

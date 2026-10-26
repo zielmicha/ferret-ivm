@@ -31,14 +31,55 @@ pub enum SubEvent {
 
 pub enum ExecResult {
     Query { columns: Vec<ResultColumn>, rows: Vec<Row> },
+    /// The rows of a query larger than one chunk, handed over as the engine
+    /// finds them (`EngineHandle::execute` collects them into `Query`).
+    Rows { columns: Vec<ResultColumn>, rows: RowStream },
     Command { tag: String },
     Subscribe { columns: Vec<ResultColumn>, rx: Receiver<SubEvent>, cancel: Arc<AtomicBool>, progress: bool },
+}
+
+/// Rows of a query result in chunks, sent by the engine as it finds them;
+/// an error ends them. Dropping the stream ends the read in the engine at
+/// its next chunk.
+pub struct RowStream {
+    pub(crate) first: Option<Vec<Row>>,
+    pub(crate) rx: Receiver<Result<Vec<Row>>>,
+}
+
+impl RowStream {
+    /// The next chunk; None after the last.
+    pub fn next_chunk(&mut self) -> Option<Result<Vec<Row>>> {
+        match self.first.take() {
+            Some(c) => Some(Ok(c)),
+            None => self.rx.recv().ok(),
+        }
+    }
+
+    /// All the rows.
+    pub fn collect(mut self) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        while let Some(c) = self.next_chunk() {
+            rows.extend(c?);
+        }
+        Ok(rows)
+    }
+}
+
+impl ExecResult {
+    /// A streamed result collected into `Query`.
+    pub fn collected(self) -> Result<ExecResult> {
+        match self {
+            ExecResult::Rows { columns, rows } => Ok(ExecResult::Query { columns, rows: rows.collect()? }),
+            other => Ok(other),
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExecResult::Query { columns, rows } => write!(f, "Query({} cols, {} rows)", columns.len(), rows.len()),
+            ExecResult::Rows { columns, .. } => write!(f, "Rows({} cols, streamed)", columns.len()),
             ExecResult::Command { tag } => write!(f, "Command({tag})"),
             ExecResult::Subscribe { .. } => write!(f, "Subscribe"),
         }

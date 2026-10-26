@@ -5,7 +5,7 @@ use super::*;
 use crate::catalog::ObjectKind;
 use crate::dataflow::lower::Lowerer;
 use crate::dataflow::NodeKind;
-use crate::exec::{sort_rows, ExecCtx, Rows};
+use crate::exec::{ExecCtx, Rows};
 use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, ShowKind, Statement, SubscribeTarget};
 use crate::sql::plan::Rel;
 use crate::sql::ParamSlot;
@@ -46,6 +46,57 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
 
 /// Rows per chunk of a snapshot sent to a sink or a subscriber.
 const SNAPSHOT_CHUNK_ROWS: usize = 10_000;
+
+/// A query result goes to the session in chunks of this many rows, or of
+/// about `RESULT_CHUNK_BYTES` (estimated), whichever comes first.
+const RESULT_CHUNK_ROWS: usize = 1024;
+const RESULT_CHUNK_BYTES: usize = 256 << 10;
+
+/// Answers a read with its rows as they are found: a result of one chunk
+/// as `ExecResult::Query` (an error before it is complete fails the
+/// statement), a larger one as `ExecResult::Rows`, whose first chunk is in
+/// the reply and the rest follow (an error then ends the rows).
+struct ChunkedReply {
+    columns: Vec<ResultColumn>,
+    reply: Sender<Result<ExecResult>>,
+    chunk: Vec<Row>,
+    bytes: usize,
+    rest: Option<Sender<Result<Vec<Row>>>>,
+}
+
+impl ChunkedReply {
+    /// Add a row; false once nobody reads the rows any more.
+    fn push(&mut self, row: Row) -> bool {
+        self.bytes += row.iter().map(crate::types::codec::approx_len).sum::<usize>();
+        self.chunk.push(row);
+        if self.chunk.len() < RESULT_CHUNK_ROWS && self.bytes < RESULT_CHUNK_BYTES {
+            return true;
+        }
+        let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(RESULT_CHUNK_ROWS));
+        self.bytes = 0;
+        match &self.rest {
+            Some(tx) => tx.send(Ok(chunk)).is_ok(),
+            None => {
+                let (tx, rx) = unbounded();
+                self.rest = Some(tx);
+                let rows = RowStream { first: Some(chunk), rx };
+                self.reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows })).is_ok()
+            }
+        }
+    }
+
+    fn finish(self, r: Result<()>) {
+        let ChunkedReply { columns, reply, chunk, rest, .. } = self;
+        match rest {
+            None => {
+                let _ = reply.send(r.map(|()| ExecResult::Query { columns, rows: chunk }));
+            }
+            Some(tx) => {
+                let _ = tx.send(r.map(|()| chunk));
+            }
+        }
+    }
+}
 
 impl Engine {
     /// The current contents of dataflow node `node`, handed to `f` in
@@ -136,8 +187,19 @@ impl Engine {
     pub(crate) fn execute_rel(&mut self, rel: &Rel, at: ReadAt) -> Result<Rows> {
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default() };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default(), visited: 0 };
         ctx.execute(rel)
+    }
+
+    /// The result rows of a query at `at`, handed to `out` as they are found
+    /// (`exec::ExecCtx::run_query`; false from `out` ends the read). Returns
+    /// the number of arrangement entries its scans visited.
+    pub(crate) fn read_query(&mut self, q: &crate::sql::BoundQuery, at: ReadAt, out: &mut dyn FnMut(Row) -> Result<bool>) -> Result<u64> {
+        let rt = &self.rt;
+        let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default(), visited: 0 };
+        ctx.run_query(q, out)?;
+        Ok(ctx.visited)
     }
 
     fn check_view_errors(&self, rel: &Rel) -> Result<()> {
@@ -310,35 +372,6 @@ impl Engine {
         self.check_view_errors(&bq.rel)?;
         // now() is the logical clock as of the read, so reads are repeatable
         bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
-        let mut rows = self.execute_rel(&bq.rel, at)?;
-        crate::dataflow::consolidate(&mut rows);
-        rows.retain(|(_, w)| *w > 0);
-        if !bq.order.is_empty() {
-            sort_rows(&mut rows, &bq.order);
-        }
-        // expand multiplicities, apply OFFSET/LIMIT, project visible columns
-        let mut out: Vec<Row> = Vec::new();
-        let mut skipped = 0u64;
-        let limit = bq.limit.unwrap_or(u64::MAX);
-        let mut last: Option<Row> = None;
-        'outer: for (r, w) in rows {
-            for _ in 0..w {
-                if skipped < bq.offset {
-                    skipped += 1;
-                    continue;
-                }
-                if out.len() as u64 >= limit {
-                    // FETCH ... WITH TIES keeps rows tied with the last one
-                    let tied = bq.with_ties
-                        && last.as_ref().is_some_and(|l| bq.order.iter().all(|k| l[k.col].sql_cmp(&r[k.col]) == std::cmp::Ordering::Equal));
-                    if !tied {
-                        break 'outer;
-                    }
-                }
-                out.push(r[..bq.visible].to_vec());
-                last = Some(r.clone());
-            }
-        }
         let types = bq.column_types();
         let columns = bq
             .names
@@ -347,7 +380,18 @@ impl Engine {
             .zip(types)
             .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
             .collect();
-        Ok(Some(ExecResult::Query { columns, rows: out }))
+        // the rows go to the session in chunks as they are found; a session
+        // that stops reading them (or a cancel) ends the read
+        let interrupts = vars.interrupts.clone();
+        let mut res = ChunkedReply { columns, reply, chunk: Vec::new(), bytes: 0, rest: None };
+        let r = self.read_query(&bq, at, &mut |row| {
+            if interrupts.as_ref().is_some_and(|i| i.cancelled()) {
+                return Err(SqlError::new(codes::QUERY_CANCELED, "canceling statement due to user request"));
+            }
+            Ok(res.push(row))
+        });
+        res.finish(r.map(|_| ()));
+        Ok(None)
     }
 
     /// Has every source's LSN frontier reached `lsn` (written `text`)? A
@@ -518,10 +562,11 @@ impl Engine {
         let (tx, rx) = unbounded();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if snapshot {
-            let snap = self.graph.snapshot(&mut self.env, node)?;
-            if !snap.data.is_empty() {
-                let _ = tx.send(SubEvent::Data { gsn: self.processed, rows: snap.data });
-            }
+            // in chunks, as they are read from the node's arrangement
+            let gsn = self.processed;
+            self.snapshot_chunks(node, &mut |rows| {
+                let _ = tx.send(SubEvent::Data { gsn, rows });
+            })?;
         }
         let _ = tx.send(SubEvent::Progress { gsn: self.processed });
         self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
