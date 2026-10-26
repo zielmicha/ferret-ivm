@@ -676,3 +676,37 @@ fn windows_follow_random_changes() {
         random_changes_keep_views_equal_from(&format!("window-random-large-{seed}"), &queries, 80, seed * 104_729, 150);
     }
 }
+
+/// The partitions of a window operator that are in error are remembered
+/// (and checkpointed): a change to part of such a partition, also after a
+/// restart, keeps it in error until the failing row is gone, and changes
+/// to other partitions are applied in part (partitions of more than 32
+/// rows).
+#[test]
+fn window_partition_errors_across_restart() {
+    let dir = tmpdir("window-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+    exec(&h, "INSERT INTO t SELECT i, i % 2, 1 + i % 5 FROM generate_series(1, 200) i");
+    let q = "SELECT id, ntile(v) OVER (PARTITION BY g ORDER BY id) AS nt, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM t";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW w AS {q}"));
+    let check = |h: &EngineHandle| assert_eq!(rows_of(h, "SELECT * FROM w").map(sorted), rows_of(h, q).map(sorted));
+    check(&h);
+    exec(&h, "UPDATE t SET v = 0 WHERE id = 10");
+    assert_eq!(read_error(&h, "SELECT * FROM w"), Some("22014 argument of ntile must be greater than zero".to_string()));
+    exec(&h, "UPDATE t SET v = 3 WHERE id = 12");
+    exec(&h, "CHECKPOINT");
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "UPDATE t SET v = 2 WHERE id = 14");
+    exec(&h, "UPDATE t SET v = 2 WHERE id = 15");
+    assert_eq!(read_error(&h, "SELECT * FROM w"), Some("22014 argument of ntile must be greater than zero".to_string()));
+    exec(&h, "UPDATE t SET v = 1 WHERE id = 10");
+    check(&h);
+    exec(&h, "INSERT INTO t VALUES (201, 1, 4)");
+    check(&h);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

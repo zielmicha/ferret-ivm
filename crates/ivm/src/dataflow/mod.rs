@@ -981,6 +981,21 @@ impl Graph {
             }
             cache.retain(|k, _| readers.get(k).copied().unwrap_or(0) > 0);
         }
+        // Window operators whose partitions in error are not known (neither
+        // computed above nor restored from a checkpoint: a new operator that
+        // had no snapshot to take, or a checkpoint of an older version)
+        // compute them now, so that their steps can change partitions in
+        // part.
+        let unknown: Vec<window::WindowPlan> = self
+            .live_nodes()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Window(p) if n.hydrated && !p.errors_known.load(std::sync::atomic::Ordering::Acquire) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        for p in unknown {
+            window::snapshot(self, env, &p, &mut Output::default())?;
+        }
         Ok(())
     }
 

@@ -466,9 +466,11 @@ are recomputed whole: finding what to read would cost more.
 An error in a partition (for example `ntile(0)`) becomes an error record,
 and none of its rows is output. The partitions in error are remembered
 (`WindowPlan::errors`): a change to a partition in error, or one that puts
-it in error, recomputes the whole partition before and after the GSN, as
-does any change while the state is not known (an operator whose state was
-neither restored from a checkpoint nor computed by a snapshot).
+it in error, recomputes the whole partition before and after the GSN. The
+state is computed by the operator's snapshot or restored from a checkpoint;
+an operator for which neither happened (a new one whose snapshot was not
+taken, or one recovered from a checkpoint of an older version) computes it
+at the end of hydration.
 
 ### Recursive
 

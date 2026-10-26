@@ -349,6 +349,18 @@ fn windows_read_only_what_a_change_reaches() {
         t.upsert(name, (0..n).map(|i| vec![int(i), int(1), int(i)]).collect());
         t.ddl(&format!("CREATE MATERIALIZED VIEW {name}_v AS SELECT id, {f} AS x FROM {name}"));
         let last = |t: &mut T| t.rows(&format!("{name}_v")).last().unwrap()[1].clone();
+        if name == "running" {
+            // a window operator whose state is unknown (as recovered from an
+            // older checkpoint) learns it when the graph is hydrated
+            let p = t.e.graph.live_nodes().find_map(|n| match &n.kind {
+                crate::dataflow::NodeKind::Window(p) => Some(p.clone()),
+                _ => None,
+            });
+            let known = &p.unwrap().errors_known;
+            known.store(false, Ordering::Release);
+            t.e.graph.hydrate(&mut t.e.env, t.gsn).unwrap();
+            assert!(known.load(Ordering::Acquire));
+        }
         let (update, _) = t.work(|t| t.upsert(name, vec![vec![int(n - 1), int(1), int(n)]]));
         let (append, _) = t.work(|t| t.upsert(name, vec![vec![int(n), int(1), int(n + 1)]]));
         let reads = update.max(append);

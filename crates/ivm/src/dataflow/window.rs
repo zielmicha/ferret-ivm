@@ -88,8 +88,8 @@ pub struct WindowPlan {
     /// part of a partition; checkpointed with the graph's error state.
     pub errors: OpErrors,
     /// Whether `errors` is known (computed by a snapshot, or restored from a
-    /// checkpoint that kept it); while it is not, every change recomputes
-    /// its whole partition.
+    /// checkpoint that kept it; hydration computes it otherwise); while it
+    /// is not, every change recomputes its whole partition.
     pub errors_known: Arc<AtomicBool>,
 }
 
