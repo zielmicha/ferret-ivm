@@ -1,7 +1,7 @@
 //! Memory bounds: work on data much larger than the buffer pool must stay
 //! within the pool plus a constant. A counting allocator measures the
 //! process's peak heap (this file holds a single test, so that nothing else
-//! allocates meanwhile).
+//! allocates meanwhile; its parts run one after the other).
 
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
@@ -76,23 +76,30 @@ fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
     }
 }
 
-/// Hydrating views of a table about ten times the buffer pool, and views
-/// several times larger still (a filter, joins with fan-out, aggregates)
-/// peaks within the pool and a constant. (Hydration used to hold the whole
-/// snapshot, every encoded entry and the dirty tree: 135 to 370 MiB here.)
 #[test]
-fn hydration_memory_stays_within_the_cache() {
-    let dir = tmpdir("hydration");
+fn memory_stays_within_the_cache() {
+    let dir = tmpdir("bounds");
     let cache = 4 * MB;
     let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, cache_bytes: cache, ..Default::default() };
     let running = coord::start(cfg).expect("engine starts");
     let h = running.handle.clone();
-    exec(&h, "CREATE TABLE t (id bigint PRIMARY KEY, k bigint, s text)");
+    hydration(&h, cache);
+    large_commit(&h, cache);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Hydrating views of a table about ten times the buffer pool, and views
+/// several times larger still (a filter, joins with fan-out, aggregates)
+/// peaks within the pool and a constant. (Hydration used to hold the whole
+/// snapshot, every encoded entry and the dirty tree: 135 to 370 MiB here.)
+fn hydration(h: &EngineHandle, cache: usize) {
+    exec(h, "CREATE TABLE t (id bigint PRIMARY KEY, k bigint, s text)");
     let n = 200_000;
     for i in (0..n).step_by(20_000) {
-        exec(&h, &format!("INSERT INTO t SELECT g, g % 50000, repeat('s', 150) || g FROM generate_series({i}, {}) g", i + 19_999));
+        exec(h, &format!("INSERT INTO t SELECT g, g % 50000, repeat('s', 150) || g FROM generate_series({i}, {}) g", i + 19_999));
     }
-    exec(&h, "CHECKPOINT");
+    exec(h, "CHECKPOINT");
     // (the first join builds the index on t (k) the others use)
     let views = [
         ("filter", "SELECT id, k, s FROM t WHERE k >= 0", "200000"),
@@ -103,17 +110,49 @@ fn hydration_memory_stays_within_the_cache() {
     ];
     for (name, q, count) in views {
         let (before, _) = heap();
-        exec(&h, &format!("CREATE MATERIALIZED VIEW {name} AS {q}"));
+        exec(h, &format!("CREATE MATERIALIZED VIEW {name} AS {q}"));
         let (_, peak) = heap();
         let used = peak.saturating_sub(before);
         assert!(used < cache + 40 * MB, "hydrating {name} used {} MiB above {} MiB", used / MB, before / MB);
-        assert_eq!(rows(&h, &format!("SELECT count(*) FROM {name}")), [count], "{name}");
+        assert_eq!(rows(h, &format!("SELECT count(*) FROM {name}")), [count], "{name}");
     }
     // the views are maintained as usual afterwards
-    exec(&h, "UPDATE t SET k = k + 1 WHERE id < 10");
-    assert_eq!(rows(&h, "SELECT count(*) FROM filter WHERE k >= 1 AND id < 10"), ["10"]);
-    assert_eq!(rows(&h, "SELECT sum(c) FROM joinagg"), rows(&h, "SELECT count(*) FROM t a JOIN t b ON a.k = b.k"));
-    assert_eq!(rows(&h, "SELECT sum(c) FROM agg"), ["200000"]);
-    running.shutdown();
-    let _ = std::fs::remove_dir_all(&dir);
+    exec(h, "UPDATE t SET k = k + 1 WHERE id < 10");
+    assert_eq!(rows(h, "SELECT count(*) FROM filter WHERE k >= 1 AND id < 10"), ["10"]);
+    assert_eq!(rows(h, "SELECT sum(c) FROM joinagg"), rows(h, "SELECT count(*) FROM t a JOIN t b ON a.k = b.k"));
+    assert_eq!(rows(h, "SELECT sum(c) FROM agg"), ["200000"]);
+}
+
+/// A commit many times the buffer pool, into a table with views (a filter,
+/// a join, an aggregate), costs the dataflow no more than the pool and a
+/// constant beyond what the same commit costs into a table without views
+/// (the statement and the log record themselves, outside the dataflow).
+/// The deltas used to be held in memory, all of them until the end of the
+/// GSN.
+fn large_commit(h: &EngineHandle, cache: usize) {
+    exec(h, "CREATE TABLE plain (id bigint PRIMARY KEY, k bigint, s text)");
+    exec(h, "CREATE TABLE q (id bigint PRIMARY KEY, k bigint, s text)");
+    exec(h, "CREATE TABLE d (k bigint PRIMARY KEY, name text)");
+    exec(h, "INSERT INTO d SELECT g, 'name' || g FROM generate_series(0, 999) g");
+    exec(h, "CREATE MATERIALIZED VIEW qf AS SELECT id, k, s FROM q WHERE k >= 0");
+    exec(h, "CREATE MATERIALIZED VIEW qj AS SELECT q.id, d.name, q.s FROM q JOIN d ON q.k = d.k");
+    exec(h, "CREATE MATERIALIZED VIEW qa AS SELECT k, count(*) AS c, max(s) AS m FROM q GROUP BY k");
+    exec(h, "CHECKPOINT");
+    let insert = |t: &str| {
+        let (before, _) = heap();
+        exec(h, &format!("INSERT INTO {t} SELECT g, g % 1000, repeat('s', 300) || g FROM generate_series(1, 150000) g"));
+        let (_, peak) = heap();
+        peak.saturating_sub(before)
+    };
+    let alone = insert("plain");
+    let with_views = insert("q");
+    assert!(
+        with_views < alone + cache + 40 * MB,
+        "the commit used {} MiB with views, {} MiB without",
+        with_views / MB,
+        alone / MB
+    );
+    assert_eq!(rows(h, "SELECT count(*), sum(k) FROM qf"), rows(h, "SELECT count(*), sum(k) FROM q"));
+    assert_eq!(rows(h, "SELECT count(*) FROM qj"), ["150000"]);
+    assert_eq!(rows(h, "SELECT count(*), sum(c) FROM qa"), ["1000|150000"]);
 }

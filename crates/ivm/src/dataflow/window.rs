@@ -6,6 +6,7 @@
 //! functions such as row_number where one insert shifts every later row.
 
 use super::agg::AggSpec;
+use super::delta::{NodeDelta, StepOut};
 use super::*;
 use crate::sql::plan::{AggFunc, FrameBound, FrameUnits, RangeOffsets, SortKey, WindowFunc};
 use crate::storage::Summary;
@@ -351,39 +352,44 @@ fn partition_rows(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], a
     Ok(out)
 }
 
-pub fn step(g: &Graph, env: &mut Env, p: &WindowPlan, delta: &Delta, gsn: Gsn, out: &mut Output) -> Result<()> {
+pub fn step(g: &Graph, env: &mut Env, p: &WindowPlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
-    let mut parts: Vec<Vec<u8>> = Vec::new();
-    for (row, _) in delta {
+    let parts = super::ops::affected_keys(env, delta, gsn, &|row| {
         let kv: Vec<Datum> = p.partition.iter().map(|c| row[*c].clone()).collect();
-        parts.push(layout.encode_prefix(&kv));
-    }
-    parts.sort();
-    parts.dedup();
-    for prefix in parts {
-        let old = partition_rows(env, a.tree, &layout, &prefix, ReadAt::Before(gsn))?;
-        let new = partition_rows(env, a.tree, &layout, &prefix, ReadAt::Latest)?;
+        Ok(layout.encode_prefix(&kv))
+    })?;
+    parts.for_each(env, &mut |env, prefix| {
+        let old = partition_rows(env, a.tree, &layout, prefix, ReadAt::Before(gsn))?;
+        let new = partition_rows(env, a.tree, &layout, prefix, ReadAt::Latest)?;
         match (compute_partition(&old, &p.order, &p.funcs), compute_partition(&new, &p.order, &p.funcs)) {
             (Ok(o), Ok(nw)) => {
-                out.data.extend(o.into_iter().map(|r| (r, -1)));
-                out.data.extend(nw.into_iter().map(|r| (r, 1)));
+                for r in o {
+                    out.push(env, r, -1)?;
+                }
+                for r in nw {
+                    out.push(env, r, 1)?;
+                }
             }
             (o, nw) => {
                 if let Err(e) = &o {
-                    out.errs.push((err_record(e), -1));
+                    out.err(err_record(e), -1);
                 } else if let Ok(o) = o {
-                    out.data.extend(o.into_iter().map(|r| (r, -1)));
+                    for r in o {
+                        out.push(env, r, -1)?;
+                    }
                 }
                 if let Err(e) = &nw {
-                    out.errs.push((err_record(e), 1));
+                    out.err(err_record(e), 1);
                 } else if let Ok(nw) = nw {
-                    out.data.extend(nw.into_iter().map(|r| (r, 1)));
+                    for r in nw {
+                        out.push(env, r, 1)?;
+                    }
                 }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn snapshot(g: &Graph, env: &mut Env, p: &WindowPlan, out: &mut super::ops::SnapOut) -> Result<()> {

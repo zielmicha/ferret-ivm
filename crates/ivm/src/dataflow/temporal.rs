@@ -10,6 +10,7 @@
 //! retracts it when it expires; future events wait in an arrangement ordered
 //! by time, and each step releases the events that are due.
 
+use super::delta::{NodeDelta, StepOut};
 use super::*;
 use crate::error::codes;
 use crate::expr::func::func_def;
@@ -234,12 +235,20 @@ fn schedule(layout: &Layout, now: i64, row: &[Datum], w: i64, (lo, hi): (i64, i6
     Ok(now >= lo)
 }
 
-pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &Delta, gsn: Gsn, out: &mut Output) -> Result<()> {
+pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let now = g.now;
     let ev = g.arr(p.events);
     let layout = ev.layout.clone();
     let tree = ev.tree;
+    // event changes, applied as they accumulate: the due events are read
+    // first, and new ones lie after them
     let mut ups: Vec<(Vec<u8>, i64)> = Vec::new();
+    let flush = |env: &mut Env, ups: &mut Vec<(Vec<u8>, i64)>, all: bool| {
+        if ups.len() >= super::ops::BATCH_ROWS * 16 || (all && !ups.is_empty()) {
+            env.apply(tree, ups, gsn)?;
+        }
+        Ok::<(), SqlError>(())
+    };
     // events that are due: everything at or before now
     let bound = crate::types::encoding::prefix_successor(&layout.encode_prefix(&[Datum::Int8(now)]));
     let hi = match &bound {
@@ -254,23 +263,27 @@ pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &Delta, gsn: Gsn,
         }
         let r = layout.decode_row(&k)?;
         let sign = if matches!(r[1], Datum::Int2(0)) { 1 } else { -1 };
-        out.data.push((r[2..].to_vec(), sign * w));
+        out.push(env, r[2..].to_vec(), sign * w)?;
         ups.push((k.into_vec(), -w));
+        flush(env, &mut ups, false)?;
     }
     // changed rows
-    for (row, w) in delta {
-        match validity(&p.preds, row) {
-            Ok(Some(iv)) => {
-                if schedule(&layout, now, row, *w, iv, &mut ups)? {
-                    out.data.push((row.clone(), *w));
+    delta.for_each_batch(env, &mut |env, batch| {
+        for (row, w) in batch {
+            match validity(&p.preds, row) {
+                Ok(Some(iv)) => {
+                    if schedule(&layout, now, row, *w, iv, &mut ups)? {
+                        out.push(env, row.clone(), *w)?;
+                    }
                 }
+                Ok(None) => {}
+                Err(e) if super::reduce::is_data_error(&e) => out.err(err_record(&e), *w),
+                Err(e) => return Err(e),
             }
-            Ok(None) => {}
-            Err(e) if super::reduce::is_data_error(&e) => out.errs.push((err_record(&e), *w)),
-            Err(e) => return Err(e),
         }
-    }
-    env.apply(tree, &mut ups, gsn)
+        flush(env, &mut ups, false)
+    })?;
+    flush(env, &mut ups, true)
 }
 
 /// Rows of the input valid now (a batch of the input's snapshot).

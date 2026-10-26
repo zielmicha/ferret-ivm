@@ -1,75 +1,121 @@
 //! Operator step / snapshot implementations (except join, reduce, window).
 
+use super::delta::{DeltaBuf, KeySet, Keys, NodeDelta, StepOut};
 use super::*;
 use crate::storage::History;
 use crate::types::Datum;
 use std::ops::Bound;
 
-/// Step dispatch for non-table nodes.
+/// Step dispatch for non-table nodes. Input deltas are read in batches
+/// (spilled ones a batch at a time), and the output is produced into
+/// `rows`, which consolidates it (and spills it when large).
 pub fn step_node(
     g: &Graph,
     env: &mut Env,
     node: &Node,
-    inputs: &[&Output],
+    inputs: &[&NodeDelta],
     gsn: Gsn,
-    all: &FxHashMap<NodeId, Output>,
-) -> Result<Output> {
-    let mut out = Output::default();
+    all: &FxHashMap<NodeId, NodeDelta>,
+    rows: DeltaBuf,
+) -> Result<NodeDelta> {
+    let mut out = StepOut::new(rows);
     // errors flow through every operator
     for i in inputs {
         out.errs.extend(i.errs.iter().cloned());
     }
+    match step_operator(g, env, node, inputs, gsn, all, &mut out) {
+        Ok(()) => out.finish(env),
+        Err(e) => {
+            out.rows.abort(env)?;
+            Err(e)
+        }
+    }
+}
+
+fn step_operator(
+    g: &Graph,
+    env: &mut Env,
+    node: &Node,
+    inputs: &[&NodeDelta],
+    gsn: Gsn,
+    all: &FxHashMap<NodeId, NodeDelta>,
+    out: &mut StepOut,
+) -> Result<()> {
     match &node.kind {
         NodeKind::Table { .. } | NodeKind::Constant { .. } => {}
-        NodeKind::Mfp { mfp } => {
-            for (row, w) in &inputs[0].data {
+        NodeKind::Mfp { mfp } => inputs[0].for_each_batch(env, &mut |env, batch| {
+            for (row, w) in batch {
                 match mfp.eval(row) {
-                    Ok(Some(r)) => out.data.push((r, *w)),
+                    Ok(Some(r)) => out.push(env, r, *w)?,
                     Ok(None) => {}
-                    Err(e) => out.errs.push((err_record(&e), *w)),
+                    Err(e) => out.err(err_record(&e), *w),
                 }
             }
-        }
+            Ok(())
+        })?,
         NodeKind::Union { negate } => {
             for (i, inp) in inputs.iter().enumerate() {
+                // (errors are never negated: they union)
                 let s = if negate[i] { -1 } else { 1 };
-                out.data.extend(inp.data.iter().map(|(r, w)| (r.clone(), w * s)));
-                if negate[i] {
-                    // errors are never negated: they union
-                }
+                inp.for_each_batch(env, &mut |env, batch| {
+                    for (r, w) in batch {
+                        out.push(env, r.clone(), w * s)?;
+                    }
+                    Ok(())
+                })?;
             }
         }
-        NodeKind::Negate => {
-            out.data.extend(inputs[0].data.iter().map(|(r, w)| (r.clone(), -w)));
-        }
-        NodeKind::FlatMap { funcs, ordinality } => {
-            for (row, w) in &inputs[0].data {
+        NodeKind::Negate => inputs[0].for_each_batch(env, &mut |env, batch| {
+            for (r, w) in batch {
+                out.push(env, r.clone(), -w)?;
+            }
+            Ok(())
+        })?,
+        NodeKind::FlatMap { funcs, ordinality } => inputs[0].for_each_batch(env, &mut |env, batch| {
+            for (row, w) in batch {
                 match tablefunc::eval(funcs, row, *ordinality) {
                     Ok(rows) => {
                         for extra in rows {
                             let mut r = row.clone();
                             r.extend(extra);
-                            out.data.push((r, *w));
+                            out.push(env, r, *w)?;
                         }
                     }
-                    Err(e) => out.errs.push((err_record(&e), *w)),
+                    Err(e) => out.err(err_record(&e), *w),
                 }
             }
-        }
-        NodeKind::Join(p) => join::step(g, env, node, p, gsn, all, &mut out)?,
-        NodeKind::Reduce(p) => reduce::step(g, env, p, &inputs[0].data, gsn, &mut out)?,
-        NodeKind::Distinct { arr } => distinct_step(g, env, *arr, &inputs[0].data, gsn, &mut out)?,
+            Ok(())
+        })?,
+        NodeKind::Join(p) => join::step(g, env, node, p, gsn, all, out)?,
+        NodeKind::Reduce(p) => reduce::step(g, env, p, inputs[0], gsn, out)?,
+        NodeKind::Distinct { arr } => distinct_step(g, env, *arr, inputs[0], gsn, out)?,
         NodeKind::SetOp { op, all: is_all, left_arr, right_arr } => {
-            setop_step(g, env, *op, *is_all, *left_arr, *right_arr, &inputs[0].data, &inputs[1].data, gsn, &mut out)?
+            setop_step(g, env, *op, *is_all, *left_arr, *right_arr, inputs[0], inputs[1], gsn, out)?
         }
-        NodeKind::TopK(p) => topk_step(g, env, p, &inputs[0].data, gsn, &mut out)?,
-        NodeKind::Window(p) => window::step(g, env, p, &inputs[0].data, gsn, &mut out)?,
-        NodeKind::Recursive(p) => recursive_step(g, env, node, p, gsn, &mut out)?,
-        NodeKind::Temporal(p) => temporal::step(g, env, p, &inputs[0].data, gsn, &mut out)?,
+        NodeKind::TopK(p) => topk_step(g, env, p, inputs[0], gsn, out)?,
+        NodeKind::Window(p) => window::step(g, env, p, inputs[0], gsn, out)?,
+        NodeKind::Recursive(p) => recursive_step(g, env, node, p, gsn, out)?,
+        NodeKind::Temporal(p) => temporal::step(g, env, p, inputs[0], gsn, out)?,
     }
-    consolidate(&mut out.data);
-    consolidate_errs(&mut out.errs);
-    Ok(out)
+    Ok(())
+}
+
+/// The distinct key prefixes `key` gives the rows of a delta, in order.
+pub fn affected_keys(env: &mut Env, delta: &NodeDelta, gsn: Gsn, key: &dyn Fn(&Row) -> Result<Vec<u8>>) -> Result<Keys> {
+    let mut set = KeySet::new(gsn);
+    let r = delta.for_each_batch(env, &mut |env, batch| {
+        for (row, _) in batch {
+            set.push(env, key(row)?)?;
+        }
+        Ok(())
+    });
+    match r {
+        Ok(()) => set.finish(env),
+        Err(e) => {
+            set.abort(env)?;
+            Err(e)
+        }
+    }
 }
 
 /// Hydration hook for operators with private state.
@@ -269,34 +315,63 @@ fn snapshot_errs(g: &Graph, env: &mut Env, id: NodeId) -> Result<ErrDelta> {
 
 // ---------------------------------------------------------------- base tables
 
+/// What a table's changes at a GSN leave for the next batch of them.
+#[derive(Default)]
+pub struct TableCarry {
+    /// The row the last change deleted (see `table_step`).
+    deleted: Option<Row>,
+}
+
 /// Apply logged changes to a base table: compute the delta against the stored
 /// current values (before-images come from the primary index, so the source
 /// never needs REPLICA IDENTITY FULL; unchanged TOAST values are filled in).
-pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChange>, _gsn: Gsn) -> Result<Output> {
+/// The delta goes to `emit`, which applies it to the table's arrangements
+/// before anything here reads them again: a commit's changes come in
+/// batches, each read against the table as the previous ones left it (so
+/// the deltas of the batches add up to the commit's), and a `Truncate`
+/// emits what precedes it and then retracts the stored rows a batch at a
+/// time.
+pub fn table_step(
+    g: &Graph,
+    env: &mut Env,
+    node: &Node,
+    changes: Vec<TableChange>,
+    carry: &mut TableCarry,
+    emit: &mut RowSink,
+) -> Result<()> {
     let NodeKind::Table { pk, primary, .. } = &node.kind else { unreachable!() };
     let arr = g.arr(*primary);
     let layout = arr.layout.clone();
     let tree = arr.tree;
-    let mut out = Output::default();
+    // retract every stored row (the changes before were emitted, so this
+    // includes them)
+    let truncate = |env: &mut Env, emit: &mut RowSink| {
+        g.scan_stream(env, *primary, ReadAt::Latest, &mut |env, mut rows| {
+            for (_, w) in rows.iter_mut() {
+                *w = -*w;
+            }
+            emit(env, rows)
+        })
+    };
     if pk.is_empty() {
         // multiset table keyed by all columns
+        let mut out: Delta = Vec::new();
         for ch in changes {
             match ch {
-                TableChange::Insert { row } | TableChange::Upsert { row, .. } => out.data.push((row, 1)),
-                TableChange::Remove { row } => out.data.push((row, -1)),
-                TableChange::Delete { key } => out.data.push((key, -1)),
+                TableChange::Insert { row } | TableChange::Upsert { row, .. } => out.push((row, 1)),
+                TableChange::Remove { row } => out.push((row, -1)),
+                TableChange::Delete { key } => out.push((key, -1)),
                 TableChange::Truncate => {
-                    // retract the stored contents; the changes so far in this
-                    // tick are dropped (retracting them as well would leave
-                    // them negative)
-                    let mut cur = g.scan_arr(env, *primary, ReadAt::Latest)?;
-                    consolidate(&mut cur);
-                    out.data = cur.into_iter().map(|(r, w)| (r, -w)).collect();
+                    consolidate(&mut out);
+                    if !out.is_empty() {
+                        emit(env, std::mem::take(&mut out))?;
+                    }
+                    truncate(env, emit)?;
                 }
             }
         }
-        consolidate(&mut out.data);
-        return Ok(out);
+        consolidate(&mut out);
+        return if out.is_empty() { Ok(()) } else { emit(env, out) };
     }
     // keyed upserts: every key touched (in first-touch order) with its
     // stored row and its row after this tick's changes
@@ -320,7 +395,7 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
     // The row the previous change deleted. A primary key change arrives as a
     // delete of the old key directly followed by an upsert of the new row,
     // whose unchanged (TOASTed) values are those of the old key's row.
-    let mut deleted: Option<Row> = None;
+    let mut deleted: Option<Row> = carry.deleted.take();
     for ch in changes {
         let just_deleted = std::mem::take(&mut deleted);
         match ch {
@@ -366,21 +441,25 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
             }
             TableChange::Truncate => {
                 // every stored row and every row touched so far goes away
-                let all = g.scan_arr(env, *primary, ReadAt::Latest)?;
-                for (row, _) in all {
-                    if let std::collections::hash_map::Entry::Vacant(e) = index.entry(layout.encode_prefix_of(&row, pk)) {
-                        e.insert(touched.len());
-                        touched.push((Some(row), After::Absent));
-                    }
+                index.clear();
+                let out = touched_delta(std::mem::take(&mut touched));
+                if !out.is_empty() {
+                    emit(env, out)?;
                 }
-                for t in touched.iter_mut() {
-                    t.1 = After::Absent;
-                }
+                truncate(env, emit)?;
             }
         }
     }
-    // Rows of different keys differ (in their key columns), so the delta is
-    // consolidated once unchanged rows are left out.
+    carry.deleted = deleted;
+    let out = touched_delta(touched);
+    if out.is_empty() { Ok(()) } else { emit(env, out) }
+}
+
+/// The delta of touched keys: `-stored, +final` for each key whose row
+/// changed. Rows of different keys differ (in their key columns), so the
+/// delta is consolidated once unchanged rows are left out.
+fn touched_delta(touched: Vec<(Option<Row>, After)>) -> Delta {
+    let mut out = Vec::new();
     for (stored, after) in touched {
         let new = match after {
             After::Stored => continue,
@@ -393,13 +472,13 @@ pub fn table_step(g: &Graph, env: &mut Env, node: &Node, changes: Vec<TableChang
             continue;
         }
         if let Some(o) = stored {
-            out.data.push((o, -1));
+            out.push((o, -1));
         }
         if let Some(n) = new {
-            out.data.push((n, 1));
+            out.push((n, 1));
         }
     }
-    Ok(out)
+    out
 }
 
 /// A base table row after the changes of one tick.
@@ -412,15 +491,9 @@ enum After {
 
 // ---------------------------------------------------------------- distinct
 
-fn affected_prefixes(layout: &Layout, delta: &Delta) -> Result<Vec<Vec<u8>>> {
-    let mut v: Vec<Vec<u8>> = Vec::with_capacity(delta.len());
-    for (row, _) in delta {
-        let kv = layout.key_values(row)?;
-        v.push(layout.encode_prefix(&kv));
-    }
-    v.sort();
-    v.dedup();
-    Ok(v)
+/// The canonical key prefixes of a delta's rows, in order.
+fn affected_prefixes(env: &mut Env, layout: &Layout, delta: &NodeDelta, gsn: Gsn) -> Result<Keys> {
+    affected_keys(env, delta, gsn, &|row| Ok(layout.encode_prefix(&layout.key_values(row)?)))
 }
 
 /// First entry with positive weight (as of `at`) under `prefix`, and the total.
@@ -438,24 +511,24 @@ fn representative(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], a
     Ok((rep, total))
 }
 
-fn distinct_step(g: &Graph, env: &mut Env, arr: ArrId, delta: &Delta, gsn: Gsn, out: &mut Output) -> Result<()> {
+fn distinct_step(g: &Graph, env: &mut Env, arr: ArrId, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let a = g.arr(arr);
     let layout = a.layout.clone();
-    for p in affected_prefixes(&layout, delta)? {
-        let (old, oc) = representative(env, a.tree, &layout, &p, ReadAt::Before(gsn))?;
-        let (new, nc) = representative(env, a.tree, &layout, &p, ReadAt::Latest)?;
+    affected_prefixes(env, &layout, delta, gsn)?.for_each(env, &mut |env, p| {
+        let (old, oc) = representative(env, a.tree, &layout, p, ReadAt::Before(gsn))?;
+        let (new, nc) = representative(env, a.tree, &layout, p, ReadAt::Latest)?;
         if oc > 0
             && let Some(o) = old
         {
-            out.data.push((o, -1));
+            out.push(env, o, -1)?;
         }
         if nc > 0
             && let Some(n) = new
         {
-            out.data.push((n, 1));
+            out.push(env, n, 1)?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn distinct_snapshot(g: &Graph, env: &mut Env, arr: ArrId, out: &mut SnapOut) -> Result<()> {
@@ -498,36 +571,45 @@ fn setop_step(
     all: bool,
     la: ArrId,
     ra: ArrId,
-    ld: &Delta,
-    rd: &Delta,
+    ld: &NodeDelta,
+    rd: &NodeDelta,
     gsn: Gsn,
-    out: &mut Output,
+    out: &mut StepOut,
 ) -> Result<()> {
     let (l, r) = (g.arr(la), g.arr(ra));
     let (ll, rl) = (l.layout.clone(), r.layout.clone());
-    let mut prefixes = affected_prefixes(&ll, ld)?;
-    prefixes.extend(affected_prefixes(&rl, rd)?);
-    prefixes.sort();
-    prefixes.dedup();
-    for p in prefixes {
-        let (lrep_old, a_old) = representative(env, l.tree, &ll, &p, ReadAt::Before(gsn))?;
-        let (lrep_new, a_new) = representative(env, l.tree, &ll, &p, ReadAt::Latest)?;
-        let (rrep_old, b_old) = representative(env, r.tree, &rl, &p, ReadAt::Before(gsn))?;
-        let (rrep_new, b_new) = representative(env, r.tree, &rl, &p, ReadAt::Latest)?;
+    let mut prefixes = KeySet::new(gsn);
+    for (layout, d) in [(&ll, ld), (&rl, rd)] {
+        let res = d.for_each_batch(env, &mut |env, batch| {
+            for (row, _) in batch {
+                prefixes.push(env, layout.encode_prefix(&layout.key_values(row)?))?;
+            }
+            Ok(())
+        });
+        if let Err(e) = res {
+            prefixes.abort(env)?;
+            return Err(e);
+        }
+    }
+    prefixes.finish(env)?.for_each(env, &mut |env, p| {
+        let (lrep_old, a_old) = representative(env, l.tree, &ll, p, ReadAt::Before(gsn))?;
+        let (lrep_new, a_new) = representative(env, l.tree, &ll, p, ReadAt::Latest)?;
+        let (rrep_old, b_old) = representative(env, r.tree, &rl, p, ReadAt::Before(gsn))?;
+        let (rrep_new, b_new) = representative(env, r.tree, &rl, p, ReadAt::Latest)?;
         let m_old = setop_mult(op, all, a_old, b_old);
         let m_new = setop_mult(op, all, a_new, b_new);
         if m_old > 0
             && let Some(rep) = lrep_old.or(rrep_old)
         {
-            out.data.push((rep, -m_old));
+            out.push(env, rep, -m_old)?;
         }
         if m_new > 0
             && let Some(rep) = lrep_new.or(rrep_new)
         {
-            out.data.push((rep, m_new));
+            out.push(env, rep, m_new)?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn setop_snapshot(g: &Graph, env: &mut Env, op: SetOpKind, all: bool, la: ArrId, ra: ArrId, out: &mut SnapOut) -> Result<()> {
@@ -654,23 +736,22 @@ fn topk_rows(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], at: Re
     Ok(out)
 }
 
-fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &Delta, gsn: Gsn, out: &mut Output) -> Result<()> {
+fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
-    let mut groups: Vec<Vec<u8>> = Vec::new();
-    for (row, _) in delta {
+    let groups = affected_keys(env, delta, gsn, &|row| {
         let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
-        groups.push(layout.encode_prefix(&kv));
-    }
-    groups.sort();
-    groups.dedup();
-    for prefix in groups {
-        for (r, w) in topk_rows(env, a.tree, &layout, &prefix, ReadAt::Before(gsn), p)? {
-            out.data.push((r, -w));
+        Ok(layout.encode_prefix(&kv))
+    })?;
+    groups.for_each(env, &mut |env, prefix| {
+        for (r, w) in topk_rows(env, a.tree, &layout, prefix, ReadAt::Before(gsn), p)? {
+            out.push(env, r, -w)?;
         }
-        out.data.extend(topk_rows(env, a.tree, &layout, &prefix, ReadAt::Latest, p)?);
-    }
-    Ok(())
+        for (r, w) in topk_rows(env, a.tree, &layout, prefix, ReadAt::Latest, p)? {
+            out.push(env, r, w)?;
+        }
+        Ok(())
+    })
 }
 
 fn topk_snapshot(g: &Graph, env: &mut Env, p: &TopKPlan, out: &mut SnapOut) -> Result<()> {
@@ -755,14 +836,20 @@ fn recursive_snapshot(g: &Graph, env: &mut Env, p: &RecursivePlan, out: &mut Sna
     Ok(())
 }
 
-fn recursive_step(g: &Graph, env: &mut Env, node: &Node, p: &RecursivePlan, gsn: Gsn, out: &mut Output) -> Result<()> {
+fn recursive_step(g: &Graph, env: &mut Env, node: &Node, p: &RecursivePlan, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let _ = (node, gsn);
-    let old = g.scan_arr(env, p.out_arr, ReadAt::Latest)?;
-    out.data.extend(old.into_iter().map(|(r, w)| (r, -w)));
+    g.scan_stream(env, p.out_arr, ReadAt::Latest, &mut |env, old| {
+        for (r, w) in old {
+            out.push(env, r, -w)?;
+        }
+        Ok(())
+    })?;
     let mut errors = p.errors.lock();
     match crate::exec::eval_recursive(g, env, p) {
         Ok(rows) => {
-            out.data.extend(rows);
+            for (r, w) in rows {
+                out.push(env, r, w)?;
+            }
             if let Some(prev) = errors.remove(&Vec::new()) {
                 out.errs.push((prev, -1));
             }

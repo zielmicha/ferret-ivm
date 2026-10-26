@@ -10,6 +10,7 @@
 //! Semijoin inputs are "presence" inputs: their rows are the distinct keys
 //! of the underlying collection, read through count summaries.
 
+use super::delta::{NodeDelta, Rows, StepOut};
 use super::mfp::Mfp;
 use super::*;
 use crate::types::datum::exact_cmp;
@@ -118,9 +119,59 @@ impl JoinPlan {
     }
 }
 
+/// Receives a presence key and its weight change.
+type KeyChangeFn<'a> = dyn FnMut(&mut Env, &[u8], i64) -> Result<()> + 'a;
+
+/// This tick's weight change per key of a presence input's collection: in
+/// memory, or in a temporary tree when the input's delta was spilled.
+enum PresenceDelta {
+    Mem(FxHashMap<Vec<u8>, i64>),
+    Tree(TreeId),
+}
+
+impl PresenceDelta {
+    fn get(&self, env: &mut Env, prefix: &[u8]) -> Result<i64> {
+        match self {
+            PresenceDelta::Mem(m) => Ok(m.get(prefix).copied().unwrap_or(0)),
+            PresenceDelta::Tree(t) => Ok(env.get(*t, prefix)?.map(|h| h.total()).unwrap_or(0)),
+        }
+    }
+
+    /// The keys with a non-zero change, in key order.
+    fn for_each(&self, env: &mut Env, f: &mut KeyChangeFn) -> Result<()> {
+        match self {
+            PresenceDelta::Mem(m) => {
+                let mut keys: Vec<&Vec<u8>> = m.keys().collect();
+                keys.sort();
+                for k in keys {
+                    let dw = m[k];
+                    if dw != 0 {
+                        f(env, k, dw)?;
+                    }
+                }
+                Ok(())
+            }
+            PresenceDelta::Tree(t) => {
+                let mut c = env.cursor(*t, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+                while let Some((k, h)) = env.cursor_next(&mut c)? {
+                    f(env, &k, h.total())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn release(self, env: &mut Env) -> Result<()> {
+        match self {
+            PresenceDelta::Mem(_) => Ok(()),
+            PresenceDelta::Tree(t) => env.drop_tree(t),
+        }
+    }
+}
+
 /// Presence count of a key under `at` (count summaries; "before" derived from
 /// this tick's delta of the presence collection).
-fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], at: ReadAt, delta: Option<&FxHashMap<Vec<u8>, i64>>) -> Result<i64> {
+fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], at: ReadAt, delta: Option<&PresenceDelta>) -> Result<i64> {
     let a = g.arr(arr);
     let hi = crate::types::encoding::prefix_successor(prefix);
     let s = match &hi {
@@ -130,7 +181,7 @@ fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], at: ReadA
     let latest = s.count;
     Ok(match at {
         ReadAt::Latest => latest,
-        ReadAt::Before(_) => latest - delta.and_then(|d| d.get(prefix)).copied().unwrap_or(0),
+        ReadAt::Before(_) => latest - delta.map_or(Ok(0), |d| d.get(env, prefix))?,
         ReadAt::AsOf(_) => latest,
     })
 }
@@ -145,7 +196,7 @@ fn presence_prefix(layout: &Layout, vals: &[Datum], exact: bool) -> Result<Vec<u
 struct Ctx<'a> {
     g: &'a Graph,
     p: &'a JoinPlan,
-    pres_delta: Vec<Option<FxHashMap<Vec<u8>, i64>>>,
+    pres_delta: Vec<Option<PresenceDelta>>,
 }
 
 /// Key values of a lookup step for a joined row (None: matches nothing).
@@ -362,89 +413,79 @@ fn lookup_step(
     if next.is_empty() { Ok(()) } else { emit(env, next) }
 }
 
-fn presence_deltas(g: &Graph, p: &JoinPlan, all: &FxHashMap<NodeId, Output>) -> Result<Vec<Option<FxHashMap<Vec<u8>, i64>>>> {
+fn presence_deltas(env: &mut Env, g: &Graph, p: &JoinPlan, all: &FxHashMap<NodeId, NodeDelta>, gsn: Gsn) -> Result<Vec<Option<PresenceDelta>>> {
     let mut v = Vec::with_capacity(p.inputs.len());
     for inp in &p.inputs {
         match inp.presence {
             None => v.push(None),
             Some(parr) => {
                 let layout = &g.arr(parr).layout;
-                let mut m: FxHashMap<Vec<u8>, i64> = FxHashMap::default();
-                if let Some(o) = all.get(&inp.node) {
-                    for (row, w) in &o.data {
-                        let kv = layout.key_values(row)?;
-                        *m.entry(presence_prefix(layout, &kv, inp.exact)?).or_default() += w;
+                let d = match all.get(&inp.node) {
+                    Some(rows @ NodeDelta { rows: Rows::Tree { .. }, .. }) => {
+                        let tree = env.create_temp_tree(std::sync::Arc::new(crate::storage::CountSummarizer));
+                        let mut b = crate::storage::TreeBuilder::new(env, tree, gsn);
+                        let r = rows.for_each_batch(env, &mut |env, batch| {
+                            for (row, w) in batch {
+                                b.push(env, presence_prefix(layout, &layout.key_values(row)?, inp.exact)?, *w)?;
+                            }
+                            Ok(())
+                        });
+                        let r = match r {
+                            Ok(()) => b.finish(env),
+                            Err(e) => b.abort(env).and(Err(e)),
+                        };
+                        match r {
+                            Ok(()) => PresenceDelta::Tree(tree),
+                            Err(e) => {
+                                env.drop_tree(tree)?;
+                                return Err(e);
+                            }
+                        }
                     }
-                }
-                v.push(Some(m));
+                    rows => {
+                        let mut m: FxHashMap<Vec<u8>, i64> = FxHashMap::default();
+                        if let Some(NodeDelta { rows: Rows::Mem(d), .. }) = rows {
+                            for (row, w) in d {
+                                let kv = layout.key_values(row)?;
+                                *m.entry(presence_prefix(layout, &kv, inp.exact)?).or_default() += w;
+                            }
+                        }
+                        PresenceDelta::Mem(m)
+                    }
+                };
+                v.push(Some(d));
             }
         }
     }
     Ok(v)
 }
 
-pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all: &FxHashMap<NodeId, Output>, out: &mut Output) -> Result<()> {
-    let cx = Ctx { g, p, pres_delta: presence_deltas(g, p, all)? };
+pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
+    let cx = Ctx { g, p, pres_delta: presence_deltas(env, g, p, all, gsn)? };
+    let r = step_paths(env, &cx, gsn, all, out);
+    for d in cx.pres_delta.into_iter().flatten() {
+        d.release(env)?;
+    }
+    r
+}
+
+/// Extend the changes of every input along its path.
+fn step_paths(env: &mut Env, cx: &Ctx, gsn: Gsn, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
+    let (g, p) = (cx.g, cx.p);
     for path in &p.paths {
         let src = &p.inputs[path.source];
         let Some(d) = all.get(&src.node) else { continue };
-        if d.data.is_empty() {
+        if d.rows.is_empty() {
             continue;
         }
-        let mut start = Vec::new();
-        if let Some(parr) = src.presence {
-            // presence changes of keys touched this tick
-            let layout = g.arr(parr).layout.clone();
-            let deltas = cx.pres_delta[path.source].as_ref().unwrap();
-            let mut keys: Vec<&Vec<u8>> = deltas.keys().collect();
-            keys.sort();
-            for prefix in keys {
-                let dw = deltas[prefix];
-                if dw == 0 {
-                    continue;
-                }
-                let new = presence_count(env, g, parr, prefix, ReadAt::Latest, None)?;
-                let old = new - dw;
-                if (old > 0) != (new > 0) {
-                    let kv = if src.exact { layout.decode_row(prefix)? } else { layout.decode_key_values(prefix)?.0 };
-                    let mut row = vec![Datum::Null; p.width];
-                    row[src.offset..src.offset + src.width].clone_from_slice(&kv);
-                    start.push((row, if new > 0 { 1 } else { -1 }));
-                }
-            }
-        } else {
-            for (raw, w) in &d.data {
-                match src.mfp.eval(raw) {
-                    Ok(Some(post)) => {
-                        let mut row = vec![Datum::Null; p.width];
-                        row[src.offset..src.offset + src.width].clone_from_slice(&post);
-                        start.push((row, *w));
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        // input expression errors count once per input row
-                        if path.source == first_path_of(p, path.source) {
-                            out.errs.push((err_record(&e), *w));
-                        }
-                    }
-                }
-            }
-        }
-        // changes that cancel after the input's MFP (e.g. updates of
-        // columns the join does not use) need no lookups
-        consolidate(&mut start);
-        match src.presence.and_then(|_| presence_key_exprs(p, path.source)) {
-            Some(keys) => {
-                // The presence input's columns hold its key as decoded from
-                // the index: canonical, without numeric scales, -0 and the
-                // like. Paths that look the input up compute them from the
-                // other inputs' rows instead; recompute them that way, or
-                // rows derived here would not retract rows derived there.
-                let mut rows = Vec::new();
-                run_path(env, &cx, path, start, Some(gsn), &mut |_, r| {
-                    rows.extend(r);
-                    Ok(())
-                })?;
+        // The presence input's columns hold its key as decoded from the
+        // index: canonical, without numeric scales, -0 and the like. Paths
+        // that look the input up compute them from the other inputs' rows
+        // instead; recompute them that way, or rows derived here would not
+        // retract rows derived there.
+        let keys = src.presence.and_then(|_| presence_key_exprs(p, path.source));
+        let mut emit = |env: &mut Env, mut rows: Delta| {
+            if let Some(keys) = keys {
                 for (row, _) in rows.iter_mut() {
                     for (j, e) in keys.iter().enumerate() {
                         if let Ok(v) = e.eval(row) {
@@ -452,12 +493,70 @@ pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all:
                         }
                     }
                 }
-                out.data.extend(rows);
             }
-            None => run_path(env, &cx, path, start, Some(gsn), &mut |_, r| {
-                out.data.extend(r);
+            for (r, w) in rows {
+                out.push(env, r, w)?;
+            }
+            Ok(())
+        };
+        // changes that cancel after the input's MFP (e.g. updates of
+        // columns the join does not use) need no lookups
+        let mut run = |env: &mut Env, mut start: Delta| {
+            consolidate(&mut start);
+            run_path(env, cx, path, start, Some(gsn), &mut emit)
+        };
+        let (mut errs, mut errs_limit) = (Vec::new(), super::ops::BATCH_ROWS);
+        if let Some(parr) = src.presence {
+            // presence changes of keys touched this tick
+            let layout = g.arr(parr).layout.clone();
+            let deltas = cx.pres_delta[path.source].as_ref().unwrap();
+            let mut start = Vec::new();
+            let mut bytes = 0;
+            deltas.for_each(env, &mut |env, prefix, dw| {
+                let new = presence_count(env, g, parr, prefix, ReadAt::Latest, None)?;
+                let old = new - dw;
+                if (old > 0) != (new > 0) {
+                    let kv = if src.exact { layout.decode_row(prefix)? } else { layout.decode_key_values(prefix)?.0 };
+                    let mut row = vec![Datum::Null; p.width];
+                    row[src.offset..src.offset + src.width].clone_from_slice(&kv);
+                    bytes += row_bytes(&row);
+                    start.push((row, if new > 0 { 1 } else { -1 }));
+                    if bytes >= PATH_BYTES {
+                        bytes = 0;
+                        run(env, std::mem::take(&mut start))?;
+                    }
+                }
                 Ok(())
-            })?,
+            })?;
+            run(env, start)?;
+        } else {
+            d.for_each_batch(env, &mut |env, batch| {
+                let mut start = Vec::with_capacity(batch.len());
+                for (raw, w) in batch {
+                    match src.mfp.eval(raw) {
+                        Ok(Some(post)) => {
+                            let mut row = vec![Datum::Null; p.width];
+                            row[src.offset..src.offset + src.width].clone_from_slice(&post);
+                            start.push((row, *w));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            // input expression errors count once per input row
+                            if path.source == first_path_of(p, path.source) {
+                                errs.push((err_record(&e), *w));
+                            }
+                        }
+                    }
+                }
+                if errs.len() >= errs_limit {
+                    consolidate_errs(&mut errs);
+                    errs_limit = (2 * errs.len()).max(super::ops::BATCH_ROWS);
+                }
+                run(env, start)
+            })?;
+        }
+        for (e, w) in errs {
+            out.err(e, w);
         }
     }
     Ok(())
@@ -513,7 +612,7 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut super::ops::Sn
     // with equal keys in a chunk share their lookups
     let mut start = Vec::new();
     let mut start_bytes = 0;
-    let mut errs = Vec::new();
+    let (mut errs, mut errs_limit) = (Vec::new(), super::ops::BATCH_ROWS);
     let mut emit = |env: &mut Env, rows: Delta| {
         for (r, w) in rows {
             out.push(env, r, w)?;
@@ -533,8 +632,9 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut super::ops::Sn
                 Err(e) => errs.push((err_record(&e), w)),
             }
         }
-        if errs.len() >= super::ops::BATCH_ROWS {
+        if errs.len() >= errs_limit {
             consolidate_errs(&mut errs);
+            errs_limit = (2 * errs.len()).max(super::ops::BATCH_ROWS);
         }
         if start_bytes >= PATH_BYTES {
             start_bytes = 0;

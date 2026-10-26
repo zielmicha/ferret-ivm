@@ -433,6 +433,12 @@ impl Env {
         self.trees.get(&tree).map(|t| t.summary.count).unwrap_or(0)
     }
 
+    /// Does the tree hold no entries? (Its count is the sum of the current
+    /// weights, which may be zero while entries remain.)
+    pub fn tree_is_empty(&self, tree: TreeId) -> bool {
+        self.trees.get(&tree).is_none_or(|t| t.root.is_none())
+    }
+
     // ------------------------------------------------------------------
     // arena helpers
 

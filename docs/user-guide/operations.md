@@ -29,7 +29,8 @@ Fixed internal parameters (not configurable):
 | unacknowledged commits per source | 10,000 |
 | initial-snapshot chunk | 10,000 rows |
 | groups cached in memory per aggregation | 2^18 (half evicted when full) |
-| sort buffer when building an index (hydration) | an eighth of the cache, within 1 MiB and 64 MiB |
+| sort buffer when building or updating an index in bulk (hydration, large changes) | an eighth of the cache, within 1 MiB and 64 MiB |
+| change (delta) of a view or operator kept in memory per GSN, and changes of a table applied at once | an eighth of the cache, within 1 MiB and 256 MiB (larger ones go to temporary trees) |
 | rows per hydration batch | 1,024 (or 1 MiB of index entries) |
 | join rows looked up at once | about 8 MiB |
 | nodes relocated per garbage-collection pass | 1000 |
@@ -51,9 +52,13 @@ Things to keep in mind when sizing:
   threads for the web UI when it is enabled).
 - **Memory outside the cache**: hydration of a new view holds a few
   batches of rows, a sort buffer per index it builds and about 16 MiB of
-  join rows in flight (a window partition or a recursive query's result is
-  computed whole); aggregation group caches; subscription and sink queues
-  are unbounded. The queue of logged records the engine has yet to
+  join rows in flight; applying a commit holds the changes of operators
+  with consumers still to run up to an eighth of the cache each, and sort
+  buffers for the indexes it updates in bulk (a window partition or a
+  recursive query's result is computed whole); a large commit's log record
+  itself, and the rows delivered to subscriptions and sinks, are in memory
+  whole; aggregation group caches; subscription and sink queues are
+  unbounded. The queue of logged records the engine has yet to
   apply is bounded: when the engine is 10,000 records behind, the log stops
   taking new records until it catches up (sources then pause reading the
   replication stream, and the upstream keeps the WAL).

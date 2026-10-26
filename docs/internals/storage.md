@@ -92,8 +92,8 @@ allocates a slot and replaces the pointer by `Mem(slot)`.
 There is no separate in-memory mode: a tree that fits in the cache is served
 from memory, a larger one degrades gradually as nodes are re-read from the
 segment files (through the operating system's page cache). The same holds
-for data that is not yet durable: a batch or a hydration much larger than
-the cache is written out as it goes.
+for data that is not yet durable: a batch, a commit or a hydration much
+larger than the cache is written out as it goes.
 
 ## Histories
 
@@ -243,8 +243,10 @@ only.
 
 Applying batches of entries in arbitrary key order to a large tree would
 touch, and rewrite, every leaf with every batch. A `TreeBuilder`
-(`sort.rs`), used to build arrangements during hydration, loads entries in
-bounded memory with an external merge sort:
+(`sort.rs`) loads entries in bounded memory with an external merge sort;
+the dataflow uses it to build arrangements during hydration, to spill large
+deltas and key sets into temporary trees, and to apply large deltas of
+nodes nobody reads to their arrangements:
 
 - entries are buffered up to an eighth of the cache (at least 1 MiB, at
   most 64 MiB, counting 40 bytes per entry besides its key);
@@ -258,11 +260,13 @@ bounded memory with an external merge sort:
   64 while there are more) into the target in key order, adding up equal
   entries, in batches of a quarter of the buffer, and drops the runs.
 
-Temporary trees (`Env::create_temp_tree`) take their ids from the top of
-the id range downwards, so the ids of persistent trees do not depend on
-them; they are not meant to outlive the operation that creates them, and
-one that a checkpoint happens to record is not attached after recovery
-and is dropped with the other unreferenced trees.
+Temporary trees (`Env::create_temp_tree`: sort runs, spilled deltas) take
+their ids from the top of the id range downwards, so the ids of persistent
+trees do not depend on them; they are not meant to outlive the operation
+that creates them, and one that a checkpoint happens to record is not
+attached after recovery and is dropped with the other unreferenced trees.
+`Env::tree_is_empty` tells a tree without entries (its count, the sum of
+the current weights, can be zero while entries remain).
 
 ### How aggregates use summaries
 

@@ -15,6 +15,7 @@
 //! summarized from the index as before.
 
 use super::agg::AggSpec;
+use super::delta::{NodeDelta, Rows, StepOut};
 use super::*;
 use crate::storage::Summary;
 use crate::types::datum::exact_cmp;
@@ -237,8 +238,8 @@ fn old_row(g: &Graph, env: &mut Env, p: &ReducePlan, gvals: &[Datum]) -> Result<
     Ok(rows.into_iter().find(|(_, w)| *w > 0).map(|(r, _)| r))
 }
 
-pub fn step(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, _gsn: Gsn, out: &mut Output) -> Result<()> {
-    let r = step_groups(g, env, p, delta, out);
+pub fn step(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
+    let r = step_groups(g, env, p, delta, gsn, out);
     if r.is_err() {
         // the cache may be ahead of what this failed step will leave behind
         p.cache.0.lock().clear();
@@ -246,96 +247,143 @@ pub fn step(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, _gsn: Gsn, 
     r
 }
 
-fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mut Output) -> Result<()> {
+fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let layout = g.arr(p.input_arr).layout.clone();
     let ng = p.group_key.len();
+    static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cx = GroupCx {
+        layout: &layout,
+        cacheable: !p.ordered() && !*NO_CACHE.get_or_init(|| std::env::var("IVM_NO_GROUP_CACHE").is_ok()),
+        fidelity_key: layout.key_types[..ng].iter().any(crate::types::encoding::has_fidelity),
+    };
+    let Rows::Mem(rows) = &delta.rows else {
+        // A spilled delta: its groups (canonical key prefixes) through a key
+        // set, each summarized from the index (no rows to fold into a
+        // cached summary); the key values are the prefix's (canonical, which
+        // is exact where it matters: without fidelity suffixes).
+        let groups = super::ops::affected_keys(env, delta, gsn, &|row| {
+            let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
+            Ok(layout.encode_prefix(&kv))
+        })?;
+        return groups.for_each(env, &mut |env, prefix| {
+            let kv = layout.decode_prefix(prefix, ng)?;
+            step_group(g, env, p, &cx, prefix.to_vec(), &kv, None, out)
+        });
+    };
     // affected groups (canonical key prefixes) with their changed rows
     let mut groups: BTreeMap<Vec<u8>, (Vec<Datum>, Vec<(&Row, i64)>)> = BTreeMap::new();
-    for (row, w) in delta {
+    for (row, w) in rows {
         let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
         let prefix = layout.encode_prefix(&kv);
         groups.entry(prefix).or_insert_with(|| (kv, Vec::new())).1.push((row, *w));
     }
-    static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let cacheable = !p.ordered() && !*NO_CACHE.get_or_init(|| std::env::var("IVM_NO_GROUP_CACHE").is_ok());
-    let fidelity_key = layout.key_types[..ng].iter().any(crate::types::encoding::has_fidelity);
+    for (prefix, (kv, rows)) in groups {
+        step_group(g, env, p, &cx, prefix, &kv, Some(&rows), out)?;
+    }
+    Ok(())
+}
+
+/// What every group of a step needs.
+struct GroupCx<'a> {
+    layout: &'a Layout,
+    cacheable: bool,
+    fidelity_key: bool,
+}
+
+/// Recompute one affected group and emit the change of its output row.
+/// `rows` are the group's changed rows, which may be folded into its cached
+/// summary.
+#[allow(clippy::too_many_arguments)]
+fn step_group(
+    g: &Graph,
+    env: &mut Env,
+    p: &ReducePlan,
+    cx: &GroupCx,
+    prefix: Vec<u8>,
+    kv: &[Datum],
+    rows: Option<&[(&Row, i64)]>,
+    out: &mut StepOut,
+) -> Result<()> {
+    let ng = p.group_key.len();
+    let (cacheable, fidelity_key) = (cx.cacheable, cx.fidelity_key);
     let mut errors = p.errors.lock();
     let mut cache = p.cache.0.lock();
-    for (prefix, (kv, rows)) in groups {
-        let mut old: Option<Option<Row>> = None;
-        let mut result = None;
-        if cacheable && let Some((mut s, ckv)) = cache.remove(&prefix) {
-            // the cached summary also gives the group's current output
-            if let Ok(o) = finish_group(p, &s, &ckv)? {
-                old = Some(o);
-            }
-            if fold_rows(p, &layout, &mut s, &ckv, &rows, fidelity_key)? {
-                result = Some(finish_group(p, &s, &ckv)?);
-                if s.count != 0 || ng == 0 {
-                    cache.insert(prefix.clone(), (s, ckv));
-                }
+    let mut old: Option<Option<Row>> = None;
+    let mut result = None;
+    if cacheable && let Some((mut s, ckv)) = cache.remove(&prefix) {
+        // the cached summary also gives the group's current output
+        if let Ok(o) = finish_group(p, &s, &ckv)? {
+            old = Some(o);
+        }
+        if let Some(rows) = rows
+            && fold_rows(p, cx.layout, &mut s, &ckv, rows, fidelity_key)?
+        {
+            result = Some(finish_group(p, &s, &ckv)?);
+            if s.count != 0 || ng == 0 {
+                cache.insert(prefix.clone(), (s, ckv));
             }
         }
-        let old = match old {
-            Some(o) => {
-                #[cfg(debug_assertions)]
-                {
-                    let stored = old_row(g, env, p, &kv)?;
-                    if !same_row(&stored, &o) {
-                        panic!("group cache diverged for {kv:?}: cached {o:?}, stored {stored:?}, delta {rows:?}");
-                    }
-                }
-                o
-            }
-            None => old_row(g, env, p, &kv)?,
-        };
-        let result = match result {
-            Some(r) => r,
-            None => {
-                let (r, state) = compute_group(g, env, p, &prefix, (!fidelity_key).then_some(&kv[..]))?;
-                if cacheable && let Some(state) = state {
-                    if cache.len() >= GROUP_CACHE_CAP {
-                        // evict about half (hash order is effectively random)
-                        let mut n = 0usize;
-                        cache.retain(|_, _| {
-                            n += 1;
-                            n % 2 == 0
-                        });
-                    }
-                    cache.insert(prefix.clone(), state);
-                }
-                r
-            }
-        };
-        match result {
-            Ok(new) => {
-                // exact comparison: a new representation is a change too
-                if !same_row(&old, &new) {
-                    if let Some(o) = old {
-                        out.data.push((o, -1));
-                    }
-                    if let Some(n) = new {
-                        out.data.push((n, 1));
-                    }
-                }
-                if let Some(prev) = errors.remove(&prefix) {
-                    out.errs.push((prev, -1));
+    }
+    let old = match old {
+        Some(o) => {
+            #[cfg(debug_assertions)]
+            {
+                let stored = old_row(g, env, p, kv)?;
+                if !same_row(&stored, &o) {
+                    panic!("group cache diverged for {kv:?}: cached {o:?}, stored {stored:?}, delta {rows:?}");
                 }
             }
-            Err(e) => {
-                // the group has no valid value: retract it and report the error
+            o
+        }
+        None => old_row(g, env, p, kv)?,
+    };
+    let result = match result {
+        Some(r) => r,
+        None => {
+            let (r, state) = compute_group(g, env, p, &prefix, (!fidelity_key).then_some(kv))?;
+            if cacheable && let Some(state) = state {
+                if cache.len() >= GROUP_CACHE_CAP {
+                    // evict about half (hash order is effectively random)
+                    let mut n = 0usize;
+                    cache.retain(|_, _| {
+                        n += 1;
+                        n % 2 == 0
+                    });
+                }
+                cache.insert(prefix.clone(), state);
+            }
+            r
+        }
+    };
+    drop(cache);
+    match result {
+        Ok(new) => {
+            // exact comparison: a new representation is a change too
+            if !same_row(&old, &new) {
                 if let Some(o) = old {
-                    out.data.push((o, -1));
+                    out.push(env, o, -1)?;
                 }
-                let rec = err_record(&e);
-                match errors.insert(prefix, rec.clone()) {
-                    Some(prev) if prev == rec => {}
-                    Some(prev) => {
-                        out.errs.push((prev, -1));
-                        out.errs.push((rec, 1));
-                    }
-                    None => out.errs.push((rec, 1)),
+                if let Some(n) = new {
+                    out.push(env, n, 1)?;
                 }
+            }
+            if let Some(prev) = errors.remove(&prefix) {
+                out.err(prev, -1);
+            }
+        }
+        Err(e) => {
+            // the group has no valid value: retract it and report the error
+            if let Some(o) = old {
+                out.push(env, o, -1)?;
+            }
+            let rec = err_record(&e);
+            match errors.insert(prefix, rec.clone()) {
+                Some(prev) if prev == rec => {}
+                Some(prev) => {
+                    out.err(prev, -1);
+                    out.err(rec, 1);
+                }
+                None => out.err(rec, 1),
             }
         }
     }

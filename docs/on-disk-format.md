@@ -900,7 +900,7 @@ checkpoint of a running engine).
   fingerprint changed, or of views and indexes that could not be built and
   are kept as broken, and temporary trees, below) are dropped during
   start-up, after hydration.
-- **Temporary trees** (the sorted runs of hydration) take tree ids counting
+- **Temporary trees** (sorted runs, spilled deltas) take tree ids counting
   down from 2^64 − 1, outside the range of `next_tree_id`, and are dropped
   by the operation that creates them; a checkpoint does not happen during
   one, but would record such a tree like any other.
