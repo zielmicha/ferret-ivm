@@ -2052,16 +2052,9 @@ impl Env {
         let tree_ids = self.tree_ids();
         let mut records = Vec::with_capacity(tree_ids.len());
         let mut space = Vec::with_capacity(tree_ids.len());
-        // live bytes per segment as the checkpoint has them: without the
-        // nodes of temporary trees, which it does not record
-        let mut segments = self.seg_live.clone();
         for tid in tree_ids {
+            // (temporary trees are not recorded)
             if tid >= TEMP_TREES {
-                for (seg, live) in &self.trees[&tid].seg_live {
-                    if let Some(e) = segments.get_mut(seg) {
-                        e.1 = e.1.saturating_sub(*live);
-                    }
-                }
                 continue;
             }
             let loc = match self.trees[&tid].root {
@@ -2080,7 +2073,16 @@ impl Env {
         let active = self.segs.active_id();
         let active_len = self.segs.active_len();
         self.seg_live.entry(active).or_insert((0, 0));
-        segments.entry(active).or_insert((0, 0));
+        // live bytes per segment as the checkpoint has them: without the
+        // nodes of temporary trees
+        let mut segments = self.seg_live.clone();
+        for (_, t) in self.trees.iter().filter(|(id, _)| **id >= TEMP_TREES) {
+            for (seg, live) in &t.seg_live {
+                if let Some(e) = segments.get_mut(seg) {
+                    e.1 = e.1.saturating_sub(*live);
+                }
+            }
+        }
         self.checkpoint_seq += 1;
         let rec = CheckpointRecord {
             seq: self.checkpoint_seq,
