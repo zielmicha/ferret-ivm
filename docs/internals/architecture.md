@@ -193,8 +193,9 @@ a source, or answered to a client before it is durable. Under load, batches
 grow and the cost of `fsync` is shared; when idle, a batch is a single
 record. `--no-sync` skips the `fsync` but keeps the order.
 
-`SeqMsg::Truncate(gsn)` (sent after each checkpoint) deletes old log
-segments; `SeqMsg::Shutdown` stops the sequencer after the current batch.
+`SeqMsg::Truncate(gsn)` (sent after each checkpoint with its GSN) deletes
+the log segments the checkpoint covers; `SeqMsg::Shutdown` stops the
+sequencer after the current batch.
 
 Backpressure: before each batch the sequencer waits while the engine has
 `MAX_ENGINE_LAG` (10,000) or more durable records still to apply

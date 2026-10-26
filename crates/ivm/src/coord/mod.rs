@@ -916,8 +916,9 @@ impl Engine {
         let header = meta::encode_header(&self.meta, self.next_req);
         self.env.checkpoint(self.processed, &header)?;
         let relocated = self.env.gc(1000)?;
-        let keep_from = self.processed.saturating_sub(self.cfg.retention_gsns);
-        let _ = self.seq.send(SeqMsg::Truncate(keep_from));
+        // recovery replays the log after the checkpoint, and nothing else
+        // reads the log
+        let _ = self.seq.send(SeqMsg::Truncate(self.processed));
         self.last_checkpoint = Instant::now();
         self.records_since_checkpoint = 0;
         // (the next checkpoint writes the relocated nodes)

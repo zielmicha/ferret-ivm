@@ -182,8 +182,10 @@ engine that is idle takes no checkpoints otherwise.
    (the commit point), delete dead segments
    ([Storage](storage.md#segments-and-checkpoints));
 3. `Env::gc(1000)`: relocate live nodes of the oldest sparse segment;
-4. send `Truncate(processed − retention)` to the sequencer, which deletes
-   log segments whose records all lie at or before that GSN.
+4. send `Truncate(processed)` to the sequencer, which deletes log segments
+   whose records all lie at or before the checkpoint: recovery replays the
+   log after the checkpoint, and nothing else reads the log (`AS OF` reads
+   use the histories in the trees).
 
 The engine thread does nothing else while a checkpoint runs. Its cost is
 that of the nodes that changed since the previous one; it does not depend

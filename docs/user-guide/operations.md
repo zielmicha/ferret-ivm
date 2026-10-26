@@ -13,7 +13,7 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 |---|---|---|
 | `--cache-mb` | 1024 | Target size of the node cache. Clean index nodes beyond it are evicted (CLOCK) and re-read from segment files on demand; dirty nodes stay until the next checkpoint, and a checkpoint is forced when dirty nodes exceed half of it. Working sets that fit run from memory; larger ones degrade gradually. |
 | `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
-| `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes, more input-log segments on disk, and more clock ticks. `0` keeps no history beyond the previous GSN. |
+| `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes and more clock ticks. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
 | `--no-sync` | off | Skips `fsync` of the input log. Only for tests and benchmarks; see [Durability](#durability-and---no-sync). |
 
@@ -199,7 +199,8 @@ a restart replays at most that many. A checkpoint is also taken on the
 4. deletes sealed segment files with no live nodes;
 5. runs one garbage-collection pass;
 6. asks the sequencer to delete input-log segments whose records all lie at
-   or before `checkpoint GSN − retention`.
+   or before the checkpoint's GSN (only recovery reads the log, and it
+   starts after the checkpoint).
 
 What a checkpoint writes is what changed since the previous one: its cost
 does not grow with the catalog, its DDL history or the error records that
@@ -219,8 +220,9 @@ checkpoint. The active segment is never collected, so up to one segment
 Each index entry keeps a history of (GSN, weight) changes. Changes at or
 before the *retention frontier* (`last applied GSN − --retention-gsns`) are
 merged into one when an index leaf is next rewritten, and `AS OF` reads
-before the frontier are refused. The same bound decides which input-log
-segments a checkpoint may delete. See [Reads](reads.md#time-travel-as-of-gsn).
+before the frontier are refused. Retention does not keep input-log
+segments: `AS OF` reads use the histories in the indexes. See
+[Reads](reads.md#time-travel-as-of-gsn).
 
 ## Durability and --no-sync
 

@@ -296,9 +296,11 @@ The engine converts it to the PostgreSQL epoch (subtracting
   (`input log is missing records: expected gsn <g>, found <h> in <path>`),
   rather than replaying around the damage.
 - **Truncation** (`truncate_before(g)`, after every checkpoint with
-  `g = checkpoint GSN − retention`): every segment except the current one
-  whose successor starts at or before `g + 1` (so all its records are ≤ `g`)
-  is deleted.
+  `g` = the checkpoint's GSN): every segment except the current one whose
+  successor starts at or before `g + 1` (so all its records are ≤ `g`) is
+  deleted. Recovery replays the log after the checkpoint, and nothing else
+  reads the log, so the records a checkpoint covers are not kept (`AS OF`
+  reads use the histories in the trees, not the log).
 - The engine ignores records whose GSN is at or below the last GSN it has
   applied.
 
@@ -1040,9 +1042,9 @@ checkpoint of a running engine).
   are kept as broken) are dropped during start-up, after hydration.
 - **Retention**: history elements at or before the retention frontier
   (`processed GSN − --retention-gsns`) are merged when a leaf is next
-  modified (in the metadata tree too, which merges away replaced records);
-  input-log segments whose records all lie at or before
-  `checkpoint GSN − retention` are deleted after the checkpoint.
+  modified (in the metadata tree too, which merges away replaced records).
+  Input-log segments whose records all lie at or before the checkpoint's
+  GSN are deleted after the checkpoint, whatever the retention.
 
 ## Compatibility
 
