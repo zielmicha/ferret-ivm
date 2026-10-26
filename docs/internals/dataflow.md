@@ -519,6 +519,19 @@ Meanwhile:
 - At most a million forwarded records are kept for a thread still
   hydrating; beyond, the engine waits for it.
 
+What "the view exists as of *g*" means: from *g* on its name is taken, it
+is listed, and DDL can build on it; its contents at every GSN after *g* are
+those of an inline run, but they can be read only once it is live, at some
+*p* > *g* that depends on timing: every read of it, at any read point,
+waits until then. *p* is never observable in contents — reads wait,
+subscribers and sinks get what an inline run gives them at the same GSNs,
+and a checkpoint taken in between holds only the catalog entry, so recovery
+(or replay, which hydrates inline at *g*) reaches the same state. A view or
+index created while another hydration is in progress is hydrated as of the
+GSN the next hydration begins at, not as of its own statement's: its
+contents from then on are the same function of the log, and nothing could
+read it before.
+
 Replacements need more than the new contents:
 
 - A replaced materialized view (`replace_view`) is switched to its new
