@@ -1110,7 +1110,9 @@ checkpoint of a running engine).
   per-tree live bytes and the parents' locations of leaves (which it does
   not read unless they are rewritten). Reading and rewriting clean nodes is
   budgeted: for compaction and for relocation each, 8 MiB plus the bytes the
-  checkpoints since the previous pass wrote for the engine's own updates.
+  checkpoints since the previous pass wrote for the engine's own updates,
+  and in memory, what the buffer pool has room for besides its dirty
+  nodes.
 - **Evacuated segments**: sealed segments with `live_bytes × 2 <
   total_bytes`, in decreasing order of `(1 − u) × age / (1 + u)` (`u` =
   live / total, `age` = active segment id − segment id), while their live
