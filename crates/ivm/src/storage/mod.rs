@@ -369,11 +369,11 @@ impl Env {
         self.next_tree_id
     }
 
-    /// A tree for temporary contents (sort runs), which its user drops. Its
-    /// id is taken from the top of the id range downwards, leaving the ids
-    /// of `create_tree` a function of the operations that create trees. One
-    /// that a checkpoint happens to record is not attached after recovery,
-    /// so the engine drops it then.
+    /// A tree for temporary contents (sort runs, spilled deltas), which its
+    /// user drops. Its id is taken from the top of the id range downwards,
+    /// leaving the ids of `create_tree` a function of the operations that
+    /// create trees. One that a checkpoint happens to record is not attached
+    /// after recovery, so the engine drops it then.
     pub fn create_temp_tree(&mut self, summarizer: Arc<dyn Summarizer>) -> TreeId {
         let mut id = TreeId::MAX;
         while self.trees.contains_key(&id) {
@@ -1411,12 +1411,11 @@ impl Env {
         Ok(())
     }
 
-    /// Write dirty nodes early until at most `target` dirty bytes remain
-    /// (or nothing more can be written without evicting clean nodes), as
-    /// the pool does on its own beyond half of the cache. A hook for callers
-    /// that manage memory or checkpoints incrementally: the nodes written
-    /// are clean and evictable, the next checkpoint only writes the rest.
-    /// Returns the dirty bytes left.
+    /// Write dirty nodes early, children before parents, until at most
+    /// `target` dirty bytes remain, as the pool does on its own beyond half
+    /// of the cache. A hook for callers that manage memory or checkpoints
+    /// incrementally: the nodes written are clean and evictable, the next
+    /// checkpoint only writes the rest. Returns the dirty bytes left.
     pub fn write_back(&mut self, target: usize) -> Result<usize> {
         // children before parents: leaves first, then each level above
         while self.dirty_bytes > target {
@@ -1442,6 +1441,8 @@ impl Env {
                 break;
             }
         }
+        // the nodes written can be evicted
+        self.evict_stall = None;
         self.maybe_evict()?;
         Ok(self.dirty_bytes)
     }
