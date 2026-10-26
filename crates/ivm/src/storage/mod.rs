@@ -1968,7 +1968,11 @@ impl Env {
     pub fn maintain(&mut self) -> Result<MaintStats> {
         let written = std::mem::take(&mut self.fg_appended);
         let b = MAINT_MIN_BYTES.saturating_add(written);
-        self.maintain_with(MaintBudget { compact: b, gc: b })
+        // the nodes it rewrites stay in the pool, dirty, until the
+        // checkpoint writes them: what the pool's target leaves besides the
+        // dirty nodes it holds (only clean ones can be evicted)
+        let memory = self.opts.cache_bytes.saturating_sub(self.dirty_bytes);
+        self.maintain_with(MaintBudget { compact: b, gc: b, memory })
     }
 
     /// A maintenance pass: rewrite the leaves whose compaction is due (and
@@ -1988,6 +1992,7 @@ impl Env {
             victims,
             compact: budget.compact,
             gc: budget.gc,
+            memory: budget.memory,
             leaf_depth: None,
         };
         for tid in self.tree_ids() {
@@ -2102,6 +2107,10 @@ impl Env {
             }
             let due = leaf_due(&entries);
             self.put_node(id, Node::Leaf(entries));
+            if !dirty {
+                // (as compacted: what stays in memory)
+                m.dirtied(self.slot(id).mem);
+            }
             return Ok(Visit::New(smallvec::smallvec![Part { sep: Box::default(), id, summary: old.clone(), min_seg: u32::MAX, due }]));
         }
         let relocate = in_victim && m.charge(true, bytes);
@@ -2192,6 +2201,7 @@ impl Env {
             // the path to a rewritten node is rewritten too
             self.make_dirty(id);
             self.slot_mut(id).by_maint = true;
+            m.dirtied(self.slot(id).mem);
         }
         if children.is_empty() {
             self.slot_mut(id).loaded_children = 0;
@@ -2277,10 +2287,14 @@ pub struct MaintBudget {
     /// For evacuating sparse segments (it also bounds the live bytes of
     /// the segments chosen).
     pub gc: u64,
+    /// Memory (`Slot::mem`) that the clean nodes the pass rewrites may take:
+    /// they stay in the buffer pool, dirty, until the checkpoint writes
+    /// them. No node is read for rewriting once it is used up.
+    pub memory: usize,
 }
 
 impl MaintBudget {
-    pub const UNLIMITED: MaintBudget = MaintBudget { compact: u64::MAX, gc: u64::MAX };
+    pub const UNLIMITED: MaintBudget = MaintBudget { compact: u64::MAX, gc: u64::MAX, memory: usize::MAX };
 }
 
 /// What a maintenance pass did.
@@ -2308,6 +2322,7 @@ struct Maint {
     /// Remaining budgets.
     compact: u64,
     gc: u64,
+    memory: usize,
     /// Depth of the leaves of the tree being visited, once one was seen.
     leaf_depth: Option<usize>,
     stats: MaintStats,
@@ -2319,15 +2334,20 @@ impl Maint {
     }
 
     /// Take `bytes` from the GC or the compaction budget; false (taking
-    /// nothing) once it is exhausted.
+    /// nothing) once it is exhausted, or the memory for rewritten nodes is.
     fn charge(&mut self, gc: bool, bytes: u64) -> bool {
         let b = if gc { &mut self.gc } else { &mut self.compact };
-        if *b == 0 {
+        if *b == 0 || self.memory == 0 {
             self.stats.unfinished = true;
             return false;
         }
         *b = b.saturating_sub(bytes);
         true
+    }
+
+    /// The pass made a clean node of `mem` bytes of memory dirty.
+    fn dirtied(&mut self, mem: usize) {
+        self.memory = self.memory.saturating_sub(mem);
     }
 }
 

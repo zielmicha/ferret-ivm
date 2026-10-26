@@ -757,7 +757,7 @@ impl Harness {
             1 => u64::MAX,
             _ => self.rng.range(1, 20_000) as u64,
         };
-        let b = MaintBudget { compact: budget(), gc: budget() };
+        let b = MaintBudget { compact: budget(), gc: budget(), memory: usize::MAX };
         let st = self.env().maintain_with(b).unwrap();
         if st.merged > 0 {
             self.event("merges");
@@ -1307,7 +1307,7 @@ fn time_travel_crashes_and_gc_against_model() {
                 }
                 3 => {
                     let b = 1 + rng.below(40_000);
-                    env.maintain_with(MaintBudget { compact: b, gc: b }).unwrap();
+                    env.maintain_with(MaintBudget { compact: b, gc: b, memory: usize::MAX }).unwrap();
                 }
                 4 => {
                     // crash: everything after the last checkpoint is lost
@@ -1519,7 +1519,7 @@ fn a_pass_short_of_budget_reports_work_left() {
     env.apply(t, &mut (0..n).filter(|i| i % 10 != 0).map(|i| (key8(i, 20), -1)).collect(), 2).unwrap();
     env.checkpoint(2, b"").unwrap();
     env.set_frontier(2);
-    let budget = MaintBudget { compact: 64 << 10, gc: 64 << 10 };
+    let budget = MaintBudget { compact: 64 << 10, gc: 64 << 10, memory: usize::MAX };
     let mut passes = 0;
     loop {
         let st = env.maintain_with(budget).unwrap();
@@ -1538,7 +1538,49 @@ fn a_pass_short_of_budget_reports_work_left() {
     env.apply(t, &mut (0..n).filter(|i| i % 10 == 0).map(|i| (key8(i, 20), -1)).collect(), 3).unwrap();
     env.checkpoint(3, b"").unwrap();
     env.set_frontier(3);
-    assert!(env.maintain_with(MaintBudget { compact: 0, gc: 0 }).unwrap().unfinished);
+    assert!(env.maintain_with(MaintBudget { compact: 0, gc: 0, memory: usize::MAX }).unwrap().unfinished);
+}
+
+/// The nodes a pass rewrites stay in the pool, dirty, until the checkpoint
+/// writes them: a pass rewrites no more than the pool's target has room for
+/// besides the dirty nodes it holds, whatever its byte budget, and says that
+/// it left work, which the passes that follow do.
+#[test]
+fn a_pass_rewrites_what_the_pool_has_room_for() {
+    let tmp = TempDir::new("storage-maint-memory");
+    let cache = 1 << 20;
+    let opts = EnvOptions { cache_bytes: cache, ..EnvOptions::default() };
+    let (mut env, _) = Env::open(tmp.path(), opts).unwrap();
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    let n = 100_000u64;
+    for c in (0..n).step_by(10_000) {
+        env.apply(t, &mut (c..c + 10_000).map(|i| (key8(i, 20), 1)).collect(), 1).unwrap();
+        env.checkpoint(1, b"").unwrap();
+    }
+    for c in (0..n).step_by(10_000) {
+        env.apply(t, &mut (c..c + 10_000).filter(|i| i % 10 != 0).map(|i| (key8(i, 20), -1)).collect(), 2).unwrap();
+        env.checkpoint(2, b"").unwrap();
+    }
+    env.set_frontier(2);
+    let mut passes = 0;
+    loop {
+        let st = env.maintain().unwrap();
+        let dirty = env.dirty_bytes();
+        // (the last node rewritten, and the path to it, may go beyond)
+        assert!(dirty < cache + (256 << 10), "a pass left {dirty} bytes of dirty nodes in a pool of {cache}: {st:?}");
+        env.checkpoint(2, b"").unwrap();
+        passes += 1;
+        if !st.unfinished {
+            break;
+        }
+        assert!(passes < 100, "the passes do not finish: {st:?}");
+    }
+    assert!(passes > 1, "one pass compacted the whole tree within a pool of {cache} bytes");
+    // nothing is left that a pass without limits would compact
+    let st = env.maintain_with(MaintBudget::UNLIMITED).unwrap();
+    assert_eq!(st.compacted, 0, "{st:?}");
+    let (_, _, entries, _) = shape(&mut env, t);
+    assert!(entries as u64 <= n / 10 + n / 100, "{entries} entries left");
 }
 
 /// Appending keys in small batches fills leaves to 90% (they used to split
