@@ -242,10 +242,11 @@ proptest! {
         prop_assert_eq!(&ab, &forward);
         ab.subtract(&a);
         prop_assert_eq!(&ab, &b);
-        // one encoding, which round-trips
+        // one encoding, which round-trips and whose length is predicted
         let enc = encode_state(&forward);
         prop_assert_eq!(&enc, &encode_state(&other));
         prop_assert_eq!(&decode_state(&enc), &forward);
+        prop_assert_eq!(AggState::SumFloat(Box::new(forward.clone())).encoded_len(), enc.len());
     }
 
     /// Limb and big-integer arithmetic agree.
@@ -309,6 +310,34 @@ fn float_sum_encoding_examples() {
     s.add(0.2, -1);
     s.add(f64::NAN, 2);
     assert_eq!(hex(&s), "08 00 00 04 00 00");
+}
+
+/// Node size estimates count the summaries as encoded.
+#[test]
+fn summary_encoded_len_is_exact() {
+    use AggKind::*;
+    let num = |s: &str| Datum::numeric(Numeric::parse(s).unwrap());
+    let interval = |d| Datum::Interval(pgdatetime::Interval { months: 1, days: d, micros: 3 });
+    let cases: Vec<(AggKind, Vec<Datum>)> = vec![
+        (CountNonNull, vec![Datum::Int8(1), Datum::Int8(2)]),
+        (SumInt, vec![Datum::Int8(-5), Datum::Int8(1 << 40)]),
+        (SumNumeric, vec![num("123.4500"), num("-1e300"), num("NaN")]),
+        (SumFloat, vec![Datum::Float8(0.1), Datum::Float8(-1e300), Datum::Float8(f64::INFINITY)]),
+        (Min, vec![Datum::text_owned("x".repeat(100)), Datum::text_owned("w".repeat(200))]),
+        (Max, vec![interval(2), interval(-7)]),
+        (Min, vec![num("2.50"), num("-0.001")]),
+        (Max, vec![Datum::Float8(-0.0), Datum::Float8(f64::NAN)]),
+    ];
+    for (k, vals) in cases {
+        let mut s = Summary::empty(&[k]);
+        for (n, v) in vals.iter().enumerate() {
+            k.add(&mut s.aggs[0], v, 3 * n as i64 + 1).unwrap();
+            s.count += 1 << (20 * n);
+            let mut enc = Vec::new();
+            s.encode(&mut enc);
+            assert_eq!(s.encoded_len(), enc.len(), "{s:?}");
+        }
+    }
 }
 
 /// Typical sums stay inline and small.

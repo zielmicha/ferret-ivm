@@ -18,6 +18,7 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{Signed, ToPrimitive, Zero};
 use pgnumeric::Numeric;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -102,6 +103,11 @@ impl Summary {
         for a in &self.aggs {
             a.encode(out);
         }
+    }
+
+    /// Length of the encoding (for node size estimates).
+    pub fn encoded_len(&self) -> usize {
+        ivarint_len(self.count) + uvarint_len(self.aggs.len() as u64) + self.aggs.iter().map(AggState::encoded_len).sum::<usize>()
     }
 
     pub fn decode(buf: &mut &[u8]) -> Result<Summary> {
@@ -284,6 +290,11 @@ impl PartialEq for Datum {
     }
 }
 
+thread_local! {
+    /// Buffer for measuring encodings without allocating.
+    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 impl AggState {
     pub fn combine(&mut self, other: &AggState) {
         match (self, other) {
@@ -349,6 +360,26 @@ impl AggState {
         }
     }
 
+    fn encoded_len(&self) -> usize {
+        1 + match self {
+            AggState::Count(c) => ivarint_len(*c),
+            AggState::SumInt(_) => 16,
+            AggState::SumFloat(f) => f.encoded_len(),
+            AggState::Min(None) | AggState::Max(None) => 1,
+            AggState::Min(Some(Datum::Text(s) | Datum::Json(s))) | AggState::Max(Some(Datum::Text(s) | Datum::Json(s))) => {
+                1 + uvarint_len(s.len() as u64) + s.len()
+            }
+            _ => {
+                return SCRATCH.with(|b| {
+                    let mut b = b.borrow_mut();
+                    b.clear();
+                    self.encode(&mut b);
+                    b.len()
+                });
+            }
+        }
+    }
+
     fn decode(buf: &mut &[u8]) -> Result<AggState> {
         Ok(match get_u8(buf)? {
             1 => AggState::Count(get_ivarint(buf)?),
@@ -374,6 +405,14 @@ impl AggState {
             t => return Err(SqlError::corrupt(format!("bad agg state tag {t}"))),
         })
     }
+}
+
+fn uvarint_len(v: u64) -> usize {
+    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
+}
+
+fn ivarint_len(v: i64) -> usize {
+    uvarint_len(((v << 1) ^ (v >> 63)) as u64)
 }
 
 /// Exact, order-independent and invertible sum of weighted numerics.
@@ -608,6 +647,10 @@ impl FloatSum {
         put_ivarint(out, self.neg_inf);
     }
 
+    fn encoded_len(&self) -> usize {
+        self.finite.encoded_len() + ivarint_len(self.nan) + ivarint_len(self.pos_inf) + ivarint_len(self.neg_inf)
+    }
+
     fn decode(buf: &mut &[u8]) -> Result<FloatSum> {
         let finite = Dyadic::decode(buf)?;
         Ok(FloatSum { finite, nan: get_ivarint(buf)?, pos_inf: get_ivarint(buf)?, neg_inf: get_ivarint(buf)? })
@@ -794,6 +837,11 @@ impl Dyadic {
         let start = out.len();
         out.extend(self.mag.iter().flat_map(|l| l.to_le_bytes()));
         out.truncate(start + len);
+    }
+
+    fn encoded_len(&self) -> usize {
+        let len = (self.bits() as usize).div_ceil(8);
+        ivarint_len(self.exp as i64) + uvarint_len((len as u64) << 1) + len
     }
 
     fn decode(buf: &mut &[u8]) -> Result<Dyadic> {

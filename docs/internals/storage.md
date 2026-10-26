@@ -35,8 +35,10 @@ whether it has been attached after recovery.
 A child's separator is the lower bound of its key range (ignored for the
 first child); a key belongs to the last child whose separator is `<=` it.
 Nodes are split by size: the target is 16 KiB of estimated serialized size
-for leaves and for internal nodes. A node whose contents after an update
-exceed the target is split into chunks of balanced size (internal nodes keep
+for leaves and for internal nodes (`node::entry_size`, `node::child_size`: a
+leaf entry counts its key, 4 bytes and 6 per history element; a child its
+separator, its summary as encoded and 24 bytes). A node whose contents
+after an update exceed the target is split into chunks of balanced size (internal nodes keep
 at least two children per chunk); when they exceed twice the target (a bulk
 load, hydration), the chunks are filled to 90% of it, so that the next
 inserts do not split every node right away. When a leaf splits, the
