@@ -1408,3 +1408,29 @@ mod api {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// A sink over a relation too large to snapshot within the engine thread's
+/// read budget starts from a snapshot taken on a reader thread, as of the
+/// GSN it was created at, and then gets the changes applied meanwhile:
+/// the target ends up equal to the relation, and commits made while the
+/// snapshot was taken are not lost or doubled.
+#[test]
+fn sinks_over_large_relations_start_from_a_snapshot_taken_off_the_engine_thread() {
+    let up = Upstream::start();
+    let dir = tmpdir("sink-large");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    ivm.exec("INSERT INTO t SELECT i, i % 10 FROM generate_series(1, 120000) i");
+    let mut other = ivm.connect();
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    for i in 0..50 {
+        other.simple_query(&format!("UPDATE t SET v = v + 100 WHERE id = {}", i * 997 + 1)).unwrap();
+        other.simple_query(&format!("INSERT INTO t VALUES ({}, 7)", 200_000 + i)).unwrap();
+        other.simple_query(&format!("DELETE FROM t WHERE id = {}", i * 991 + 5)).unwrap();
+    }
+    let mut up = up;
+    let want = ivm.rows("SELECT count(*), sum(v), sum(id) FROM t");
+    eventually("the target to catch up", || up.rows("SELECT count(*), sum(v), sum(id) FROM target") == want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}

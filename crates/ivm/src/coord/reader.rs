@@ -5,6 +5,12 @@
 //! graph it reads: the same read point and plan, hence the same result,
 //! while the engine goes on. The budget bounds what a read costs the engine
 //! thread; small reads (point lookups, short ranges) cost no fork.
+//!
+//! The snapshots that a subscription `WITH SNAPSHOT` to a relation and a
+//! sink start from are taken the same way: within the budget on the engine
+//! thread, else on a reader thread as of the GSN the subscription or sink
+//! starts at, while the outputs of the relation's node at the records
+//! applied meanwhile are kept, to be delivered after the snapshot.
 
 use super::*;
 use crate::exec::{ExecCtx, Rows};
@@ -16,23 +22,52 @@ pub(crate) const INLINE_READ_ENTRIES: u64 = 50_000;
 /// Reader threads (each read holds a fork with a buffer pool of its own).
 const READERS: usize = 4;
 
-/// A read to run on a reader thread.
-pub(crate) struct ReadJob {
-    env: Env,
-    graph: Graph,
-    /// Relation id -> its node, for the relations the plan reads.
-    objects: Vec<(ObjectId, NodeId)>,
-    bq: crate::sql::BoundQuery,
-    at: ReadAt,
-    settings: Arc<BTreeMap<String, String>>,
-    reply: Sender<Result<ExecResult>>,
+/// Work for a reader thread, with the fork it reads.
+pub(crate) enum ReadJob {
+    /// A read, answered to its client.
+    Query {
+        env: Env,
+        graph: Graph,
+        /// Relation id -> its node, for the relations the plan reads.
+        objects: Vec<(ObjectId, NodeId)>,
+        bq: Box<crate::sql::BoundQuery>,
+        at: ReadAt,
+        settings: Arc<BTreeMap<String, String>>,
+        reply: Sender<Result<ExecResult>>,
+    },
+    /// A node's snapshot, handed back to the engine (which it wakes).
+    Snapshot { env: Env, graph: Graph, node: NodeId, done: Sender<Result<Output>>, wake: Sender<EngineMsg> },
 }
 
-fn run(mut job: ReadJob) -> Result<ExecResult> {
-    let objects = |oid: u64| job.objects.iter().find(|(o, _)| *o == oid).map(|(_, n)| *n);
-    let mut ctx = ExecCtx { g: &job.graph, env: &mut job.env, at: job.at, objects: &objects, rec: Default::default() };
-    let rows: Rows = crate::expr::with_session_settings(job.settings.clone(), || ctx.execute(&job.bq.rel))?;
-    Ok(super::read::finish_read(job.bq, rows))
+fn run(job: ReadJob) {
+    match job {
+        ReadJob::Query { mut env, graph, objects, bq, at, settings, reply } => {
+            let objects = |oid: u64| objects.iter().find(|(o, _)| *o == oid).map(|(_, n)| *n);
+            let mut ctx = ExecCtx { g: &graph, env: &mut env, at, objects: &objects, rec: Default::default() };
+            let rows: Result<Rows> = crate::expr::with_session_settings(settings, || ctx.execute(&bq.rel));
+            let _ = reply.send(rows.map(|rows| super::read::finish_read(*bq, rows)));
+        }
+        ReadJob::Snapshot { mut env, graph, node, done, wake } => {
+            let _ = done.send(graph.snapshot(&mut env, node));
+            let _ = wake.send(EngineMsg::Wake);
+        }
+    }
+}
+
+/// A snapshot being taken on a reader thread for a subscription or a sink
+/// that starts at `gsn`, and the outputs of its node at the records applied
+/// since (None: it did not change), delivered after it.
+pub(crate) struct Snapshotting {
+    gsn: Gsn,
+    node: NodeId,
+    done: Receiver<Result<Output>>,
+    outputs: Vec<(Gsn, Option<Output>)>,
+    then: AfterSnapshot,
+}
+
+pub(crate) enum AfterSnapshot {
+    Subscription(super::hydrate::PendingSub),
+    Sink { id: ObjectId, name: String, def: crate::catalog::SinkDef, columns: Vec<crate::types::Column> },
 }
 
 impl Engine {
@@ -55,6 +90,10 @@ impl Engine {
             .collect();
         let graph = self.graph.fork_of(&objects.iter().map(|(_, n)| *n).collect::<Vec<_>>());
         let env = self.env.fork()?;
+        self.send_to_reader(ReadJob::Query { env, graph, objects, bq: Box::new(bq), at, settings: vars.settings, reply })
+    }
+
+    fn send_to_reader(&mut self, job: ReadJob) -> Result<()> {
         let tx = match &self.readers {
             Some(tx) => tx.clone(),
             None => {
@@ -64,8 +103,7 @@ impl Engine {
                     // (the engine thread's stack: the same executor runs here)
                     std::thread::Builder::new().name(format!("ivm-reader-{i}")).stack_size(64 << 20).spawn(move || {
                         for job in rx.iter() {
-                            let reply = job.reply.clone();
-                            let _ = reply.send(run(job));
+                            run(job);
                         }
                     })?;
                 }
@@ -73,7 +111,92 @@ impl Engine {
                 tx
             }
         };
-        let job = ReadJob { env, graph, objects, bq, at, settings: vars.settings, reply };
         tx.send(job).map_err(|_| SqlError::internal("reader threads stopped"))
+    }
+
+    /// The snapshot of `node` now, if it is taken within the read budget
+    /// (always when replaying or without threads); else it is taken on a
+    /// reader thread, as of the last applied GSN, and `then` follows it
+    /// (`poll_snapshots`).
+    pub(crate) fn snapshot_or_defer(&mut self, node: NodeId, then: AfterSnapshot) -> Result<Option<(Output, AfterSnapshot)>> {
+        let Some(wake) = self.handle.as_ref().filter(|_| !self.replaying).map(|h| h.tx.clone()) else {
+            return Ok(Some((self.graph.snapshot(&mut self.env, node)?, then)));
+        };
+        self.env.set_read_budget(Some(INLINE_READ_ENTRIES));
+        let r = self.graph.snapshot(&mut self.env, node);
+        self.env.set_read_budget(None);
+        match r {
+            Err(e) if e.code == crate::storage::READ_BUDGET => {}
+            r => return Ok(Some((r?, then))),
+        }
+        let graph = self.graph.fork_of(&[node]);
+        let env = self.env.fork()?;
+        let (tx, done) = bounded(1);
+        self.send_to_reader(ReadJob::Snapshot { env, graph, node, done: tx, wake })?;
+        self.snapshotting.push(Snapshotting { gsn: self.processed, node, done, outputs: Vec::new(), then });
+        Ok(None)
+    }
+
+    /// Keep a record's outputs for the snapshots being taken.
+    pub(crate) fn keep_for_snapshots(&mut self, gsn: Gsn, outputs: &FxHashMap<NodeId, Output>) {
+        for s in self.snapshotting.iter_mut() {
+            s.outputs.push((gsn, outputs.get(&s.node).cloned()));
+        }
+    }
+
+    /// Start the subscriptions and sinks whose snapshots have been taken,
+    /// with the outputs kept since.
+    pub(crate) fn poll_snapshots(&mut self) -> Result<()> {
+        let mut i = 0;
+        while i < self.snapshotting.len() {
+            let r = match self.snapshotting[i].done.try_recv() {
+                Ok(r) => r,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Err(_) => Err(SqlError::internal("reader thread vanished")),
+            };
+            let s = self.snapshotting.remove(i);
+            let snapshot = r?;
+            self.after_snapshot(s.then, s.gsn, snapshot, s.outputs)?;
+        }
+        Ok(())
+    }
+
+    /// Start a subscription or a sink from its snapshot as of `gsn` and the
+    /// outputs of its node at the records applied since.
+    pub(crate) fn after_snapshot(&mut self, then: AfterSnapshot, gsn: Gsn, snapshot: Output, outputs: Vec<(Gsn, Option<Output>)>) -> Result<()> {
+        match then {
+            AfterSnapshot::Subscription(p) => {
+                let steps: Vec<(Gsn, FxHashMap<NodeId, Output>)> =
+                    outputs.into_iter().map(|(g, o)| (g, o.map(|o| (p.node, o)).into_iter().collect())).collect();
+                self.start_subscription(p, gsn, Some(snapshot), &steps);
+            }
+            AfterSnapshot::Sink { id, name, def, columns } => {
+                let handle = self.handle.clone().ok_or_else(|| SqlError::internal("sink without engine handle"))?;
+                let node = self.rt.views.get(&def.from).map(|v| v.node).or_else(|| self.rt.tables.get(&def.from).copied());
+                let node = node.ok_or_else(|| SqlError::internal("sink source without dataflow"))?;
+                let h = crate::sink::start(id, name, def, node, columns, snapshot.data, gsn, handle)?;
+                for (g, o) in outputs {
+                    match o {
+                        Some(o) => h.send(g, &o.data),
+                        None => h.progress(g),
+                    }
+                }
+                self.sink_handles.insert(id, h);
+            }
+        }
+        Ok(())
+    }
+
+    /// Is the sink waiting for its snapshot?
+    pub(crate) fn snapshotting_sink(&self, id: ObjectId) -> bool {
+        self.snapshotting.iter().any(|s| matches!(&s.then, AfterSnapshot::Sink { id: x, .. } if *x == id))
+    }
+
+    /// Forget the snapshot being taken for a sink (dropped or restarted).
+    pub(crate) fn forget_sink_snapshot(&mut self, id: ObjectId) {
+        self.snapshotting.retain(|s| !matches!(&s.then, AfterSnapshot::Sink { id: x, .. } if *x == id));
     }
 }

@@ -387,7 +387,12 @@ it reads (`Graph::fork_of`): the same read point and plan, hence the same
 result, while the engine goes on applying records and answering other
 statements. The reader thread answers the client. A small read costs no
 fork; a large one costs the engine thread its budget and the fork (one
-reference-count increment per loaded node).
+reference-count increment per loaded node). The snapshots that a sink and
+a `SUBSCRIBE ... WITH SNAPSHOT` to a relation start from are taken the same
+way (`Engine::snapshot_or_defer`): one taken off the engine thread is as of
+the GSN the sink or subscription starts at, and the engine keeps the
+relation's outputs at the records it applies meanwhile, delivered after the
+snapshot; DDL records wait until no such snapshot is being taken.
 
 Because the executor and the dataflow share the aggregate, window and
 expression code, a maintained view and the same query run ad hoc compute

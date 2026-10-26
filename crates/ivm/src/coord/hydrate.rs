@@ -217,10 +217,13 @@ impl Engine {
         match then {
             Then::Reply { req, res } => self.reply_pending(req, res),
             Then::ViewErrors(id) => self.take_root_errors(id),
-            Then::Subscribe(p) => {
-                let snapshot = if p.snapshot { Some(self.graph.snapshot(&mut self.env, p.node)?) } else { None };
-                self.start_subscription(p, self.processed, snapshot, &[]);
+            Then::Subscribe(p) if p.snapshot => {
+                // (a large one is taken off the engine thread)
+                if let Some((snapshot, then)) = self.snapshot_or_defer(p.node, super::reader::AfterSnapshot::Subscription(p))? {
+                    self.after_snapshot(then, self.processed, snapshot, Vec::new())?;
+                }
             }
+            Then::Subscribe(p) => self.start_subscription(p, self.processed, None, &[]),
         }
         Ok(())
     }
@@ -365,7 +368,7 @@ impl Engine {
     /// Start a subscription as of `gsn`, with its node's snapshot then and
     /// its outputs at the records applied since (`steps`), as `deliver`
     /// would have delivered them.
-    fn start_subscription(&mut self, p: PendingSub, gsn: Gsn, snapshot: Option<Output>, steps: &[(Gsn, FxHashMap<NodeId, Output>)]) {
+    pub(crate) fn start_subscription(&mut self, p: PendingSub, gsn: Gsn, snapshot: Option<Output>, steps: &[(Gsn, FxHashMap<NodeId, Output>)]) {
         let (tx, rx) = unbounded();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(s) = snapshot
@@ -379,6 +382,9 @@ impl Engine {
             deliver_to(&sub, *g, outs.get(&sub.node));
         }
         self.subs.push(sub);
-        let _ = p.reply.send(Ok(ExecResult::Subscribe { columns: p.columns, rx, cancel, progress: p.progress }));
+        // (a client that is gone no longer reads it: it ends)
+        if p.reply.send(Ok(ExecResult::Subscribe { columns: p.columns, rx, cancel: cancel.clone(), progress: p.progress })).is_err() {
+            cancel.store(true, Ordering::Release);
+        }
     }
 }

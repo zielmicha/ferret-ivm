@@ -184,6 +184,8 @@ pub struct Engine {
     /// Threads running large reads on forks (`reader.rs`), started when
     /// first needed.
     readers: Option<Sender<reader::ReadJob>>,
+    /// Snapshots being taken on reader threads for subscriptions and sinks.
+    pub(crate) snapshotting: Vec<reader::Snapshotting>,
     /// Command tags of DML waiting to be applied.
     pub(crate) dml_counts: HashMap<u64, String>,
     /// Requests to run after the current message.
@@ -467,6 +469,7 @@ impl Engine {
             dml_reads: None,
             outbox: Vec::new(),
             readers: None,
+            snapshotting: Vec::new(),
             dml_counts: HashMap::new(),
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),
@@ -659,6 +662,10 @@ impl Engine {
                 }
             }
             self.flush_outbox();
+            if !self.snapshotting.is_empty() {
+                self.poll_snapshots()?;
+                self.apply_durable(&handle)?;
+            }
             self.poll_hydration(&handle)?;
             self.poll_checkpoint(false)?;
             self.maybe_checkpoint()?;
@@ -700,7 +707,11 @@ impl Engine {
     fn apply_durable(&mut self, handle: &EngineHandle) -> Result<()> {
         let mut applied = false;
         while let Some((_, rec)) = self.held.front() {
-            if self.hydration.is_some() && self.must_wait_for_hydration(rec) {
+            // (and DDL while snapshots are taken for the subscriptions and
+            // sinks it could end or replace)
+            if (self.hydration.is_some() && self.must_wait_for_hydration(rec))
+                || (!self.snapshotting.is_empty() && matches!(rec, LogRecord::Ddl { .. } | LogRecord::Schema { .. }))
+            {
                 break;
             }
             let (gsn, rec) = self.held.pop_front().unwrap();
@@ -975,6 +986,9 @@ impl Engine {
             } else {
                 sink.progress(gsn);
             }
+        }
+        if !self.snapshotting.is_empty() {
+            self.keep_for_snapshots(gsn, outputs);
         }
     }
 

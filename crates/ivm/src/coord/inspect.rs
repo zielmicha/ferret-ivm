@@ -765,7 +765,11 @@ impl Engine {
     pub(crate) fn sink_status(&self, id: ObjectId) -> String {
         match self.rt.broken.get(&id) {
             Some(reason) => format!("error: broken: {reason}"),
-            None => self.sink_handles.get(&id).map(|h| h.status()).unwrap_or_else(|| "stopped".into()),
+            None => match self.sink_handles.get(&id) {
+                Some(h) => h.status(),
+                None if self.snapshotting_sink(id) => "starting".into(),
+                None => "stopped".into(),
+            },
         }
     }
 

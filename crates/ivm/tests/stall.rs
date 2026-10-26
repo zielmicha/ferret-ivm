@@ -500,3 +500,55 @@ fn large_reads_do_not_hold_up_commits() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The snapshot of a large view that a subscription starts with is taken
+/// off the engine thread: commits are applied and answered meanwhile, and
+/// the snapshot (as of the GSN the subscription started at) and the changes
+/// after it add up to the view's contents. (A sink's starting snapshot is
+/// taken the same way.)
+#[test]
+fn large_subscription_snapshots_do_not_hold_up_commits() {
+    let _serial = serial();
+    let dir = tmpdir("subscribe-snapshot");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE wide (id int PRIMARY KEY, g int, pad text)");
+    for lo in (0..600_000).step_by(100_000) {
+        exec(&h, &format!("INSERT INTO wide SELECT i, i % 7, repeat('x', 50) FROM generate_series({lo}, {}) i", lo + 99_999));
+    }
+    exec(&h, "CREATE MATERIALIZED VIEW wv AS SELECT id, g FROM wide WHERE g < 5");
+    let h2 = h.clone();
+    let sub = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let r = exec(&h2, "SUBSCRIBE wv WITH (PROGRESS)");
+        (r, t0.elapsed())
+    });
+    let (mut i, mut slowest) = (0, Duration::ZERO);
+    while !sub.is_finished() {
+        let t0 = Instant::now();
+        exec(&h, &format!("INSERT INTO wide VALUES ({}, {}, 'y')", 1_000_000 + i, i % 7));
+        i += 1;
+        if !sub.is_finished() {
+            slowest = slowest.max(t0.elapsed());
+        }
+    }
+    let (r, took) = sub.join().unwrap();
+    let ExecResult::Subscribe { rx, cancel, .. } = r else { panic!("not a subscription") };
+    assert!(i >= 3, "{i} commits answered while the snapshot was taken");
+    assert!(slowest * 3 < took, "a commit took {slowest:?} of the snapshot's {took:?}");
+    exec(&h, "INSERT INTO wide VALUES (-1, 1, 'z')");
+    let last = gsn(&h);
+    let mut n = 0i64;
+    for ev in rx.iter() {
+        match ev {
+            SubEvent::Data { rows, .. } => n += rows.iter().map(|(_, w)| w).sum::<i64>(),
+            SubEvent::Progress { gsn } if gsn >= last => break,
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => panic!("{e}"),
+        }
+    }
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(vec![n.to_string()], rows(&h, "SELECT count(*) FROM wv"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
