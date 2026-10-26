@@ -578,11 +578,15 @@ impl BackendWriter {
     }
 
     /// Writes all buffered bytes to `w` (then flushes `w`) and clears the
-    /// buffer. After an error the connection should be considered broken.
+    /// buffer, freeing it if a large message grew it beyond 4 MiB. After an
+    /// error the connection should be considered broken.
     pub fn flush_to<W: Write>(&mut self, w: &mut W) -> io::Result<()> {
         w.write_all(&self.buf)?;
         w.flush()?;
         self.buf.clear();
+        if self.buf.capacity() > 4 << 20 {
+            self.buf = Vec::new();
+        }
         Ok(())
     }
 }

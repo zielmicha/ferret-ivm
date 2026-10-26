@@ -71,14 +71,55 @@ impl IntoIterator for SharedRows {
 
 pub enum ExecResult {
     Query { columns: Vec<ResultColumn>, rows: Vec<Row> },
+    /// The rows of a query larger than one chunk, handed over as the engine
+    /// finds them (`EngineHandle::execute` collects them into `Query`).
+    Rows { columns: Vec<ResultColumn>, rows: RowStream },
     Command { tag: String },
     Subscribe { columns: Vec<ResultColumn>, rx: Receiver<SubEvent>, cancel: Arc<AtomicBool>, progress: bool },
+}
+
+/// Rows of a query result in chunks, sent by the engine as it finds them;
+/// an error ends them. Dropping the stream ends the read in the engine at
+/// its next chunk.
+pub struct RowStream {
+    pub(crate) first: Option<Vec<Row>>,
+    pub(crate) rx: Receiver<Result<Vec<Row>>>,
+}
+
+impl RowStream {
+    /// The next chunk; None after the last.
+    pub fn next_chunk(&mut self) -> Option<Result<Vec<Row>>> {
+        match self.first.take() {
+            Some(c) => Some(Ok(c)),
+            None => self.rx.recv().ok(),
+        }
+    }
+
+    /// All the rows.
+    pub fn collect(mut self) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        while let Some(c) = self.next_chunk() {
+            rows.extend(c?);
+        }
+        Ok(rows)
+    }
+}
+
+impl ExecResult {
+    /// A streamed result collected into `Query`.
+    pub fn collected(self) -> Result<ExecResult> {
+        match self {
+            ExecResult::Rows { columns, rows } => Ok(ExecResult::Query { columns, rows: rows.collect()? }),
+            other => Ok(other),
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExecResult::Query { columns, rows } => write!(f, "Query({} cols, {} rows)", columns.len(), rows.len()),
+            ExecResult::Rows { columns, .. } => write!(f, "Rows({} cols, streamed)", columns.len()),
             ExecResult::Command { tag } => write!(f, "Command({tag})"),
             ExecResult::Subscribe { .. } => write!(f, "Subscribe"),
         }
@@ -136,6 +177,11 @@ pub enum Request {
     /// sequencer; this is for engine-originated records).
     Log { rec: LogRecord },
     Checkpoint { reply: Sender<Result<Gsn>> },
+    /// A sink's thread asks for its relation's contents, to resynchronize
+    /// its target; they are sent through the sink's channel
+    /// (`sink::SinkMsg::Snapshot`). `token` is the thread's
+    /// (`SinkHandle::token`).
+    SinkSnapshot { sink: crate::sql::plan::ObjectId, token: u64 },
     /// Introspection snapshot for the web UI (see `coord::inspect`).
     Inspect(super::inspect::InspectRequest),
 }
@@ -172,6 +218,9 @@ pub struct Shared {
     pub crash: AtomicBool,
     /// The memory budget, and the memory of queued records and changes.
     pub mem: crate::memory::MemBudget,
+    /// Where sources spool transactions too large to hold in memory (set
+    /// once the log is open; without it they hold them).
+    pub spool: std::sync::OnceLock<crate::log::SpoolDir>,
 }
 
 impl Shared {

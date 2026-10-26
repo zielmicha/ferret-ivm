@@ -784,7 +784,6 @@ impl Engine {
             Some(reason) => format!("error: broken: {reason}"),
             None => match self.sink_handles.get(&id) {
                 Some(h) => h.status(),
-                None if self.snapshotting_sink(id) => "starting".into(),
                 None => "stopped".into(),
             },
         }

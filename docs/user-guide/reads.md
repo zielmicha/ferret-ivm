@@ -167,6 +167,34 @@ see [Indexes](tables-and-views.md#indexes)); reading a virtual view
 evaluates its query. Expression errors make the query fail, as in
 PostgreSQL.
 
+Rows are produced as the indexes are scanned and sent to the client as
+they come, in chunks of 1,024 rows (or about 256 KB):
+
+- without `ORDER BY`, a read stops scanning once it has `OFFSET` + `LIMIT`
+  rows (`SELECT * FROM t LIMIT 1` reads one entry), and its rows come in
+  the order of the index it scans, which is unspecified;
+- with an `ORDER BY` that is the order of an index of the relation read —
+  its leading key columns in the same direction and `NULLS` placement,
+  possibly after columns fixed by equalities, as in
+  `WHERE region = 'eu' ORDER BY id` with an index on `(region, id)` — the
+  index is scanned in order and the read stops at its `LIMIT` too; this
+  works through computed result columns and filters, not through joins or
+  aggregates;
+- any other `ORDER BY` with `LIMIT` keeps only the rows that can still be
+  among the first `OFFSET` + `LIMIT` (and their ties with `WITH TIES`)
+  while it reads; `ORDER BY` without `LIMIT` sorts the whole result;
+- aggregates consume their input as it is read; the build side of a hash
+  join, `DISTINCT`, set operations, window functions and `WITH RECURSIVE`
+  hold their inputs.
+
+Rows tied in the `ORDER BY` can come in any order, and which of them a
+`LIMIT` keeps depends on the index read. An error in the middle of a large
+result (a division by zero in row 20,000, say) ends it after the rows
+already sent, as in PostgreSQL; a result of one chunk fails before any row.
+A client that stops reading (it disconnects) ends the read at its next
+chunk. The engine thread does not wait for the client: chunks it produced
+faster than the client reads them wait in memory.
+
 ## Transactions
 
 There are no multi-statement transactions. `BEGIN` / `START TRANSACTION`,
@@ -278,7 +306,9 @@ The result columns are:
 The stream consists of:
 
 1. with `SNAPSHOT` (default): the current contents, as rows with
-   `gsn` = the last applied GSN and positive `diff` (the multiplicity);
+   `gsn` = the last applied GSN and positive `diff` (the multiplicity),
+   read from the relation's index and sent in chunks of 10,000 rows (the
+   session writes them out every 1 MiB);
 2. a progress row at that GSN (only with `PROGRESS`);
 3. for every later GSN at which the relation changes: its changes,
    consolidated — no row appears with both signs within a GSN, so an update

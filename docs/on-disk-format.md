@@ -56,7 +56,9 @@ decoding files written by a running engine.
 ├── FORMAT.new                  (transient)
 ├── LOCK
 ├── log/
-│   └── log-<first GSN, %020u>.ivl ...
+│   ├── log-<first GSN, %020u>.ivl ...
+│   ├── parts-<GSN, %020u>.ivp ...
+│   └── spool-<pid>-<n>.tmp     (transient)
 └── store/
     ├── MANIFEST
     ├── MANIFEST.new            (transient)
@@ -69,6 +71,8 @@ decoding files written by a running engine.
 | `FORMAT.new` | `coord::start` | the new `FORMAT`, until renamed |
 | `LOCK` | `coord::start` | empty; exclusive lock |
 | `log/log-NNNNNNNNNNNNNNNNNNNN.ivl` | sequencer (`log::LogWriter`) | input-log segment; the number is the GSN of its first record, zero-padded to 20 digits |
+| `log/parts-NNNNNNNNNNNNNNNNNNNN.ivp` | sequencer, or a source's spool renamed by it | the changes of the `CommitParts` record at that GSN ([Parts files](#parts-files)) |
+| `log/spool-<pid>-<n>.tmp` | source threads (`log::Spool`) | the changes of an upstream transaction still being received; renamed to a parts file at its commit |
 | `store/MANIFEST` | checkpoints (`storage::manifest`) | sequence of checkpoint records |
 | `store/MANIFEST.new` | manifest rewrite | the single record of a rewritten manifest, until renamed |
 | `store/seg-NNNNNNNN.dat` | checkpoints (`storage::segment`) | B+tree node frames; the number is the segment id (`u32`, from 1), zero-padded to 8 digits |
@@ -123,9 +127,11 @@ Code: `crates/ivm/src/log.rs`.
 
 - A new log starts with `log-00000000000000000001.ivl`.
 - Records are appended by the sequencer in batches: each record is encoded
-  into an in-memory buffer as a frame, the whole batch is written with one
-  `write_all`, and then the file is `fdatasync`ed (`sync_data`) unless
-  `--no-sync` is set.
+  into an in-memory buffer as a frame, the batch is written with
+  `write_all` (whenever the buffer reaches 8 MiB, and at the end of the
+  batch), and then the file is `fdatasync`ed (`sync_data`) unless
+  `--no-sync` is set. Afterwards a buffer that grew beyond 10 MiB (a single
+  large record) is freed.
 - **Rotation**: when a record is appended while the buffer is empty (i.e. the
   first record of a batch) and the current segment holds at least 64 MiB
   (67,108,864 bytes), the current segment is `fsync`ed, a new segment named
@@ -152,7 +158,11 @@ offset  size  field
 ```
 
 The CRC covers the GSN, so a frame moved to another position fails its
-check. A tick frame from a running engine:
+check. A record whose payload does not fit the 32-bit length is refused
+when it is appended (SQLSTATE `54000`, `a log record of <n> bytes exceeds
+the frame limit of 4 GiB`; only a single row of more than 4 GiB could
+cause it, as commits are split, see below): written with a wrapped length,
+it would be read back as a torn tail. A tick frame from a running engine:
 
 ```
 09 00 00 00                 len = 9
@@ -173,6 +183,7 @@ The first payload byte is the record tag (`LogRecord::encode` / `decode`):
 | 3 | `Progress` | `uvarint source`, `uvarint lsn`, `str state` |
 | 4 | `Schema` | `uvarint source`, `uvarint table`, `bytes columns_json`, `uvarint k`, `k × uvarint pk_column` |
 | 5 | `Tick` | `ivarint micros` |
+| 6 | `CommitParts` | `uvarint source`, `uvarint lsn`, `uvarint parts`, `uvarint changes` |
 
 Any other tag is a decoding error (`bad log record tag`).
 
@@ -216,6 +227,14 @@ e9 07  01  02  04 04  09 02 75 73  00                  table 1001, Upsert, row(i
 and `DELETE FROM orders WHERE id = 4` (table 1000):
 `01 00 0c 01 e8 07 02 01 04 08` — Commit, source 0, request 12, one change,
 table 1000, `Delete`, key row with one value, int4 4.
+
+**CommitParts** — a commit whose changes take more than `PART_BYTES`
+(1 MiB, 1,048,576 bytes) encoded: the same as a `Commit` with the same
+`source` and `lsn`, whose `changes` changes are in the
+[parts file](#parts-files) of the record's GSN, in `parts` frames. The
+sequencer logs every larger `Commit` this way (local DML), and sources log
+their spooled transactions this way. Records written before it existed are
+single `Commit` frames of any size, which are still read.
 
 **Ddl** — a catalog change.
 
@@ -273,34 +292,70 @@ copy starts.
 The engine converts it to the PostgreSQL epoch (subtracting
 946,684,800,000,000) and keeps the maximum.
 
+### Parts files
+
+`log/parts-<GSN>.ivp` holds the changes of the `CommitParts` record at that
+GSN as a sequence of frames with the [frame](#frame) layout, except that the
+`u64` after the CRC is the part's number (0, 1, …) instead of a GSN (the
+CRC covers it). A part's payload is `uvarint n` followed by `n` changes
+encoded as in a `Commit` record. A part is cut once its changes reach
+`PART_BYTES` encoded, so it holds at most `PART_BYTES` plus one change; the
+file has no header, and its frame count and total number of changes are
+those of its record.
+
+A parts file is complete and durable before its record can be: the
+sequencer writes the file of a large `Commit` (`fdatasync`), or renames a
+source's finished spool (written and `fdatasync`ed by the source thread) to
+the record's GSN, then `fsync`s `log/`, and only then appends the record.
+The record is the commit point: a parts file without it (a crash in
+between) is deleted when the log is opened.
+
+A source spools a transaction (`log::Spool`, `log/spool-<pid>-<n>.tmp`,
+the same format) once the changes it holds reach `PART_BYTES`, and writes
+further changes there as they arrive; a schema change or a failed table in
+the middle of the transaction rewrites the spool through a second file
+(`.new`, renamed over it). Spools of transactions that did not commit (the
+replication session ended; the transaction is sent again) are deleted when
+the session ends, and any left by a crash when the log is opened.
+
 ### Opening, replay and truncation
 
 - **Open** (`LogWriter::open`): only the newest segment is read. Frames are
-  parsed from offset 0 while a full 16-byte header is present, the payload is
-  complete, the CRC matches and the payload decodes. If any bytes follow the
-  last good frame, the file is truncated there and `fsync`ed (logged as
-  `truncating torn log tail`). The last GSN is the last good frame's; if the
-  newest segment has none, it is the last frame of the previous segment, or
-  the segment's first GSN − 1 if there is no previous segment. The next GSN is
-  the last GSN + 1 (or the checkpoint's GSN + 1 if that is later, see above),
-  and appends continue in the newest segment.
+  read from offset 0 while a full 16-byte header is present, the payload is
+  complete and the CRC matches (payloads are not decoded: replay does that
+  once). If any bytes follow the last good frame, the file is truncated
+  there and `fsync`ed (logged as `truncating torn log tail`). The last GSN
+  is the last good frame's; if the newest segment has none, it is the last
+  frame of the previous segment, or the segment's first GSN − 1 if there is
+  no previous segment. Then every `spool-*` file and every parts file whose
+  GSN is above the last GSN is deleted (and `log/` `fsync`ed). The next GSN
+  is the last GSN + 1 (or the checkpoint's GSN + 1 if that is later, see
+  above), and appends continue in the newest segment.
 - **Replay** (`read_from(after)`, `after` = the checkpoint's GSN, 0 without
-  a checkpoint): segments
-  are visited in GSN order; a segment is skipped if the next segment starts
-  at or before `after + 1`. Each remaining segment is parsed with the same
-  rules and its records with `gsn > after` are returned. Only the newest
-  segment may end in a torn write (already truncated by the open): a frame
-  that fails to parse in any earlier segment stops the start with a
-  data-corrupted error (`input log segment <path> is corrupt at byte <n>`),
-  and so do returned GSNs that are not consecutive from `after + 1`
+  a checkpoint) is an iterator reading one frame at a time: segments are
+  visited in GSN order; a segment is skipped if the next segment starts at
+  or before `after + 1`. Frames of the remaining segments are read with the
+  same rules; those with `gsn ≤ after` are checked (CRC) but not decoded,
+  the others are decoded and returned. Only the newest segment may end in a
+  torn write (already truncated by the open): a frame that fails its check
+  in any earlier segment stops the start with a data-corrupted error
+  (`input log segment <path> is corrupt at byte <n>`), and so do a frame
+  whose CRC matches but whose payload does not decode
+  (`input log segment <path> has a record that does not decode at gsn <g>`)
+  and GSNs that are not consecutive from `after + 1`
   (`input log is missing records: expected gsn <g>, found <h> in <path>`),
-  rather than replaying around the damage.
+  rather than replaying around the damage. The parts of a `CommitParts`
+  record are read when it is applied, one part at a time (`read_parts`); a
+  missing parts file, a part with the wrong number, an incomplete or
+  damaged frame, or a number of parts or changes other than the record's
+  is a data-corrupted error too.
 - **Truncation** (`truncate_before(g)`, after every checkpoint with
   `g` = the checkpoint's GSN): every segment except the current one whose
   successor starts at or before `g + 1` (so all its records are ≤ `g`) is
-  deleted. Recovery replays the log after the checkpoint, and nothing else
-  reads the log, so the records a checkpoint covers are not kept (`AS OF`
-  reads use the histories in the trees, not the log).
+  deleted, and so is every parts file of a GSN ≤ `g`. Recovery replays the
+  log after the checkpoint, and nothing else reads the log, so the records a
+  checkpoint covers are not kept (`AS OF` reads use the histories in the
+  trees, not the log).
 - The engine ignores records whose GSN is at or below the last GSN it has
   applied.
 
@@ -1218,7 +1273,7 @@ The engine notices incompatible data through these checks:
 |---|---|---|
 | `FORMAT` | `the data directory has format <n>, which this version of ivm cannot read ...`, `... does not hold a format version` | refused at start-up before anything is opened |
 | frame CRC and length (log, segments, manifest) | `node checksum mismatch`, `input log segment ... is corrupt at byte <n>`, torn-tail truncation | log: in the newest segment, a bad frame and everything after it are truncated at start-up as a torn write; anywhere else, and for a gap in the GSNs after the checkpoint (`input log is missing records ...`), start-up fails; segments: fatal on access; manifest: a torn tail after the last valid record is dropped, and a manifest with contents but no valid record (or a missing one while segment files hold data) stops the start, modifying nothing |
-| record decoding | `bad log record tag`, `bad change tag`, `bad datum tag`, `bad agg state tag`, ... | fatal; except that in the newest log segment a frame that does not decode counts as a torn write and is truncated with everything after it |
+| record decoding | `bad log record tag`, `bad change tag`, `bad datum tag`, `bad agg state tag`, ... | fatal (in the log: also in the newest segment, where a frame with a valid CRC that does not decode stops replay instead of being truncated) |
 | checkpoint header and metadata tree | `the data directory has format <n> ...` (header), `bad metadata entry (...)`, `the metadata tree has no next object id` | fatal at start-up |
 | format 1 `AppState` JSON decoding | `cannot decode checkpoint state: ...` | fatal at start-up |
 | every table's primary index found by fingerprint | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | fatal at start-up |
@@ -1227,7 +1282,7 @@ Consequences of code changes for an existing data directory:
 
 | Change | Consequence |
 |---|---|
-| frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag truncates the newest log segment at the first such record (see above), losing it and everything after it |
+| frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag fails to replay a log holding it (versions before `CommitParts` truncated the newest log segment at the first such record, losing it and everything after it: a log with `CommitParts` records, tag 6, cannot be opened by them) |
 | `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
 | metadata record layouts (tags 1–11), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tag 11 was added within format 2 (a directory without it recomputes its window operators' partitions in error once, at the first start) |
 | format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
@@ -1245,15 +1300,17 @@ Data directories written by earlier versions of the engine are compatible:
 format 1 only gained fields with defaults (and a node kind and summary
 state encodings that are written instead of older ones still read: float
 sums, wide `min`/`max` values; [Summary](#summary)), and is migrated to
-format 2 at the first start. New functions (registered among the existing
-ones, which renumbers the later ones) and planner fixes did change the
-fingerprints of many views' arrangements (for example joins on computed
-keys, whose keys are materialized in an `Mfp` node, semijoins whose presence
-inputs match exactly, the summaries of `var*`/`stddev*` over `bigint`, joins
-whose input filters or maps can fail, which have error-tracker inputs, and
-the input arrangements of window aggregates whose frames reach a partition's
-end, which carry summaries), so such a data directory keeps its tables and
-rebuilds those arrangements once at its first start.
+format 2 at the first start; the log gained a record tag (`CommitParts`)
+next to the single-frame `Commit`, which is still read. New functions
+(registered among the existing ones, which renumbers the later ones) and
+planner fixes did change the fingerprints of many views' arrangements (for
+example joins on computed keys, whose keys are materialized in an `Mfp`
+node, semijoins whose presence inputs match exactly, the summaries of
+`var*`/`stddev*` over `bigint`, joins whose input filters or maps can fail,
+which have error-tracker inputs, and the input arrangements of window
+aggregates whose frames reach a partition's end, which carry summaries), so
+such a data directory keeps its tables and rebuilds those arrangements once
+at its first start.
 `crates/ivm/tests/data/format1` is a format-1 directory that the restart
 tests migrate.
 

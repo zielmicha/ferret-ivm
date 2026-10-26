@@ -340,6 +340,31 @@ fn ddl_and_dml_in_one_upstream_transaction() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An upstream transaction larger than what the source holds in memory (6
+/// MB here) is spooled to the log directory as it arrives and logged as
+/// one commit with its parts; it applies as one transaction, also when it
+/// is replayed after a crash.
+#[test]
+fn large_upstream_transactions_are_spooled() {
+    let (mut up, mut ivm, dir) = setup("large-txn", &["CREATE TABLE t (id int PRIMARY KEY, s text)", "INSERT INTO t VALUES (0, 'x')"]);
+    ivm.exec("CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n, sum(length(s)) AS l FROM t");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["1|1"]);
+    ivm.exec("CHECKPOINT");
+    up.exec("BEGIN; INSERT INTO t SELECT g, repeat('y', 1000) FROM generate_series(1, 6000) g; UPDATE t SET s = 'zz' WHERE id = 0; COMMIT");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["6001|6000002"]);
+    let files = |prefix: &str| std::fs::read_dir(dir.join("log")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(prefix)).count();
+    assert_eq!(files("parts-"), 1, "logged as one commit with its parts");
+    assert_eq!(files("spool-"), 0);
+    // replayed from the log after a crash (no checkpoint since the commit)
+    ivm.running.take().unwrap().crash();
+    drop(ivm);
+    let mut ivm = Ivm::start(&dir);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["6001|6000002"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT s FROM t WHERE id = 0"), ["zz"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Rows deleted upstream while a table is re-snapshotted after a schema
 /// change are deleted: the re-snapshot only upserts the rows it reads, and
 /// the deletes of keys it had not reached yet used to be skipped.
@@ -1082,6 +1107,51 @@ fn sink_keeps_changes_while_its_target_is_unreachable() {
     eventually("sink", || {
         later.query("SELECT count(*) FROM v_copy").map(|r| r.rows[0][0].clone()).ok().flatten() == Some("6".to_string())
     });
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink writes a transaction in messages of bounded size (a
+/// resynchronization used to be one SQL string, which PostgreSQL rejects
+/// beyond 1 GB, so a large relation never finished its first sync), and
+/// bounds the changes it keeps while it cannot write: beyond the bound it
+/// drops them and resynchronizes the target from a fresh snapshot instead
+/// (they used to grow without limit, and the catch-up write with them).
+/// Each resynchronization is one transaction.
+#[test]
+fn sinks_write_in_bounded_messages_and_resynchronize_a_large_backlog() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int)");
+    let dir = tmpdir("sink-bounded");
+    let mut ivm = Ivm::start_with(&dir, |c| c.sink_limits = ivm::sink::SinkLimits { message_bytes: 4096, pending_bytes: 16 << 10 });
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    ivm.exec("INSERT INTO t SELECT g, g FROM generate_series(1, 3000) g");
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    let same = |ivm: &mut Ivm, up: &mut Upstream| {
+        let want = ivm.rows("SELECT count(*), sum(v) FROM t");
+        up.client.query("SELECT count(*), sum(v) FROM target").ok().map(|r| r.rows.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>().join("|")).collect::<Vec<_>>()) == Some(want)
+    };
+    // (about 50 KB of SQL in messages of 4 KB)
+    eventually("the first sync", || same(&mut ivm, &mut up));
+    let xmins = |up: &mut Upstream| up.rows("SELECT count(DISTINCT xmin::text) FROM target");
+    assert_eq!(xmins(&mut up), ["1"], "the first sync is one transaction");
+    eventually("the sink to run", || status(&mut ivm).starts_with("running"));
+    ivm.exec("INSERT INTO t VALUES (5000, 5000)");
+    eventually("a change", || same(&mut ivm, &mut up));
+    // the target rejects every change while about 100 KB of changes come
+    up.exec("ALTER TABLE target ADD CONSTRAINT small CHECK (v < 10000)");
+    for i in 0..40 {
+        ivm.exec(&format!("UPDATE t SET v = v + 10000 WHERE id % 40 = {i}"));
+    }
+    eventually("the writes to fail", || status(&mut ivm).contains("violates check constraint"));
+    up.exec("ALTER TABLE target DROP CONSTRAINT small");
+    eventually("the target to catch up", || same(&mut ivm, &mut up));
+    // by a resynchronization (rows that did not change were rewritten too)
+    assert_eq!(xmins(&mut up), ["1"], "the backlog was dropped and the target rewritten in one transaction");
+    eventually("the sink to run again", || status(&mut ivm).starts_with("running"));
+    ivm.exec("DELETE FROM t WHERE id <= 10");
+    eventually("the next change", || same(&mut ivm, &mut up));
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }

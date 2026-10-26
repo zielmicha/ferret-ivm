@@ -13,7 +13,7 @@
 //! applied meanwhile are kept, to be delivered after the snapshot.
 
 use super::*;
-use crate::exec::{ExecCtx, Rows};
+use crate::exec::ExecCtx;
 use crate::storage::ReadAt;
 
 /// Entries a read may visit on the engine thread.
@@ -33,6 +33,7 @@ pub(crate) enum ReadJob {
         bq: Box<crate::sql::BoundQuery>,
         at: ReadAt,
         settings: Arc<BTreeMap<String, String>>,
+        interrupts: Option<Arc<Interrupts>>,
         reply: Sender<Result<ExecResult>>,
     },
     /// A node's snapshot, handed back to the engine (which it wakes).
@@ -41,11 +42,21 @@ pub(crate) enum ReadJob {
 
 fn run(job: ReadJob) {
     match job {
-        ReadJob::Query { mut env, graph, objects, bq, at, settings, reply } => {
+        ReadJob::Query { mut env, graph, objects, bq, at, settings, interrupts, reply } => {
             let objects = |oid: u64| objects.iter().find(|(o, _)| *o == oid).map(|(_, n)| *n);
-            let mut ctx = ExecCtx { g: &graph, env: &mut env, at, objects: &objects, rec: Default::default() };
-            let rows: Result<Rows> = crate::expr::with_session_settings(settings, || ctx.execute(&bq.rel));
-            let _ = reply.send(rows.map(|rows| super::read::finish_read(*bq, rows)));
+            let mut ctx = ExecCtx { g: &graph, env: &mut env, at, objects: &objects, rec: Default::default(), visited: 0 };
+            // the rows go to the session in chunks as they are found; a
+            // session that stops reading them (or a cancel) ends the read
+            let mut res = super::read::ChunkedReply::new(super::read::result_columns(&bq), reply);
+            let r = crate::expr::with_session_settings(settings, || {
+                ctx.run_query(&bq, &mut |row| {
+                    if interrupts.as_ref().is_some_and(|i| i.cancelled()) {
+                        return Err(SqlError::new(codes::QUERY_CANCELED, "canceling statement due to user request"));
+                    }
+                    Ok(res.push(row))
+                })
+            });
+            res.finish(r);
         }
         ReadJob::Snapshot { mut env, graph, node, done, wake } => {
             let _ = done.send(graph.snapshot(&mut env, node));
@@ -67,7 +78,6 @@ pub(crate) struct Snapshotting {
 
 pub(crate) enum AfterSnapshot {
     Subscription(super::hydrate::PendingSub),
-    Sink { id: ObjectId, name: String, def: crate::catalog::SinkDef, columns: Vec<crate::types::Column> },
 }
 
 impl Engine {
@@ -90,7 +100,7 @@ impl Engine {
             .collect();
         let graph = self.graph.fork_of(&objects.iter().map(|(_, n)| *n).collect::<Vec<_>>());
         let env = self.fork_env()?;
-        self.send_to_reader(ReadJob::Query { env, graph, objects, bq: Box::new(bq), at, settings: vars.settings, reply })
+        self.send_to_reader(ReadJob::Query { env, graph, objects, bq: Box::new(bq), at, settings: vars.settings, interrupts: vars.interrupts, reply })
     }
 
     fn send_to_reader(&mut self, job: ReadJob) -> Result<()> {
@@ -173,35 +183,7 @@ impl Engine {
                     outputs.into_iter().map(|(g, o)| (g, o.map(|o| (p.node, o)).into_iter().collect())).collect();
                 self.start_subscription(p, gsn, Some(snapshot), &steps);
             }
-            AfterSnapshot::Sink { id, name, def, columns } => {
-                let handle = self.handle.clone().ok_or_else(|| SqlError::internal("sink without engine handle"))?;
-                let node = self.rt.views.get(&def.from).map(|v| v.node).or_else(|| self.rt.tables.get(&def.from).copied());
-                let node = node.ok_or_else(|| SqlError::internal("sink source without dataflow"))?;
-                let mut h = crate::sink::start(id, name, def, node, columns, snapshot.data, gsn, handle)?;
-                let limit = self.shared.mem.consumer_limit();
-                for (g, o) in outputs {
-                    // (one that falls behind is restarted after the next record)
-                    match o.and_then(|o| super::own_rows(&o.data)) {
-                        Some((rows, bytes)) => h.send(g, &rows, bytes, limit),
-                        None => {
-                            h.progress(g);
-                            true
-                        }
-                    };
-                }
-                self.sink_handles.insert(id, h);
-            }
         }
         Ok(())
-    }
-
-    /// Is the sink waiting for its snapshot?
-    pub(crate) fn snapshotting_sink(&self, id: ObjectId) -> bool {
-        self.snapshotting.iter().any(|s| matches!(&s.then, AfterSnapshot::Sink { id: x, .. } if *x == id))
-    }
-
-    /// Forget the snapshot being taken for a sink (dropped or restarted).
-    pub(crate) fn forget_sink_snapshot(&mut self, id: ObjectId) {
-        self.snapshotting.retain(|s| !matches!(&s.then, AfterSnapshot::Sink { id: x, .. } if *x == id));
     }
 }

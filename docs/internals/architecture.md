@@ -81,7 +81,8 @@ channels of capacity 1) and a small block of shared state
 (`coord::api::Shared`). What the channels hold is bounded in bytes of
 memory instead ([Memory](#memory)): records submitted to the log and not
 yet applied by sources waiting for room, the queues to subscriptions and
-sinks by their consumers' limits. The web UI keeps at most 16 of its
+sinks by their consumers' limits. (The channels carrying a query's result
+chunks to its session are not bounded.) The web UI keeps at most 16 of its
 snapshot requests queued at the engine.
 
 | Shared field | Meaning |
@@ -127,6 +128,15 @@ snapshot requests queued at the engine.
 1. The source thread collects the changes of one upstream transaction and,
    at its commit, sends `SeqMsg::Append { rec: Commit, ack: Some(tx) }` to the
    sequencer without waiting (`log_async`). Several commits can be in flight.
+   It holds at most `log::PART_BYTES` (1 MiB) of a transaction's changes:
+   beyond that it writes them, as they arrive, to a spool file in the log
+   directory (`log::Spool`), and at the commit sends the finished spool
+   instead (`SeqMsg::AppendSpooled`, `log_spooled`), which the sequencer
+   renames to the parts file of the commit's GSN and logs as a
+   `CommitParts` record ([On-disk format](../on-disk-format.md#parts-files)).
+   With protocol version 1, `pgoutput` sends a transaction only once it has
+   committed, so a spool is never aborted; a session that ends in the middle
+   of one deletes it (the upstream sends the transaction again).
 2. The sequencer assigns the next GSN, appends the record, and at the end of
    the batch `fsync`s the log, publishes `durable_gsn`, sends the GSN on each
    `ack` channel, and forwards the batch to the engine as
@@ -140,7 +150,9 @@ snapshot requests queued at the engine.
 4. The engine applies the record: the changes go through the dataflow at
    that GSN (`Graph::step_observed`, which returns the rows of the nodes
    subscriptions and sinks read), and the outputs are delivered to
-   subscriptions and sinks.
+   subscriptions and sinks. A `CommitParts` record's changes are read from
+   its parts file one part at a time (`apply_commit`); the dataflow then
+   steps the GSN with all of them.
 
 Source progress (snapshot bookkeeping) and schema records are logged with
 the blocking `EngineHandle::log`, which returns once the record is durable.
@@ -215,9 +227,13 @@ dataflow so that temporal filters release due events.
 The sequencer processes messages in batches: it blocks for the first message
 (or the tick deadline), adds a tick if one is due, then drains more messages
 without blocking, up to 4096 per batch. All `Append`s of a batch are encoded
-into one buffer, written with one `write`, and made durable with one
+into one buffer, written with one `write` (or several: the buffer is
+written out whenever it reaches 8 MiB), and made durable with one
 `fdatasync` (an `AppendAll` — the records the engine submitted in one round
-of messages, see below — counts as its records). Only then are acknowledgements sent
+of messages, see below — counts as its records). A commit with more than
+`log::PART_BYTES` of changes (local DML) is written to its parts file, made
+durable first, and logged as a small `CommitParts` record, so no frame holds
+more than about 1 MiB of changes. Only then are acknowledgements sent
 and the records handed to the engine — no record is applied, acknowledged to
 a source, or answered to a client before it is durable. Under load, batches
 grow and the cost of `fsync` is shared; when idle, a batch is a single
@@ -253,9 +269,10 @@ round):
 | Message | Action |
 |---|---|
 | `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, send every sink the last applied GSN as its progress, re-check parked reads. While a hydration is in progress, a `Schema` record or a `Ddl` record replacing a view or creating a sink, and the records after it, are held until no hydration is; `Commit` and `Tick` records are forwarded to it before they are applied. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
-| `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
+| `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed (their rows sent to the session in chunks as they are found) or parked; `SUBSCRIBE` is registered (its snapshot sent in chunks); `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | ask for a checkpoint: answered with its GSN once one begun after the request is committed |
+| `Request(SinkSnapshot)` | a sink thread resynchronizes its target: read its relation at the last applied GSN and send it through the sink's channel in chunks of 10,000 rows (from the arrangement, chunk by chunk), after the changes sent so far ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)) |
 | `Request(Inspect)` | build a snapshot for the web UI (`coord/inspect.rs`) between two records, so that it is consistent at one GSN, and hand it to the requester's callback |
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
 | `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress (except one that fell behind, or one held for a replacement still being hydrated, which was not sent the records since) and ask it to stop, stop the sequencer, take a final checkpoint after the one being written, if any (not after a simulated crash, which only waits for that one to be written), wait up to 5 s for sources and sinks, exit |
@@ -279,7 +296,7 @@ checkpoint.
 
 | Record | Effect |
 |---|---|
-| `Commit` | group the changes by table (changes to tables that no longer exist are skipped), `Graph::step_observed` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
+| `Commit`, `CommitParts` | group the changes by table (changes to tables that no longer exist are skipped; a `CommitParts` record's are read from its parts file, one part at a time), `Graph::step_observed` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); write the catalog's changes into the metadata tree at the record's GSN (`persist_meta`); reply |
 | `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
 | `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |

@@ -664,10 +664,16 @@ impl Engine {
     pub(crate) fn start_subscription(&mut self, p: PendingSub, gsn: Gsn, snapshot: Option<Output>, steps: &[(Gsn, FxHashMap<NodeId, Output>)]) {
         let (tx, rx) = unbounded();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Some(s) = snapshot
-            && !s.data.is_empty()
-        {
-            let _ = tx.send(SubEvent::Data { gsn, rows: SharedRows::new(s.data) });
+        if let Some(s) = snapshot {
+            // (in chunks, which the session writes out one at a time)
+            let mut rows = s.data.into_iter();
+            loop {
+                let chunk: Delta = rows.by_ref().take(super::read::SNAPSHOT_CHUNK_ROWS).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                let _ = tx.send(SubEvent::Data { gsn, rows: SharedRows::new(chunk) });
+            }
         }
         let _ = tx.send(SubEvent::Progress { gsn, charge: crate::memory::Charge::none() });
         // (changes queued after the snapshot are bounded by its share of the memory budget)

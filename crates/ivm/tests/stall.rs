@@ -146,6 +146,7 @@ fn requests_reading_a_hydrating_view_wait_for_it() {
         std::thread::spawn(move || match try_exec(&h2, &sql) {
             Ok(ExecResult::Query { rows, .. }) => rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect(),
             Ok(ExecResult::Command { tag }) => vec![tag],
+            Ok(ExecResult::Rows { .. }) => unreachable!("execute collects streamed rows"),
             Ok(ExecResult::Subscribe { rx, cancel, .. }) => {
                 // the snapshot, up to the first progress mark
                 let mut n = 0i64;

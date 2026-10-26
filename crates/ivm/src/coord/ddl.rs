@@ -1125,7 +1125,6 @@ impl Engine {
                 if let Some(h) = self.sink_handles.remove(&id) {
                     let _ = h.stop();
                 }
-                self.forget_sink_snapshot(id);
             }
             ObjectKind::View(_) => {}
         }
@@ -1187,7 +1186,6 @@ impl Engine {
             if let Some(h) = self.sink_handles.remove(&id) {
                 let _ = h.stop();
             }
-            self.forget_sink_snapshot(id);
             if let (Some(o), Some(handle)) = (self.catalog.get(id).cloned(), self.handle.clone())
                 && let ObjectKind::Sink(sd) = &o.kind
             {
@@ -1197,7 +1195,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn start_sink(&mut self, id: ObjectId, name: &str, def: &SinkDef, _handle: &EngineHandle) -> Result<()> {
+    pub(crate) fn start_sink(&mut self, id: ObjectId, name: &str, def: &SinkDef, handle: &EngineHandle) -> Result<()> {
         let node = match self.rt.views.get(&def.from).map(|v| v.node).or_else(|| self.rt.tables.get(&def.from).copied()) {
             Some(n) => n,
             None => return Err(self.broken_error(def.from).unwrap_or_else(|| SqlError::internal("sink source without dataflow"))),
@@ -1207,11 +1205,9 @@ impl Engine {
             Some(ObjectKind::Table(t)) => t.columns.clone(),
             _ => vec![],
         };
-        // (a large snapshot is taken off the engine thread: the sink starts then)
-        let then = super::reader::AfterSnapshot::Sink { id, name: name.to_string(), def: def.clone(), columns };
-        if let Some((snapshot, then)) = self.snapshot_or_defer(node, then)? {
-            self.after_snapshot(then, self.processed, snapshot, Vec::new())?;
-        }
+        // (no snapshot: the sink asks for one when its target is behind)
+        let h = crate::sink::start(id, name.to_string(), def.clone(), node, columns, self.processed, self.cfg.sink_limits, handle.clone())?;
+        self.sink_handles.insert(id, h);
         Ok(())
     }
 }

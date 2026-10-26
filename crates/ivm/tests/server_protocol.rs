@@ -801,3 +801,41 @@ fn a_subscription_blocked_on_its_client_can_be_cancelled() {
     assert_eq!(first_values(&c.query("SELECT 7")), ["7"]);
     running.shutdown();
 }
+
+/// A large result goes out as the engine finds it, in order; an error
+/// after its first rows ends them with an ErrorResponse (as in PostgreSQL),
+/// while a result of one chunk fails before any row, as before; and a
+/// portal over a streamed result is fetched in batches across Executes.
+#[test]
+fn large_results_are_streamed() {
+    let (running, port) = start("streamed");
+    let mut c = Conn::connect(port);
+    c.query("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    c.query("INSERT INTO t SELECT g, repeat('x', 100) FROM generate_series(1, 30000) g");
+    let msgs = c.query("SELECT id, s FROM t ORDER BY id");
+    let vals = first_values(&msgs);
+    assert_eq!((vals.len(), vals[0].as_str(), vals[29999].as_str()), (30000, "1", "30000"));
+    assert_eq!(command_tags(&msgs), vec!["SELECT 30000"]);
+    // division by zero at the 20,000th row (in key order)
+    let msgs = c.query("SELECT 1 / (id - 20000) FROM t");
+    let t = tags(&msgs);
+    assert!(t.starts_with("TD") && t.ends_with("DEZ"), "{t}");
+    assert_eq!(error_code(&msgs).as_deref(), Some("22012"));
+    let sent = first_values(&msgs).len();
+    assert!((1024..20000).contains(&sent), "{sent} rows before the error");
+    let msgs = c.query("SELECT 1 / (id - 2) FROM t ORDER BY id LIMIT 5");
+    assert_eq!(tags(&msgs), "EZ");
+    // batches across Executes
+    c.parse("", "SELECT id FROM t ORDER BY id", &[]);
+    c.bind("", "", &[], 0);
+    c.execute("", 5000);
+    c.execute("", 5000);
+    c.execute("", 0);
+    let msgs = c.sync();
+    let vals = first_values(&msgs);
+    assert_eq!((vals.len(), vals[10000].as_str()), (30000, "10001"));
+    assert_eq!(msgs.iter().filter(|m| m.0 == b's').count(), 2);
+    assert_eq!(command_tags(&msgs), vec!["SELECT 20000"]);
+    assert_eq!(first_values(&c.query("SELECT count(*) FROM t")), vec!["30000"]);
+    running.shutdown();
+}

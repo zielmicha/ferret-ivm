@@ -107,7 +107,8 @@ pub fn record_bytes(rec: &LogRecord) -> usize {
                 + columns.iter().map(|c| heap_block(c.name.capacity())).sum::<usize>()
                 + heap_block(pk.capacity() * size_of::<usize>())
         }
-        LogRecord::Tick { .. } => 0,
+        // (its changes are read from its parts file, a part at a time)
+        LogRecord::Tick { .. } | LogRecord::CommitParts { .. } => 0,
     };
     // the record sits in a sequencer message, then in a durable batch
     2 * size_of::<(Gsn, LogRecord)>() + own

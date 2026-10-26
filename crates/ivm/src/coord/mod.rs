@@ -43,6 +43,8 @@ pub struct Config {
     pub retention_gsns: u64,
     /// Interval of logged clock ticks (the time now() refers to).
     pub tick: Option<Duration>,
+    /// Bounds of the sinks' messages and memory.
+    pub sink_limits: crate::sink::SinkLimits,
 }
 
 impl Default for Config {
@@ -54,6 +56,7 @@ impl Default for Config {
             sync: true,
             retention_gsns: 1000,
             tick: Some(Duration::from_secs(1)),
+            sink_limits: Default::default(),
         }
     }
 }
@@ -274,19 +277,20 @@ impl EngineHandle {
         }
     }
 
+    /// Run a statement; a streamed result (`ExecResult::Rows`) is collected.
     pub fn execute(&self, stmt: crate::sql::parser::Statement, params: Vec<crate::sql::ParamSlot>, vars: SessionVars, extra: String) -> Result<ExecResult> {
         let (tx, rx) = bounded(1);
         self.tx
             .send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params, vars, extra, reply: tx }))
             .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?;
-        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))?
+        rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"))??.collected()
     }
 
     /// `execute`, giving up when `alive` returns false (polled every 200 ms
     /// while the statement runs or waits): the request is then marked
     /// `gone` in its session's interrupts, so that the engine drops it if
     /// it is still waiting (a parked read), and the call fails with
-    /// IO_ERROR.
+    /// IO_ERROR. A query's rows may come streamed (`ExecResult::Rows`).
     pub fn execute_while(
         &self,
         stmt: crate::sql::parser::Statement,
@@ -354,6 +358,26 @@ impl EngineHandle {
         }
         let (tx, rx) = bounded(1);
         if self.seq.send(SeqMsg::Append { rec, ack: Some(tx) }).is_err() {
+            self.shared.mem.input.sub(bytes);
+            return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"));
+        }
+        Ok(rx)
+    }
+
+    /// Ask for a snapshot for sink `sink`'s thread `token` (see
+    /// `Request::SinkSnapshot`).
+    pub fn request_sink_snapshot(&self, sink: ObjectId, token: u64) {
+        let _ = self.tx.send(EngineMsg::Request(Request::SinkSnapshot { sink, token }));
+    }
+
+    /// Log the commit of a spooled transaction without waiting (see
+    /// `log_async`).
+    pub fn log_spooled(&self, source: ObjectId, lsn: u64, spool: crate::log::Spooled) -> Result<Receiver<Gsn>> {
+        // (counted as the record it becomes until the engine has applied it)
+        let bytes = crate::memory::record_bytes(&LogRecord::CommitParts { source, lsn, parts: 0, changes: 0 });
+        self.shared.mem.input.add(bytes);
+        let (tx, rx) = bounded(1);
+        if self.seq.send(SeqMsg::AppendSpooled { source, lsn, spool, ack: Some(tx) }).is_err() {
             self.shared.mem.input.sub(bytes);
             return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"));
         }
@@ -437,6 +461,7 @@ pub fn start(cfg: Config) -> Result<Running> {
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
     let mut writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
+    let _ = shared.spool.set(writer.spool_dir());
     let (env, recovered) = Env::open(
         &cfg.data_dir.join("store"),
         EnvOptions { cache_bytes: shared.mem.pool_target(0), ..Default::default() },
@@ -449,13 +474,15 @@ pub fn start(cfg: Config) -> Result<Running> {
     let handle = EngineHandle { tx: etx.clone(), seq: stx.clone(), shared: shared.clone() };
     engine.handle = Some(handle.clone());
     engine.start_sinks(&handle)?;
-    // replay the log after the checkpoint
-    let records = crate::log::read_from(&cfg.data_dir.join("log"), engine.processed)?;
-    if !records.is_empty() {
-        log::info!("replaying {} log records after gsn {}", records.len(), engine.processed);
-    }
-    for (gsn, rec) in records {
+    // replay the log after the checkpoint, one record at a time
+    let (from, mut replayed) = (engine.processed, 0u64);
+    for r in crate::log::read_from(&cfg.data_dir.join("log"), engine.processed)? {
+        let (gsn, rec) = r?;
         engine.apply_record(gsn, rec)?;
+        replayed += 1;
+    }
+    if replayed > 0 {
+        log::info!("replayed {replayed} log records after gsn {from}");
     }
     engine.sink_progress();
     // The checkpoint can be ahead of the log if the log lost records it
@@ -782,7 +809,7 @@ impl Engine {
             let (gsn, rec) = self.held.pop_front().unwrap();
             applied = true;
             let dml = match &rec {
-                LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
+                LogRecord::Commit { source: 0, lsn, .. } | LogRecord::CommitParts { source: 0, lsn, .. } => Some(*lsn),
                 _ => None,
             };
             // (counted from its submission until it is applied)
@@ -887,6 +914,7 @@ impl Engine {
                 self.append(rec);
             }
             Request::Inspect(r) => self.inspect(r),
+            Request::SinkSnapshot { sink, token } => self.send_sink_snapshot(sink, token),
             other => self.run_execute(other, handle),
         }
     }
@@ -937,39 +965,10 @@ impl Engine {
         // (false for a tick that changed nothing but the clock)
         let mut changed = true;
         match rec {
-            LogRecord::Commit { source, lsn, changes } => {
-                // local DML is planned when it arrives, but DDL logged before
-                // it (a DROP of its table) applies first: then it applies nothing
-                let dropped = source == 0 && changes.iter().any(|(t, _)| !self.rt.tables.contains_key(t));
-                let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
-                for (table, ch) in changes {
-                    if let Some(n) = self.rt.tables.get(&table) {
-                        by_node.entry(*n).or_default().push(ch);
-                    }
-                }
-                if self.hydration.is_some() {
-                    self.forward_to_hydration(gsn, &by_node)?;
-                }
-                let observed = self.delivered_nodes();
-                let outputs = self.graph.step_observed(&mut self.env, gsn, by_node, observed)?;
-                self.processed = gsn;
-                self.deliver(gsn, outputs);
-                if source == 0 {
-                    // local DML: lsn carries the request id
-                    let n = self.dml_counts.remove(&lsn).unwrap_or_default();
-                    let res = if dropped {
-                        Err(SqlError::new(codes::UNDEFINED_TABLE, "the table of this statement was dropped before it could be applied"))
-                    } else {
-                        Ok(ExecResult::Command { tag: n })
-                    };
-                    self.reply_pending(lsn, res);
-                    self.drain_dml_queue();
-                } else if self.catalog.get(source).is_some() {
-                    // (a dropped source's thread may still log a record
-                    // before it notices that it was stopped)
-                    let e = self.source_lsns.entry(source).or_insert(0);
-                    *e = (*e).max(lsn);
-                }
+            LogRecord::Commit { source, lsn, changes } => self.apply_commit(gsn, source, lsn, std::iter::once(Ok(changes)))?,
+            LogRecord::CommitParts { source, lsn, parts, changes } => {
+                let parts = crate::log::read_parts(&self.cfg.data_dir.join("log"), gsn, parts, changes)?;
+                self.apply_commit(gsn, source, lsn, parts)?;
             }
             LogRecord::Ddl { req, sql, extra } => {
                 let before = self.graph.pending();
@@ -1057,6 +1056,49 @@ impl Engine {
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
         self.records_since_checkpoint += 1;
         self.changes_since_checkpoint += changed as u64;
+        Ok(())
+    }
+
+    /// Apply a commit whose changes come in batches, in order: one for a
+    /// `Commit` record, one per part of a `CommitParts` record.
+    fn apply_commit(&mut self, gsn: Gsn, source: ObjectId, lsn: u64, batches: impl Iterator<Item = Result<Vec<(ObjectId, TableChange)>>>) -> Result<()> {
+        // local DML is planned when it arrives, but DDL logged before it (a
+        // DROP of its table) applies first: then it applies nothing
+        let mut dropped = false;
+        // (the dataflow steps a GSN with all of its changes: the parts of a
+        // commit are assembled here, read one at a time)
+        let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
+        for batch in batches {
+            for (table, ch) in batch? {
+                match self.rt.tables.get(&table) {
+                    Some(n) => by_node.entry(*n).or_default().push(ch),
+                    None => dropped |= source == 0,
+                }
+            }
+        }
+        if self.hydration.is_some() {
+            self.forward_to_hydration(gsn, &by_node)?;
+        }
+        let observed = self.delivered_nodes();
+        let outputs = self.graph.step_observed(&mut self.env, gsn, by_node, observed)?;
+        self.processed = gsn;
+        self.deliver(gsn, outputs);
+        if source == 0 {
+            // local DML: lsn carries the request id
+            let n = self.dml_counts.remove(&lsn).unwrap_or_default();
+            let res = if dropped {
+                Err(SqlError::new(codes::UNDEFINED_TABLE, "the table of this statement was dropped before it could be applied"))
+            } else {
+                Ok(ExecResult::Command { tag: n })
+            };
+            self.reply_pending(lsn, res);
+            self.drain_dml_queue();
+        } else if self.catalog.get(source).is_some() {
+            // (a dropped source's thread may still log a record
+            // before it notices that it was stopped)
+            let e = self.source_lsns.entry(source).or_insert(0);
+            *e = (*e).max(lsn);
+        }
         Ok(())
     }
 
@@ -1332,6 +1374,21 @@ impl Engine {
         }
     }
 
+    /// Send sink `id`'s thread `token` (not that of a sink it replaced) its
+    /// relation's current contents, through its channel after the changes
+    /// sent to it so far: it resynchronizes its target from them.
+    pub(crate) fn send_sink_snapshot(&mut self, id: ObjectId, token: u64) {
+        let Some(h) = self.sink_handles.get(&id).filter(|h| h.token == token) else { return };
+        let (node, tx, gsn) = (h.node, h.sender(), self.processed);
+        let r = self.snapshot_chunks(node, &mut |rows| {
+            let _ = tx.send(crate::sink::SinkMsg::Snapshot(gsn, SharedRows::new(rows)));
+        });
+        if let Err(e) = &r {
+            log::error!("cannot read the snapshot of sink {id}: {e}");
+        }
+        let _ = tx.send(crate::sink::SinkMsg::SnapshotEnd(gsn, r.err().map(|e| e.message)));
+    }
+
     /// The error of using broken object `id`, if it is broken.
     pub(crate) fn broken_error(&self, id: ObjectId) -> Option<SqlError> {
         let reason = self.rt.broken.get(&id)?;
@@ -1487,6 +1544,7 @@ mod work_tests;
 mod tests {
     use super::*;
     use crate::sql::parser::SubscribeTarget;
+    use crate::types::Datum;
 
     /// An engine on a scratch store without its threads: statements are
     /// applied by calling it directly, and nothing is logged.
@@ -1734,5 +1792,66 @@ mod tests {
         e.checkpoint().unwrap();
         let (entries, live) = meta_entries(&mut e);
         assert!(entries < 2 * live + 100, "{entries} entries left for {live} live ones");
+    }
+
+    /// A query's result rows and the arrangement entries its scans visited.
+    fn read(e: &mut Engine, sql: &str) -> (Vec<String>, u64) {
+        let q = crate::sql::parser::parse_single_query(sql).unwrap();
+        let bq = crate::sql::plan_query(&e.catalog, &q, vec![]).unwrap();
+        let mut rows = Vec::new();
+        let visited = e
+            .read_query(&bq, crate::storage::ReadAt::Latest, &mut |r| {
+                rows.push(r.iter().map(crate::types::text::format_datum).collect::<Vec<_>>().join("|"));
+                Ok(true)
+            })
+            .unwrap();
+        (rows, visited)
+    }
+
+    /// Ad hoc reads stop scanning once they have their LIMIT, also in the
+    /// order of an arrangement that is the ORDER BY (with or without an
+    /// equality on a key prefix); they used to read, consolidate and sort
+    /// the whole relation before applying the LIMIT. Other orders keep only
+    /// the rows that can be in the result while they scan.
+    #[test]
+    fn limits_stop_scans_early() {
+        let tmp = crate::testkit::TempDir::new("coord-limit-pushdown");
+        let mut e = engine(tmp.path());
+        e.apply_ddl(1, "CREATE TABLE t (id int PRIMARY KEY, g int, v text)", "").unwrap();
+        e.apply_ddl(2, "CREATE INDEX t_g ON t (g, id)", "").unwrap();
+        let t = e.catalog.by_name("t").unwrap().id;
+        let row = |i: i32| vec![Datum::Int4(i), Datum::Int4(i % 10), Datum::text(&format!("v{i}"))];
+        let n = 100_000;
+        let changes = (0..n as i32).map(|i| (t, TableChange::Upsert { row: row(i), unchanged: vec![] })).collect();
+        e.apply_record(3, LogRecord::Commit { source: 0, lsn: 1, changes }).unwrap();
+        let (rows, visited) = read(&mut e, "SELECT * FROM t LIMIT 1");
+        assert_eq!((rows.len(), visited), (1, 1));
+        let (rows, visited) = read(&mut e, "SELECT id, v FROM t ORDER BY id LIMIT 3");
+        assert_eq!(rows, ["0|v0", "1|v1", "2|v2"]);
+        assert_eq!(visited, 3);
+        let (rows, visited) = read(&mut e, "SELECT id FROM t ORDER BY id OFFSET 10 LIMIT 2");
+        assert_eq!((rows, visited), (vec!["10".to_string(), "11".to_string()], 12));
+        // the index on (g, id) is in id order within g = 3
+        let (rows, visited) = read(&mut e, "SELECT id FROM t WHERE g = 3 ORDER BY id LIMIT 2");
+        assert_eq!((rows, visited), (vec!["3".to_string(), "13".to_string()], 2));
+        // (through computed columns, the ORDER BY column hidden)
+        let (rows, visited) = read(&mut e, "SELECT v || '!' FROM t ORDER BY id LIMIT 2");
+        assert_eq!((rows, visited), (vec!["v0!".to_string(), "v1!".to_string()], 2));
+        let (rows, visited) = read(&mut e, "SELECT g, id FROM t ORDER BY g, id LIMIT 2");
+        assert_eq!((rows, visited), (vec!["0|0".to_string(), "0|10".to_string()], 2));
+        // a filter the arrangement does not serve: until the first match
+        let (rows, visited) = read(&mut e, "SELECT id FROM t WHERE v = 'v50' LIMIT 1");
+        assert_eq!((rows, visited), (vec!["50".to_string()], 51));
+        // another order: every row is read, the top ones kept
+        let (rows, visited) = read(&mut e, "SELECT id FROM t ORDER BY id DESC LIMIT 2");
+        assert_eq!((rows, visited), (vec!["99999".to_string(), "99998".to_string()], n));
+        let (rows, _) = read(&mut e, "SELECT g, id FROM t ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES");
+        assert_eq!(rows.len(), 10_000);
+        assert!(rows.iter().all(|r| r.starts_with("9|")));
+        let (rows, _) = read(&mut e, "SELECT id FROM t ORDER BY v LIMIT 3");
+        assert_eq!(rows, ["0", "1", "10"]);
+        // aggregates read their input as it is scanned
+        let (rows, visited) = read(&mut e, "SELECT count(*), max(id) FROM t");
+        assert_eq!((rows, visited), (vec!["100000|99999".to_string()], n));
     }
 }

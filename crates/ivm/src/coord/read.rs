@@ -5,7 +5,7 @@ use super::*;
 use crate::catalog::ObjectKind;
 use crate::dataflow::lower::Lowerer;
 use crate::dataflow::NodeKind;
-use crate::exec::{sort_rows, ExecCtx, Rows};
+use crate::exec::{ExecCtx, Rows};
 use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, ShowKind, Statement, SubscribeTarget};
 use crate::sql::plan::Rel;
 use crate::sql::ParamSlot;
@@ -37,46 +37,10 @@ fn interruption(req: &Request, read: bool) -> Option<SqlError> {
     (read && i.gone()).then(|| SqlError::new(codes::QUERY_CANCELED, "canceling statement: the client is gone"))
 }
 
-/// The result of a read whose plan returned `rows`: consolidated, sorted,
-/// OFFSET/LIMIT applied, multiplicities expanded, visible columns.
-pub(crate) fn finish_read(bq: crate::sql::BoundQuery, mut rows: Rows) -> ExecResult {
-    crate::dataflow::consolidate(&mut rows);
-    rows.retain(|(_, w)| *w > 0);
-    if !bq.order.is_empty() {
-        sort_rows(&mut rows, &bq.order);
-    }
-    // expand multiplicities, apply OFFSET/LIMIT, project visible columns
-    let mut out: Vec<Row> = Vec::new();
-    let mut skipped = 0u64;
-    let limit = bq.limit.unwrap_or(u64::MAX);
-    let mut last: Option<Row> = None;
-    'outer: for (r, w) in rows {
-        for _ in 0..w {
-            if skipped < bq.offset {
-                skipped += 1;
-                continue;
-            }
-            if out.len() as u64 >= limit {
-                // FETCH ... WITH TIES keeps rows tied with the last one
-                let tied = bq.with_ties
-                    && last.as_ref().is_some_and(|l| bq.order.iter().all(|k| l[k.col].sql_cmp(&r[k.col]) == std::cmp::Ordering::Equal));
-                if !tied {
-                    break 'outer;
-                }
-            }
-            out.push(r[..bq.visible].to_vec());
-            last = Some(r.clone());
-        }
-    }
+/// The result columns of a query.
+pub(crate) fn result_columns(bq: &crate::sql::BoundQuery) -> Vec<ResultColumn> {
     let types = bq.column_types();
-    let columns = bq
-        .names
-        .iter()
-        .take(bq.visible)
-        .zip(types)
-        .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
-        .collect();
-    ExecResult::Query { columns, rows: out }
+    bq.names.iter().take(bq.visible).zip(types).map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod }).collect()
 }
 
 pub fn parse_lsn(s: &str) -> Result<u64> {
@@ -86,7 +50,99 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
     Ok((hi << 32) | lo)
 }
 
+/// Rows per chunk of a snapshot sent to a sink or a subscriber.
+pub(crate) const SNAPSHOT_CHUNK_ROWS: usize = 10_000;
+
+/// A query result goes to the session in chunks of this many rows, or of
+/// about `RESULT_CHUNK_BYTES` (estimated), whichever comes first.
+const RESULT_CHUNK_ROWS: usize = 1024;
+const RESULT_CHUNK_BYTES: usize = 256 << 10;
+
+/// Answers a read with its rows as they are found: a result of one chunk
+/// as `ExecResult::Query` (an error before it is complete fails the
+/// statement), a larger one as `ExecResult::Rows`, whose first chunk is in
+/// the reply and the rest follow (an error then ends the rows).
+pub(crate) struct ChunkedReply {
+    columns: Vec<ResultColumn>,
+    reply: Sender<Result<ExecResult>>,
+    chunk: Vec<Row>,
+    bytes: usize,
+    rest: Option<Sender<Result<Vec<Row>>>>,
+}
+
+impl ChunkedReply {
+    pub(crate) fn new(columns: Vec<ResultColumn>, reply: Sender<Result<ExecResult>>) -> ChunkedReply {
+        ChunkedReply { columns, reply, chunk: Vec::new(), bytes: 0, rest: None }
+    }
+
+    /// Add a row; false once nobody reads the rows any more.
+    pub(crate) fn push(&mut self, row: Row) -> bool {
+        self.bytes += row.iter().map(crate::types::codec::approx_len).sum::<usize>();
+        self.chunk.push(row);
+        if self.chunk.len() < RESULT_CHUNK_ROWS && self.bytes < RESULT_CHUNK_BYTES {
+            return true;
+        }
+        let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(RESULT_CHUNK_ROWS));
+        self.bytes = 0;
+        match &self.rest {
+            Some(tx) => tx.send(Ok(chunk)).is_ok(),
+            None => {
+                let (tx, rx) = unbounded();
+                self.rest = Some(tx);
+                let rows = RowStream { first: Some(chunk), rx };
+                self.reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows })).is_ok()
+            }
+        }
+    }
+
+    pub(crate) fn finish(self, r: Result<()>) {
+        let ChunkedReply { columns, reply, chunk, rest, .. } = self;
+        match rest {
+            None => {
+                let _ = reply.send(r.map(|()| ExecResult::Query { columns, rows: chunk }));
+            }
+            Some(tx) => {
+                let _ = tx.send(r.map(|()| chunk));
+            }
+        }
+    }
+}
+
 impl Engine {
+    /// The current contents of dataflow node `node`, handed to `f` in
+    /// chunks of at most `SNAPSHOT_CHUNK_ROWS` rows. An arranged node is
+    /// read from its arrangement chunk by chunk, so no copy of the whole
+    /// relation is built here (a node without one is computed whole).
+    pub(crate) fn snapshot_chunks(&mut self, node: NodeId, f: &mut dyn FnMut(crate::dataflow::Delta)) -> Result<()> {
+        let Some(a) = self.graph.any_arrangement(node) else {
+            let mut rows = self.graph.snapshot(&mut self.env, node)?.data.into_iter();
+            loop {
+                let chunk: Vec<_> = rows.by_ref().take(SNAPSHOT_CHUNK_ROWS).collect();
+                if chunk.is_empty() {
+                    return Ok(());
+                }
+                f(chunk);
+            }
+        };
+        let arr = self.graph.arr(a);
+        let (layout, tree) = (&arr.layout, arr.tree);
+        let mut chunk = Vec::new();
+        self.env.for_each(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
+            let w = h.weight(ReadAt::Latest);
+            if w != 0 {
+                chunk.push((layout.decode_row(k)?, w));
+                if chunk.len() >= SNAPSHOT_CHUNK_ROWS {
+                    f(std::mem::take(&mut chunk));
+                }
+            }
+            Ok(true)
+        })?;
+        if !chunk.is_empty() {
+            f(chunk);
+        }
+        Ok(())
+    }
+
     pub(crate) fn execute(
         &mut self,
         stmt: Statement,
@@ -147,8 +203,19 @@ impl Engine {
         }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default() };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default(), visited: 0 };
         ctx.execute(rel)
+    }
+
+    /// The result rows of a query at `at`, handed to `out` as they are found
+    /// (`exec::ExecCtx::run_query`; false from `out` ends the read). Returns
+    /// the number of arrangement entries its scans visited.
+    pub(crate) fn read_query(&mut self, q: &crate::sql::BoundQuery, at: ReadAt, out: &mut dyn FnMut(Row) -> Result<bool>) -> Result<u64> {
+        let rt = &self.rt;
+        let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default(), visited: 0 };
+        ctx.run_query(q, out)?;
+        Ok(ctx.visited)
     }
 
     fn check_view_errors(&self, rel: &Rel) -> Result<()> {
@@ -327,17 +394,30 @@ impl Engine {
         self.check_view_errors(&bq.rel)?;
         // now() is the logical clock as of the read, so reads are repeatable
         bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
-        // a read that turns out large goes on off the engine thread
+        // within a budget on the engine thread, or else off it; the rows go
+        // to the session in chunks as they are found
+        let columns = result_columns(&bq);
+        let mut rows = Vec::new();
         self.env.set_read_budget(Some(super::reader::INLINE_READ_ENTRIES));
-        let r = self.execute_rel(&bq.rel, at);
+        let r = self.read_query(&bq, at, &mut |row| {
+            rows.push(row);
+            Ok(true)
+        });
         self.env.set_read_budget(None);
         match r {
-            Err(e) if e.code == crate::storage::READ_BUDGET => {
-                self.read_elsewhere(bq, at, vars, reply)?;
-                Ok(None)
+            // (it sent nothing yet: it runs again there)
+            Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, at, vars, reply)?,
+            r => {
+                let mut res = ChunkedReply::new(columns, reply);
+                for row in rows {
+                    if !res.push(row) {
+                        break;
+                    }
+                }
+                res.finish(r.map(|_| ()));
             }
-            r => Ok(Some(finish_read(bq, r?))),
         }
+        Ok(None)
     }
 
     /// Has every source's LSN frontier reached `lsn` (written `text`)? A
