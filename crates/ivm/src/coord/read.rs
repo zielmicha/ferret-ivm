@@ -887,27 +887,46 @@ impl Engine {
         rows
     }
 
-    /// Average entries per key prefix of an arrangement (sampled).
+    /// Average live entries per key prefix of an arrangement, sampled from
+    /// runs of entries starting at evenly spaced ranks of its weight (found
+    /// through the subtree counts, which skip entries retracted but not yet
+    /// compacted away without visiting them; within a run they are skipped
+    /// too).
     fn estimate_fanout(&mut self, arr: ArrId) -> f64 {
+        use std::ops::Bound;
+        const RUNS: i64 = 16;
+        const RUN: usize = 128;
         let a = self.graph.arr(arr);
         let layout = a.layout.clone();
         let tree = a.tree;
-        let total = self.env.tree_count(tree).max(0) as f64;
-        if total == 0.0 {
+        let total = self.env.tree_count(tree);
+        if total <= 0 {
             return 1.0;
         }
-        let mut c = self.env.cursor(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-        let mut keys = std::collections::BTreeSet::new();
-        let mut n = 0;
-        while let Ok(Some((k, _))) = self.env.cursor_next(&mut c) {
-            if let Ok(kb) = layout.key_bytes(&k) {
-                keys.insert(kb.to_vec());
-            }
-            n += 1;
-            if n >= 2000 {
-                break;
-            }
+        // a small tree is one run from its start
+        let runs = if total <= RUNS * RUN as i64 { 1 } else { RUNS };
+        let (mut entries, mut keys) = (0usize, 0usize);
+        for r in 0..runs {
+            let rank = if runs == 1 { 0 } else { (total as i128 * (2 * r as i128 + 1) / (2 * runs as i128)) as i64 };
+            let Ok(Some((start, _, _))) = self.env.nth(tree, Bound::Unbounded, Bound::Unbounded, rank) else { continue };
+            let (mut n, mut visited) = (0usize, 0usize);
+            let mut last: Option<Vec<u8>> = None;
+            let _ = self.env.for_each(tree, Bound::Included(&start), Bound::Unbounded, &mut |k, h| {
+                visited += 1;
+                if h.total() > 0
+                    && let Ok(kb) = layout.key_bytes(k)
+                {
+                    // entries with equal keys are adjacent
+                    if last.as_deref() != Some(kb) {
+                        keys += 1;
+                        last = Some(kb.to_vec());
+                    }
+                    n += 1;
+                }
+                Ok(n < RUN && visited < 8 * RUN)
+            });
+            entries += n;
         }
-        if keys.is_empty() { 1.0 } else { (n as f64 / keys.len() as f64).max(1.0) }
+        if keys == 0 { 1.0 } else { (entries as f64 / keys as f64).max(1.0) }
     }
 }

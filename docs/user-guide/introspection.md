@@ -119,8 +119,10 @@ One row per base table that the view depends on:
 The estimate starts at 1 and follows the first consumer at each step: a
 delta join multiplies it by `1 + lookups`, where `lookups` sums the expected
 number of index probes along the table's delta path (each probe's fan-out is
-the average number of entries per key in a sample of up to 2000 entries of
-the probed index); a `Reduce` adds 2 (two range summaries); a `TopK` adds
+the average number of current entries per key of the probed index, sampled
+from 16 runs of up to 128 entries spread evenly over it, or from its start
+when it holds at most 2,048 entries; deleted rows not yet compacted away are
+skipped); a `Reduce` adds 2 (two range summaries); a `TopK` adds
 its limit (100 without one); a `Window` multiplies by 10. It is a rough
 guide, not a cost model — the planner does not use it.
 
