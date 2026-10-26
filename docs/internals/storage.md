@@ -148,7 +148,7 @@ subtree (`storage::Summary`): the sum of the current weights of its entries
 | `CountTrue`, `CountFalse` | `Count(i64)` | weighted count of entries whose boolean argument is true / false |
 | `SumInt`, `SumSqInt` | `SumInt(i128)` | weighted sum (of squares) of an integer argument |
 | `SumNumeric`, `SumSqNumeric` | `SumNumeric(NumSum)` | exact `numeric` sum (not limited to numeric's range) |
-| `SumFloat`, `SumSqFloat` | `SumFloat(FloatSum)` | exact float sum |
+| `SumFloat`, `SumSqFloat` | `SumFloat(FloatSum)` | exact float sum (a normalized dyadic rational) |
 | `Min`, `Max` | `Min(Option<Datum>)`, `Max(Option<Datum>)` | extreme value among entries with positive weight |
 
 The summarizer of an arrangement (`LayoutSummarizer`) decodes the columns of
@@ -202,16 +202,28 @@ only.
   value read from it is range-checked (`Numeric::checked`); a group whose
   sum lies beyond the range becomes an error record of that group, which is
   retracted when the group is back in range.
-- `FloatSum` keeps the finite part as an integer multiple of 2^-1074 (the
-  smallest subnormal double) in a big integer: each `x = m·2^e` adds
-  `m·2^(e+1074)`. Addition is exact, associative and invertible; the value is
-  rounded to the nearest double (ties to even) once, when read. Infinities
-  and NaN are counted apart. Squares are added as `m²·2^(2e+1074)`
-  (truncated below the grid). `avg` divides the exact sum with 128 extra
-  bits before rounding; variance is computed from the exact sums as
-  `(N·Q − S²) / (N·(N−1))` (or `N²`). A finite sum whose rounded value
-  overflows (for `sum(real)`, overflows `real`) fails with
-  `value out of range: overflow`.
+- `FloatSum` keeps the exact finite sum as a dyadic rational `±m·2^e`
+  (`Dyadic`), normalized so that every value has one representation and
+  encoding: `m` odd, or 0 with `e` = 0. Each `x = m·2^e` adds `m·2^e`;
+  addition aligns the exponents and is exact, associative and invertible.
+  The magnitude is held in 64-bit limbs, inline up to 256 bits: a sum needs
+  about 53 bits plus the span of its terms' exponents plus the bits of their
+  count (106 bits plus twice the span for squares), so adding a value does
+  not allocate, and a typical sum encodes in 10 to 20 bytes, a sum of
+  squares in up to about 30. The value is rounded to the nearest double
+  (ties to even) once, when read. Infinities and NaN are counted apart.
+  Squares are added as `m²·2^(2e)`, truncated to a multiple of 2^-1074 (the
+  smallest subnormal double), which every sum therefore is. `avg` divides
+  the sum, as a number of 2^-1074 units, with 128 extra bits, truncates and
+  rounds; for sums of at least 2^115 units, where that is correctly
+  rounded, a correctly rounded division of the limbs gives the same result.
+  Variance is computed from the exact sums as `(N·Q − S²) / (N·(N−1))` (or
+  `N²`) on the 2^-2148 grid of the squares, with 128 extra bits, truncated
+  and rounded. (These results are
+  those of the earlier representation, an integer multiple of 2^-1074 in a
+  big integer, bit for bit: maintained views hold values computed with it.)
+  A finite sum whose rounded value overflows (for `sum(real)`, overflows
+  `real`) fails with `value out of range: overflow`.
 
 ### How aggregates use summaries
 

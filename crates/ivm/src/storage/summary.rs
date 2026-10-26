@@ -14,7 +14,7 @@ use crate::error::{Result, SqlError};
 use crate::types::codec::{self, get_ivarint, get_u8, get_uvarint, put_ivarint, put_uvarint};
 use crate::types::Datum;
 use crate::types::datum::exact_cmp;
-use num_bigint::{BigInt, Sign};
+use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{Signed, ToPrimitive, Zero};
 use pgnumeric::Numeric;
 use smallvec::SmallVec;
@@ -335,7 +335,7 @@ impl AggState {
                 s.encode(out);
             }
             AggState::SumFloat(f) => {
-                out.push(5);
+                out.push(8);
                 f.encode(out);
             }
             AggState::Min(d) => {
@@ -361,7 +361,7 @@ impl AggState {
                 AggState::SumInt(v)
             }
             4 => AggState::SumNumeric(Box::new(NumSum::decode(buf)?)),
-            5 => AggState::SumFloat(Box::new(FloatSum::decode(buf)?)),
+            5 => AggState::SumFloat(Box::new(FloatSum::decode_fixed(buf)?)),
             6 => {
                 let d = codec::decode_datum(buf)?;
                 AggState::Min(if d.is_null() { None } else { Some(d) })
@@ -370,6 +370,7 @@ impl AggState {
                 let d = codec::decode_datum(buf)?;
                 AggState::Max(if d.is_null() { None } else { Some(d) })
             }
+            8 => AggState::SumFloat(Box::new(FloatSum::decode(buf)?)),
             t => return Err(SqlError::corrupt(format!("bad agg state tag {t}"))),
         })
     }
@@ -496,13 +497,15 @@ impl NumSum {
 
 /// Exact, order-independent and invertible sum of weighted doubles.
 ///
-/// The finite part is an integer multiple of 2^-1074 (the smallest subnormal)
-/// held in a big integer, so addition is exact and associative; the result is
-/// rounded once when read. This pins down floating-point SUM/AVG so that the
-/// result is a pure function of the multiset, independent of update order.
+/// The exact sum of doubles is a dyadic rational, kept normalized
+/// ([`Dyadic`]); the result is rounded once when read. This pins down
+/// floating-point SUM/AVG so that the result is a pure function of the
+/// multiset, independent of update order. Every finite sum is a multiple of
+/// 2^-1074 (the smallest subnormal), the grid that squares are truncated to
+/// (`add_square`) and that `div_value` and `variance` compute on.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct FloatSum {
-    pub fixed: BigInt,
+    pub finite: Dyadic,
     pub nan: i64,
     pub pos_inf: i64,
     pub neg_inf: i64,
@@ -518,20 +521,13 @@ impl FloatSum {
             self.neg_inf += w;
         } else if x != 0.0 {
             let (m, e) = decompose(x);
-            // x = m * 2^e, e >= -1074
-            let shifted = BigInt::from(m) << ((e + 1074) as usize);
-            self.fixed += shifted * w;
+            self.finite.add_mag((m < 0) != (w < 0), limbs_of_product(m.unsigned_abs() as u128, w.unsigned_abs()), e);
         }
     }
 
-    /// Add w * x^2 exactly (x^2 = m^2 * 2^(2e) needs scale 2^-2148).
+    /// Add w·x², where x² = m²·2^(2e) is truncated to a multiple of 2^-1074
+    /// when it has bits below it.
     pub fn add_square(&mut self, x: f64, w: i64) {
-        // squares are tracked in a separate scale: we store them as x*x rounded
-        // to the exact product in the 2^-1074 grid when representable; to keep
-        // things simple and exact for typical data, use the f64 product's
-        // exact value when it is finite (x*x is exactly representable only if
-        // m^2 fits 53 bits, which is not general) -> accumulate the exact
-        // product m^2 * 2^(2e+1074) when 2e >= -1074, else round.
         if !x.is_finite() {
             self.add(x * x, w);
             return;
@@ -540,21 +536,25 @@ impl FloatSum {
             return;
         }
         let (m, e) = decompose(x);
-        let m2 = BigInt::from(m) * BigInt::from(m);
-        let exp = 2 * e + 1074;
-        let v = if exp >= 0 { m2 << (exp as usize) } else { m2 >> ((-exp) as usize) };
-        self.fixed += v * w;
+        let m2 = m.unsigned_abs() as u128 * m.unsigned_abs() as u128; // < 2^106
+        let (sq, exp) = if 2 * e >= -1074 {
+            (m2, 2 * e)
+        } else {
+            let s = (-1074 - 2 * e) as u32;
+            (m2.checked_shr(s).unwrap_or(0), -1074)
+        };
+        self.finite.add_mag(w < 0, limbs_of_product(sq, w.unsigned_abs()), exp);
     }
 
     pub fn combine(&mut self, o: &FloatSum) {
-        self.fixed += &o.fixed;
+        self.finite.add(&o.finite);
         self.nan += o.nan;
         self.pos_inf += o.pos_inf;
         self.neg_inf += o.neg_inf;
     }
 
     pub fn subtract(&mut self, o: &FloatSum) {
-        self.fixed -= &o.fixed;
+        self.finite.sub(&o.finite);
         self.nan -= o.nan;
         self.pos_inf -= o.pos_inf;
         self.neg_inf -= o.neg_inf;
@@ -571,35 +571,51 @@ impl FloatSum {
         if self.neg_inf > 0 {
             return f64::NEG_INFINITY;
         }
-        bigint_scaled_to_f64(&self.fixed, -1074)
+        self.finite.to_f64()
     }
 
-    /// Exact division of the finite part by n, correctly rounded (for AVG).
+    /// The finite part divided by n (for AVG): the quotient on the 2^-1074
+    /// grid with 128 more bits, truncated, then rounded to the nearest
+    /// double (ties to even).
     pub fn div_value(&self, n: i64) -> f64 {
         let v = self.value();
         if !v.is_finite() || n == 0 {
             return v / n as f64;
         }
-        // scale up to keep precision, then divide
-        let scaled: BigInt = &self.fixed << 128usize;
-        let q = scaled / BigInt::from(n);
-        bigint_scaled_to_f64(&q, -1074 - 128)
+        self.finite.div_to_f64(n)
+    }
+
+    /// Variance of n values from their sum (`self`) and sum of squares:
+    /// `(N·Q − S²) / (N·(N−1))` for a sample, else `/ N²`, computed exactly
+    /// on the 2^-2148 grid of the squares with 128 more bits, truncated,
+    /// then rounded to the nearest double. 0 when not positive. The caller
+    /// handles special values.
+    pub fn variance(&self, sumsq: &FloatSum, n: i64, sample: bool) -> f64 {
+        let (s, q) = (self.finite.to_fixed(), sumsq.finite.to_fixed());
+        let nb = BigInt::from(n);
+        let num: BigInt = ((&nb * &q) << 1074u32) - &s * &s;
+        if !num.is_positive() {
+            return 0.0;
+        }
+        let denom = if sample { &nb * BigInt::from(n - 1) } else { &nb * &nb };
+        bigint_scaled_to_f64(&((num << 128u32) / denom), -2148 - 128)
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
-        let (sign, bytes) = self.fixed.to_bytes_le();
-        out.push(match sign {
-            Sign::Minus => 2,
-            Sign::NoSign => 0,
-            Sign::Plus => 1,
-        });
-        codec::put_bytes(out, &bytes);
+        self.finite.encode(out);
         put_ivarint(out, self.nan);
         put_ivarint(out, self.pos_inf);
         put_ivarint(out, self.neg_inf);
     }
 
     fn decode(buf: &mut &[u8]) -> Result<FloatSum> {
+        let finite = Dyadic::decode(buf)?;
+        Ok(FloatSum { finite, nan: get_ivarint(buf)?, pos_inf: get_ivarint(buf)?, neg_inf: get_ivarint(buf)? })
+    }
+
+    /// The encoding of agg state tag 5: the finite part as an integer
+    /// multiple of 2^-1074 (sign byte, magnitude).
+    fn decode_fixed(buf: &mut &[u8]) -> Result<FloatSum> {
         let sign = match get_u8(buf)? {
             2 => Sign::Minus,
             0 => Sign::NoSign,
@@ -607,12 +623,301 @@ impl FloatSum {
         };
         let bytes = codec::get_bytes(buf)?;
         Ok(FloatSum {
-            fixed: BigInt::from_bytes_le(sign, bytes),
+            finite: Dyadic::checked(Dyadic::from_bigint(&BigInt::from_bytes_le(sign, bytes), -1074))?,
             nan: get_ivarint(buf)?,
             pos_inf: get_ivarint(buf)?,
             neg_inf: get_ivarint(buf)?,
         })
     }
+}
+
+/// An exact dyadic rational `±mag·2^exp`, normalized so that each value has
+/// one representation (and encoding): `mag` is odd, or 0 (no limbs) with a
+/// positive sign and `exp` = 0. The magnitude is held inline up to 256 bits:
+/// a sum of doubles needs about 53 bits plus the span of their exponents
+/// plus the bits of their count (106 bits plus twice the span for squares),
+/// so adding a double to it rarely allocates.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Dyadic {
+    neg: bool,
+    /// Little-endian 64-bit limbs, without high zero limbs.
+    mag: Limbs,
+    exp: i32,
+}
+
+type Limbs = SmallVec<[u64; 4]>;
+
+impl Dyadic {
+    /// `±mag·2^e` (`mag` of any parity), normalized.
+    fn new(neg: bool, mut mag: Limbs, e: i32) -> Dyadic {
+        trim(&mut mag);
+        let mut d = Dyadic { neg, mag, exp: e };
+        d.normalize();
+        d
+    }
+
+    fn from_bigint(v: &BigInt, e: i32) -> Dyadic {
+        let (sign, bytes) = v.to_bytes_le();
+        Dyadic::new(sign == Sign::Minus, limbs_from_le(&bytes), e)
+    }
+
+    fn normalize(&mut self) {
+        if self.mag.is_empty() {
+            *self = Dyadic::default();
+            return;
+        }
+        let i = self.mag.iter().position(|&x| x != 0).unwrap();
+        let tz = 64 * i as u32 + self.mag[i].trailing_zeros();
+        shr_limbs(&mut self.mag, tz);
+        self.exp += tz as i32;
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.mag.is_empty()
+    }
+
+    /// Bits of the magnitude.
+    fn bits(&self) -> u64 {
+        match self.mag.last() {
+            None => 0,
+            Some(&top) => 64 * self.mag.len() as u64 - top.leading_zeros() as u64,
+        }
+    }
+
+    /// Add `±mag·2^e` (`mag` without high zero limbs).
+    fn add_mag(&mut self, neg: bool, mut mag: Limbs, e: i32) {
+        if mag.is_empty() {
+            return;
+        }
+        if self.mag.is_empty() {
+            *self = Dyadic::new(neg, mag, e);
+            return;
+        }
+        let lo = self.exp.min(e);
+        shl_limbs(&mut self.mag, (self.exp - lo) as u32);
+        shl_limbs(&mut mag, (e - lo) as u32);
+        self.exp = lo;
+        if self.neg == neg {
+            add_limbs(&mut self.mag, &mag);
+        } else {
+            match cmp_limbs(&self.mag, &mag) {
+                Ordering::Equal => self.mag.clear(),
+                Ordering::Greater => sub_limbs(&mut self.mag, &mag),
+                Ordering::Less => {
+                    sub_limbs(&mut mag, &self.mag);
+                    self.mag = mag;
+                    self.neg = neg;
+                }
+            }
+        }
+        self.normalize();
+    }
+
+    pub fn add(&mut self, o: &Dyadic) {
+        self.add_mag(o.neg, o.mag.clone(), o.exp);
+    }
+
+    pub fn sub(&mut self, o: &Dyadic) {
+        self.add_mag(!o.neg, o.mag.clone(), o.exp);
+    }
+
+    /// Rounded to the nearest double, ties to even (±infinity beyond the
+    /// range); the same steps as `bigint_scaled_to_f64`.
+    pub fn to_f64(&self) -> f64 {
+        let bits = self.bits();
+        if bits == 0 {
+            return 0.0;
+        }
+        let r = if bits <= 53 {
+            ldexp(self.mag[0] as f64, self.exp)
+        } else {
+            // keep 53 significant bits, round half to even using the rest
+            let shift = bits - 53;
+            let (q, b) = ((shift / 64) as usize, shift % 64);
+            let mut top = self.mag[q] >> b;
+            if b > 0 && q + 1 < self.mag.len() {
+                top |= self.mag[q + 1] << (64 - b);
+            }
+            top &= (1 << 53) - 1;
+            // the half-unit bit, and whether any bit below it is set
+            let (hq, hb) = (((shift - 1) / 64) as usize, (shift - 1) % 64);
+            let rest = if self.mag[hq] >> hb & 1 == 0 {
+                Ordering::Less
+            } else if self.mag[..hq].iter().any(|&x| x != 0) || self.mag[hq] & ((1 << hb) - 1) != 0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            };
+            round_top(top, rest, self.exp as i64 + shift as i64)
+        };
+        if self.neg { -r } else { r }
+    }
+
+    /// The value in units of 2^-1074: an integer for every sum of doubles
+    /// (and of their truncated squares).
+    fn to_fixed(&self) -> BigInt {
+        let bytes: Vec<u8> = self.mag.iter().flat_map(|l| l.to_le_bytes()).collect();
+        let sign = if self.neg { Sign::Minus } else { Sign::Plus };
+        BigInt::from_biguint(sign, BigUint::from_bytes_le(&bytes)) << (self.exp + 1074) as u32
+    }
+
+    /// `self / n` (`n` nonzero) on the 2^-1074 grid with 128 more bits,
+    /// truncated, then rounded to the nearest double.
+    fn div_to_f64(&self, n: i64) -> f64 {
+        if self.is_zero() {
+            return 0.0;
+        }
+        // A sum of at least 2^115 grid units has a quotient of at least
+        // 2^52 units (2^-1022, the smallest normal double), where that
+        // computation is correctly rounded (the truncation cannot turn the
+        // remainder into an exact half: that would need a remainder of the
+        // division divisible by 2^128). So a correctly rounded quotient,
+        // with a sticky bit for the remainder, gives the same result without
+        // scaling to the grid. Smaller sums, and magnitudes beyond 127 bits,
+        // take the long way.
+        let bits = self.bits();
+        if bits <= 127 && bits + (self.exp + 1074) as u64 > 115 {
+            let mag = self.mag[0] as u128 | (self.mag.get(1).copied().unwrap_or(0) as u128) << 64;
+            let s = mag.leading_zeros() - 1;
+            let x = mag << s; // 127 bits: the quotient has at least 64
+            let d = n.unsigned_abs() as u128;
+            let q = (x / d) << 1 | !x.is_multiple_of(d) as u128;
+            return u128_scaled_to_f64(self.neg != (n < 0), q, self.exp - s as i32 - 1);
+        }
+        bigint_scaled_to_f64(&((self.to_fixed() << 128u32) / BigInt::from(n)), -1074 - 128)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_ivarint(out, self.exp as i64);
+        let len = (self.bits() as usize).div_ceil(8);
+        put_uvarint(out, (len as u64) << 1 | self.neg as u64);
+        let start = out.len();
+        out.extend(self.mag.iter().flat_map(|l| l.to_le_bytes()));
+        out.truncate(start + len);
+    }
+
+    fn decode(buf: &mut &[u8]) -> Result<Dyadic> {
+        let exp = get_ivarint(buf)?;
+        let head = get_uvarint(buf)?;
+        let len = (head >> 1) as usize;
+        if buf.len() < len || !(-(1 << 20)..=1 << 20).contains(&exp) {
+            return Err(SqlError::corrupt("bad float sum in summary"));
+        }
+        let (mag, rest) = buf.split_at(len);
+        *buf = rest;
+        Dyadic::checked(Dyadic::new(head & 1 == 1, limbs_from_le(mag), exp as i32))
+    }
+
+    /// Reject values no sum of doubles can have (from corrupt data), whose
+    /// `to_fixed` would fail or be huge.
+    fn checked(d: Dyadic) -> Result<Dyadic> {
+        if d.is_zero() || (d.exp >= -1074 && d.exp as i64 + d.bits() as i64 <= 1 << 16) {
+            Ok(d)
+        } else {
+            Err(SqlError::corrupt("bad float sum in summary"))
+        }
+    }
+}
+
+fn limbs_from_le(bytes: &[u8]) -> Limbs {
+    bytes
+        .chunks(8)
+        .map(|c| {
+            let mut b = [0u8; 8];
+            b[..c.len()].copy_from_slice(c);
+            u64::from_le_bytes(b)
+        })
+        .collect()
+}
+
+/// The limbs of `a·b`.
+fn limbs_of_product(a: u128, b: u64) -> Limbs {
+    let lo = (a as u64 as u128) * b as u128;
+    let hi = (a >> 64) * b as u128 + (lo >> 64);
+    let mut v: Limbs = smallvec::smallvec![lo as u64, hi as u64, (hi >> 64) as u64];
+    trim(&mut v);
+    v
+}
+
+fn trim(v: &mut Limbs) {
+    while v.last() == Some(&0) {
+        v.pop();
+    }
+}
+
+fn shl_limbs(v: &mut Limbs, s: u32) {
+    if s == 0 || v.is_empty() {
+        return;
+    }
+    let (q, b) = ((s / 64) as usize, s % 64);
+    if b > 0 {
+        let mut carry = 0;
+        for x in v.iter_mut() {
+            let next = *x >> (64 - b);
+            *x = *x << b | carry;
+            carry = next;
+        }
+        if carry != 0 {
+            v.push(carry);
+        }
+    }
+    if q > 0 {
+        v.insert_many(0, std::iter::repeat_n(0, q));
+    }
+}
+
+/// Shift right by `s` bits, dropping them.
+fn shr_limbs(v: &mut Limbs, s: u32) {
+    let (q, b) = ((s / 64) as usize, s % 64);
+    v.drain(..q.min(v.len()));
+    if b > 0 {
+        for i in 0..v.len() {
+            let high = v.get(i + 1).map_or(0, |&x| x << (64 - b));
+            v[i] = v[i] >> b | high;
+        }
+        trim(v);
+    }
+}
+
+fn add_limbs(a: &mut Limbs, b: &[u64]) {
+    if a.len() < b.len() {
+        a.resize(b.len(), 0);
+    }
+    let mut carry = false;
+    for (i, x) in a.iter_mut().enumerate() {
+        let y = b.get(i).copied().unwrap_or(0);
+        if i >= b.len() && !carry {
+            break;
+        }
+        let (s, c1) = x.overflowing_add(y);
+        let (s, c2) = s.overflowing_add(carry as u64);
+        *x = s;
+        carry = c1 || c2;
+    }
+    if carry {
+        a.push(1);
+    }
+}
+
+/// `a -= b`, for `a >= b`.
+fn sub_limbs(a: &mut Limbs, b: &[u64]) {
+    let mut borrow = false;
+    for (i, x) in a.iter_mut().enumerate() {
+        let y = b.get(i).copied().unwrap_or(0);
+        if i >= b.len() && !borrow {
+            break;
+        }
+        let (d, b1) = x.overflowing_sub(y);
+        let (d, b2) = d.overflowing_sub(borrow as u64);
+        *x = d;
+        borrow = b1 || b2;
+    }
+    trim(a);
+}
+
+/// Order of magnitudes without high zero limbs.
+fn cmp_limbs(a: &[u64], b: &[u64]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.iter().rev().cmp(b.iter().rev()))
 }
 
 /// x = m * 2^e with integer m (|m| < 2^53) and e >= -1074.
@@ -643,25 +948,46 @@ pub fn bigint_scaled_to_f64(v: &BigInt, scale: i32) -> f64 {
         // keep 53 significant bits, round half to even using the rest
         let shift = (bits - 53) as u64;
         let top = (&mag >> shift).to_u64().unwrap();
-        let rem = &mag - (num_bigint::BigUint::from(top) << shift);
-        let half = num_bigint::BigUint::from(1u8) << (shift - 1);
-        let mut m = top;
-        match rem.cmp(&half) {
-            Ordering::Greater => m += 1,
-            Ordering::Equal => {
-                if m & 1 == 1 {
-                    m += 1
-                }
-            }
-            Ordering::Less => {}
-        }
-        let e = scale as i64 + shift as i64;
-        // smallest normal check: if the result would be subnormal we already
-        // have more bits than representable; ldexp performs final rounding
-        // only in that rare case.
-        ldexp(m as f64, e.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+        let rem = &mag - (BigUint::from(top) << shift);
+        let half = BigUint::from(1u8) << (shift - 1);
+        round_top(top, rem.cmp(&half), scale as i64 + shift as i64)
     };
     if neg { -result } else { result }
+}
+
+/// `bigint_scaled_to_f64` of an inline magnitude (the same steps).
+fn u128_scaled_to_f64(neg: bool, mag: u128, scale: i32) -> f64 {
+    if mag == 0 {
+        return 0.0;
+    }
+    let bits = 128 - mag.leading_zeros() as i64;
+    let result = if bits <= 53 {
+        ldexp(mag as f64, scale)
+    } else {
+        let shift = (bits - 53) as u32;
+        let rem = mag & ((1u128 << shift) - 1);
+        round_top((mag >> shift) as u64, rem.cmp(&(1u128 << (shift - 1))), scale as i64 + shift as i64)
+    };
+    if neg { -result } else { result }
+}
+
+/// `top·2^e` rounded up by one unit if the rest (compared to half a unit)
+/// requires it, ties to even.
+fn round_top(top: u64, rest: Ordering, e: i64) -> f64 {
+    let mut m = top;
+    match rest {
+        Ordering::Greater => m += 1,
+        Ordering::Equal => {
+            if m & 1 == 1 {
+                m += 1
+            }
+        }
+        Ordering::Less => {}
+    }
+    // smallest normal check: if the result would be subnormal we already
+    // have more bits than representable; ldexp performs final rounding
+    // only in that rare case.
+    ldexp(m as f64, e.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
 }
 
 fn ldexp(x: f64, e: i32) -> f64 {
@@ -686,26 +1012,4 @@ fn ldexp(x: f64, e: i32) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn float_sum_exact() {
-        let mut s = FloatSum::default();
-        s.add(1e100, 1);
-        s.add(1.0, 1);
-        s.add(-1e100, 1);
-        assert_eq!(s.value(), 1.0);
-        let mut s = FloatSum::default();
-        for _ in 0..10 {
-            s.add(0.1, 1);
-        }
-        assert_eq!(s.value(), 1.0); // exact sum of ten 0.1s rounds to 1.0
-        s.add(0.1, -10);
-        assert_eq!(s.value(), 0.0);
-        let mut s = FloatSum::default();
-        s.add(5e-324, 3);
-        assert_eq!(s.value(), 3.0 * 5e-324);
-        assert_eq!(s.div_value(3), 5e-324);
-    }
-}
+mod tests;

@@ -345,10 +345,10 @@ comparison), `−old, +new` is emitted.
   a structure that counts NaN/±Infinity and display scales separately and is
   not limited to numeric's range (only the value read from it is checked),
   so that removing a value restores the exact previous result; float sums as
-  a big integer multiple of 2^-1074 (the smallest subnormal), so addition is
-  exact and associative and the result is rounded once. Variance and
-  standard deviation are computed from exact sums of squares. Maintaining a
-  summary therefore never fails on data. See [Storage](storage.md#summaries).
+  exact dyadic rationals, so addition is exact and associative and the
+  result is rounded once. Variance and standard deviation are computed from
+  exact sums of squares. Maintaining a summary therefore never fails on
+  data. See [Storage](storage.md#summaries).
 
 ### Distinct
 

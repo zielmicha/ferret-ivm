@@ -370,14 +370,25 @@ m × aggstate
 | 1 | `Count` | `ivarint` |
 | 2 | `SumInt` | 16 bytes, `i128 LE` (two's complement) |
 | 4 | `SumNumeric` | finite sum as a [compact numeric](#compact-numeric-encoding) (not limited to numeric's range, see below); `uvarint s`, `s × (uvarint display_scale, ivarint count)`; `ivarint nan`; `ivarint pos_inf`; `ivarint neg_inf` |
-| 5 | `SumFloat` | `u8 sign` (0 = zero, 1 = positive, 2 = negative), `bytes magnitude` (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = sign × magnitude × 2^−1074 |
+| 5 | `SumFloat` (read only) | `u8 sign` (0 = zero, 1 = positive, 2 = negative), `bytes magnitude` (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = sign × magnitude × 2^−1074. Written by earlier versions; decoded into the state that tag 8 encodes |
 | 6 | `Min` | one [codec datum](#row-codec); NULL (tag 0) means "no value" |
 | 7 | `Max` | same |
+| 8 | `SumFloat` | `ivarint exp`, `uvarint h`, `h >> 1` bytes magnitude (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = (−1 if `h & 1`) × magnitude × 2^exp |
 
 Tag 3 is unused. The aggregate states are positional: their meaning (which
 `AggKind` and which argument expression) comes from the arrangement's layout,
 which is derived from the catalog when the dataflow is planned; it is not
 stored in the tree.
+
+A float sum (tag 8) has one encoding per value: it is normalized, the
+magnitude odd and without high zero bytes, or the finite value 0, encoded
+as `exp` 0, `h` 0 and no bytes. Every finite sum of doubles is a multiple of 2^−1074 (squares are
+truncated to that grid), so `exp` ≥ −1074; decoding normalizes and
+rejects an `exp` below that or a value beyond 2^65536 (`bad float sum in
+summary`). The sum of the values 1 to 10 (55 × 2^0) is the state
+`08 00 02 37 00 00 00`; the sum of 0.1 and 0.2 (0x26666666666667 ×
+2^−55) is `08 6d 0e 67 66 66 66 66 66 26 00 00 00`; and two NaNs (the
+finite part 0) `08 00 00 04 00 00`.
 
 The finite part of a `SumNumeric` state is the exact sum of its subtree's
 terms (the arguments, or for `SumSqNumeric` their squares, times their
@@ -918,7 +929,7 @@ Consequences of code changes for an existing data directory:
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag truncates the newest log segment at the first such record (see above), losing it and everything after it |
 | `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#checkpoint-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array.) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
-| summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them |
+| summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tag 8 (float sums as normalized dyadic rationals) was added later: data written before it decodes (tag 5, as described [above](#summary)), data written since fails to decode in earlier versions (`bad agg state tag`) |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
 | inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again, and the rebuilt arrangements' history (`arr_since`) starts at the checkpoint the engine restarted from: `AS OF` reads that need them at earlier GSNs fail |
 | semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
