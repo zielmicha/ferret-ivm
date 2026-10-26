@@ -145,16 +145,19 @@ about 80 in memory.)
   sweep that ends over a limit records a stall, and sweeps resume only once
   the arena or the dirty memory has grown by a sixteenth of the target
   (plus a leaf) beyond it, so sweeping costs nothing when there is nothing
-  to evict. A large scan — one that has read more than a quarter of the
-  target from disk — also evicts, while the pool is over its target, the
-  nodes it read as soon as it is done with them (`evict_scanned`, after
-  each leaf): it recycles its own nodes, at O(depth) per leaf, instead of
-  loading the whole tree or pushing the pool's working set out (what a
-  smaller scan reads is cached like any other node, a sweep running after
-  every 1/64 of the target it reads). `Env::write_back(target)` writes
-  dirty nodes, children before parents, until at most `target` bytes of
-  dirty memory remain: the hook for callers that manage memory or
-  checkpoints themselves.
+  to evict. Two kinds of nodes are not candidates: dirty nodes frozen in a
+  checkpoint job in progress, which the job writes (below), and in a fork
+  the nodes it still shares with the environment it was forked from
+  ([Forks](#forks)). A large scan — one that has read more than a quarter
+  of the target from disk — also evicts, while the pool is over its
+  target, the nodes it read as soon as it is done with them
+  (`evict_scanned`, after each leaf): it recycles its own nodes, at
+  O(depth) per leaf, instead of loading the whole tree or pushing the
+  pool's working set out (what a smaller scan reads is cached like any
+  other node, a sweep running after every 1/64 of the target it reads).
+  `Env::write_back(target)` writes dirty nodes, children before parents,
+  until at most `target` bytes of dirty memory remain: the hook for callers
+  that manage memory or checkpoints themselves.
 
 There is no separate in-memory mode: a tree that fits in the cache is served
 from memory, a larger one degrades gradually as nodes are re-read from the
@@ -236,6 +239,8 @@ changes at one GSN:
 `for_each_prefix`, cursors, and everything built on them) may still visit:
 past it they fail with the internal code `IVMRB`, which the engine uses to
 move a large read off its thread ([Planner](planner.md#batch-execution)).
+A scan the budget stops is done with what it read: a large one evicts it
+first, as at its end.
 
 Summaries reflect the **current** weights only; historical reads use the
 histories. (Operators that need a previous aggregate value read it from
