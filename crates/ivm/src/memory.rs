@@ -393,12 +393,17 @@ impl MemBudget {
         total.saturating_sub(others).max(total / 4)
     }
 
+    /// Have the records waiting to be applied reached their limit?
+    pub fn input_full(&self) -> bool {
+        self.input.used() >= self.input_limit()
+    }
+
     /// Wait until the records waiting to be applied are below their limit,
     /// then count `bytes` more. A record larger than the limit gets in once
     /// the queue is below it, so that it is never refused. False when
     /// `stop` turns true first (polled every millisecond).
     pub fn admit_input(&self, bytes: usize, stop: impl Fn() -> bool) -> bool {
-        while self.input.used() >= self.input_limit() {
+        while self.input_full() {
             if stop() {
                 return false;
             }

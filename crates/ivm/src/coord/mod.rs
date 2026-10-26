@@ -353,12 +353,35 @@ impl EngineHandle {
     /// Append a record without waiting for it to be durable; the receiver
     /// yields its GSN once it is. Waits first while the records the engine
     /// has yet to apply fill their part of the memory budget: this is the
-    /// backpressure on sources, in bytes of memory.
+    /// backpressure on submitters, in bytes of memory. (A source's
+    /// replication thread must not wait: it checks `input_full` before it
+    /// reads more, and logs with `log_now`.)
     pub fn log_async(&self, rec: LogRecord) -> Result<Receiver<Gsn>> {
         let bytes = crate::memory::record_bytes(&rec);
         if !self.shared.mem.admit_input(bytes, || self.shared.shutdown.load(Ordering::Acquire)) {
             return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"));
         }
+        self.send_admitted(rec, bytes)
+    }
+
+    /// Do the records the engine has yet to apply fill their part of the
+    /// memory budget? A submitter that must not wait (a source's
+    /// replication thread, which keeps its session up) stops producing
+    /// records while they do, and logs what it has with `log_now`.
+    pub fn input_full(&self) -> bool {
+        self.shared.mem.input_full()
+    }
+
+    /// `log_async` without waiting for room: for a submitter that stopped
+    /// producing while `input_full` (so the queue exceeds its limit by at
+    /// most what one of its steps logs).
+    pub fn log_now(&self, rec: LogRecord) -> Result<Receiver<Gsn>> {
+        let bytes = crate::memory::record_bytes(&rec);
+        self.shared.mem.input.add(bytes);
+        self.send_admitted(rec, bytes)
+    }
+
+    fn send_admitted(&self, rec: LogRecord, bytes: usize) -> Result<Receiver<Gsn>> {
         let (tx, rx) = bounded(1);
         if self.seq.send(SeqMsg::Append { rec, ack: Some(tx) }).is_err() {
             self.shared.mem.input.sub(bytes);
@@ -373,10 +396,11 @@ impl EngineHandle {
         let _ = self.tx.send(EngineMsg::Request(Request::SinkSnapshot { sink, token }));
     }
 
-    /// Log the commit of a spooled transaction without waiting (see
-    /// `log_async`).
+    /// Log the commit of a spooled transaction without waiting, as
+    /// `log_now`. Its changes are in the spool file, which becomes the
+    /// commit's parts file: only the small record it becomes counts in the
+    /// memory of the records waiting to be applied.
     pub fn log_spooled(&self, source: ObjectId, lsn: u64, spool: crate::log::Spooled) -> Result<Receiver<Gsn>> {
-        // (counted as the record it becomes until the engine has applied it)
         let bytes = crate::memory::record_bytes(&LogRecord::CommitParts { source, lsn, parts: 0, changes: 0 });
         self.shared.mem.input.add(bytes);
         let (tx, rx) = bounded(1);

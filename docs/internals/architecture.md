@@ -81,7 +81,8 @@ Communication uses `crossbeam` channels (unbounded, except one-shot reply
 channels of capacity 1) and a small block of shared state
 (`coord::api::Shared`). What the channels hold is bounded in bytes of
 memory instead ([Memory](#memory)): records submitted to the log and not
-yet applied by sources waiting for room, the queues to subscriptions and
+yet applied by sources that stop reading while they fill their part, the
+queues to subscriptions and
 sinks by their consumers' limits, the rows a reader thread streams to a
 session or sink by the few chunks in flight (`coord::stream`). The web UI
 keeps at most 16 of its
@@ -129,7 +130,9 @@ snapshot requests queued at the engine.
 
 1. The source thread collects the changes of one upstream transaction and,
    at its commit, sends `SeqMsg::Append { rec: Commit, ack: Some(tx) }` to the
-   sequencer without waiting (`log_async`). Several commits can be in flight.
+   sequencer without waiting (`log_now`: neither for the record to be
+   durable nor for room, see [Group commit](#group-commit)). Several
+   commits can be in flight.
    It holds at most `log::PART_BYTES` (1 MiB) of a transaction's changes:
    beyond that it writes them, as they arrive, to a spool file in the log
    directory (`log::Spool`), and at the commit sends the finished spool
@@ -161,8 +164,9 @@ snapshot requests queued at the engine.
 Source progress (snapshot bookkeeping, as `ProgressDelta` records) and
 schema records are sent the same way and count as in flight, at the LSN of
 the commit before them, until durable. A source with 10,000 records in
-flight stops reading the stream until some are durable, but goes on sending
-status updates, so its session stays up.
+flight, or while the records waiting to be applied fill their part of the
+memory budget, stops reading the stream until some are durable or
+applied, but goes on sending status updates, so its session stays up.
 
 ### Local DML
 
@@ -250,22 +254,28 @@ record. `--no-sync` skips the `fsync` but keeps the order.
 the log segments the checkpoint covers; `SeqMsg::Shutdown` stops the
 sequencer after the current batch.
 
-Backpressure is applied where records enter, in bytes of memory: a source
-submitting a record (`EngineHandle::log_async`, also behind the blocking
-`log`) first waits while the records submitted and not yet applied take
-their part of the memory budget (`MemBudget::admit_input`: an eighth, at
-least 4 MiB; a record larger than that gets in once the queue is below
-it), polling every millisecond, and gives up with `57P01` when the server
-shuts down. Each record is counted at its size in memory
-(`memory::record_bytes`: its rows as decoded, not as logged, and its place
-in the queues) from its submission until the engine has applied it; the
-engine's own appends (DML, DDL) and the sequencer's ticks are counted
-without waiting. So the sequencer's queue and the engine's queue of durable
-batches both stay bounded, whatever the size of the records, and the
-sequencer itself never waits. The engine never waits for the sequencer
-either (its appends are not acknowledged synchronously), so it always
-catches up. (Sources also stop once 10,000 of their commits are
-unacknowledged, which bounds their acknowledgement bookkeeping.)
+Backpressure is applied where records enter, in bytes of memory: while
+the records submitted and not yet applied take their part of the memory
+budget (`MemBudget::input_full`: an eighth, at least 4 MiB), a source
+stops reading its replication stream (`PgSource::backlogged`; it goes on
+sending status updates, so its session stays up and the upstream keeps
+the WAL), and logs what it has already decoded without waiting
+(`EngineHandle::log_now`): the queue exceeds its limit by at most what one
+replication message produces. Other submitters wait for room
+(`EngineHandle::log_async`, also behind the blocking `log`: polling every
+millisecond, a record larger than the limit getting in once the queue is
+below it, giving up with `57P01` when the server shuts down). Each record
+is counted at its size in memory (`memory::record_bytes`: its rows as
+decoded, not as logged, and its place in the queues) from its submission
+until the engine has applied it — a `CommitParts` record, whose changes
+are in its parts file, at its own small size; the engine's own appends
+(DML, DDL) and the sequencer's ticks are counted without waiting. So the
+sequencer's queue and the engine's queue of durable batches both stay
+bounded, whatever the size of the records, and the sequencer itself never
+waits. The engine never waits for the sequencer either (its appends are
+not acknowledged synchronously), so it always catches up. (Sources also
+stop once 10,000 of their records are unacknowledged, which bounds their
+acknowledgement bookkeeping.)
 
 ## The engine loop
 
@@ -341,7 +351,7 @@ do not depend on how wide rows are or how they serialize:
 
 | Part | Meter | Limit | At the limit |
 |---|---|---|---|
-| records submitted to the log and not yet applied | `MemBudget::input` | an eighth, at least 4 MiB | sources wait ([Group commit](#group-commit)) |
+| records submitted to the log and not yet applied | `MemBudget::input` | an eighth, at least 4 MiB | sources stop reading their streams ([Group commit](#group-commit)) |
 | changes queued for a subscription, and the chunks of its snapshot in flight | `Subscription::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB | the subscription ends with `53000` |
 | changes queued for a sink, until written, and the chunks of its snapshot in flight | `SinkHandle::queue` (likewise) | a sixteenth, at least 4 MiB | the sink falls behind and resynchronises its target |
 | query results in flight to sessions | `MemBudget::outputs` | a few chunks per read on a reader thread (it waits for its session); what a read on the engine thread returns, within its budget | the read goes on off the engine thread |

@@ -887,7 +887,8 @@ impl PgSource {
                             spool.write(&txn.changes)?;
                             self.engine.log_spooled(self.id, end_lsn.0, spool.finish()?)?
                         }
-                        None => self.engine.log_async(LogRecord::Commit { source: self.id, lsn: end_lsn.0, changes: txn.changes })?,
+                        // (no waiting for room: see `backlogged`)
+                        None => self.engine.log_now(LogRecord::Commit { source: self.id, lsn: end_lsn.0, changes: txn.changes })?,
                     };
                     self.inflight.push_back((end_lsn.0, rx));
                 } else {
@@ -1235,18 +1236,23 @@ impl PgSource {
         }
     }
 
-    /// So many records wait to be durable that the source stops reading the
-    /// stream until some are (the upstream keeps the WAL meanwhile). It
-    /// keeps its session, sending status updates as usual.
+    /// So many records wait to be durable, or the records the engine has
+    /// yet to apply fill their part of the memory budget (whatever source
+    /// logged them), that the source stops reading the stream until some
+    /// are durable, or applied (the upstream keeps the WAL meanwhile). It
+    /// keeps its session, sending status updates as usual: it never waits
+    /// for room when it logs (`EngineHandle::log_now`), it stops reading
+    /// what it would log instead.
     fn backlogged(&self) -> bool {
-        self.inflight.len() > MAX_INFLIGHT
+        self.inflight.len() > MAX_INFLIGHT || self.engine.input_full()
     }
 
-    /// Append a record to the log without waiting for it. It is in flight
-    /// until durable, at the LSN of the last commit before it.
+    /// Append a record to the log without waiting for it (or for room: see
+    /// `backlogged`). It is in flight until durable, at the LSN of the last
+    /// commit before it.
     fn log_tracked(&mut self, rec: LogRecord) -> Result<()> {
         let lsn = self.last_lsn();
-        let rx = self.engine.log_async(rec)?;
+        let rx = self.engine.log_now(rec)?;
         self.inflight.push_back((lsn, rx));
         Ok(())
     }
@@ -2698,6 +2704,47 @@ mod tests {
             })
             .flatten()
             .collect()
+    }
+
+    /// While the records the engine has yet to apply fill their part of the
+    /// memory budget, the source stops reading its stream (it is
+    /// backlogged) instead of waiting for room on its replication thread
+    /// when it logs: a commit decoded then is logged at once, and the
+    /// source reads on once the engine has applied enough. (It used to wait
+    /// in the logging call, sending no status updates meanwhile.)
+    #[test]
+    fn a_full_input_queue_stops_reading_without_waiting() {
+        let (mut src, log) = source(vec![table(&["id", "a"], vec![0])], done_state(10));
+        let mem = &src.engine.shared.mem;
+        mem.set_total(32 << 20);
+        assert!(!src.backlogged());
+        // the engine is behind by its whole share
+        mem.input.add(mem.input_limit());
+        assert!(src.backlogged());
+        // a transaction the source had decoded is logged without waiting
+        src.handle_message(begin(5)).unwrap();
+        src.handle_message(relation(&["id", "a"], 1)).unwrap();
+        src.handle_message(insert(&[1, 1])).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let shared = src.engine.shared.clone();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = src.handle_message(commit(100));
+                let _ = tx.send(());
+            });
+            let logged = rx.recv_timeout(Duration::from_secs(5));
+            // (a commit waiting for room gives up at a shutdown)
+            shared.shutdown.store(true, Ordering::Release);
+            assert!(logged.is_ok(), "the commit waited for room");
+        });
+        shared.shutdown.store(false, Ordering::Release);
+        src.drain_acks(true).unwrap();
+        assert!(log.lock().iter().any(|r| matches!(r, LogRecord::Commit { .. })));
+        assert!(src.backlogged());
+        // the engine applies them
+        let mem = &src.engine.shared.mem;
+        mem.input.sub(mem.input.used());
+        assert!(!src.backlogged());
     }
 
     /// A transaction larger than memory: its changes beyond `PART_BYTES`

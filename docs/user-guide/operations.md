@@ -25,7 +25,7 @@ Fixed internal parameters (not configurable):
 | storage segment size (roll-over threshold) | 256 MiB |
 | input-log segment size (roll-over threshold) | 64 MiB |
 | maximum records per sequencer batch (group commit) | 4096 |
-| records waiting to be applied, before sources wait | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
+| records waiting to be applied, before sources stop reading their streams | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | changes queued per subscription or sink | a sixteenth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | aggregation group caches, all together | an eighth of `--memory-mb` |
 | transient working memory of the dataflow (below) | an eighth of `--memory-mb` |
@@ -81,7 +81,7 @@ the limits mean the same for narrow and wide rows:
 
 | Part | Limit | When it is reached |
 |---|---|---|
-| records logged (or submitted to the log) that the engine has not applied yet | an eighth (at least 4 MiB) | sources wait before logging more, so they stop reading the replication stream for a while (the upstream keeps the WAL); the engine never waits, so it always catches up. A single record larger than the limit is let in once the queue is below it |
+| records logged (or submitted to the log) that the engine has not applied yet (a large upstream transaction, which a source spools to the log directory, counts at the size of its small commit record) | an eighth (at least 4 MiB) | sources stop reading the replication stream for a while (keeping their sessions; the upstream keeps the WAL), and log what they decoded already without waiting; the engine never waits, so it always catches up |
 | changes queued for one subscription (and the chunks of its snapshot in flight) | a sixteenth (at least 4 MiB) | the subscription ends with `53000` and its queue is dropped ([Reads](reads.md#ending-a-subscription)) |
 | rows of query results on their way to sessions | the rows of a read on the engine thread (at most 50,000, 8 MiB), two chunks of about 256 KB per read on a reader thread | a read too large for the engine thread runs on a reader thread, which waits for its client |
 | changes queued for one sink and not written yet (and the chunks of its snapshot in flight) | a sixteenth (at least 4 MiB) | the sink falls behind: it is sent nothing more, drops what it holds and resynchronises its target from a snapshot ([Sinks](sinks.md#delivering-changes)) |

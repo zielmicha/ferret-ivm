@@ -270,9 +270,10 @@ stream (it keeps reconnecting with `error: ...`), the slot holds back WAL
 removal indefinitely. (A table the source cannot copy does not stop the
 stream, see [below](#tables-added-to-or-removed-from-the-publication).)
 When the records waiting to be applied fill their part of the memory budget
-(an eighth of `--memory-mb`, in bytes of memory), a source waits before
-logging more until the engine catches up: it then stops reading the
-replication stream, and the upstream keeps the WAL meanwhile.
+(an eighth of `--memory-mb`, in bytes of memory), sources stop reading the
+replication stream until the engine catches up (also each one with 10,000
+of its records waiting to be durable), and the upstream keeps the WAL
+meanwhile. Their sessions stay up: they go on sending status updates.
 
 ## Initial snapshot
 
