@@ -19,6 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub enum SeqMsg {
     Append { rec: LogRecord, ack: Option<Sender<Gsn>> },
+    /// Records the engine submitted together (statements it evaluated in
+    /// one round): appended in one batch.
+    AppendAll(Vec<LogRecord>),
     Truncate(Gsn),
     Shutdown,
 }
@@ -88,12 +91,21 @@ impl Sequencer {
                         }
                         durable.push((gsn, rec));
                     }
+                    SeqMsg::AppendAll(recs) => {
+                        for rec in recs {
+                            let gsn = next;
+                            next += 1;
+                            self.writer.append(gsn, &rec)?;
+                            durable.push((gsn, rec));
+                        }
+                    }
                     SeqMsg::Truncate(g) => self.writer.truncate_before(g)?,
                     SeqMsg::Shutdown => shutdown = true,
                 }
             }
             if !durable.is_empty() {
                 self.writer.flush()?;
+                self.shared.log_batches.fetch_add(1, Ordering::Relaxed);
                 let last = durable.last().unwrap().0;
                 self.shared.durable_gsn.store(last, Ordering::Release);
                 for (a, g) in acks {

@@ -2,11 +2,14 @@
 //! fed by the sequencer with durable log records in GSN order.
 
 pub mod api;
+mod checkpoint;
 pub mod ddl;
 mod dml;
+mod hydrate;
 pub mod inspect;
 pub mod meta;
 mod read;
+mod reader;
 pub mod seq;
 
 use crate::catalog::{Catalog, ObjectKind};
@@ -93,6 +96,9 @@ pub(crate) struct Subscription {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
+    /// Changes are held back: its view is being replaced, and it gets the
+    /// change to the new version once that is hydrated.
+    pub held: bool,
     pub progress: bool,
     /// The materialized view subscribed to by name (its node may be shared
     /// with other views, so dropping it is matched by view, not by node).
@@ -117,6 +123,9 @@ pub(crate) enum Wait {
     Lsn,
     /// The initial snapshots of the tables it reads (rechecked on wake).
     Snapshot,
+    /// The hydration of a relation it reads (re-run when a hydration
+    /// finished after this many had).
+    Hydration(u64),
 }
 
 /// DDL statements kept in the catalog history (`ivm.catalog_history`), the
@@ -127,6 +136,10 @@ pub const MAX_HISTORY: usize = 10_000;
 /// make a checkpoint due once this many records were applied since the last
 /// one (an hour of ticks at the default interval).
 const MAX_TICKS_WITHOUT_CHECKPOINT: u64 = 3600;
+
+/// Most messages the engine handles in one round (before deferred requests,
+/// sending the submitted records, and its other work).
+const MAX_MESSAGES_PER_ROUND: usize = 256;
 
 pub struct Engine {
     pub cfg: Config,
@@ -141,8 +154,19 @@ pub struct Engine {
     pub(crate) parked: Vec<Parked>,
     pub(crate) subs: Vec<Subscription>,
     pub(crate) next_req: u64,
-    dml_inflight: Option<u64>,
+    /// DML logged but not applied yet, with the rows it writes (`dml.rs`).
+    dml_pending: Vec<(u64, dml::Touched)>,
+    /// DML waiting for pending DML whose rows it read, in arrival order.
     dml_queue: VecDeque<Request>,
+    /// The rows the DML statement being evaluated reads.
+    pub(crate) dml_reads: Option<dml::Touched>,
+    /// Records submitted in this round of messages, not sent yet.
+    outbox: Vec<(u64, LogRecord)>,
+    /// Threads running large reads on forks (`reader.rs`), started when
+    /// first needed.
+    readers: Option<Sender<reader::ReadJob>>,
+    /// Snapshots being taken on reader threads for subscriptions and sinks.
+    pub(crate) snapshotting: Vec<reader::Snapshotting>,
     /// Command tags of DML waiting to be applied.
     pub(crate) dml_counts: HashMap<u64, String>,
     /// Requests to run after the current message.
@@ -172,6 +196,27 @@ pub struct Engine {
     pub clock: i64,
     /// Recent (gsn, clock) ticks, for now() in reads as of a past GSN.
     pub ticks: VecDeque<(Gsn, i64)>,
+    /// The hydration in progress off the engine thread (`hydrate.rs`).
+    pub(crate) hydration: Option<hydrate::Hydration>,
+    /// What waits for the hydration to begin after it (statements applied
+    /// while it was in progress whose dataflow is still pending).
+    pub(crate) hydration_next: Vec<hydrate::Then>,
+    /// Hydrations finished so far.
+    pub(crate) hydrations_done: u64,
+    /// What the record being applied leaves for after the hydration of what
+    /// it built (`hydrate::Then`).
+    pub(crate) record_then: Vec<hydrate::Then>,
+    /// Sinks whose changes are held back: their view is being replaced and
+    /// they get the change to its new version once it is hydrated.
+    pub(crate) held_sinks: rustc_hash::FxHashSet<ObjectId>,
+    /// Durable records not applied yet: one that must wait for the
+    /// hydration in progress (or for snapshots being taken) and those after
+    /// it.
+    held: VecDeque<(Gsn, LogRecord)>,
+    /// The checkpoint being written in the background (`checkpoint.rs`).
+    checkpointing: Option<checkpoint::InFlight>,
+    /// Requests for a checkpoint, answered when the next one is committed.
+    checkpoint_waiters: Vec<checkpoint::Waiter>,
 }
 
 /// Handle used by sessions and sources.
@@ -441,8 +486,12 @@ impl Engine {
             parked: Vec::new(),
             subs: Vec::new(),
             next_req: 1,
-            dml_inflight: None,
+            dml_pending: Vec::new(),
             dml_queue: VecDeque::new(),
+            dml_reads: None,
+            outbox: Vec::new(),
+            readers: None,
+            snapshotting: Vec::new(),
             dml_counts: HashMap::new(),
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),
@@ -460,6 +509,14 @@ impl Engine {
             sink_handles: HashMap::new(),
             clock: 0,
             ticks: VecDeque::new(),
+            hydration: None,
+            hydration_next: Vec::new(),
+            hydrations_done: 0,
+            record_then: Vec::new(),
+            held_sinks: Default::default(),
+            held: VecDeque::new(),
+            checkpointing: None,
+            checkpoint_waiters: Vec::new(),
         }
     }
 
@@ -592,48 +649,33 @@ impl Engine {
     }
 
     fn run(mut self, rx: Receiver<EngineMsg>, handle: EngineHandle) -> Result<()> {
-        loop {
-            let msg = match rx.recv_timeout(Duration::from_millis(200)) {
+        'run: loop {
+            let first = match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(m) => Some(m),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
                 Err(_) => break,
             };
-            match msg {
-                Some(EngineMsg::Durable(batch)) => {
-                    for (gsn, rec) in batch {
-                        let dml = match &rec {
-                            LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
-                            _ => None,
-                        };
-                        // (counted from its submission until it is applied)
-                        let bytes = crate::memory::record_bytes(&rec);
-                        let r = self.apply_record(gsn, rec);
-                        self.shared.mem.input.sub(bytes);
-                        self.rebalance_memory();
-                        if let Err(e) = r {
-                            log::error!("failed to apply gsn {gsn}: {e}");
-                            if e.code.starts_with("XX") || e.code.starts_with("58") {
-                                return Err(e);
-                            }
-                            // (data errors are error records, so this is a
-                            // bug) The record is not applied again: its
-                            // statement fails instead of leaving the client,
-                            // the DML queued behind it and fresh reads
-                            // waiting forever.
-                            self.processed = self.processed.max(gsn);
-                            if let Some(req) = dml {
-                                self.dml_counts.remove(&req);
-                                self.reply_pending(req, Err(e));
-                                self.drain_dml_queue();
-                            }
-                        }
+            // with the messages already waiting, so that the statements
+            // among them are logged together (one log append for all)
+            let mut msgs: VecDeque<Option<EngineMsg>> = VecDeque::from([first]);
+            while msgs.len() < MAX_MESSAGES_PER_ROUND
+                && let Ok(m) = rx.try_recv()
+            {
+                msgs.push_back(Some(m));
+            }
+            for msg in msgs {
+                match msg {
+                    Some(EngineMsg::Durable(batch)) => {
+                        self.held.extend(batch);
+                        self.apply_durable(&handle)?;
                     }
-                    self.shared.processed_gsn.store(self.processed, Ordering::Release);
-                    self.wake_parked(&handle);
+                    Some(EngineMsg::Request(req)) => self.handle_request(req, &handle),
+                    Some(EngineMsg::Shutdown) => {
+                        self.flush_outbox();
+                        break 'run;
+                    }
+                    Some(EngineMsg::Wake) | None => self.wake_parked(&handle),
                 }
-                Some(EngineMsg::Request(req)) => self.handle_request(req, &handle),
-                Some(EngineMsg::Shutdown) => break,
-                Some(EngineMsg::Wake) | None => self.wake_parked(&handle),
             }
             while !self.deferred.is_empty() {
                 let reqs = std::mem::take(&mut self.deferred);
@@ -641,6 +683,13 @@ impl Engine {
                     self.handle_request(r, &handle);
                 }
             }
+            self.flush_outbox();
+            if !self.snapshotting.is_empty() {
+                self.poll_snapshots()?;
+                self.apply_durable(&handle)?;
+            }
+            self.poll_hydration(&handle)?;
+            self.poll_checkpoint(false)?;
             self.rebalance_memory();
             self.restart_lagging_sinks();
             self.maybe_checkpoint()?;
@@ -658,6 +707,9 @@ impl Engine {
         let _ = self.seq.send(SeqMsg::Shutdown);
         if !self.shared.crash.load(Ordering::Acquire) {
             self.checkpoint()?;
+        } else {
+            // (no writer may outlive the engine: a restart opens the store)
+            self.abandon_checkpoint();
         }
         // give sources and sinks a moment to finish; one stuck in a
         // connection attempt is left behind
@@ -673,22 +725,89 @@ impl Engine {
         Ok(())
     }
 
+    /// Apply the durable records received, in GSN order, up to one that
+    /// must wait for the hydration in progress (`must_wait_for_hydration`;
+    /// it is applied once no hydration is).
+    fn apply_durable(&mut self, handle: &EngineHandle) -> Result<()> {
+        let mut applied = false;
+        while let Some((_, rec)) = self.held.front() {
+            // (and DDL while snapshots are taken for the subscriptions and
+            // sinks it could end or replace)
+            if (self.hydration.is_some() && self.must_wait_for_hydration(rec))
+                || (!self.snapshotting.is_empty() && matches!(rec, LogRecord::Ddl { .. } | LogRecord::Schema { .. }))
+            {
+                break;
+            }
+            let (gsn, rec) = self.held.pop_front().unwrap();
+            applied = true;
+            let dml = match &rec {
+                LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
+                _ => None,
+            };
+            // (counted from its submission until it is applied)
+            let bytes = crate::memory::record_bytes(&rec);
+            let r = self.apply_record(gsn, rec);
+            self.shared.mem.input.sub(bytes);
+            self.rebalance_memory();
+            if let Err(e) = r {
+                log::error!("failed to apply gsn {gsn}: {e}");
+                if e.code.starts_with("XX") || e.code.starts_with("58") {
+                    return Err(e);
+                }
+                // (data errors are error records, so this is a
+                // bug) The record is not applied again: its
+                // statement fails instead of leaving the client,
+                // the DML queued behind it and fresh reads
+                // waiting forever.
+                self.processed = self.processed.max(gsn);
+                if let Some(req) = dml {
+                    self.dml_counts.remove(&req);
+                    self.reply_pending(req, Err(e));
+                    self.drain_dml_queue();
+                }
+            }
+        }
+        if applied {
+            self.shared.processed_gsn.store(self.processed, Ordering::Release);
+            self.wake_parked(handle);
+        }
+        Ok(())
+    }
+
     pub(crate) fn alloc_req(&mut self) -> u64 {
         let r = self.next_req;
         self.next_req += 1;
         r
     }
 
-    /// Submit a record to the sequencer; `reply` is answered when it is applied.
+    /// Submit a record to the sequencer; `reply` is answered when it is
+    /// applied. (Sent at the end of the engine's round of messages, with the
+    /// other statements' records: `flush_outbox`.)
     pub(crate) fn submit(&mut self, rec: LogRecord, req: u64, reply: Sender<Result<ExecResult>>) {
         self.pending.insert(req, reply);
-        if matches!(rec, LogRecord::Commit { source: 0, .. }) {
-            self.dml_inflight = Some(req);
+        self.outbox.push((req, rec));
+        if self.handle.is_none() {
+            self.flush_outbox();
         }
-        if !self.append(rec)
-            && let Some(r) = self.pending.remove(&req)
-        {
-            let _ = r.send(Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
+    }
+
+    /// Send the submitted records to the sequencer in one message: it
+    /// appends them in one batch, with one write and one `fdatasync`. They
+    /// are counted in the input queue's memory without waiting for room
+    /// (the engine is what empties the queue).
+    fn flush_outbox(&mut self) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        let (reqs, recs): (Vec<u64>, Vec<LogRecord>) = std::mem::take(&mut self.outbox).into_iter().unzip();
+        let bytes: usize = recs.iter().map(crate::memory::record_bytes).sum();
+        self.shared.mem.input.add(bytes);
+        if self.seq.send(SeqMsg::AppendAll(recs)).is_err() {
+            self.shared.mem.input.sub(bytes);
+            for req in reqs {
+                self.reply_pending(req, Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
+            }
+            self.drain_dml_queue();
         }
     }
 
@@ -708,24 +827,20 @@ impl Engine {
         if let Some(r) = self.pending.remove(&req) {
             let _ = r.send(res);
         }
-        if self.dml_inflight == Some(req) {
-            self.dml_inflight = None;
-        }
+        self.dml_pending.retain(|(r, _)| *r != req);
     }
 
     fn handle_request(&mut self, req: Request, handle: &EngineHandle) {
         match req {
             Request::Execute { ref stmt, .. } if self.is_dml(stmt) => {
-                if self.dml_inflight.is_some() {
-                    self.dml_queue.push_back(req);
-                } else {
+                // (behind DML that is waiting: in arrival order)
+                if self.dml_queue.is_empty() {
                     self.run_execute(req, handle);
+                } else {
+                    self.dml_queue.push_back(req);
                 }
             }
-            Request::Checkpoint { reply } => {
-                let r = self.checkpoint().map(|_| self.processed);
-                let _ = reply.send(r);
-            }
+            Request::Checkpoint { reply } => self.request_checkpoint(checkpoint::Waiter::Request(reply)),
             Request::Log { rec } => {
                 self.append(rec);
             }
@@ -737,6 +852,10 @@ impl Engine {
     fn run_execute(&mut self, req: Request, handle: &EngineHandle) {
         match req {
             Request::Execute { stmt, params, vars, extra, reply } => {
+                // (a statement reading a relation still being hydrated is
+                // parked until it is done: kept to be run again)
+                let retry = (self.hydration.is_some() || (!self.dml_pending.is_empty() && self.is_dml(&stmt)))
+                    .then(|| (stmt.clone(), params.clone(), vars.clone(), extra.clone()));
                 // (current_setting() in the statement reads the session's settings)
                 let settings = vars.settings.clone();
                 let r = crate::expr::with_session_settings(settings, || self.execute(*stmt, params, vars, extra, reply.clone(), handle));
@@ -745,6 +864,17 @@ impl Engine {
                         let _ = reply.send(Ok(res));
                     }
                     Ok(None) => {} // deferred (submitted or parked)
+                    Err(e) if e.code == hydrate::HYDRATING && retry.is_some() => {
+                        let (stmt, params, vars, extra) = retry.unwrap();
+                        let wait = Wait::Hydration(self.hydrations_done);
+                        self.parked.push(Parked { wait, req: Request::Execute { stmt, params, vars, extra, reply } });
+                    }
+                    // (it read rows pending DML writes: evaluated again after it,
+                    // first among the DML waiting)
+                    Err(e) if e.code == dml::WAIT && retry.is_some() => {
+                        let (stmt, params, vars, extra) = retry.unwrap();
+                        self.dml_queue.push_front(Request::Execute { stmt, params, vars, extra, reply });
+                    }
                     Err(e) => {
                         let _ = reply.send(Err(e));
                     }
@@ -775,6 +905,9 @@ impl Engine {
                         by_node.entry(*n).or_default().push(ch);
                     }
                 }
+                if self.hydration.is_some() {
+                    self.forward_to_hydration(gsn, &by_node)?;
+                }
                 let observed = self.delivered_nodes();
                 let outputs = self.graph.step_observed(&mut self.env, gsn, by_node, observed)?;
                 self.processed = gsn;
@@ -797,6 +930,7 @@ impl Engine {
                 }
             }
             LogRecord::Ddl { req, sql, extra } => {
+                let before = self.graph.pending();
                 let res = self.apply_ddl(gsn, &sql, &extra);
                 self.processed = gsn;
                 self.snap_epoch += 1;
@@ -815,7 +949,15 @@ impl Engine {
                 {
                     log::warn!("DDL at gsn {gsn} failed on replay: {e}");
                 }
-                self.reply_pending(req, res);
+                // what it built is hydrated (in the background, or after the
+                // hydration in progress): the reply waits for it
+                let mut then = std::mem::take(&mut self.record_then);
+                if then.is_empty() && self.graph.pending() == before {
+                    self.reply_pending(req, res);
+                } else {
+                    then.push(hydrate::Then::Reply { req, res });
+                    self.hydrate(gsn, then)?;
+                }
                 self.drain_dml_queue();
             }
             LogRecord::Progress { source, lsn: _, state } => {
@@ -828,6 +970,8 @@ impl Engine {
             LogRecord::Schema { source, table, columns, pk } => {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
                 self.processed = gsn;
+                let then = std::mem::take(&mut self.record_then);
+                self.hydrate(gsn, then)?;
                 // The source snapshots the table again to fill in the new
                 // columns. It logs its reset state (with the truncate a key
                 // change needs) just before this record; the record resets
@@ -853,6 +997,9 @@ impl Engine {
                 while self.ticks.len() > 1 && self.ticks[1].0 <= frontier {
                     self.ticks.pop_front();
                 }
+                if self.hydration.is_some() {
+                    self.forward_to_hydration(gsn, &FxHashMap::default())?;
+                }
                 // temporal filters release the events that became due
                 let observed = self.delivered_nodes();
                 let rows_before = self.graph.step_totals.out_rows;
@@ -869,14 +1016,11 @@ impl Engine {
         Ok(())
     }
 
+    /// Evaluate the waiting DML again (some pending DML was applied): from
+    /// the main loop, in order (`handle_request` queues the others again
+    /// behind the first that still has to wait).
     fn drain_dml_queue(&mut self) {
-        // executed from the main loop via handle_request on the next message;
-        // here we only re-enqueue so ordering is preserved
-        if self.dml_inflight.is_none()
-            && let Some(req) = self.dml_queue.pop_front()
-        {
-            self.deferred.push(req);
-        }
+        self.deferred.extend(self.dml_queue.drain(..));
     }
 
     /// The logical clock as of `gsn` (what now() returns in a read at `gsn`).
@@ -903,40 +1047,19 @@ impl Engine {
                 merge_errors(&mut v.errors, &o.errs);
             }
         }
+        if !self.snapshotting.is_empty() {
+            self.keep_for_snapshots(gsn, &outputs);
+        }
         let limit = self.shared.mem.consumer_limit();
         let mut shared = FxHashMap::default();
-        for s in self.subs.iter() {
-            if s.cancel.load(Ordering::Acquire) {
-                continue;
-            }
-            if let Some(o) = outputs.get(&s.node) {
-                // a new error record ends the subscription, as it fails
-                // reads (a retracted one does not)
-                if !o.errs.is_empty() {
-                    let mut errs = o.errs.clone();
-                    crate::dataflow::consolidate_errs(&mut errs);
-                    if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
-                        let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
-                    }
-                }
-                if let Some((rows, bytes)) = shared_rows(&mut shared, &mut outputs, s.node) {
-                    if s.queue.used() + bytes > limit {
-                        end_slow_subscription(s, bytes, limit);
-                        continue;
-                    }
-                    let _ = s.tx.send(SubEvent::Data { gsn, rows: SharedRows::shared(&rows, s.queue.charge(bytes)) });
-                }
-            }
-            if s.progress {
-                if s.queue.used() + SUB_EVENT_BYTES > limit {
-                    end_slow_subscription(s, SUB_EVENT_BYTES, limit);
-                    continue;
-                }
-                let _ = s.tx.send(SubEvent::Progress { gsn, charge: s.queue.charge(SUB_EVENT_BYTES) });
-            }
+        // (held: their view is being replaced, and they get the change to
+        // its new version once that is hydrated)
+        for s in self.subs.iter().filter(|s| !s.held) {
+            let errs = outputs.get(&s.node).map(|o| o.errs.clone()).unwrap_or_default();
+            deliver_to(s, gsn, &errs, shared_rows(&mut shared, &mut outputs, s.node), limit);
         }
         for (id, sink) in self.sink_handles.iter_mut() {
-            if sink.behind() {
+            if sink.behind() || self.held_sinks.contains(id) {
                 continue;
             }
             let sent = match shared_rows(&mut shared, &mut outputs, sink.node) {
@@ -998,43 +1121,74 @@ impl Engine {
         crate::dataflow::reduce::trim_caches(&self.graph);
     }
 
-    /// A checkpoint is due every `checkpoint_interval` (or as soon as dirty
-    /// nodes exceed half the pool's share of the memory budget, since they
-    /// cannot be evicted until a checkpoint writes them) once something
-    /// durable changed: records other than clock ticks that changed nothing
-    /// but the clock — or the last checkpoint's maintenance pass left space
-    /// to reclaim for lack of budget, which the next one continues. Ticks
-    /// alone only add replay work: they make one due after
-    /// MAX_TICKS_WITHOUT_CHECKPOINT of them.
+    /// Begin a checkpoint in the background (`checkpoint.rs`) when one is
+    /// asked for, or due: every `checkpoint_interval` (or as soon as dirty
+    /// nodes still exceed half the pool's share of the memory budget, which
+    /// the pool's early writes keep them below) once something durable
+    /// changed: records other than clock ticks that changed nothing but the
+    /// clock — or the last checkpoint's maintenance pass left space to
+    /// reclaim for lack of budget, which the next one continues. Ticks alone
+    /// only add replay work: they make one due after
+    /// MAX_TICKS_WITHOUT_CHECKPOINT of them. One checkpoint at a time, and
+    /// none while a table is rebuilt.
     fn maybe_checkpoint(&mut self) -> Result<()> {
-        if self.changes_since_checkpoint == 0 && self.records_since_checkpoint < MAX_TICKS_WITHOUT_CHECKPOINT {
+        if self.checkpointing.is_some() || self.rebuilding_table() {
             return Ok(());
         }
-        // dirty nodes cannot be evicted until a checkpoint writes them
+        let asked = !self.checkpoint_waiters.is_empty();
+        if !asked && self.changes_since_checkpoint == 0 && self.records_since_checkpoint < MAX_TICKS_WITHOUT_CHECKPOINT {
+            return Ok(());
+        }
         let dirty = self.env.dirty_bytes();
-        if self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.env.cache_capacity() / 2 {
-            self.checkpoint()?;
+        if asked || self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.env.cache_capacity() / 2 {
+            self.begin_checkpoint()?;
         }
         Ok(())
     }
 
+    /// Take a checkpoint now, on the engine thread, after the one in
+    /// progress (at shutdown, and in an engine without threads).
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
-        // what changed since the last one goes into the metadata tree; the
-        // manifest record names that tree in a small header
-        self.persist_meta(self.processed)?;
-        // reclaim space first, so that this checkpoint writes what it rewrote
-        let maint = self.env.maintain()?;
-        let header = meta::encode_header(&self.meta, self.next_req);
+        self.poll_checkpoint(true)?;
+        if self.rebuilding_table() {
+            // (replay rebuilds it from the schema record after the last one)
+            log::info!("no checkpoint while a table is rebuilt after a schema change");
+            return Ok(());
+        }
+        let header = self.prepare_checkpoint()?;
         self.env.checkpoint(self.processed, &header)?;
-        // recovery replays the log after the checkpoint, and nothing else
-        // reads the log
-        let _ = self.seq.send(SeqMsg::Truncate(self.processed));
+        self.after_checkpoint(self.processed);
+        Ok(())
+    }
+
+    /// What every checkpoint does on the engine thread before the dirty
+    /// nodes are frozen: write what changed since the last one into the
+    /// metadata tree (the manifest record names that tree in a small
+    /// header, returned), and reclaim space, so that the checkpoint writes
+    /// what the maintenance pass rewrote. Records applied from now on count
+    /// towards the next checkpoint.
+    pub(crate) fn prepare_checkpoint(&mut self) -> Result<Vec<u8>> {
+        self.persist_meta(self.processed)?;
+        let maint = self.env.maintain()?;
         self.last_checkpoint = Instant::now();
         self.records_since_checkpoint = 0;
         // (an idle engine goes on reclaiming, a budget per checkpoint, until
         // a pass finds nothing left)
         self.changes_since_checkpoint = maint.unfinished as u64;
-        Ok(())
+        Ok(meta::encode_header(&self.meta, self.next_req))
+    }
+
+    /// Is a table being rebuilt in the background (`apply_schema_change`)?
+    /// No checkpoint is taken meanwhile: its rows are in neither version's
+    /// index alone, and a table's rows exist nowhere else.
+    fn rebuilding_table(&self) -> bool {
+        self.hydration.is_some() && self.graph.live_nodes().any(|n| !n.hydrated && matches!(n.kind, crate::dataflow::NodeKind::Table { .. }))
+    }
+
+    /// Once a checkpoint at `gsn` is committed: recovery replays the log
+    /// after it, and nothing else reads the log.
+    pub(crate) fn after_checkpoint(&mut self, gsn: Gsn) {
+        let _ = self.seq.send(SeqMsg::Truncate(gsn));
     }
 
     fn start_sources(&mut self, handle: &EngineHandle) -> Result<()> {
@@ -1141,6 +1295,57 @@ fn shared_rows(
     let bytes = crate::memory::delta_bytes(&rows);
     shared.insert(node, (rows.clone(), bytes));
     Some((rows, bytes))
+}
+
+/// An output's rows as a copy of their own, with their bytes (for one
+/// consumer); None if empty.
+pub(crate) fn own_rows(rows: &crate::dataflow::Delta) -> Option<(Arc<crate::dataflow::Delta>, usize)> {
+    (!rows.is_empty()).then(|| {
+        let rows = Arc::new(rows.clone());
+        let bytes = crate::memory::delta_bytes(&rows);
+        (rows, bytes)
+    })
+}
+
+/// Deliver to subscription `s` its node's output at `gsn`: error records
+/// `errs` and the rows (shared, with their bytes), then a progress mark if
+/// it asked for them. Every event counts in its queue's memory: one whose
+/// client does not read as fast ends with 53000 instead.
+pub(crate) fn deliver_to(s: &Subscription, gsn: Gsn, errs: &[((String, String), i64)], rows: Option<(Arc<crate::dataflow::Delta>, usize)>, limit: usize) {
+    if s.cancel.load(Ordering::Acquire) {
+        return;
+    }
+    // a new error record ends the subscription, as it fails reads (a
+    // retracted one does not)
+    if !errs.is_empty() {
+        let mut errs = errs.to_vec();
+        crate::dataflow::consolidate_errs(&mut errs);
+        if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
+            let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+        }
+    }
+    if let Some((rows, bytes)) = rows
+        && !send_rows(s, gsn, &rows, bytes, limit)
+    {
+        return;
+    }
+    if s.progress {
+        if s.queue.used() + SUB_EVENT_BYTES > limit {
+            return end_slow_subscription(s, SUB_EVENT_BYTES, limit);
+        }
+        let _ = s.tx.send(SubEvent::Progress { gsn, charge: s.queue.charge(SUB_EVENT_BYTES) });
+    }
+}
+
+/// Send rows to subscription `s`, counted in its queue's memory; false if
+/// that ended it (its client does not read as fast).
+pub(crate) fn send_rows(s: &Subscription, gsn: Gsn, rows: &Arc<crate::dataflow::Delta>, bytes: usize, limit: usize) -> bool {
+    if s.queue.used() + bytes > limit {
+        end_slow_subscription(s, bytes, limit);
+        return false;
+    }
+    let _ = s.tx.send(SubEvent::Data { gsn, rows: SharedRows::shared(rows, s.queue.charge(bytes)) });
+    true
 }
 
 /// End a subscription whose queue would exceed its limit with `more`
@@ -1252,11 +1457,12 @@ mod tests {
         let mut e = engine(tmp.path());
         let limit = 1 << 20;
         e.graph.group_caches.set_limit(limit);
-        e.apply_ddl(1, "CREATE TABLE ta (id int PRIMARY KEY, g int)", "").unwrap();
-        e.apply_ddl(2, "CREATE TABLE tb (id int PRIMARY KEY, g int)", "").unwrap();
-        e.apply_ddl(3, "CREATE MATERIALIZED VIEW va AS SELECT g, count(*) AS n, sum(id) AS s FROM ta GROUP BY g", "").unwrap();
-        e.apply_ddl(4, "CREATE MATERIALIZED VIEW vb AS SELECT g, count(*) AS n, sum(id) AS s FROM tb GROUP BY g", "").unwrap();
-        e.processed = 4;
+        let ddl = |sql: &str| LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() };
+        e.apply_record(1, ddl("CREATE TABLE ta (id int PRIMARY KEY, g int)")).unwrap();
+        e.apply_record(2, ddl("CREATE TABLE tb (id int PRIMARY KEY, g int)")).unwrap();
+        // (hydrated as the records are applied: inline, without threads)
+        e.apply_record(3, ddl("CREATE MATERIALIZED VIEW va AS SELECT g, count(*) AS n, sum(id) AS s FROM ta GROUP BY g")).unwrap();
+        e.apply_record(4, ddl("CREATE MATERIALIZED VIEW vb AS SELECT g, count(*) AS n, sum(id) AS s FROM tb GROUP BY g")).unwrap();
         let ids = |e: &Engine| ["ta", "tb"].map(|n| e.catalog.by_name(n).unwrap().id);
         let [ta, tb] = ids(&e);
         let cache_bytes = |e: &Engine, view: &str| {
@@ -1312,7 +1518,8 @@ mod tests {
         let (nodes, arrs) = (e.graph.live_nodes().count(), e.graph.live_arrangements().count());
         let text = "SELECT s.a, s.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) s JOIN m ON m.id = s.a";
         let q = crate::sql::parser::parse_single_query(text).unwrap();
-        let err = e.subscribe(SubscribeTarget::Query(Box::new(q), text.to_string()), true, false, vec![]).unwrap_err();
+        let (reply, _) = bounded(1);
+        let err = e.subscribe(SubscribeTarget::Query(Box::new(q), text.to_string()), true, false, vec![], reply).unwrap_err();
         assert!(err.message.contains("has no dataflow"), "{}", err.message);
         assert_eq!((e.graph.live_nodes().count(), e.graph.live_arrangements().count()), (nodes, arrs));
         assert!(e.subs.is_empty());

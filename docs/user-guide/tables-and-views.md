@@ -132,9 +132,12 @@ DELETE FROM table [ [ AS ] alias ] [ WHERE condition ]
 - `now()` and related functions in DML return the **wall-clock time when the
   statement runs**, not the logical clock used by reads; the computed values
   are logged.
-- DML statements are serialized: one is in flight at a time, and the client
-  gets its reply after the change has been applied, so a following read sees
-  it.
+- DML statements from different sessions are logged together (sharing the
+  log's appends and `fsync`s) unless one read rows another, logged before
+  it, writes: it then waits for that one to be applied and is evaluated
+  again. The outcome is that of running the statements one after another in
+  the order they were logged. The client gets its reply after the change
+  has been applied, so a following read sees it.
 - A statement planned while a `DROP` of its table was already logged (but
   not yet applied) applies nothing and fails with SQLSTATE `42P01`
   (`the table of this statement was dropped before it could be applied`).
@@ -176,8 +179,16 @@ Column types are derived from the query; an untyped literal column (such as
 operators, reuses every operator and index that an existing view already has
 (identical sub-plans are shared), and **hydrates** the new parts at the
 statement's GSN by reading existing indexes — the upstream is never
-contacted. Maintenance continues from the next GSN. The statement returns
-after hydration, so a large view takes as long as one scan of its inputs.
+contacted. Hydration runs on a thread of its own, on a version of the
+indexes as of that GSN, and then catches up with the changes applied since;
+meanwhile the engine goes on maintaining the other views, applying changes
+and answering other statements. The statement returns once the view is
+maintained like the others, so a large view takes about as long as one scan
+of its inputs. Until then the view is listed (with no rows) and statements
+reading it wait for it. Views and indexes created meanwhile are hydrated
+after it (their statements return then); `CREATE OR REPLACE` of an
+existing view and `CREATE SINK` logged meanwhile wait for it, and so do the
+changes logged after them. `CREATE INDEX` works the same way.
 
 Errors found while binding and planning the query (unknown columns,
 unsupported constructs, non-deterministic functions, a column list that is
@@ -218,7 +229,11 @@ Otherwise:
   modifiers) are unchanged, subscriptions to the view and sinks from it
   receive the difference between the old and the new contents as one change
   at that GSN; otherwise subscriptions to the view end with
-  `materialized view "x" changed its columns` (SQLSTATE `55000`).
+  `materialized view "x" changed its columns` (SQLSTATE `55000`). The new
+  version is hydrated off the engine thread, as a new view is: reads of the
+  view wait for it, its subscribers and sinks get the difference and then
+  the new version's changes once it is hydrated, and the statement returns
+  then.
 - **Every other combination** (virtual by materialized, materialized by
   virtual, virtual by virtual): the old object is dropped and the new one is
   created under the same id. Subscriptions reading the old object end as for

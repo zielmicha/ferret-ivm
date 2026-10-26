@@ -147,6 +147,9 @@ pub struct Shared {
     pub durable_gsn: AtomicU64,
     /// Last GSN applied by the engine.
     pub processed_gsn: AtomicU64,
+    /// Batches of records the sequencer has appended to the input log, each
+    /// made durable with one write and one `fdatasync`.
+    pub log_batches: AtomicU64,
     /// Per-source LSN frontier: every commit at or below it has been logged.
     pub source_lsn: Mutex<HashMap<u64, u64>>,
     /// Sources asked to request a keepalive (to advance the LSN frontier).

@@ -14,6 +14,14 @@
 //!   the manifest record missing or torn, or the record written but the
 //!   segments it freed not yet deleted.
 //!
+//! Checkpoints are also taken in the background: the job is begun, the
+//! environment goes on (updates, drops, GC, forks) while it is written, and
+//! it is finished later, or the process crashes before it was written or
+//! after it was committed but before it was finished. Forks are taken at
+//! random points and checked against the model as of then, after the
+//! environment went on and after updates to the fork itself; trees are
+//! filled in a fork and adopted.
+//!
 //! Node sizes, segment size, retention and the buffer pool (down to a few
 //! KB, so nodes are evicted all the time) are part of the generated case.
 //! Point lookups are checked after every step; full verification compares
@@ -41,7 +49,6 @@ use proptest::prelude::*;
 use proptest::sample::select;
 use crate::types::Datum;
 use std::collections::BTreeMap;
-use std::os::unix::fs::FileExt;
 
 // ---------------------------------------------------------------------------
 // trees and their summarizers
@@ -246,9 +253,9 @@ fn apply_op(env: &mut Env, model: &mut Model, frontier: &mut Gsn, op: &Op) {
             model.insert(*id, TreeModel { kind: *kind, universe: *universe, entries: BTreeMap::new(), keys: vec![] });
         }
         Op::Drop(id) => {
-            let read = env.segs.bytes_read;
+            let read = env.segment_reads();
             env.drop_tree(*id).unwrap();
-            assert_eq!(env.segs.bytes_read, read, "dropping tree {id} read nodes");
+            assert_eq!(env.segment_reads(), read, "dropping tree {id} read nodes");
             model.remove(id);
         }
     }
@@ -417,20 +424,6 @@ fn verify_points(env: &mut Env, rng: &mut Rng, model: &Model, frontier: Gsn, now
     }
 }
 
-/// Read a node straight from its segment file (without loading it).
-fn read_disk_node(files: &mut BTreeMap<u32, std::fs::File>, dir: &Path, loc: DiskLoc) -> Node {
-    let f = files.entry(loc.seg).or_insert_with(|| {
-        std::fs::File::open(segment::segment_path(dir, loc.seg)).unwrap_or_else(|e| panic!("segment {} of {loc:?}: {e}", loc.seg))
-    });
-    let mut frame = vec![0u8; loc.len as usize];
-    f.read_exact_at(&mut frame, loc.off).unwrap();
-    let len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
-    let crc = u32::from_le_bytes(frame[4..8].try_into().unwrap());
-    assert_eq!(len + 8, frame.len(), "frame length at {loc:?}");
-    assert_eq!(crc32fast::hash(&frame[8..]), crc, "frame checksum at {loc:?}");
-    Node::decode(&frame[8..]).unwrap()
-}
-
 struct Walk {
     /// Bytes of reachable on-disk node images per segment.
     live: BTreeMap<u32, u64>,
@@ -438,7 +431,6 @@ struct Walk {
     tree_live: BTreeMap<u32, u64>,
     /// Reachable in-memory nodes.
     slots: usize,
-    files: BTreeMap<u32, std::fs::File>,
     /// Kind-2 nodes (which record no `due`) may have been written.
     legacy: bool,
     /// Every leaf must have been compacted where due as of this frontier.
@@ -457,10 +449,11 @@ fn walk(env: &Env, w: &mut Walk, ptr: NodePtr, parent: u32, tree: TreeId, lo: Op
             assert_eq!(s.tree, tree, "tree of slot {id}");
             assert_eq!(s.dirty, s.disk.is_none(), "a node is dirty iff it has no disk location");
             assert_eq!(s.bytes, s.node.as_ref().unwrap().byte_size(), "cached size of slot {id}");
-            if let (Some(loc), Node::Internal(children)) = (s.disk, s.node.as_ref().unwrap()) {
+            if let (Some(loc), Node::Internal(children)) = (s.disk, s.node.as_deref().unwrap()) {
                 // a clean node's frame (written by a checkpoint or early)
                 // matches it and points at its children's current frames
-                let Node::Internal(on_disk) = read_disk_node(&mut w.files, &env.dir, loc) else { panic!("slot {id}: leaf frame") };
+                let frame = env.segs.read(loc).unwrap_or_else(|e| panic!("frame of slot {id} at {loc:?}: {e}"));
+                let Node::Internal(on_disk) = Node::decode(&frame).unwrap() else { panic!("slot {id}: leaf frame") };
                 assert_eq!(on_disk.len(), children.len(), "children of clean slot {id} vs its frame");
                 for (c, d) in children.iter().zip(&on_disk) {
                     let cur = match c.ptr {
@@ -472,10 +465,12 @@ fn walk(env: &Env, w: &mut Walk, ptr: NodePtr, parent: u32, tree: TreeId, lo: Op
                 }
             }
             w.slots += 1;
-            (s.node.as_ref().unwrap(), s.disk, Some(id))
+            (s.node.as_deref().unwrap(), s.disk, Some(id))
         }
         NodePtr::Disk(loc) => {
-            disk_node = read_disk_node(&mut w.files, &env.dir, loc);
+            // (through the environment: a fork reads segments that a
+            // checkpoint deleted since)
+            disk_node = Node::decode(&env.segs.read(loc).unwrap_or_else(|e| panic!("node at {loc:?}: {e}"))).unwrap();
             (&disk_node, Some(loc), None)
         }
     };
@@ -547,8 +542,10 @@ fn check_due(env: &Env, w: &Walk, ptr: NodePtr, recorded: Gsn, actual: Gsn, tree
 /// without limits ran at this frontier, and nothing was modified since.
 fn check_structure(env: &mut Env, legacy: bool, compacted_at: Option<Gsn>) {
     // nodes written early may still be buffered
-    env.segs.write_buffer().unwrap();
-    let mut w = Walk { live: BTreeMap::new(), tree_live: BTreeMap::new(), slots: 0, files: BTreeMap::new(), legacy, compacted_at };
+    if env.segs.writable() {
+        env.segs.write_buffer().unwrap();
+    }
+    let mut w = Walk { live: BTreeMap::new(), tree_live: BTreeMap::new(), slots: 0, legacy, compacted_at };
     for tid in env.tree_ids() {
         let t = &env.trees[&tid];
         assert!(t.attached, "tree {tid} not attached");
@@ -692,6 +689,10 @@ struct Harness {
     events: BTreeMap<&'static str, u64>,
     /// Kind-2 nodes may be present (the case started in legacy format).
     legacy: bool,
+    /// Forks with the model, frontier and GSN as of when they were taken.
+    forks: Vec<(Env, Model, Gsn, Gsn)>,
+    /// A tree being filled in a fork (left alone here until adopted).
+    adopting: Option<TreeId>,
 }
 
 impl Harness {
@@ -718,6 +719,8 @@ impl Harness {
             checkpoints: 0,
             events: BTreeMap::new(),
             legacy: setup.legacy,
+            forks: Vec::new(),
+            adopting: None,
         }
     }
 
@@ -746,7 +749,10 @@ impl Harness {
             self.create_tree();
         }
         self.gsn += if self.rng.chance(10) { self.rng.range(2, 5) as u64 } else { 1 };
-        let ids: Vec<TreeId> = self.model.keys().copied().collect();
+        let ids: Vec<TreeId> = self.model.keys().copied().filter(|id| Some(*id) != self.adopting).collect();
+        if ids.is_empty() {
+            return;
+        }
         let n = 1 + self.rng.index(ids.len().min(3));
         for _ in 0..n {
             let id = *self.rng.pick(&ids);
@@ -757,6 +763,143 @@ impl Harness {
         if f > self.frontier {
             self.op(Op::Frontier(f));
         }
+    }
+
+    /// Updates while a background checkpoint is written or a fork is
+    /// filled: steps, tree creation and drops, GC, forks.
+    fn meanwhile(&mut self) {
+        for _ in 0..self.rng.range(0, 6) {
+            match self.rng.below(11) {
+                0 => self.create_tree(),
+                1 if self.model.len() > 2 => {
+                    let ids: Vec<TreeId> = self.model.keys().copied().filter(|id| Some(*id) != self.adopting).collect();
+                    let id = *self.rng.pick(&ids);
+                    self.op(Op::Drop(id));
+                }
+                2 => self.maintain(),
+                3 => self.fork(),
+                4 => self.write_back(),
+                _ => self.step(),
+            }
+        }
+    }
+
+    /// Write dirty nodes early (`Env::write_back`), all or some.
+    fn write_back(&mut self) {
+        let dirty = self.env().dirty_bytes() as u64;
+        let target = if self.rng.chance(50) { 0 } else { self.rng.below(dirty + 1) as usize };
+        let left = self.env().write_back(target).unwrap();
+        assert!(left <= target, "write_back to {target} left {left} dirty bytes");
+    }
+
+    fn fork(&mut self) {
+        self.event("fork");
+        let f = self.env().fork().unwrap_or_else(|e| panic!("fork: {e}"));
+        if self.forks.len() >= 2 {
+            self.forks.remove(0);
+        }
+        self.forks.push((f, self.model.clone(), self.frontier, self.gsn));
+    }
+
+    /// A fork still reads every tree as of when it was taken, also after
+    /// updates of its own (which do not show in the environment).
+    fn check_fork(&mut self) {
+        if self.forks.is_empty() {
+            return;
+        }
+        self.event("check fork");
+        let i = self.rng.index(self.forks.len());
+        let (mut f, mut model, mut frontier, now) = self.forks.remove(i);
+        // (not its segment accounting, which no checkpoint uses: it counts the
+        // nodes of trees dropped before it was taken as live)
+        let verify = |f: &mut Env, rng: &mut Rng, model: &Model, frontier: Gsn, now: Gsn| {
+            assert_eq!(f.tree_ids(), model.keys().copied().collect::<Vec<_>>(), "tree set of a fork");
+            for (id, m) in model {
+                verify_tree(f, rng, *id, m, frontier, now);
+            }
+            check_structure(f, false, None);
+        };
+        verify(&mut f, &mut self.rng, &model, frontier, now);
+        let ids: Vec<TreeId> = model.keys().copied().collect();
+        if !ids.is_empty() {
+            for k in 0..self.rng.range(1, 4) {
+                let id = *self.rng.pick(&ids);
+                let ups = gen_batch(&mut self.rng, &model[&id]);
+                apply_op(&mut f, &mut model, &mut frontier, &Op::Apply { tree: id, ups, gsn: now + 1 + k as u64 });
+            }
+            verify(&mut f, &mut self.rng, &model, frontier, now + 3);
+        }
+        drop(f);
+        self.verify();
+    }
+
+    /// Create a tree here, fill it in a fork while the environment goes on,
+    /// and adopt it.
+    fn adopt(&mut self) {
+        self.event("adopt");
+        let id = self.env().next_tree_id();
+        let kind = *self.rng.pick(&KINDS);
+        let universe = *self.rng.pick(&[30, 200, 3000]);
+        self.op(Op::Create { id, kind, universe });
+        let mut m = self.model[&id].clone();
+        let mut f = self.env().fork().unwrap();
+        let at = self.gsn;
+        self.adopting = Some(id);
+        self.meanwhile();
+        self.adopting = None;
+        // (the model is never compacted: the fork's frontier does not matter)
+        let mut ops = Vec::new();
+        for k in 0..self.rng.range(1, 8) {
+            let ups = gen_batch(&mut self.rng, &m);
+            let op = Op::Apply { tree: id, ups, gsn: at + 1 + k as u64 };
+            let mut single = Model::from([(id, m)]);
+            let mut fr = 0;
+            apply_op(&mut f, &mut single, &mut fr, &op);
+            m = single.remove(&id).unwrap();
+            ops.push(op);
+        }
+        self.env().adopt_trees(&mut f, &[id]).unwrap();
+        drop(f);
+        self.model.insert(id, m);
+        // replayed after a crash as if applied here
+        self.since.extend(ops);
+        self.gsn = self.gsn.max(at + 8);
+        self.verify();
+    }
+
+    /// A checkpoint written in the background: begun, written and finished
+    /// with updates in between, or interrupted by a crash.
+    fn async_checkpoint(&mut self) {
+        self.checkpoints += 1;
+        let (gsn, app) = (self.gsn, format!("checkpoint {} at {}", self.checkpoints, self.gsn).into_bytes());
+        let job = self.env().begin_checkpoint(gsn).unwrap();
+        assert!(self.env().begin_checkpoint(gsn).is_err(), "a second checkpoint while one is in progress");
+        let frozen = Ckpt { durable: true, gsn, app: app.clone(), model: self.model.clone(), frontier: self.frontier };
+        let since_freeze = self.since.len();
+        self.meanwhile();
+        if self.rng.chance(10) {
+            self.event("crash: before background checkpoint written");
+            drop(job);
+            self.env = None;
+            self.forks.clear();
+            let ckpt = self.ckpt.clone();
+            return self.recover(ckpt);
+        }
+        let done = job.run(&app).unwrap();
+        self.meanwhile();
+        self.since.drain(..since_freeze);
+        if self.rng.chance(10) {
+            self.event("crash: before background checkpoint finished");
+            drop(done);
+            self.env = None;
+            self.forks.clear();
+            return self.recover(frozen);
+        }
+        self.event("background checkpoint");
+        self.env().finish_checkpoint(done).unwrap();
+        self.ckpt = frozen;
+        check_segment_files(self.env.as_ref().unwrap(), false);
+        self.verify();
     }
 
     fn checkpoint(&mut self) {
@@ -827,6 +970,7 @@ impl Harness {
     fn reopen(&mut self) {
         self.checkpoint();
         self.env = None;
+        self.forks.clear();
         let ckpt = self.ckpt.clone();
         self.recover(ckpt);
     }
@@ -869,6 +1013,7 @@ impl Harness {
         if variant >= 4 && self.ckpt.durable {
             return self.crash_in_checkpoint(variant == 5);
         }
+        self.forks.clear();
         if self.rng.chance(50) {
             self.crash_after_early_writes();
         }
@@ -967,6 +1112,7 @@ impl Harness {
         self.env().checkpoint(gsn, &app).unwrap();
         let after = files(&self.dir);
         self.env = None;
+        self.forks.clear();
         let mut image: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (name, data) in &after {
             if name.starts_with("seg-") {
@@ -1080,6 +1226,10 @@ enum Action {
     /// The buffer pool's target changes (`Env::set_cache_bytes`, as the
     /// memory budget rebalances it); the next access evicts down to it.
     Cache,
+    AsyncCheckpoint,
+    Fork,
+    CheckFork,
+    Adopt,
 }
 
 /// An action with the seed of the random choices it makes.
@@ -1097,6 +1247,10 @@ fn arb_action() -> impl Strategy<Value = (Action, u64)> {
         5 => Just(Crash),
         4 => Just(Verify),
         2 => Just(Cache),
+        6 => Just(AsyncCheckpoint),
+        3 => Just(Fork),
+        3 => Just(CheckFork),
+        2 => Just(Adopt),
     ];
     (kind, any::<u64>())
 }
@@ -1119,12 +1273,7 @@ fn run(setup: &Setup, actions: &[(Action, u64)], name: &str) {
                 h.checkpoint()
             }
             Action::Gc => h.maintain(),
-            Action::WriteBack => {
-                let dirty = h.env().dirty_bytes() as u64;
-                let target = if h.rng.chance(50) { 0 } else { h.rng.below(dirty + 1) as usize };
-                let left = h.env().write_back(target).unwrap();
-                assert!(left <= target, "write_back to {target} left {left} dirty bytes");
-            }
+            Action::WriteBack => h.write_back(),
             Action::GcRound => h.gc_round(),
             Action::Reopen => {
                 h.event("reopen");
@@ -1137,6 +1286,10 @@ fn run(setup: &Setup, actions: &[(Action, u64)], name: &str) {
                 let bytes = *h.rng.pick(&[64 << 20, 256 << 10, 32 << 10, 8 << 10, 2 << 10]);
                 h.env().set_cache_bytes(bytes);
             }
+            Action::AsyncCheckpoint => h.async_checkpoint(),
+            Action::Fork => h.fork(),
+            Action::CheckFork => h.check_fork(),
+            Action::Adopt => h.adopt(),
         }
         let (frontier, now) = (h.frontier, h.gsn);
         verify_points(h.env.as_mut().unwrap(), &mut h.rng, &h.model, frontier, now);
@@ -1243,7 +1396,7 @@ fn check_live_accounting(env: &mut Env) {
             NodePtr::Mem(id) => {
                 let slot = env.slot(id);
                 assert!(!slot.dirty, "dirty node after a checkpoint");
-                let ch = match slot.node.as_ref().unwrap() {
+                let ch = match slot.node.as_deref().unwrap() {
                     Node::Internal(ch) => ch.iter().map(|c| c.ptr).collect(),
                     Node::Leaf(_) => vec![],
                 };

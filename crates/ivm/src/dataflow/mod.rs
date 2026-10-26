@@ -120,6 +120,7 @@ pub struct Node {
     pub hydrated: bool,
 }
 
+#[derive(Clone)]
 pub struct Arrangement {
     pub id: ArrId,
     pub node: NodeId,
@@ -231,7 +232,7 @@ pub type OpErrors = Arc<parking_lot::Mutex<GroupErrors>>;
 /// The error records of an operator's groups in error (one per group, by
 /// group key prefix), and, once the graph mirrors them durably
 /// (`Graph::take_error_changes`), their changes since it last took them.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct GroupErrors {
     groups: BTreeMap<Vec<u8>, (String, String)>,
     /// Weight changes by (group, error); None while not mirrored.
@@ -1179,6 +1180,141 @@ impl Graph {
             self.node_mut(id).hydrated = true;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------ hydration elsewhere
+
+    /// Nodes and arrangements not hydrated yet: what `hydrate` would compute.
+    pub fn pending(&self) -> (Vec<NodeId>, Vec<ArrId>) {
+        let nodes = self.live_nodes().filter(|n| !n.hydrated).map(|n| n.id).collect();
+        let arrs = self.live_arrangements().filter(|a| !a.hydrated).map(|a| a.id).collect();
+        (nodes, arrs)
+    }
+
+    /// A copy of nodes `roots` and what they read, transitively — their
+    /// inputs and the nodes owning the arrangements their operators read —
+    /// with all of those nodes' arrangements, for another thread (with a
+    /// fork of the storage). Operator state is copied, not shared; node and
+    /// arrangement ids stay the same.
+    pub fn fork_of(&self, roots: &[NodeId]) -> Graph {
+        let keep_nodes = self.closure(roots);
+        let mut g = Graph { now: self.now, stepped_now: self.stepped_now, topo_dirty: true, ..Graph::default() };
+        g.nodes = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let n = n.as_ref().filter(|n| keep_nodes.contains(&n.id))?;
+                let mut kind = n.kind.clone();
+                // (a fork steps its operators too: their error state must not be shared)
+                let copy = |e: &OpErrors| -> OpErrors { Arc::new(parking_lot::Mutex::new(e.lock().clone())) };
+                match &mut kind {
+                    NodeKind::Reduce(p) => p.errors = copy(&p.errors),
+                    NodeKind::Recursive(p) => p.errors = copy(&p.errors),
+                    _ => {}
+                }
+                Some(Node {
+                    id: n.id,
+                    kind,
+                    inputs: n.inputs.clone(),
+                    schema: n.schema.clone(),
+                    fp: n.fp.clone(),
+                    refs: n.refs,
+                    arrangements: n.arrangements.clone(),
+                    hydrated: n.hydrated,
+                })
+            })
+            .collect();
+        g.arrs = self.arrs.iter().map(|a| a.as_ref().filter(|a| keep_nodes.contains(&a.node)).cloned()).collect();
+        g.node_by_fp = g.live_nodes().map(|n| (n.fp.clone(), n.id)).collect();
+        g.arr_by_fp = g.live_arrangements().map(|a| (a.fp.clone(), a.id)).collect();
+        g.node_errors = self.node_errors.iter().filter(|(id, _)| keep_nodes.contains(id)).map(|(k, v)| (*k, v.clone())).collect();
+        g
+    }
+
+    /// Nodes `roots` and what they read, transitively: their inputs and the
+    /// nodes owning the arrangements their operators read.
+    fn closure(&self, roots: &[NodeId]) -> FxHashSet<NodeId> {
+        let mut keep: FxHashSet<NodeId> = FxHashSet::default();
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        while let Some(id) = stack.pop() {
+            if !keep.insert(id) {
+                continue;
+            }
+            let n = self.node(id);
+            stack.extend(n.inputs.iter().copied());
+            stack.extend(operator_arrangements(&n.kind).into_iter().map(|a| self.arr(a).node));
+        }
+        keep
+    }
+
+    /// Drop the nodes that `roots` do not read (`closure`), with their
+    /// arrangements (in a fork, so that its steps leave them alone).
+    pub fn retain_closure(&mut self, roots: &[NodeId]) {
+        let keep = self.closure(roots);
+        for id in 0..self.nodes.len() {
+            if self.nodes[id].is_some() && !keep.contains(&id) {
+                let n = self.nodes[id].take().unwrap();
+                self.node_by_fp.remove(&n.fp);
+                self.node_errors.remove(&id);
+                for a in n.arrangements {
+                    if let Some(arr) = self.arrs[a].take() {
+                        self.arr_by_fp.remove(&arr.fp);
+                    }
+                }
+            }
+        }
+        self.topo_dirty = true;
+    }
+
+    /// Drop the arrangements that no operator reads, except `keep` (in a
+    /// fork once hydrated: its steps maintain only what they need).
+    pub fn prune_arrangements(&mut self, keep: &[ArrId]) {
+        let mut used: FxHashSet<ArrId> = keep.iter().copied().collect();
+        for n in self.live_nodes() {
+            used.extend(operator_arrangements(&n.kind));
+            // (a recursive query reads its sources' contents at every step)
+            if let NodeKind::Recursive(p) = &n.kind {
+                used.extend(p.sources.iter().filter_map(|(_, s)| self.any_arrangement(*s)));
+            }
+        }
+        for a in 0..self.arrs.len() {
+            if self.arrs[a].is_some() && !used.contains(&a) {
+                let arr = self.arrs[a].take().unwrap();
+                self.arr_by_fp.remove(&arr.fp);
+                if let Some(n) = self.nodes[arr.node].as_mut() {
+                    n.arrangements.retain(|x| *x != a);
+                }
+            }
+        }
+    }
+
+    /// Take over what fork `from` hydrated of `nodes` and `arrs` (the pending
+    /// ones when it was taken; their trees are adopted by the storage
+    /// separately): hydration flags, `since`, error records and operator
+    /// error state. Those freed here in the meantime are skipped.
+    pub fn adopt_hydrated(&mut self, from: &Graph, nodes: &[NodeId], arrs: &[ArrId]) {
+        for &a in arrs {
+            let (Some(Some(mine)), Some(Some(theirs))) = (self.arrs.get(a), from.arrs.get(a)) else { continue };
+            if mine.fp != theirs.fp {
+                continue;
+            }
+            let (hydrated, since) = (theirs.hydrated, theirs.since);
+            let mine = self.arrs[a].as_mut().unwrap();
+            mine.hydrated = hydrated;
+            mine.since = since;
+        }
+        for &id in nodes {
+            let (Some(Some(mine)), Some(Some(theirs))) = (self.nodes.get(id), from.nodes.get(id)) else { continue };
+            if mine.fp != theirs.fp {
+                continue;
+            }
+            if let (Some(m), Some(t)) = (operator_errors(&mine.kind), operator_errors(&theirs.kind)) {
+                *m.lock() = t.lock().clone();
+            }
+            let errs = from.errors_of(id);
+            self.set_errors(id, &errs);
+            self.node_mut(id).hydrated = theirs.hydrated;
+        }
     }
 
     /// Arrangement fingerprint -> tree for checkpoints.

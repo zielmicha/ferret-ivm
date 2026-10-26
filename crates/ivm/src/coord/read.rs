@@ -37,6 +37,48 @@ fn interruption(req: &Request, read: bool) -> Option<SqlError> {
     (read && i.gone()).then(|| SqlError::new(codes::QUERY_CANCELED, "canceling statement: the client is gone"))
 }
 
+/// The result of a read whose plan returned `rows`: consolidated, sorted,
+/// OFFSET/LIMIT applied, multiplicities expanded, visible columns.
+pub(crate) fn finish_read(bq: crate::sql::BoundQuery, mut rows: Rows) -> ExecResult {
+    crate::dataflow::consolidate(&mut rows);
+    rows.retain(|(_, w)| *w > 0);
+    if !bq.order.is_empty() {
+        sort_rows(&mut rows, &bq.order);
+    }
+    // expand multiplicities, apply OFFSET/LIMIT, project visible columns
+    let mut out: Vec<Row> = Vec::new();
+    let mut skipped = 0u64;
+    let limit = bq.limit.unwrap_or(u64::MAX);
+    let mut last: Option<Row> = None;
+    'outer: for (r, w) in rows {
+        for _ in 0..w {
+            if skipped < bq.offset {
+                skipped += 1;
+                continue;
+            }
+            if out.len() as u64 >= limit {
+                // FETCH ... WITH TIES keeps rows tied with the last one
+                let tied = bq.with_ties
+                    && last.as_ref().is_some_and(|l| bq.order.iter().all(|k| l[k.col].sql_cmp(&r[k.col]) == std::cmp::Ordering::Equal));
+                if !tied {
+                    break 'outer;
+                }
+            }
+            out.push(r[..bq.visible].to_vec());
+            last = Some(r.clone());
+        }
+    }
+    let types = bq.column_types();
+    let columns = bq
+        .names
+        .iter()
+        .take(bq.visible)
+        .zip(types)
+        .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
+        .collect();
+    ExecResult::Query { columns, rows: out }
+}
+
 pub fn parse_lsn(s: &str) -> Result<u64> {
     let (hi, lo) = s.split_once('/').ok_or_else(|| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
     let hi = u64::from_str_radix(hi.trim(), 16).map_err(|_| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
@@ -59,14 +101,13 @@ impl Engine {
         }
         match stmt {
             Statement::Select { query, as_of, .. } => self.select(query, as_of, params, vars, reply),
-            Statement::Subscribe { target, snapshot, progress, as_of: _, copy: _ } => {
-                self.subscribe(target, snapshot, progress, params).map(Some)
-            }
+            Statement::Subscribe { target, snapshot, progress, as_of: _, copy: _ } => self.subscribe(target, snapshot, progress, params, reply),
             Statement::Show(k) => self.show(k).map(Some),
             Statement::Explain { kind, target } => self.explain(kind, target, params).map(Some),
             Statement::Checkpoint => {
-                self.checkpoint()?;
-                Ok(Some(ExecResult::Command { tag: "CHECKPOINT".into() }))
+                // (answered once the next checkpoint is committed)
+                self.request_checkpoint(super::checkpoint::Waiter::Statement(reply));
+                Ok(None)
             }
             Statement::Empty => Ok(Some(ExecResult::Command { tag: String::new() })),
             Statement::Sql(s) => match *s {
@@ -97,6 +138,13 @@ impl Engine {
 
     /// Run a logical plan against current (or historical) state.
     pub(crate) fn execute_rel(&mut self, rel: &Rel, at: ReadAt) -> Result<Rows> {
+        if self.reads_hydrating(rel) {
+            // (the request is parked until the hydration is done)
+            return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
+        }
+        if self.dml_reads.is_some() {
+            self.record_dml_reads(rel);
+        }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
         let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default() };
@@ -273,44 +321,17 @@ impl Engine {
         self.check_view_errors(&bq.rel)?;
         // now() is the logical clock as of the read, so reads are repeatable
         bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
-        let mut rows = self.execute_rel(&bq.rel, at)?;
-        crate::dataflow::consolidate(&mut rows);
-        rows.retain(|(_, w)| *w > 0);
-        if !bq.order.is_empty() {
-            sort_rows(&mut rows, &bq.order);
-        }
-        // expand multiplicities, apply OFFSET/LIMIT, project visible columns
-        let mut out: Vec<Row> = Vec::new();
-        let mut skipped = 0u64;
-        let limit = bq.limit.unwrap_or(u64::MAX);
-        let mut last: Option<Row> = None;
-        'outer: for (r, w) in rows {
-            for _ in 0..w {
-                if skipped < bq.offset {
-                    skipped += 1;
-                    continue;
-                }
-                if out.len() as u64 >= limit {
-                    // FETCH ... WITH TIES keeps rows tied with the last one
-                    let tied = bq.with_ties
-                        && last.as_ref().is_some_and(|l| bq.order.iter().all(|k| l[k.col].sql_cmp(&r[k.col]) == std::cmp::Ordering::Equal));
-                    if !tied {
-                        break 'outer;
-                    }
-                }
-                out.push(r[..bq.visible].to_vec());
-                last = Some(r.clone());
+        // a read that turns out large goes on off the engine thread
+        self.env.set_read_budget(Some(super::reader::INLINE_READ_ENTRIES));
+        let r = self.execute_rel(&bq.rel, at);
+        self.env.set_read_budget(None);
+        match r {
+            Err(e) if e.code == crate::storage::READ_BUDGET => {
+                self.read_elsewhere(bq, at, vars, reply)?;
+                Ok(None)
             }
+            r => Ok(Some(finish_read(bq, r?))),
         }
-        let types = bq.column_types();
-        let columns = bq
-            .names
-            .iter()
-            .take(bq.visible)
-            .zip(types)
-            .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
-            .collect();
-        Ok(Some(ExecResult::Query { columns, rows: out }))
     }
 
     /// Has every source's LSN frontier reached `lsn` (written `text`)? A
@@ -377,6 +398,7 @@ impl Engine {
                 // re-run: it parks again if a snapshot is still loading
                 Wait::Snapshot => snapshots_changed,
                 Wait::Gsn(g) => self.processed >= g,
+                Wait::Hydration(done) => self.hydrations_done > done,
             };
             if ready {
                 self.deferred.push(p.req);
@@ -393,7 +415,16 @@ impl Engine {
         self.parked = still;
     }
 
-    pub(super) fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
+    /// Start a subscription; the reply is sent once a query's dataflow is
+    /// hydrated (Ok(None)).
+    pub(super) fn subscribe(
+        &mut self,
+        target: SubscribeTarget,
+        snapshot: bool,
+        progress: bool,
+        params: Vec<ParamSlot>,
+        reply: Sender<Result<ExecResult>>,
+    ) -> Result<Option<ExecResult>> {
         let mut view = None;
         let (node, pinned, columns, reads): (NodeId, Option<NodeId>, Vec<ResultColumn>, Vec<ObjectId>) = match target {
             SubscribeTarget::Name(name) => {
@@ -407,8 +438,14 @@ impl Engine {
                     ObjectKind::MaterializedView(v) => {
                         view = Some(obj.id);
                         let rt = &self.rt.views[&obj.id];
+                        if self.hydration.is_some() && !self.graph.arr(rt.arr).hydrated {
+                            return Err(SqlError::new(super::hydrate::HYDRATING, "the view is being hydrated"));
+                        }
                         let cols = v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect();
                         (rt.node, None, cols, vec![obj.id])
+                    }
+                    ObjectKind::Table(_) if self.hydration.is_some() && !self.graph.node(self.rt.tables[&obj.id]).hydrated => {
+                        return Err(SqlError::new(super::hydrate::HYDRATING, "the table is being rebuilt"));
                     }
                     ObjectKind::Table(t) => (
                         self.rt.tables[&obj.id],
@@ -421,12 +458,16 @@ impl Engine {
                         // names the columns, as in reads of it
                         let text = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
                         let q = crate::sql::parser::parse_single_query(&text)?;
-                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params);
+                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params, reply);
                     }
                     _ => sql_bail!(codes::WRONG_OBJECT_TYPE, "cannot subscribe to {} \"{name}\"", obj.kind.name()),
                 }
             }
             SubscribeTarget::Query(q, _) => {
+                if self.hydration.is_some() {
+                    // (its dataflow is hydrated after the one in progress)
+                    return Err(SqlError::new(super::hydrate::HYDRATING, "a hydration is in progress"));
+                }
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
                 super::ddl::check_catalog_reads(&bq)?;
@@ -470,27 +511,22 @@ impl Engine {
                 };
                 self.graph.retain_node(node);
                 self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-                if let Err(e) = self.graph.hydrate(&mut self.env, self.processed) {
-                    let _ = self.graph.release_node(&mut self.env, node);
-                    return Err(e);
-                }
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
                 (node, Some(node), cols, reads)
             }
         };
-        let (tx, rx) = unbounded();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if snapshot {
-            let snap = self.graph.snapshot(&mut self.env, node)?;
-            if !snap.data.is_empty() {
-                let _ = tx.send(SubEvent::Data { gsn: self.processed, rows: SharedRows::new(snap.data) });
+        // as of the last record: in the background if it has a new dataflow
+        let p = super::hydrate::PendingSub { node, pinned, columns, reads, view, snapshot, progress, reply };
+        if pinned.is_none() {
+            // (a view or table: nothing to hydrate)
+            self.then_inline(super::hydrate::Then::Subscribe(p))?;
+        } else if let Err(e) = self.hydrate(self.processed, vec![super::hydrate::Then::Subscribe(p)]) {
+            if let Some(n) = pinned {
+                let _ = self.graph.release_node(&mut self.env, n);
             }
+            return Err(e);
         }
-        let _ = tx.send(SubEvent::Progress { gsn: self.processed, charge: crate::memory::Charge::none() });
-        // (changes queued after the snapshot are bounded by its share of the memory budget)
-        let queue = crate::memory::Meter::child(&self.shared.mem.outputs);
-        self.subs.push(Subscription { node, tx, queue, cancel: cancel.clone(), pinned, progress, view, reads });
-        Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
+        Ok(None)
     }
 
     /// Add to `reads` the relations that the materialized views in it read

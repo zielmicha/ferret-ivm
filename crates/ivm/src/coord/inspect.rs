@@ -774,7 +774,11 @@ impl Engine {
     pub(crate) fn sink_status(&self, id: ObjectId) -> String {
         match self.rt.broken.get(&id) {
             Some(reason) => format!("error: broken: {reason}"),
-            None => self.sink_handles.get(&id).map(|h| h.status()).unwrap_or_else(|| "stopped".into()),
+            None => match self.sink_handles.get(&id) {
+                Some(h) => h.status(),
+                None if self.snapshotting_sink(id) => "starting".into(),
+                None => "stopped".into(),
+            },
         }
     }
 
@@ -1685,6 +1689,7 @@ impl Engine {
                     Wait::Gsn(g) => ("gsn", Some(g)),
                     Wait::Lsn => ("lsn", None),
                     Wait::Snapshot => ("snapshot", None),
+                    Wait::Hydration(_) => ("hydration", None),
                 };
                 let sql = match &p.req {
                     Request::Execute { stmt, .. } => match &**stmt {
@@ -1730,7 +1735,7 @@ impl Engine {
             parked,
             pending_requests: self.pending.len(),
             dml_queued: self.dml_queue.len(),
-            dml_inflight: self.dml_inflight.is_some(),
+            dml_inflight: !self.dml_pending.is_empty(),
             sinks,
         }
     }

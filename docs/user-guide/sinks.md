@@ -62,7 +62,12 @@ started (its status says why).
    applied GSN (the *snapshot GSN*) and starts a sink thread. At an engine
    start this happens before the log is replayed, from the checkpoint's
    state: the snapshot GSN is the checkpoint's, and the replayed records
-   reach the sink like live ones.
+   reach the sink like live ones. A snapshot too large to take on the engine
+   thread within its read budget is taken on a reader thread from a fork of
+   the storage at the snapshot GSN; the engine keeps the relation's changes
+   at the records it applies meanwhile and hands them to the sink thread
+   when it starts (`SHOW SINKS` says `starting` until then), and DDL waits
+   until it has.
 2. The thread connects and runs, every time it (re)connects:
 
    ```sql

@@ -12,7 +12,7 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 | Knob | Default | Trade-off |
 |---|---|---|
 | `--memory-mb` | 2048 | The memory budget: the buffer pool of index nodes, the aggregation group caches, the records waiting to be applied and the changes queued for subscriptions and sinks together ([Memory](#memory)). The buffer pool gets what the others leave; index nodes beyond its share are evicted (CLOCK) and re-read from segment files on demand — modified (dirty) nodes are written to the segment files first, and are also written once they exceed half of the pool's share, ahead of the next checkpoint (which makes them durable). Working sets that fit run from memory; larger ones degrade gradually — also large transactions and view hydration, which build their results through the pool. `--cache-mb` is an older name of this flag (it used to size the buffer pool alone, counted in serialized bytes: about a quarter of the memory it took). |
-| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash (dirty memory stays within half of the pool's share either way). A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
+| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash (dirty memory stays within half of the pool's share either way). A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. Checkpoints are written by a thread of their own: reads and maintenance go on meanwhile (nodes modified meanwhile are copied, once each, and stay dirty until the next checkpoint). |
 | `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes and more clock ticks. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
 | `--no-sync` | off | Skips `fsync` of the input log. Only for tests and benchmarks; see [Durability](#durability-and---no-sync). |
@@ -55,12 +55,17 @@ Things to keep in mind when sizing:
   sequencer, one thread per source, sink and client session, and three
   threads for the web UI when it is enabled).
 - **Memory**: see [below](#memory). Outside the budget: hydration of a
-  new view holds a few batches of rows and join rows in flight (sized from
-  the working memory, but not counted in it); a window partition or a
-  recursive query's result is computed whole; a large commit's log record
-  itself, and the rows delivered to subscriptions and sinks, are in memory
-  whole; an ad-hoc query's result is built in memory, and each session,
-  source and sink thread has its own buffers.
+  new view runs in a fork of the storage with a buffer pool of its own (of
+  the same target; nodes are shared with the engine's until one side
+  modifies them), holds a few batches of rows and join rows in flight
+  (sized from the working memory, but not counted in it), and keeps the
+  changes of the tables it reads applied meanwhile (at most a million
+  records' worth) until it has caught up; a large read runs on a fork too
+  (up to four at a time); a window partition or a recursive query's result
+  is computed whole; a large commit's log record itself, and the rows
+  delivered to subscriptions and sinks, are in memory whole; an ad-hoc
+  query's result is built in memory, and each session, source and sink
+  thread has its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
 

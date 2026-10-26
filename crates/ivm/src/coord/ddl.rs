@@ -481,6 +481,25 @@ impl Engine {
     /// is empty, hence up to date; a recovered one must find its index in the
     /// checkpoint, as its rows exist nowhere else.
     pub(crate) fn table_rt(&mut self, id: ObjectId, def: &TableDef, recovering: bool) -> Result<()> {
+        let node = self.add_table_node(id, def);
+        let NodeKind::Table { primary, .. } = self.graph.node(node).kind else { unreachable!() };
+        if recovering {
+            if !self.graph.arr(primary).hydrated {
+                return Err(SqlError::corrupt(format!(
+                    "the checkpoint has no index for table {id} (version {}); refusing to start without its rows",
+                    def.version
+                )));
+            }
+        } else {
+            self.graph.arrs[primary].as_mut().unwrap().hydrated = true;
+        }
+        self.graph.node_mut(node).hydrated = true;
+        Ok(())
+    }
+
+    /// The Table node and primary index of a base table, retained and
+    /// registered (hydrated by the caller).
+    fn add_table_node(&mut self, id: ObjectId, def: &TableDef) -> NodeId {
         let schema: Vec<ColumnType> = def.columns.iter().map(|c| c.ty.clone()).collect();
         let key: Vec<usize> = if def.pk.is_empty() { (0..schema.len()).collect() } else { def.pk.clone() };
         let node = self.graph.add_node_with_output_arr(
@@ -497,20 +516,8 @@ impl Engine {
             },
         );
         self.graph.retain_node(node);
-        let NodeKind::Table { primary, .. } = self.graph.node(node).kind else { unreachable!() };
-        if recovering {
-            if !self.graph.arr(primary).hydrated {
-                return Err(SqlError::corrupt(format!(
-                    "the checkpoint has no index for table {id} (version {}); refusing to start without its rows",
-                    def.version
-                )));
-            }
-        } else {
-            self.graph.arrs[primary].as_mut().unwrap().hydrated = true;
-        }
-        self.graph.node_mut(node).hydrated = true;
         self.rt.tables.insert(id, node);
-        Ok(())
+        node
     }
 
     /// Plan and lower a materialized view; pins its root and read arrangement.
@@ -631,12 +638,10 @@ impl Engine {
         }
         if cv.materialized {
             self.create_view_rt(id, &query_sql)?;
-            self.graph.hydrate(&mut self.env, gsn)?;
-            // the errors in the root's contents (also when it is shared with
-            // other views and was hydrated long ago)
-            let errs = self.graph.errors_of(self.rt.views[&id].node);
-            merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::MaterializedView(def), created_gsn: gsn, create_sql: sql.to_string() });
+            // (hydrated after the statement, in the background: its reply
+            // waits for it)
+            self.record_then.push(hydrate::Then::ViewErrors(id));
         } else {
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::View(def), created_gsn: gsn, create_sql: sql.to_string() });
         }
@@ -784,14 +789,15 @@ impl Engine {
     }
 
     /// Replace a materialized view: plan the new version (sharing unchanged
-    /// fragments), hydrate it, switch readers and subscribers at `gsn`, and
-    /// release the old version.
+    /// fragments) and switch readers to it at `gsn`. Once it is hydrated
+    /// (after the statement, in the background) its subscribers and sinks
+    /// get the change from the old to the new contents as of `gsn`, and the
+    /// old version is released (`finish_replace`).
     fn replace_view(&mut self, gsn: Gsn, id: ObjectId, name: &str, sql: &str, def: ViewDef) -> Result<ExecResult> {
         if self.rt.broken.contains_key(&id) {
             return self.repair_view(gsn, id, name, sql, def);
         }
         let old = self.rt.views.remove(&id).expect("view runtime");
-        let old_rows = self.graph.scan_arr(&mut self.env, old.arr, crate::storage::ReadAt::Latest)?;
         let old_cat = self.catalog.get(id).cloned();
         self.catalog.insert(CatalogObject {
             id,
@@ -815,29 +821,16 @@ impl Engine {
             _ => vec![],
         };
         let old_index_arrs = self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
-        self.graph.hydrate(&mut self.env, gsn)?;
-        // the new root's error records (also when it is shared and was
-        // hydrated long ago, or is the old version's own root)
-        let new_node = self.rt.views[&id].node;
-        let errs = self.graph.errors_of(new_node);
-        merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
-        let new_arr = self.rt.views[&id].arr;
-        let new_rows = self.graph.scan_arr(&mut self.env, new_arr, crate::storage::ReadAt::Latest)?;
-        // subscribers see the change from the old to the new definition
-        let mut diff: Vec<(crate::types::Row, i64)> = new_rows;
-        diff.extend(old_rows.into_iter().map(|(r, w)| (r, -w)));
-        crate::dataflow::consolidate(&mut diff);
-        // (by view: other views and ad hoc subscriptions may share the old node)
+        // (by view: other views and ad hoc subscriptions may share the old
+        // node) subscribers see the change from the old to the new
+        // definition once it is hydrated: until then they get nothing
         let same = same_columns(&def.columns, &old_cols);
         for s in self.subs.iter_mut() {
             if s.view != Some(id) {
                 continue;
             }
             if same {
-                s.node = new_node;
-                if !diff.is_empty() {
-                    let _ = s.tx.send(SubEvent::Data { gsn, rows: SharedRows::new(diff.clone()) });
-                }
+                s.held = true;
             } else {
                 // they were promised the old columns
                 let _ = s.tx.send(SubEvent::Error(SqlError::new(
@@ -867,29 +860,10 @@ impl Engine {
             .copied()
             .filter(|sid| matches!(self.catalog.get(*sid).map(|o| &o.kind), Some(ObjectKind::Sink(sd)) if sd.from == id))
             .collect();
-        if same {
-            let rows = Arc::new(diff.clone());
-            let (bytes, limit) = (crate::memory::delta_bytes(&rows), self.shared.mem.consumer_limit());
-            for sid in &sinks {
-                if let Some(sink) = self.sink_handles.get_mut(sid) {
-                    sink.node = new_node;
-                    if rows.is_empty() {
-                        sink.progress(gsn);
-                    } else {
-                        // (one that falls behind is restarted by the next delivery)
-                        sink.send(gsn, &rows, bytes, limit);
-                    }
-                }
-            }
-        } else {
-            // (re-planned after an upstream change) new rows, new columns
-            self.restart_sinks(sinks)?;
-        }
-        for a in old_index_arrs {
-            self.graph.release_arr(&mut self.env, a)?;
-        }
-        self.graph.release_arr(&mut self.env, old.arr)?;
-        self.graph.release_node(&mut self.env, old.node)?;
+        // (held until then, also those that start over with new columns:
+        // their targets must not get the old version's later changes)
+        self.held_sinks.extend(sinks.iter().copied());
+        self.record_then.push(hydrate::Then::Replaced(Box::new(hydrate::Replaced { id, old, old_index_arrs, same, sinks })));
         Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
     }
 
@@ -919,24 +893,8 @@ impl Engine {
         };
         // (broken views have no index arrangements to release)
         self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
-        self.graph.hydrate(&mut self.env, gsn)?;
-        let errs = self.graph.errors_of(self.rt.views[&id].node);
-        merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
-        // (also while replaying: sinks receive replayed records)
-        if let Some(handle) = self.handle.clone() {
-            let sinks: Vec<(ObjectId, String, SinkDef)> = self
-                .catalog
-                .objects
-                .values()
-                .filter_map(|o| match &o.kind {
-                    ObjectKind::Sink(s) if s.from == id && self.rt.broken.contains_key(&o.id) => Some((o.id, o.name.clone(), s.clone())),
-                    _ => None,
-                })
-                .collect();
-            for (sid, sname, sdef) in sinks {
-                self.start_sink_or_mark_broken(sid, &sname, &sdef, &handle);
-            }
-        }
+        // its sinks start once it is hydrated (`finish_repair`)
+        self.record_then.push(hydrate::Then::Repaired(id));
         Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
     }
 
@@ -1006,8 +964,9 @@ impl Engine {
         let id = self.catalog.alloc_id();
         let def = IndexDef { on: target.id, columns: key };
         self.create_index_rt(id, &def)?;
-        self.graph.hydrate(&mut self.env, gsn)?;
         self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::Index(def), created_gsn: gsn, create_sql: sql.to_string() });
+        // (hydrated after the statement, in the background: its reply waits
+        // for it)
         Ok(ExecResult::Command { tag: "CREATE INDEX".into() })
     }
 
@@ -1113,6 +1072,7 @@ impl Engine {
                 if let Some(h) = self.sink_handles.remove(&id) {
                     let _ = h.stop();
                 }
+                self.forget_sink_snapshot(id);
             }
             ObjectKind::View(_) => {}
         }
@@ -1120,7 +1080,9 @@ impl Engine {
     }
 
     /// Upstream schema change: rebuild the table's index in the new shape,
-    /// re-plan dependent views and swap them at `gsn`.
+    /// re-plan dependent views and swap them at `gsn`. The new version is
+    /// filled from the old one's rows and hydrated after the record, in the
+    /// background (`hydrate::Rebuilt`); the table's sinks start over then.
     pub(crate) fn apply_schema_change(&mut self, gsn: Gsn, table: ObjectId, columns: Vec<Column>, pk: Vec<usize>) -> Result<()> {
         let Some(obj) = self.catalog.get(table).cloned() else { return Ok(()) };
         let ObjectKind::Table(mut def) = obj.kind.clone() else { return Ok(()) };
@@ -1128,46 +1090,16 @@ impl Engine {
             return Ok(());
         }
         let old_node = self.rt.tables[&table];
-        let old_rows = self.graph.snapshot(&mut self.env, old_node)?.data;
         let old_columns = def.columns.clone();
         // map old columns to new by name
         let mapping: Vec<Option<usize>> = columns.iter().map(|c| def.columns.iter().position(|o| o.name == c.name)).collect();
         def.columns = columns.clone();
         def.pk = pk;
         def.version += 1;
-        self.create_table_rt(table, &def, gsn)?;
-        let new_node = self.rt.tables[&table];
-        let mut rows = Vec::with_capacity(old_rows.len());
-        for (r, w) in old_rows {
-            let nr: crate::types::Row = mapping
-                .iter()
-                .zip(&columns)
-                .map(|(m, c)| match m {
-                    Some(i) => crate::expr::cast::cast_datum(&r[*i], &c.ty.ty, c.ty.typmod, true).unwrap_or(crate::types::Datum::Null),
-                    None => crate::types::Datum::Null,
-                })
-                .collect();
-            // a row without its (new) key cannot be found again by the key
-            // the re-snapshot upserts: leave it to the re-snapshot
-            if def.pk.iter().any(|c| nr[*c].is_null()) {
-                continue;
-            }
-            rows.push((nr, w));
-        }
-        let NodeKind::Table { primary, .. } = self.graph.node(new_node).kind else { unreachable!() };
-        let arr = self.graph.arr(primary);
-        let mut ups = Vec::with_capacity(rows.len());
-        for (r, w) in &rows {
-            ups.push((arr.layout.encode_row(r)?, *w));
-        }
-        let tree = arr.tree;
-        self.env.apply(tree, &mut ups, gsn)?;
+        let new_node = self.add_table_node(table, &def);
         self.catalog.insert(CatalogObject { kind: ObjectKind::Table(def.clone()), ..obj.clone() });
         // indexes on the table move to the new version
-        for a in self.move_indexes(table, &format!("table {}", obj.name), &old_columns, &columns) {
-            self.graph.release_arr(&mut self.env, a)?;
-        }
-        self.graph.hydrate(&mut self.env, gsn)?;
+        let old_index_arrs = self.move_indexes(table, &format!("table {}", obj.name), &old_columns, &columns);
         // subscribers to the table were promised the old columns (and
         // queries over it would go on reading the old version)
         for s in self.subs.iter() {
@@ -1179,26 +1111,30 @@ impl Engine {
                 s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        // sinks from the table start over with the new columns
-        self.restart_sinks_on(old_node)?;
+        // sinks from the table start over with the new columns, once it is
+        // filled: they get nothing until then
+        let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == old_node).map(|(id, _)| *id).collect();
+        self.held_sinks.extend(sinks.iter().copied());
         self.replan_dependents(gsn, table)?;
-        self.graph.release_node(&mut self.env, old_node)?;
+        self.record_then.push(hydrate::Then::Rebuilt(Box::new(hydrate::Rebuilt {
+            old_node,
+            new_node,
+            mapping,
+            columns,
+            pk: def.pk,
+            old_index_arrs,
+            sinks,
+        })));
         Ok(())
     }
 
-    /// Restart the sinks reading dataflow node `node` (whose relation was
-    /// rebuilt with other columns) from their relation's current version.
-    fn restart_sinks_on(&mut self, node: NodeId) -> Result<()> {
-        let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == node).map(|(id, _)| *id).collect();
-        self.restart_sinks(sinks)
-    }
-
     /// Restart sinks from their relation's current version.
-    fn restart_sinks(&mut self, sinks: Vec<ObjectId>) -> Result<()> {
+    pub(crate) fn restart_sinks(&mut self, sinks: Vec<ObjectId>) -> Result<()> {
         for id in sinks {
             if let Some(h) = self.sink_handles.remove(&id) {
                 let _ = h.stop();
             }
+            self.forget_sink_snapshot(id);
             if let (Some(o), Some(handle)) = (self.catalog.get(id).cloned(), self.handle.clone())
                 && let ObjectKind::Sink(sd) = &o.kind
             {
@@ -1208,7 +1144,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn start_sink(&mut self, id: ObjectId, name: &str, def: &SinkDef, handle: &EngineHandle) -> Result<()> {
+    pub(crate) fn start_sink(&mut self, id: ObjectId, name: &str, def: &SinkDef, _handle: &EngineHandle) -> Result<()> {
         let node = match self.rt.views.get(&def.from).map(|v| v.node).or_else(|| self.rt.tables.get(&def.from).copied()) {
             Some(n) => n,
             None => return Err(self.broken_error(def.from).unwrap_or_else(|| SqlError::internal("sink source without dataflow"))),
@@ -1218,9 +1154,11 @@ impl Engine {
             Some(ObjectKind::Table(t)) => t.columns.clone(),
             _ => vec![],
         };
-        let snapshot = self.graph.snapshot(&mut self.env, node)?.data;
-        let h = crate::sink::start(id, name.to_string(), def.clone(), node, columns, snapshot, self.processed, handle.clone())?;
-        self.sink_handles.insert(id, h);
+        // (a large snapshot is taken off the engine thread: the sink starts then)
+        let then = super::reader::AfterSnapshot::Sink { id, name: name.to_string(), def: def.clone(), columns };
+        if let Some((snapshot, then)) = self.snapshot_or_defer(node, then)? {
+            self.after_snapshot(then, self.processed, snapshot, Vec::new())?;
+        }
         Ok(())
     }
 }

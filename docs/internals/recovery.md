@@ -6,6 +6,7 @@ chapter describes the recovery protocol, how checkpointed indexes are found
 again, how sources resume, and the DBLog snapshot algorithm as implemented.
 Code: `crates/ivm/src/coord/mod.rs` (`start`, `recover`, `checkpoint`),
 `crates/ivm/src/coord/meta.rs` (the metadata tree, `FORMAT`),
+`crates/ivm/src/coord/checkpoint.rs`,
 `crates/ivm/src/storage/mod.rs` (`Env::open`, `Env::checkpoint`),
 `crates/ivm/src/log.rs`, `crates/ivm/src/source/postgres.rs`.
 
@@ -118,6 +119,28 @@ with status 1 at once) and accepts connections only once recovery is done.
 A data directory without a checkpoint replays the whole log from GSN 1 (the
 log is only truncated after checkpoints).
 
+### Hydrations in progress
+
+A view or index hydrated off the engine thread
+([Dataflow](dataflow.md#hydration-off-the-engine-thread)) exists from its
+DDL record's GSN *g* on, but its trees are adopted only when the hydration
+has caught up, at some later GSN *p*. Nothing about it is durable but the
+DDL record and the checkpoints:
+
+- A checkpoint taken between *g* and *p* holds the object in the catalog,
+  but not its trees (they are not hydrated in the engine, so the metadata
+  tree names no arrangement of it, nor error records of its nodes).
+  Recovery from it rebuilds the object as of the checkpoint GSN, and the
+  view takes its root's error records, as every view does at recovery.
+- A crash before a checkpoint after *g* replays the DDL record, which
+  hydrates inline as of *g*; the records after it are replayed as usual.
+
+Either way the state at every GSN after the recovery point is the one an
+uninterrupted run reaches: a background hydration computes exactly what an
+inline one followed by the same steps does (`tests/stall.rs` crashes in the
+middle of one). Its client gets no reply (the connection breaks); the
+statement takes effect.
+
 ### Matching checkpointed indexes
 
 A checkpoint records, for every hydrated arrangement, its **structural
@@ -158,14 +181,15 @@ fingerprint mismatch only costs a rebuild.
 
 ## Checkpoints
 
-A checkpoint is taken on `CHECKPOINT`, on shutdown, and when one is due
-(`Engine::maybe_checkpoint`, after every message the engine handles): every
-`--checkpoint-secs`, or as soon as the memory of dirty nodes still exceeds
-half of the buffer pool's share of the memory budget after a message (the
-pool writes dirty nodes early to keep them below that), once something
-durable changed since the last
-one — a record was applied other than a clock tick that changed nothing but
-the clock (a tick that releases temporal-filter events counts), or the last
+A checkpoint is begun when one is asked for (`CHECKPOINT`,
+`EngineHandle::checkpoint`, answered once one begun after the request is
+committed) and when one is due (`Engine::maybe_checkpoint`, after every
+round of messages the engine handles): every `--checkpoint-secs`, or as
+soon as the memory of dirty nodes still exceeds half of the buffer pool's
+share of the memory budget (the pool writes dirty nodes early to keep them
+below that), once something durable changed since the last one — a record
+was applied other than a clock tick that changed nothing but the clock (a
+tick that releases temporal-filter events counts), or the last
 checkpoint's maintenance pass left space to reclaim for lack of budget
 (`MaintStats::unfinished`), so that the next pass continues it. Ticks alone
 only add replay work (and 25 bytes of log each): they make a checkpoint due
@@ -173,7 +197,9 @@ after 3,600 of them (an hour at the default `--tick-ms`), which bounds the
 replay of an idle engine. An engine that is idle takes no checkpoints
 otherwise, once it has reclaimed what its passes found.
 
-`Engine::checkpoint`:
+A checkpoint is written in the background (`coord/checkpoint.rs`), one at
+a time. On the engine thread, between two records (`prepare_checkpoint`,
+`Engine::begin_checkpoint`):
 
 1. `persist_meta(processed GSN)`: write what changed since the last time
    into the metadata tree — catalog objects changed by DDL since (normally
@@ -186,22 +212,46 @@ otherwise, once it has reclaimed what its passes found.
    underfull nodes, relocate the live nodes of sparse segments, in every
    tree the metadata tree included
    ([Storage](storage.md#space-reclamation));
-3. `Env::checkpoint(processed_gsn, header)`: write the remaining dirty
-   nodes (those the maintenance pass rewrote too), `fsync`, append the manifest record — the
-   trees, the segments, the header naming the metadata tree and each tree's
-   live bytes per segment, tens of bytes per tree — (the commit point),
-   delete dead segments
-   ([Storage](storage.md#segments-and-checkpoints));
-4. send `Truncate(processed)` to the sequencer, which deletes log segments
-   whose records all lie at or before the checkpoint: recovery replays the
-   log after the checkpoint, and nothing else reads the log (`AS OF` reads
-   use the histories in the trees).
+3. `Env::begin_checkpoint(processed GSN)`: freeze a version of the dirty
+   nodes, those the first two steps wrote included
+   ([Storage](storage.md#segments-and-checkpoints)). Records applied from
+   now on count towards the next checkpoint.
 
-The engine thread does nothing else while a checkpoint runs. Its cost is
-that of the nodes that changed since the previous one and of the
-maintenance pass's budgeted work; it does not depend on the size of what
-did not change (the catalog, its history of up to 11,000 statements, the
-error records).
+On a thread of its own (`ivm-checkpoint`), while the engine goes on applying
+records and answering requests:
+
+4. `CheckpointJob::run(header)`: write the frozen dirty nodes, `fsync`,
+   append the manifest record — the trees, the segments, the header naming
+   the metadata tree and each tree's live bytes per segment, tens of bytes
+   per tree — (the commit point), delete dead segments.
+
+Back on the engine thread, once it is written (the thread sends `Wake`):
+
+5. `Env::finish_checkpoint`: mark the written nodes that did not change
+   meanwhile clean;
+6. send `Truncate(checkpoint GSN)` to the sequencer, which deletes log
+   segments whose records all lie at or before the checkpoint: recovery
+   replays the log after the checkpoint, and nothing else reads the log
+   (`AS OF` reads use the histories in the trees). The log is truncated
+   only once the checkpoint is committed.
+
+At shutdown, and in an engine without threads, the same steps run in a row
+on the engine thread (`Engine::checkpoint`), after the checkpoint being
+written, if any. No checkpoint is begun while a table is being rebuilt off
+the engine thread after an upstream schema change (its rows are in neither
+version's index alone; the final checkpoint at shutdown is skipped then
+too, and recovery replays the schema record).
+
+The engine thread is held up only by the first three steps: the metadata
+that changed, the maintenance pass's budgeted work, and freezing the dirty
+nodes (one reference-count increment per dirty node); none of it depends on
+the size of what did not change (the catalog, its history of up to 11,000
+statements, the error records). Nodes it modifies while the checkpoint is
+written are copied first (once each). A checkpoint that fails (an I/O
+error) stops the engine. At shutdown the engine waits for the checkpoint
+being written and then takes the final one on its own thread; a simulated
+crash only waits for it to be written, so that no writer outlives the
+engine. Recovery is unchanged: the manifest append is the commit point.
 
 ## Source resumption
 

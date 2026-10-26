@@ -541,6 +541,116 @@ and recovery (for arrangements whose checkpointed tree could not be
 matched). After hydration the new nodes are stepped like all others from the
 next GSN on.
 
+### Hydration off the engine thread
+
+`CREATE MATERIALIZED VIEW`, `CREATE INDEX`, `CREATE OR REPLACE` (with the
+re-planning of the views reading the replaced view), upstream schema changes
+and `SUBSCRIBE (query)` hydrate their new nodes and arrangements without
+stopping the engine (`coord/hydrate.rs`). A DDL or schema record collects
+what has to follow the hydration of what it built (`hydrate::Then`) and
+starts the hydration once it has been applied. At the GSN *g* the statement is
+applied at (its DDL record, or the last applied record for `SUBSCRIBE`), the
+engine takes a fork of the storage — every tree as of *g*
+([Storage](storage.md#forks)) — and a copy of the part of the graph the new
+fragment needs (`Graph::fork_of`: the pending nodes, the nodes owning the
+pending arrangements, and everything they read, transitively, with all of
+those nodes' arrangements; operator error state copied, not shared; after
+hydrating, the thread drops the arrangements no operator of it reads, so
+that its steps maintain only those), and hands both
+to a thread of its own (`ivm-hydrate`). That thread runs `Graph::hydrate` as
+of *g* there — the same computation as inline — and then applies every
+`Commit` and `Tick` record after *g*: the engine forwards each one's table
+changes (of the fork's tables) and the clock before
+applying it itself, and the thread runs `Graph::step` on its copy of the
+graph, which steps the new fragment and the existing nodes it reads. Once the
+thread has hydrated the fragment, the engine makes it catch up: before
+forwarding a record it waits until the thread is one record less behind
+than at the previous record (so the engine goes on at about half the speed
+of maintaining everything including the new fragment, which it will have to
+do once it is live). When the thread is at most 100 records behind, the
+engine waits for it to apply them and adopts the new trees
+(`Env::adopt_trees`, which moves their nodes) and the new nodes' state —
+hydration flags, error records and per-group error state
+(`Graph::adopt_hydrated`); from the next record on the fragment is stepped
+by the engine with the rest. Its contents are exactly those of an inline
+hydration at *g* followed by the same steps. The version of the inputs it
+reads is the fork, not the trees' history, and the catch-up comes from the
+forwarded changes, not from the log.
+
+Meanwhile:
+
+- The engine applies records, maintaining the existing views, and answers
+  requests. DDL records are applied as they come, except those that would
+  hydrate inline or read a relation's contents at once — replacing an
+  existing view (`CREATE OR REPLACE`, with the re-planning of the views
+  reading it) and `CREATE SINK` — and `Schema` records: such a record, and
+  the records after it, wait until no hydration is in progress
+  (`must_wait_for_hydration`). The nodes and arrangements of a view or index
+  created meanwhile (its statement's DDL record applied, possibly on top of
+  the fragment being hydrated) are hydrated by the next hydration, which
+  begins when this one is done, with everything pending then; their
+  statements are answered when that one is.
+- The statement's view or index is in the catalog from *g* on; its DDL
+  reply is sent once the fragment is live (a `SUBSCRIBE` is answered then
+  too, with its snapshot as of *g* followed by the changes of the records
+  applied since, as if it had been running from *g*).
+- Requests that read a relation still being hydrated — reads of the view,
+  DML reading it, `SUBSCRIBE` to it — are parked (`Wait::Hydration`) and run
+  again once it is live (a fresh read then reads the latest state, which
+  includes everything up to the GSN it waited for).
+  A `SUBSCRIBE` to a query waits for the hydration in progress to be done
+  before its own begins.
+- A checkpoint saves the view or index in the catalog without its trees
+  (they are not hydrated in the engine yet, so the metadata tree names no
+  arrangement of it): recovery rebuilds it as of the checkpoint, and the
+  view takes its root's error records then, as every view does
+  ([Recovery](recovery.md#hydrations-in-progress)).
+- At most a million forwarded records are kept for a thread still
+  hydrating; beyond, the engine waits for it.
+
+What "the view exists as of *g*" means: from *g* on its name is taken, it
+is listed, and DDL can build on it; its contents at every GSN after *g* are
+those of an inline run, but they can be read only once it is live, at some
+*p* > *g* that depends on timing: every read of it, at any read point,
+waits until then. *p* is never observable in contents — reads wait,
+subscribers and sinks get what an inline run gives them at the same GSNs,
+and a checkpoint taken in between holds only the catalog entry, so recovery
+(or replay, which hydrates inline at *g*) reaches the same state. A view or
+index created while another hydration is in progress is hydrated as of the
+GSN the next hydration begins at, not as of its own statement's: its
+contents from then on are the same function of the log, and nothing could
+read it before.
+
+Replacements need more than the new contents:
+
+- A replaced materialized view (`replace_view`) is switched to its new
+  version at the record's GSN *g*; the old version is kept (and maintained)
+  until the hydration is done. Its subscribers (same columns) and sinks are
+  held — they get nothing — until then; the thread computes the change from
+  the old to the new contents as of *g* on the fork, right after hydrating,
+  and the engine then delivers it at *g*, followed by the new version's
+  outputs at the records applied since, before releasing the holds and the
+  old version (`finish_replace`). Subscribers and sinks get exactly what an
+  inline replacement at *g* would have given them, at the same GSNs, which
+  sinks need: they are idempotent by GSN. Sinks of a view whose columns
+  changed start over then (they were held too, so that their targets did
+  not get the old version's later changes).
+- A table rebuilt after an upstream schema change (`apply_schema_change`)
+  gets a new, empty Table node at *g*, to which the table's changes are
+  routed from then on; the thread first fills its primary index with the
+  old version's rows as of *g* converted to the new shape (`fill_rebuilt`)
+  and then hydrates the re-planned views. Reads of the table wait meanwhile,
+  its sinks are held and start over afterwards, and no checkpoint is taken
+  until it is done: the table's rows are in neither version's index alone,
+  and a table's rows exist nowhere else (a crash replays the schema record).
+- These records must start their hydration as of their own GSN (the switch
+  is at *g* in every run, so that the change delivered at *g* is the same):
+  they wait while another hydration is in progress (above).
+
+Replay and recovery hydrate inline, with the same steps (nothing waits for
+them). A failure of a background hydration (an internal or I/O error) stops
+the engine, as one inline would.
+
 ## Errors
 
 Error records are produced by `Mfp` and `FlatMap` (per row), `Reduce` (per

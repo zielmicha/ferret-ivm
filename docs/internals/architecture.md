@@ -55,16 +55,21 @@ Where the implementation differs from the design:
 | `ivm-listener` | the listening socket | accepts connections (`server::serve_listener`) and starts a session thread for each |
 | `ivm-signals` | | turns the first `SIGINT`/`SIGTERM` into a shutdown request; a second one exits the process at once (status 1) |
 | `ivm-sequencer` | the input-log writer | assigns GSNs, appends and `fsync`s records in batches, generates clock ticks, acknowledges submitters, forwards durable records to the engine |
-| `ivm-engine` (64 MiB stack) | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, takes checkpoints, builds the web UI's snapshots |
+| `ivm-engine` (64 MiB stack) | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, begins and finishes checkpoints, builds the web UI's snapshots |
+| `ivm-reader-<n>` (four, started by the first large read; 64 MiB stack) | forks of the storage, copies of parts of the graph | run reads that exceeded their budget on the engine thread ([Planner](planner.md#batch-execution)) and answer their clients; take large snapshots for starting sinks and subscriptions |
+| `ivm-checkpoint` (while a checkpoint is written) | a frozen version of the dirty nodes, the store's append side and manifest | serializes the application state, writes the nodes, `fsync`s and appends the manifest record ([Recovery](recovery.md#checkpoints)) |
 | `ivm-session-<n>` (one per client, 16 MiB stack) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
+| `ivm-hydrate` (while a view, index or subscription is hydrated; 64 MiB stack) | a fork of the storage and of part of the graph | hydrates the new dataflow fragment as of its statement's GSN, then applies the records the engine forwards until it has caught up ([Dataflow](dataflow.md#hydration-off-the-engine-thread)) |
 | `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, removes it and requests a shutdown |
 | `ivm-http` (with `--http-listen`: a driver thread and the two worker threads of its own tokio runtime) | the HTTP listener | the web UI's server, its once-a-second metrics sampler and the SQL console ([Web UI](../web-ui.md)); engine snapshots are requested with a callback, so no async thread blocks on the engine |
 | `ivm-slot-drop-<slot>` | | drop the replication slot of a dropped source, retrying with a delay doubling from 250 ms to 10 s (also while the stopping source's session still holds it) until it is dropped or gone; pending drops are part of the checkpointed state and started again after recovery |
 
 There is exactly one engine thread: all dataflow maintenance, all index
-reads and writes, and all query execution happen on it. Everything that
+reads and writes, and all query execution happen on it, except the
+hydration of new views, indexes and subscriptions and large reads, which
+run on forks of the storage, and writing checkpoints. Everything that
 talks to the network (sessions, sources, sinks) runs on other threads, so
 the engine never blocks on a remote server: stopping a source or a sink
 (`DROP SOURCE`, `DROP SINK`, a cascading drop, a sink restarted after a
@@ -146,11 +151,28 @@ against its current state, converts it into row changes, and submits one
 `Commit { source: 0, lsn: <request id>, ... }` record to the sequencer (a
 statement that changes nothing is answered at once, without a record). The
 reply is sent when the record comes back durable and has been applied, so
-the client's next fresh read sees it. Only one DML statement is in flight at
-a time; others queue in the engine (`dml_queue`) and run in order. DDL
-logged before the record applies first: if it dropped the statement's
-table, the record changes nothing and the statement fails (`the table of
-this statement was dropped before it could be applied`), on replay too.
+the client's next fresh read sees it. DDL logged before the record applies
+first: if it dropped the statement's table, the record changes nothing and
+the statement fails (`the table of this statement was dropped before it
+could be applied`), on replay too.
+
+Several DML statements are in flight at once (`coord/dml.rs`): a statement
+is evaluated as soon as it arrives and its record submitted, without waiting
+for the records of earlier statements to be applied, unless it read rows
+that one of those records writes. Its result could then differ from the one
+it gets after that record; it is queued (`dml_queue`, in arrival order,
+behind the first statement waiting) and evaluated again whenever a pending
+DML record has been applied. The rows a statement reads are tracked while it
+is evaluated (`Touched`): the primary keys it looks up (duplicate-key checks
+of `INSERT`, new keys of `UPDATE`); for each table the plan of
+`INSERT ... SELECT`, `UPDATE` or `DELETE` reads, the row with the key that
+its predicates equate every key column with constants, or else every row;
+for a materialized view, every row of every table. The rows a record writes
+are its keys (every row of a table without a primary key). Local tables
+change only through these records, and a statement that read nothing a
+pending record writes sees what it would see after them: the results are
+those of evaluating the statements one after another in log order, and
+replay applies the logged changes, never re-evaluating.
 
 ### DDL
 
@@ -164,7 +186,10 @@ column list — not lowering or hydration), `CREATE SOURCE` and `ALTER SOURCE
 ... REFRESH` (the discovered tables; `CREATE SOURCE` also writes the data
 directory's instance id into `extra`), and `CREATE SINK` (its relation and
 `KEY` columns). The engine then submits a `Ddl { req, sql, extra }` record
-and applies it when it comes back durable; the reply is sent then. Other
+and applies it when it comes back durable; the reply is sent then (for a
+statement that built dataflow — `CREATE [OR REPLACE] MATERIALIZED VIEW`,
+`CREATE INDEX` — once it has been hydrated off the engine thread, see
+[Dataflow](dataflow.md#hydration-off-the-engine-thread)). Other
 checks happen only while applying: `DROP` (which resolves and checks every
 name before dropping anything), `CREATE INDEX`, the rules of
 `CREATE OR REPLACE`, and lowering and hydration. A statement that fails there
@@ -190,7 +215,8 @@ The sequencer processes messages in batches: it blocks for the first message
 (or the tick deadline), adds a tick if one is due, then drains more messages
 without blocking, up to 4096 per batch. All `Append`s of a batch are encoded
 into one buffer, written with one `write`, and made durable with one
-`fdatasync`. Only then are acknowledgements sent
+`fdatasync` (an `AppendAll` — the records the engine submitted in one round
+of messages, see below — counts as its records). Only then are acknowledgements sent
 and the records handed to the engine — no record is applied, acknowledged to
 a source, or answered to a client before it is durable. Under load, batches
 grow and the cost of `fsync` is shared; when idle, a batch is a single
@@ -219,24 +245,34 @@ unacknowledged, which bounds their acknowledgement bookkeeping.)
 
 ## The engine loop
 
-The engine thread waits for an `EngineMsg` with a 200 ms timeout and
-handles:
+The engine thread waits for an `EngineMsg` with a 200 ms timeout and then
+handles it and the messages already waiting behind it (up to 256 in a
+round):
 
 | Message | Action |
 |---|---|
-| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
+| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. While a hydration is in progress, a `Schema` record or a `Ddl` record replacing a view or creating a sink, and the records after it, are held until no hydration is; `Commit` and `Tick` records are forwarded to it before they are applied. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
-| `Request(Checkpoint)` | take a checkpoint |
+| `Request(Checkpoint)` | ask for a checkpoint: answered with its GSN once one begun after the request is committed |
 | `Request(Inspect)` | build a snapshot for the web UI (`coord/inspect.rs`) between two records, so that it is consistent at one GSN, and hand it to the requester's callback |
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
-| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress (except one that fell behind) and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |
+| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress (except one that fell behind) and ask it to stop, stop the sequencer, take a final checkpoint after the one being written, if any (not after a simulated crash, which only waits for that one to be written), wait up to 5 s for sources and sinks, exit |
 
-After every message it runs deferred requests (queued DML, woken reads),
-gives the buffer pool its share of the memory budget, restarts sinks that
-fell behind and have written what they held ([Memory](#memory)), takes a
-checkpoint if one is due ([Recovery](recovery.md#checkpoints): clock ticks
-alone rarely make one due), and removes cancelled subscriptions.
+After every round it runs deferred requests (queued DML, woken reads),
+sends the records submitted in the round to the sequencer as one
+`AppendAll` (so that the statements evaluated together share one log append
+and `fdatasync`; `log_batches` in `Shared` counts the sequencer's batches),
+finishes the hydration in progress if it has caught up (then applies the
+records held behind it), finishes the checkpoint being written if it is
+done, gives the buffer pool its share of the memory budget, restarts sinks
+that fell behind and have written what they held ([Memory](#memory)),
+begins a checkpoint if one is due or asked for
+([Recovery](recovery.md#checkpoints): clock ticks alone rarely make one
+due), and removes cancelled subscriptions. The hydration thread sends
+`Wake` when it has hydrated its fragment and whenever it has applied every
+record forwarded so far; the checkpoint thread when it has written its
+checkpoint.
 
 `apply_record` dispatches on the record kind:
 
@@ -245,7 +281,7 @@ alone rarely make one due), and removes cancelled subscriptions.
 | `Commit` | group the changes by table (changes to tables that no longer exist are skipped), `Graph::step_observed` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); write the catalog's changes into the metadata tree at the record's GSN (`persist_meta`); reply |
 | `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
-| `Schema` | rebuild the table in its new shape and re-plan dependent views ([Sources](../user-guide/sources.md#upstream-schema-changes)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
+| `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
 Delivering outputs (`deliver`): the error records of each materialized
@@ -366,6 +402,7 @@ and a wait condition:
 | `Gsn(g)` | the engine has applied `g` (checked after every batch) |
 | `Lsn` | every source of the catalog has a frontier ≥ the read's LSN (`lsn_reached`; checked on `Wake` messages, which sources send when a frontier moves while `lsn_waiters` is set, after every batch and on the 200 ms timeout). When the last source is dropped, the read is re-run and fails |
 | `Snapshot` | something changed that could finish a snapshot (source progress, a schema change or DDL); the read is re-run and parks again if a table it reads, directly or through views, is still loading |
+| `Hydration` | the hydration in progress is done; a statement (read, DML or `SUBSCRIBE`) that read a view still being hydrated is re-run |
 
 While an LSN read waits, `want_keepalive` makes the sources request a
 keepalive from the upstream, so that the frontier advances to the server's
