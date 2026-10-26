@@ -29,7 +29,7 @@ Fixed internal parameters (not configurable):
 | unacknowledged commits per source | 10,000 |
 | initial-snapshot chunk | 10,000 rows |
 | groups cached in memory per aggregation | 2^18 (half evicted when full) |
-| nodes relocated per garbage-collection pass | 1000 |
+| maintenance pass budget (compaction, and relocation, each) | 8 MiB plus the bytes checkpoints wrote for updates since the previous pass |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
 | clock ticks kept | those of the retention window |
@@ -179,11 +179,11 @@ A checkpoint is taken every `--checkpoint-secs` seconds, or as soon as
 dirty index nodes exceed half of `--cache-mb`, if something durable changed
 since the last one: anything applied but clock ticks that changed nothing
 but the clock (a tick that changes a view through a temporal filter
-counts), or nodes the last garbage-collection pass relocated. Clock ticks
-alone make one due only after 3,600 of them (an hour at the default
-`--tick-ms`), so an idle engine writes nothing but its ticks to the log, and
-a restart replays at most that many. A checkpoint is also taken on the
-`CHECKPOINT` statement and as the final step of a requested shutdown. It:
+counts). Clock ticks alone make one due only after 3,600 of them (an hour
+at the default `--tick-ms`), so an idle engine writes nothing but its ticks
+to the log, and a restart replays at most that many. A checkpoint is also
+taken on the `CHECKPOINT` statement and as the final step of a requested
+shutdown. It:
 
 1. writes what changed in the catalog and the engine state since the last
    one (DDL history entries, source states and LSNs, index fingerprints →
@@ -191,13 +191,13 @@ a restart replays at most that many. A checkpoint is also taken on the
    clock ticks, pending slot drops) into the metadata tree, a tree like the
    indexes (DDL statements write their catalog changes into it right
    away);
-2. writes all dirty nodes bottom-up to the active segment and `fsync`s the
+2. runs one maintenance pass (below);
+3. writes all dirty nodes bottom-up to the active segment and `fsync`s the
    segment files;
-3. appends a checkpoint record (tree roots, segment usage, a small header
+4. appends a checkpoint record (tree roots, segment usage, a small header
    naming the metadata tree) to the manifest and `fsync`s it — this is the
    atomic commit point;
-4. deletes sealed segment files with no live nodes;
-5. runs one garbage-collection pass;
+5. deletes sealed segment files with no live nodes;
 6. asks the sequencer to delete input-log segments whose records all lie at
    or before the checkpoint's GSN (only recovery reads the log, and it
    starts after the checkpoint).
@@ -207,11 +207,21 @@ does not grow with the catalog, its DDL history or the error records that
 stay the same.
 
 Space reclamation: a node rewritten after a checkpoint makes its old copy
-dead. Garbage collection picks the oldest sealed segment that is less than
-half live and rewrites up to 1000 of its live nodes (they are written again
-at the next checkpoint); a segment with no live bytes is deleted at the next
-checkpoint. The active segment is never collected, so up to one segment
-(256 MiB) of dead space can accumulate before it is sealed.
+dead, and a deleted or updated row leaves its old version in its index leaf
+until the retention frontier passes it. The maintenance pass removes both,
+visiting only what needs it: it rewrites the index leaves where removing
+versions behind the frontier would free at least a quarter of the leaf
+(including leaves no change reaches again, such as the oldest rows of a
+queue or of a table purged by age), merges leaves and inner nodes left
+nearly empty, and rewrites the live nodes of the sealed segments that are
+less than half live, preferring the emptiest and oldest, so that they can be
+deleted. Its work on nodes not already in memory or modified is bounded per
+pass by the budget in the table above: it keeps pace with the rate at which
+updates create garbage, and the next pass continues what does not fit. A
+segment with no live bytes is deleted at the checkpoint. The active segment
+is never collected, so up to one segment (256 MiB) of dead space can
+accumulate before it is sealed. Dropping an index or view releases its space
+without reading it.
 
 `SHOW FRONTIERS` shows `checkpoint_gsn` and the number of segments.
 
@@ -219,10 +229,10 @@ checkpoint. The active segment is never collected, so up to one segment
 
 Each index entry keeps a history of (GSN, weight) changes. Changes at or
 before the *retention frontier* (`last applied GSN − --retention-gsns`) are
-merged into one when an index leaf is next rewritten, and `AS OF` reads
-before the frontier are refused. Retention does not keep input-log
-segments: `AS OF` reads use the histories in the indexes. See
-[Reads](reads.md#time-travel-as-of-gsn).
+merged into one when an index leaf is next rewritten or by the maintenance
+pass of a checkpoint (see above), and `AS OF` reads before the frontier are
+refused. Retention does not keep input-log segments: `AS OF` reads use the
+histories in the indexes. See [Reads](reads.md#time-travel-as-of-gsn).
 
 ## Durability and --no-sync
 

@@ -913,16 +913,16 @@ impl Engine {
         // what changed since the last one goes into the metadata tree; the
         // manifest record names that tree in a small header
         self.persist_meta(self.processed)?;
+        // reclaim space first, so that this checkpoint writes what it rewrote
+        self.env.maintain()?;
         let header = meta::encode_header(&self.meta, self.next_req);
         self.env.checkpoint(self.processed, &header)?;
-        let relocated = self.env.gc(1000)?;
         // recovery replays the log after the checkpoint, and nothing else
         // reads the log
         let _ = self.seq.send(SeqMsg::Truncate(self.processed));
         self.last_checkpoint = Instant::now();
         self.records_since_checkpoint = 0;
-        // (the next checkpoint writes the relocated nodes)
-        self.changes_since_checkpoint = (relocated > 0) as u64;
+        self.changes_since_checkpoint = 0;
         Ok(())
     }
 

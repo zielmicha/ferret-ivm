@@ -47,6 +47,11 @@ pub struct Child {
     pub summary: Summary,
     /// Oldest segment holding any node of this subtree (u32::MAX if none).
     pub min_seg: u32,
+    /// Smallest retention frontier at which compacting some leaf of this
+    /// subtree is worthwhile ([`leaf_due`]; `Gsn::MAX` if none). Exact for
+    /// a clean child; a lower bound for a dirty one (0 after a foreground
+    /// update) and for a child decoded from a kind-2 node (0).
+    pub due: Gsn,
 }
 
 #[derive(Clone, Debug)]
@@ -56,7 +61,10 @@ pub enum Node {
 }
 
 pub const KIND_LEAF: u8 = 1;
+/// Internal node without `due` (decoded only; written before compaction
+/// was tracked per subtree).
 pub const KIND_INTERNAL: u8 = 2;
+pub const KIND_INTERNAL_DUE: u8 = 3;
 
 impl Node {
     pub fn is_leaf(&self) -> bool {
@@ -80,6 +88,12 @@ impl Node {
 
     /// Serialize. Children must all have disk locations (`locs[i]`).
     pub fn encode(&self, child_locs: &[DiskLoc], out: &mut Vec<u8>) {
+        self.encode_as(child_locs, out, false)
+    }
+
+    /// `encode`, writing internal nodes as kind 2 (without `due`) if
+    /// `legacy` (tests of stores written before kind 3 existed).
+    pub(crate) fn encode_as(&self, child_locs: &[DiskLoc], out: &mut Vec<u8>, legacy: bool) {
         match self {
             Node::Leaf(entries) => {
                 out.push(KIND_LEAF);
@@ -101,12 +115,16 @@ impl Node {
                 }
             }
             Node::Internal(children) => {
-                out.push(KIND_INTERNAL);
+                out.push(if legacy { KIND_INTERNAL } else { KIND_INTERNAL_DUE });
                 put_uvarint(out, children.len() as u64);
                 for (c, loc) in children.iter().zip(child_locs) {
                     put_bytes(out, &c.sep);
                     loc.encode(out);
                     put_uvarint(out, c.min_seg as u64);
+                    if !legacy {
+                        // +1 so that "never" (Gsn::MAX) takes one byte
+                        put_uvarint(out, c.due.wrapping_add(1));
+                    }
                     c.summary.encode(out);
                 }
             }
@@ -139,15 +157,18 @@ impl Node {
                 }
                 Ok(Node::Leaf(entries))
             }
-            KIND_INTERNAL => {
+            kind @ (KIND_INTERNAL | KIND_INTERNAL_DUE) => {
                 let n = get_uvarint(buf)? as usize;
                 let mut children = Vec::with_capacity(n);
                 for _ in 0..n {
                     let sep = get_bytes(buf)?.to_vec().into_boxed_slice();
                     let loc = DiskLoc::decode(buf)?;
                     let min_seg = get_uvarint(buf)? as u32;
+                    // unknown in a kind-2 node: the next maintenance pass
+                    // visits the subtree and records it
+                    let due = if kind == KIND_INTERNAL_DUE { get_uvarint(buf)?.wrapping_sub(1) } else { 0 };
                     let summary = Summary::decode(buf)?;
-                    children.push(Child { sep, ptr: NodePtr::Disk(loc), summary, min_seg });
+                    children.push(Child { sep, ptr: NodePtr::Disk(loc), summary, min_seg, due });
                 }
                 Ok(Node::Internal(children))
             }
@@ -162,4 +183,51 @@ pub fn entry_size(e: &LeafEntry) -> usize {
 
 pub fn child_size(c: &Child) -> usize {
     c.sep.len() + 24 + 8 * c.summary.aggs.len() + 8
+}
+
+/// Compaction state of a leaf: the smallest frontier at which compacting it
+/// changes anything, and the smallest at which that would remove at least a
+/// quarter of its estimated size (when a rewrite is worth its cost). Both
+/// are `Gsn::MAX` if no frontier would.
+pub fn leaf_compaction(entries: &[LeafEntry]) -> (Gsn, Gsn) {
+    let mut first = Gsn::MAX;
+    let mut size = 8;
+    // (frontier, bytes compaction at that frontier removes in addition to
+    // compaction at the previous step of the same entry)
+    let mut steps: smallvec::SmallVec<[(Gsn, usize); 16]> = smallvec::SmallVec::new();
+    for e in entries {
+        let full = entry_size(e);
+        size += full;
+        let h = &e.hist.0;
+        if h.len() < 2 {
+            continue;
+        }
+        first = first.min(h[1].0);
+        // A frontier in [h[k], h[k+1]) merges h[..=k] into one change,
+        // dropped if they add up to zero; the entry goes when nothing is left.
+        let (mut sum, mut saved) = (h[0].1, 0);
+        for k in 1..h.len() {
+            sum += h[k].1;
+            let left = h.len() - k - 1 + (sum != 0) as usize;
+            let now = if left == 0 { full } else { (h.len() - left) * 6 };
+            steps.push((h[k].0, now - saved));
+            saved = now;
+        }
+    }
+    steps.sort_unstable_by_key(|s| s.0);
+    let need = size.div_ceil(4);
+    let mut acc = 0;
+    for (g, bytes) in steps {
+        acc += bytes;
+        if acc >= need {
+            return (first, g);
+        }
+    }
+    (first, Gsn::MAX)
+}
+
+/// The frontier at which compacting a leaf becomes worthwhile (see
+/// [`leaf_compaction`]).
+pub fn leaf_due(entries: &[LeafEntry]) -> Gsn {
+    leaf_compaction(entries).1
 }

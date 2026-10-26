@@ -200,10 +200,11 @@ stream until it catches up (`SHOW FRONTIERS`: `durable_gsn` −
   fills slowly (25 bytes per tick) and is deleted once it is sealed and
   covered by a checkpoint.
 - Dead index nodes are reclaimed only in sealed segments that are less than
-  half live, one segment at a time after each checkpoint (at most 1000 nodes
-  relocated per pass); up to half of any other sealed segment can stay
-  garbage, and the active segment (up to 256 MiB) is not collected until it
-  is full.
+  half live: the maintenance pass before each checkpoint relocates their
+  live nodes, within its budget
+  ([Operations](operations.md#checkpoints-and-garbage-collection)); up to
+  half of any other sealed segment can stay garbage, and the active segment
+  (up to 256 MiB) is not collected until it is full.
 - Large `--retention-gsns` keeps more versions in the indexes.
 
 ### Upstream WAL grows

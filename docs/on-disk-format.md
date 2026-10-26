@@ -375,19 +375,36 @@ retention had not yet consolidated the old version.)
 ### Internal node
 
 ```
-u8       kind = 2
+u8       kind = 3
 uvarint  n                         number of children (at least 1)
 n × child:
   bytes    separator               lower bound of the child's key range (stored but ignored for the first child)
   uvarint  seg, uvarint off, uvarint len
                                    DiskLoc of the child's frame
   uvarint  min_seg                 oldest segment id holding any node of the child's subtree (4294967295 = none)
+  uvarint  due + 1                 compaction state of the child's subtree (below); 0 = none
   summary                          the child subtree's summary (below)
 ```
 
 A key belongs to the last child whose separator is `<=` the key. Separators
 are shortened at leaf splits: the separator of a new leaf is the shortest
 prefix of its first key that is greater than the previous leaf's last key.
+
+`due` is the smallest retention frontier at which compacting some leaf of
+the subtree is worth rewriting it, the minimum over its leaves. A leaf's
+`due` (`node::leaf_due`) is the smallest frontier *f* at which compacting
+every entry's history at *f* (as described in
+[Garbage collection and retention](#garbage-collection-and-retention))
+removes at least a quarter of the leaf's estimated size: `8 + Σ (key length
++ 4 + 6 × history elements)` over its entries, an entry that compaction
+empties counting all of its size. "None" (`due + 1 = 0`, the value
+2^64 − 1 wrapped) means that no frontier would. The value of each child is
+computed from the child's contents when the node is written.
+
+Internal nodes of kind 2, written by earlier versions, are still read: the
+same layout without the `due` field. Their children's `due` reads as 0, so
+that the next maintenance pass visits every subtree under them once and
+writes the nodes on the way again as kind 3.
 
 ### Summary
 
@@ -456,6 +473,13 @@ uvarint  active_seg              id of the active segment
 uvarint  active_len              length of the active segment belonging to this checkpoint
 uvarint  next_tree_id            next tree id to allocate
 bytes    app                     application state: the header below (format 1: JSON, see AppState below)
+[ uvarint  nt                    tree space: the number of trees again, then for each
+                                 tree, in the order of the trees above:
+  nt × (uvarint due + 1          the root's due (as in an internal node; 0 = none)
+        uvarint ns
+        ns × (uvarint seg, uvarint live_bytes)) ]
+                                 bytes of the tree's node frames still live, per segment
+                                 (segments with none are left out)
 ```
 
 The application state of the current format is a header naming the
@@ -468,31 +492,43 @@ uvarint  meta_tree               id of the metadata tree (one of the trees above
 uvarint  next_req                request counter
 ```
 
-Every record is complete: it lists every tree (the metadata tree included)
-and every segment, so only the last record matters. The first record of a
-new data directory, ten seconds after `CREATE TABLE customers (id int
-PRIMARY KEY, region text)`, `INSERT INTO customers VALUES (1, 'eu'), (2,
-'us'), (3, 'x')` and `CREATE MATERIALIZED VIEW c AS SELECT id, region::int
-AS r FROM customers` (three error records, no rows):
+The tree space section follows `app` to the end of the record. Records of
+format 1 end after `app`; reading one, the engine counts each tree's live
+bytes per segment from its internal nodes (the leaves' frame lengths are in
+their parents' pointers, so no leaf is read; every leaf is at the depth of
+the leftmost one) and takes every root's `due` as 0.
+
+Every record is complete: it lists every tree (the metadata tree included),
+every segment and every tree's live bytes per segment, so only the last
+record matters. The first record of a new data directory, ten seconds after
+`CREATE TABLE customers (id int PRIMARY KEY, region text)`, `INSERT INTO
+customers VALUES (1, 'eu'), (2, 'us'), (3, 'x')` and `CREATE MATERIALIZED
+VIEW c AS SELECT id, region::int AS r FROM customers` (three error records,
+no rows):
 
 ```
-24 00 00 00  b0 1c a3 a4     len 36, crc
+30 00 00 00  f6 fe 2c ac     len 48, crc
 01                           seq 1
-0d                           gsn 13
+0e                           gsn 14
 03                           three trees
 01  01  01 00 2b  06 00  01  tree 1 (customers): root at segment 1, offset 0, 43 bytes; count 3, no aggregates; min_seg 1
-02  01  01 2b a7 09  28 00  01
-                             tree 2 (the metadata tree): root at offset 43, 1191 bytes; 20 entries
+02  01  01 2b b5 09  2a 00  01
+                             tree 2 (the metadata tree): root at offset 43, 1205 bytes; 21 entries
 03  00                       tree 3 (c): empty
-01  01 d2 09 d2 09           one segment: id 1, 1234 bytes written, 1234 live
+01  01 e0 09 e0 09           one segment: id 1, 1248 bytes written, 1248 live
 01                           active segment 1
-d2 09                        active length 1234
+e0 09                        active length 1248
 04                           next tree id 4
 03  02 02 04                 app: format 2, metadata tree 2, next request 4
+03                           tree space of three trees:
+00  01  01 2b                  tree 1: due none; 43 bytes live in segment 1
+00  01  01 b5 09               tree 2: due none; 1205 bytes live in segment 1
+00  00                         tree 3: due none; no live bytes
 ```
 
 A checkpoint after changes to some rows of one tree has the same size; the
-record grows only with the number of trees and segments.
+record grows only with the number of trees and segments (and of the
+segments each tree has nodes in).
 
 ### Reading and updating
 
@@ -517,11 +553,14 @@ record grows only with the number of trees and segments.
 ### Checkpoint procedure
 
 0. The engine writes the metadata changed since the previous checkpoint into
-   the [metadata tree](#the-metadata-tree) (`Engine::persist_meta`).
+   the [metadata tree](#the-metadata-tree) (`Engine::persist_meta`), then
+   runs a maintenance pass, which marks the nodes it rewrites dirty (see
+   [Garbage collection and retention](#garbage-collection-and-retention)).
 1. Every tree with a dirty root is written depth-first, children before their
-   parent, so that each internal node records the final locations of its
-   children; each written frame adds its length to its segment's
-   `total_bytes` and `live_bytes`.
+   parent, so that each internal node records the final locations (and
+   `min_seg` and `due`) of its children; each written frame adds its length
+   to its segment's `total_bytes` and `live_bytes`, and to its tree's live
+   bytes in that segment.
 2. The active segment and any segments sealed since the last checkpoint are
    `fsync`ed.
 3. The checkpoint record is appended to the manifest.
@@ -1027,24 +1066,45 @@ checkpoint of a running engine).
 ## Garbage collection and retention
 
 - **Segment liveness**: the manifest's segment table records, per segment,
-  the bytes written and the bytes still referenced by some tree. A node frame
-  stops being live when its node is modified (dirty), dropped, or released
-  with its tree.
+  the bytes written and the bytes still referenced by some tree, and its tree
+  space section the same live bytes per tree. A node frame stops being live
+  when its node is modified (dirty), dropped, or released with its tree.
 - **Deletion**: after each checkpoint, sealed segments with zero live bytes
   are deleted. The active segment is never deleted or collected.
-- **Relocation** (`Env::gc`, after each checkpoint, budget 1000 nodes): the
-  oldest sealed segment with `live_bytes × 2 < total_bytes` is the victim;
-  nodes stored in it (or in older segments) are marked dirty, found through
-  the per-subtree `min_seg` values, and rewritten by the next checkpoint.
+- **Compaction**: compacting a history at frontier *f* merges its elements
+  at or before *f* into one stamped with the latest of their GSNs, dropped
+  if their weights add up to 0; an entry left without elements is removed.
+  An update compacts the entries it touches, and every entry of a leaf it
+  rebuilds, at the current retention frontier (`processed GSN −
+  --retention-gsns`).
+- **Maintenance pass** (`Env::maintain`, before each checkpoint, which then
+  writes what it rewrote): it rewrites, compacting them, the leaves whose
+  `due` has passed the frontier (found through the subtrees' `due`) and
+  compacts the leaves modified since the last checkpoint. It merges a node
+  left smaller than a quarter of its target size (16 KiB) with a neighbour
+  when both fit in three quarters of it. And it relocates the live nodes of
+  the evacuated segments (chosen below): it marks them dirty (compacting
+  leaves among them), found through the per-subtree `min_seg` values, the
+  per-tree live bytes and the parents' locations of leaves (which it does
+  not read unless they are rewritten). Reading and rewriting clean nodes is
+  budgeted: for compaction and for relocation each, 8 MiB plus the bytes the
+  checkpoints since the previous pass wrote for the engine's own updates.
+- **Evacuated segments**: sealed segments with `live_bytes × 2 <
+  total_bytes`, in decreasing order of `(1 − u) × age / (1 + u)` (`u` =
+  live / total, `age` = active segment id − segment id), while their live
+  bytes fit in the relocation budget (the first always does).
+- **Dropping a tree** reads nothing: its loaded nodes are freed and its live
+  bytes per segment subtracted from the segment table.
 - **Unreferenced trees**: trees present in the checkpoint but not attached by
   any arrangement after recovery (arrangements that no longer exist, whose
   fingerprint changed, or of views and indexes that could not be built and
   are kept as broken) are dropped during start-up, after hydration.
 - **Retention**: history elements at or before the retention frontier
   (`processed GSN − --retention-gsns`) are merged when a leaf is next
-  modified (in the metadata tree too, which merges away replaced records).
-  Input-log segments whose records all lie at or before the checkpoint's
-  GSN are deleted after the checkpoint, whatever the retention.
+  modified or by a maintenance pass (in the metadata tree too, which merges
+  away replaced records). Input-log segments whose records all lie at or
+  before the checkpoint's GSN are deleted after the checkpoint, whatever the
+  retention.
 
 ## Compatibility
 
@@ -1121,6 +1181,7 @@ Consequences of code changes for an existing data directory:
 | format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them |
+| internal node kind 3, the checkpoint record's tree space section | format 1's kind-2 nodes and records without the section are read (see [Internal node](#internal-node) and [Checkpoint record](#checkpoint-record)): the first start reads every tree's internal nodes once, and maintenance passes then visit every subtree once |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
 | inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again, and the rebuilt arrangements' history (`arr_since`) starts at the checkpoint the engine restarted from: `AS OF` reads that need them at earlier GSNs fail |
 | semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
@@ -1129,11 +1190,12 @@ Consequences of code changes for an existing data directory:
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
 Data directories written by earlier versions of the engine are compatible:
-format 1 only gained fields with defaults, and is migrated to format 2 at
-the first start. New functions (registered among the existing ones, which
-renumbers the later ones) and planner fixes did change the fingerprints of
-many views' arrangements (for example joins on computed keys, whose keys
-are materialized in an `Mfp` node, semijoins whose presence inputs match
+format 1 only gained fields with defaults (and a node kind that replaces
+one still read), and is migrated to format 2 at the first start. New
+functions (registered among the existing ones, which renumbers the later
+ones) and planner fixes did change the fingerprints of many views'
+arrangements (for example joins on computed keys, whose keys are
+materialized in an `Mfp` node, semijoins whose presence inputs match
 exactly, and the summaries of `var*`/`stddev*` over `bigint`), so such a
 data directory keeps its tables and rebuilds those arrangements once at its
 first start. `crates/ivm/tests/data/format1` is a format-1 directory that

@@ -161,8 +161,7 @@ A checkpoint is taken on `CHECKPOINT`, on shutdown, and when one is due
 `--checkpoint-secs`, or as soon as dirty nodes exceed half the cache, once
 something durable changed since the last one — a record was applied other
 than a clock tick that changed nothing but the clock (a tick that releases
-temporal-filter events counts), or garbage collection relocated nodes that
-the next checkpoint must write. Ticks alone only add replay work (and 25
+temporal-filter events counts). Ticks alone only add replay work (and 25
 bytes of log each): they make a checkpoint due after 3,600 of them (an hour
 at the default `--tick-ms`), which bounds the replay of an idle engine. An
 engine that is idle takes no checkpoints otherwise.
@@ -176,21 +175,26 @@ engine that is idle takes no checkpoints otherwise.
    source states and resume LSNs, arrangements hydrated or dropped, pending
    slot drops, and the changes of the error state
    ([On-disk format](../on-disk-format.md#the-metadata-tree));
-2. `Env::checkpoint(processed_gsn, header)`: write dirty nodes (of the
-   metadata tree too), `fsync`, append the manifest record — the trees, the
-   segments and the header naming the metadata tree, tens of bytes per tree —
-   (the commit point), delete dead segments
+2. `Env::maintain()`: compact leaves behind the retention frontier, merge
+   underfull nodes, relocate the live nodes of sparse segments, in every
+   tree the metadata tree included
+   ([Storage](storage.md#space-reclamation));
+3. `Env::checkpoint(processed_gsn, header)`: write dirty nodes (those the
+   maintenance pass rewrote too), `fsync`, append the manifest record — the
+   trees, the segments, the header naming the metadata tree and each tree's
+   live bytes per segment, tens of bytes per tree — (the commit point),
+   delete dead segments
    ([Storage](storage.md#segments-and-checkpoints));
-3. `Env::gc(1000)`: relocate live nodes of the oldest sparse segment;
 4. send `Truncate(processed)` to the sequencer, which deletes log segments
    whose records all lie at or before the checkpoint: recovery replays the
    log after the checkpoint, and nothing else reads the log (`AS OF` reads
    use the histories in the trees).
 
 The engine thread does nothing else while a checkpoint runs. Its cost is
-that of the nodes that changed since the previous one; it does not depend
-on the size of what did not change (the catalog, its history of up to
-11,000 statements, the error records).
+that of the nodes that changed since the previous one and of the
+maintenance pass's budgeted work; it does not depend on the size of what
+did not change (the catalog, its history of up to 11,000 statements, the
+error records).
 
 ## Source resumption
 
