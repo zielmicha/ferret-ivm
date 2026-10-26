@@ -377,9 +377,9 @@ fn copy_dir(from: &Path, to: &Path) {
 }
 
 /// The application state (JSON) of the format-1 directory's checkpoint
-/// (read from a copy: opening a store may modify it).
-fn format1_state() -> serde_json::Value {
-    let dir = tmpdir("format1-state");
+/// (read from a copy named `name`: opening a store may modify it).
+fn format1_state(name: &str) -> serde_json::Value {
+    let dir = tmpdir(name);
     copy_dir(Path::new(FORMAT1), &dir);
     let (_env, rec) = ivm::storage::Env::open(&dir.join("store"), Default::default()).unwrap();
     let app = serde_json::from_slice(&rec.expect("a checkpoint").app).unwrap();
@@ -455,7 +455,7 @@ fn checkpoint_state(dir: &Path) -> Vec<u8> {
 /// checkpoints carry a small header naming the metadata tree.
 #[test]
 fn format1_data_directories_are_migrated() {
-    let app = format1_state();
+    let app = format1_state("format1-state");
     let dir = tmpdir("format1");
     copy_dir(Path::new(FORMAT1), &dir);
     assert!(!dir.join("FORMAT").exists());
@@ -492,7 +492,7 @@ fn format1_data_directories_are_migrated() {
 /// finds a record of the current format and only records the format.
 #[test]
 fn a_crash_during_migration_migrates_again() {
-    let app = format1_state();
+    let app = format1_state("format1-crash-state");
     let dir = tmpdir("format1-crash");
     copy_dir(Path::new(FORMAT1), &dir);
     let manifest = std::fs::read(dir.join("store/MANIFEST")).unwrap();
