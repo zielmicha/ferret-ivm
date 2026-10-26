@@ -214,8 +214,7 @@ pub struct Env {
     /// Write internal nodes as kind 2 and checkpoint records without tree
     /// space (tests of stores written by earlier versions).
     legacy_format: bool,
-    /// The manifest (None in forks, and while a checkpoint job holds it
-    /// with the segment writer).
+    /// The manifest (None in forks, and while a checkpoint job holds it).
     manifest: Option<Manifest>,
     /// Source of `Slot::version` stamps.
     stamp: u64,
@@ -251,7 +250,7 @@ struct Flushed {
 }
 
 /// A checkpoint in progress (`Env::begin_checkpoint`): a version of the
-/// dirty nodes with the store's append side and manifest.
+/// dirty nodes with the manifest (the append side is shared).
 pub struct CheckpointJob {
     env: Env,
     gsn: Gsn,
