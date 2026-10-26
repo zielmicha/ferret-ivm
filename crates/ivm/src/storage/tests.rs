@@ -1704,6 +1704,66 @@ impl Summarizer for WideTextSummarizer {
     }
 }
 
+/// Merging underfull nodes (after updates, and in maintenance passes)
+/// combines their summaries: the result must be the summary of the merged
+/// contents, also for MIN/MAX values held as prefixes, whose hash says
+/// whether all entries with the prefix have the same value — runs of one
+/// wide value, and different wide values sharing a prefix, end up in merged
+/// leaves and internal nodes.
+#[test]
+fn merges_keep_wide_extremes_exact() {
+    let tmp = TempDir::new("storage-merge-wide");
+    let opts = EnvOptions { leaf_bytes: 4096, internal_bytes: 2048, ..EnvOptions::default() };
+    let (mut env, _) = Env::open(tmp.path(), opts).unwrap();
+    let tree = env.create_tree(Arc::new(WideTextSummarizer));
+    let p = "p".repeat(300);
+    // equal wide values in runs, distinct ones sharing their prefix, and
+    // values that order before and after them
+    let value = |i: u64| match i % 50 {
+        0..20 => format!("{p}a"),
+        20..30 => format!("{p}{}", i % 3),
+        30..40 => format!("o{}", "z".repeat(200)),
+        _ => format!("q{i}"),
+    };
+    let entry = |i: u64| [&i.to_be_bytes()[..], value(i).as_bytes()].concat();
+    let n = 4000u64;
+    env.apply(tree, &mut (0..n).map(|i| (entry(i), 1)).collect(), 1).unwrap();
+    env.checkpoint(1, b"").unwrap();
+    let summ = WideTextSummarizer;
+    let mut rng = Rng::new(11);
+    let check = |env: &mut Env, rng: &mut Rng| {
+        env.check_summaries(tree).unwrap();
+        for _ in 0..20 {
+            let (a, b) = (rng.below(n + 1), rng.below(n + 1));
+            let (lo, hi) = (a.min(b).to_be_bytes(), a.max(b).to_be_bytes());
+            let got = env.range_summary(tree, Bound::Included(&lo), Bound::Excluded(&hi)).unwrap();
+            let mut want = Summary::empty(summ.spec());
+            for (k, h) in env.scan(tree, Bound::Included(&lo), Bound::Excluded(&hi)).unwrap() {
+                summ.add_entry(&mut want, &k, h.total()).unwrap();
+            }
+            assert!(got.exact_eq(&want), "{got:?} vs {want:?}");
+        }
+    };
+    let (leaves, _, _, _) = shape(&mut env, tree);
+    // delete most rows in rounds: leaves left underfull merge
+    let mut g = 1;
+    let mut merged = 0;
+    for round in 0..4u64 {
+        g += 1;
+        let mut ups: Vec<_> = (0..n).filter(|i| i % 8 != 0 && i % 4 == round).map(|i| (entry(i), -1)).collect();
+        env.apply(tree, &mut ups, g).unwrap();
+        check(&mut env, &mut rng);
+        env.set_frontier(g);
+        merged += env.maintain_with(MaintBudget::UNLIMITED).unwrap().merged;
+        env.checkpoint(g, b"").unwrap();
+        check(&mut env, &mut rng);
+    }
+    let (after, _, entries, _) = shape(&mut env, tree);
+    assert_eq!(entries as u64, n / 8);
+    assert!(merged > 0 && after * 3 < leaves, "{leaves} leaves, {after} after deleting 7/8 ({merged} merges in passes)");
+    assert!(env.tree_summary(tree).aggs.iter().any(AggState::is_prefix));
+}
+
 /// Node summaries hold prefixes of wide MIN/MAX values, so internal nodes
 /// stay within their target size and a one-row change rewrites little,
 /// while range summaries still return the values. (With the values

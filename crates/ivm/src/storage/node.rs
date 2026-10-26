@@ -1,7 +1,7 @@
 //! B+tree node representation and on-disk serialization.
 
 use super::history::History;
-use super::summary::Summary;
+use super::summary::{uvarint_len, Summary};
 use super::Gsn;
 use crate::error::{Result, SqlError};
 use crate::types::codec::{get_bytes, get_ivarint, get_u8, get_uvarint, put_bytes, put_ivarint, put_uvarint};
@@ -181,10 +181,12 @@ pub fn entry_size(e: &LeafEntry) -> usize {
     e.key.len() + 4 + e.hist.0.len() * 6
 }
 
-/// The separator and summary as encoded, plus the child's location and
-/// `min_seg`.
+/// The separator, `due` and summary as encoded, plus the child's location
+/// and `min_seg`. (A node's byte size must follow every change of these:
+/// writing a node makes its children's `due` exact, merging two children
+/// combines their summaries.)
 pub fn child_size(c: &Child) -> usize {
-    c.sep.len() + 24 + c.summary.encoded_len()
+    c.sep.len() + 24 + uvarint_len(c.due.wrapping_add(1)) + c.summary.encoded_len()
 }
 
 /// Compaction state of a leaf: the smallest frontier at which compacting it

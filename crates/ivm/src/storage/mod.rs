@@ -1086,7 +1086,8 @@ impl Env {
         self.make_dirty(a);
         self.make_dirty(b);
         let right = children.remove(l + 1);
-        *size -= node::child_size(&right);
+        // (the merged child's summary and `due` change, and with them its size)
+        *size -= node::child_size(&right) + node::child_size(&children[l]);
         let nb = self.slot_mut(b).node.take().expect("node taken");
         let na = self.slot_mut(a).node.take().expect("node taken");
         let c = &mut children[l];
@@ -1115,6 +1116,7 @@ impl Env {
             }
             _ => unreachable!("siblings at different depths"),
         };
+        *size += node::child_size(c);
         self.put_node(a, merged);
         self.put_node(b, Node::Leaf(Vec::new()));
         self.free_slot(b);
@@ -1768,6 +1770,8 @@ impl Env {
         }
         let mut node = self.slot_mut(id).node.take().unwrap();
         let mut locs = Vec::new();
+        // the node's byte size, which counts its children's `due`
+        let mut bytes = self.slot(id).bytes;
         if let Node::Internal(children) = &mut node {
             locs.reserve(children.len());
             for c in children.iter_mut() {
@@ -1778,6 +1782,7 @@ impl Env {
                         let (loc, ms, due) = self.flush_node(cid)?;
                         if was_dirty {
                             c.min_seg = ms;
+                            bytes = bytes + summary::uvarint_len(due.wrapping_add(1)) - summary::uvarint_len(c.due.wrapping_add(1));
                             c.due = due;
                         }
                         locs.push(loc);
@@ -1785,7 +1790,7 @@ impl Env {
                 }
             }
         }
-        let mut buf = Vec::with_capacity(node.byte_size() + 16);
+        let mut buf = Vec::with_capacity(bytes + 16);
         node.encode_as(&locs, &mut buf, self.legacy_format);
         let loc = self.segs.append(&buf)?;
         let (tree, by_maint) = (self.slot(id).tree, self.slot(id).by_maint);
@@ -1800,8 +1805,8 @@ impl Env {
                 ch.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX),
             ),
         };
+        self.put_node_sized(id, node, bytes);
         let slot = self.slot_mut(id);
-        slot.node = Some(node);
         slot.disk = Some(loc);
         slot.by_maint = false;
         if slot.dirty {
@@ -2033,7 +2038,9 @@ impl Env {
             match self.maint_node(cid, depth + 1, &children[i].summary, children[i].due, m, summ)? {
                 Visit::Same => i += 1,
                 Visit::Due(d) => {
+                    size -= node::child_size(&children[i]);
                     children[i].due = d;
+                    size += node::child_size(&children[i]);
                     changed = true;
                     i += 1;
                 }

@@ -42,9 +42,12 @@ first child); a key belongs to the last child whose separator is `<=` it.
 Nodes are split by size: the target is 16 KiB of estimated serialized size
 for leaves and for internal nodes (`node::entry_size`, `node::child_size`: a
 leaf entry counts its key, 4 bytes and 6 per history element; a child its
-separator, its summary as encoded and 24 bytes). A node whose contents
-after an update exceed the target is split into chunks of balanced size (internal nodes keep
-at least two children per chunk); when they exceed twice the target (a bulk
+separator, its `due` and its summary as encoded and 24 bytes). Each node's
+estimate is kept exact as its contents change, also when writing it makes
+its children's `due` exact or a merge combines two children's summaries. A
+node whose contents after an update exceed the target is split into chunks
+of balanced size (internal nodes keep at least two children per chunk);
+when they exceed twice the target (a bulk
 load, hydration), the chunks are filled to 90% of it, so that the next
 inserts do not split every node right away. After an append — a leaf
 whose updates all lie past its last key, or an internal node whose updates
@@ -63,7 +66,9 @@ not split again soon); the result is merged again while it is still that
 small. Merging internal nodes moves the right node's children, its first
 child taking the right node's separator. Merging never changes the parent's
 summary (the same entries), and the merged node's summary is the two
-summaries combined.
+summaries combined, which is exactly the summary of the merged entries:
+sums add exactly, and a `min`/`max` held as a prefix keeps its hash only
+when both sides had the same one (see [Summaries](#summaries)).
 
 `due` is the smallest retention frontier at which compacting some leaf of
 the subtree would remove at least a quarter of that leaf's estimated size

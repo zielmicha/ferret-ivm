@@ -737,7 +737,7 @@ impl AggState {
     }
 }
 
-fn uvarint_len(v: u64) -> usize {
+pub(crate) fn uvarint_len(v: u64) -> usize {
     (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
 }
 
