@@ -865,6 +865,10 @@ impl Conn {
     fn send(&mut self) -> Result<()> {
         let r = self.stream.write_all(&self.wbuf);
         self.wbuf.clear();
+        // (a large query must not keep its buffer)
+        if self.wbuf.capacity() > 4 << 20 {
+            self.wbuf = Vec::with_capacity(1024);
+        }
         r.map_err(|e| {
             let e = Error::from(e);
             self.fail(e)
