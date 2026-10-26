@@ -180,8 +180,8 @@ pub struct Env {
     frontier: Gsn,
     checkpoint_seq: u64,
     checkpoint_gsn: Gsn,
-    /// Bytes checkpoints wrote for nodes the engine (not the maintenance
-    /// pass) modified, since the last pass.
+    /// Bytes written (by checkpoints or early) for nodes the engine (not
+    /// the maintenance pass) modified, since the last pass.
     fg_appended: u64,
     /// Write internal nodes as kind 2 and checkpoint records without tree
     /// space (tests of stores written by earlier versions).
@@ -1927,13 +1927,20 @@ impl Env {
     /// frame with the rest of the segment beyond the recorded length (or
     /// the segment, if it was started after the checkpoint). If the node is
     /// modified again, the frame is garbage like any replaced node's.
-    /// `idx` is the node's position in its parent, if known.
+    ///
+    /// The one way nodes are written, early or by a checkpoint: the frame
+    /// counts as live in its segment and its tree's, and towards the next
+    /// maintenance pass's budget unless that pass dirtied the node; the
+    /// child entry above it gets the node's exact `min_seg` and `due` (the
+    /// parent's size follows), the entries above that a `min_seg` lowered
+    /// to it where they were higher (they cover more than the node), and so
+    /// does the tree when the node is its root. `idx` is the node's position
+    /// in its parent, if known.
     fn write_node(&mut self, id: u32, idx: usize) -> Result<DiskLoc> {
         let slot = self.slot(id);
         debug_assert!(slot.dirty, "writing a clean node");
         let node = slot.node.as_ref().expect("node taken");
         let mut locs = Vec::new();
-        let mut min_seg = u32::MAX;
         if let Node::Internal(children) = node {
             locs.reserve(children.len());
             for c in children {
@@ -1941,49 +1948,70 @@ impl Env {
                     NodePtr::Disk(loc) => loc,
                     NodePtr::Mem(cid) => self.slot(cid).disk.expect("writing a node above a dirty child"),
                 });
-                min_seg = min_seg.min(c.min_seg);
             }
         }
         let mut buf = Vec::with_capacity(slot.bytes + 16);
         node.encode_as(&locs, &mut buf, self.legacy_format);
+        // (the entries of clean children are exact)
+        let (min_seg, due) = match node {
+            Node::Leaf(entries) => (u32::MAX, leaf_due(entries)),
+            Node::Internal(ch) => (ch.iter().map(|c| c.min_seg).min().unwrap_or(u32::MAX), ch.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX)),
+        };
+        let (tree, by_maint) = (slot.tree, slot.by_maint);
         let loc = self.segs.append(&buf)?;
-        let tree = self.slot(id).tree;
-        self.add_live(tree, loc);
         let min_seg = min_seg.min(loc.seg);
+        self.add_live(tree, loc);
+        if !by_maint {
+            self.fg_appended += loc.len as u64;
+        }
         let slot = self.slot_mut(id);
         slot.disk = Some(loc);
         slot.dirty = false;
+        slot.by_maint = false;
         let (mem, parent) = (slot.mem, slot.parent);
         self.dirty_bytes -= mem;
-        // The entry above the node covers exactly its subtree; the entries
-        // above that cover the subtree and more, so they can only drop to
-        // `min_seg` (the active segment: no lower unless already lower).
-        let mut child = id;
-        let mut at = parent;
-        let mut hint = idx;
-        let mut exact = true;
+        if parent == NONE {
+            if let Some(t) = self.trees.get_mut(&tree)
+                && t.root == Some(NodePtr::Mem(id))
+            {
+                t.min_seg = min_seg;
+                t.due = due;
+            }
+            return Ok(loc);
+        }
+        // the entry above the node, exact
+        let Some(Node::Internal(ch)) = self.slots[parent as usize].as_mut().and_then(|s| s.node.as_mut()) else {
+            unreachable!("parent of a loaded node is not a loaded internal node")
+        };
+        let i = match ch.get(idx) {
+            Some(c) if c.ptr == NodePtr::Mem(id) => idx,
+            _ => ch.iter().position(|c| c.ptr == NodePtr::Mem(id)).expect("child pointer"),
+        };
+        let c = &mut ch[i];
+        let resized = summary::uvarint_len(due.wrapping_add(1)) as isize - summary::uvarint_len(c.due.wrapping_add(1)) as isize;
+        c.min_seg = min_seg;
+        c.due = due;
+        let p = self.slot_mut(parent);
+        p.bytes = p.bytes.checked_add_signed(resized).expect("node size");
+        // the entries above that, lowered
+        let mut child = parent;
+        let mut at = self.slot(parent).parent;
         while at != NONE {
             let Some(Node::Internal(ch)) = self.slots[at as usize].as_mut().and_then(|s| s.node.as_mut()) else {
                 unreachable!("parent of a loaded node is not a loaded internal node")
             };
-            let i = match ch.get(hint) {
-                Some(c) if c.ptr == NodePtr::Mem(child) => hint,
-                _ => ch.iter().position(|c| c.ptr == NodePtr::Mem(child)).expect("child pointer"),
-            };
-            if exact {
-                ch[i].min_seg = min_seg;
-            } else if ch[i].min_seg <= min_seg {
+            let c = ch.iter_mut().find(|c| c.ptr == NodePtr::Mem(child)).expect("child pointer");
+            if c.min_seg <= min_seg {
                 return Ok(loc);
-            } else {
-                ch[i].min_seg = min_seg;
             }
-            exact = false;
-            hint = usize::MAX;
+            c.min_seg = min_seg;
             child = at;
             at = self.slot(at).parent;
         }
-        if let Some(t) = self.trees.get_mut(&tree) {
-            t.min_seg = if exact { min_seg } else { t.min_seg.min(min_seg) };
+        if let Some(t) = self.trees.get_mut(&tree)
+            && t.root == Some(NodePtr::Mem(child))
+        {
+            t.min_seg = t.min_seg.min(min_seg);
         }
         Ok(loc)
     }
@@ -2126,16 +2154,16 @@ impl Env {
     // maintenance: compaction, merging and segment GC
 
     /// One maintenance pass with the default budget: for compaction and
-    /// for GC each, `MAINT_MIN_BYTES` plus the bytes checkpoints wrote for
-    /// the engine's own updates since the previous pass (garbage arises at
+    /// for GC each, `MAINT_MIN_BYTES` plus the bytes written for the
+    /// engine's own updates since the previous pass (garbage arises at
     /// that rate, so reclaiming keeps pace with it). Run before a
     /// checkpoint, which then writes the nodes it rewrote.
     pub fn maintain(&mut self) -> Result<MaintStats> {
         let written = std::mem::take(&mut self.fg_appended);
         let b = MAINT_MIN_BYTES.saturating_add(written);
-        // the nodes it rewrites stay in the pool, dirty, until the
-        // checkpoint writes them: what the pool's target leaves besides the
-        // dirty nodes it holds (only clean ones can be evicted)
+        // the nodes it rewrites are dirty until the checkpoint after it
+        // writes them: what the pool's target leaves besides the dirty
+        // nodes it holds (which the pool keeps within half of the target)
         let memory = self.opts.cache_bytes.saturating_sub(self.dirty_bytes);
         self.maintain_with(MaintBudget { compact: b, gc: b, memory })
     }

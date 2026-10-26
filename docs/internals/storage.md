@@ -410,10 +410,14 @@ prefix. `EXPLAIN MAINTENANCE` and `SHOW` use tree counts.
 
 Nodes are written to the **active segment** (`store/seg-<id>.dat`), an
 append-only file that is rolled over to the next id once it reaches
-256 MiB, by checkpoints and by the buffer pool's early writes. Writing a
-node lowers the `min_seg` of the child entry above it to the node's exact
-value, and the entries above that (and the tree's) to it where they were
-higher. A checkpoint (`Env::checkpoint(gsn, app)`):
+256 MiB, by checkpoints and by the buffer pool's early writes, which are
+the same operation (`write_node`, for a dirty node whose loaded children
+are clean): the frame counts as live bytes of its segment and of its tree,
+and towards the next maintenance pass's budget unless that pass dirtied
+the node; the child entry above the node gets its exact `min_seg` and
+`due` (and the parent's size, which counts the `due`, follows), and the
+entries above that (and the tree's) get a `min_seg` lowered to it where
+they were higher. A checkpoint (`Env::checkpoint(gsn, app)`):
 
 1. writes every remaining dirty node of every tree, depth-first so that
    each parent is written after its children and records their locations,
@@ -484,13 +488,13 @@ leaf of a tree is at the depth of the first one the pass reaches.
 
 Reading and rewriting clean nodes is budgeted (`MaintBudget`; rewriting the
 path to a rewritten node and anything dirty is not counted): for compaction
-(and merges) and for evacuation each, 8 MiB plus the bytes checkpoints
-wrote for the engine's own updates since the previous pass, which is the
-rate at which garbage arises. The nodes it rewrites stay in the buffer pool,
-dirty, until the checkpoint writes them, so their memory is budgeted too:
-no more than the pool's target leaves besides the dirty nodes already in it
-(only clean nodes can be evicted; the forced checkpoint at half the target
-leaves at least the other half). What does not fit waits for the next pass:
+(and merges) and for evacuation each, 8 MiB plus the bytes written for the
+engine's own updates since the previous pass (by checkpoints and early),
+which is the rate at which garbage arises. The nodes it rewrites are dirty
+until the checkpoint that follows the pass writes them, so their memory is
+budgeted too: no more than the pool's target leaves besides the dirty
+nodes already in it (the buffer pool keeps those within half of the
+target, writing the rest early). What does not fit waits for the next pass:
 the pass reports that it left work (`MaintStats::unfinished`), which makes
 the engine's next checkpoint due even if nothing else changes.
 `maintain_with` takes an explicit budget (a zero budget compacts only dirty
