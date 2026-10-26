@@ -177,6 +177,9 @@ pub struct Env {
     /// evict or write: sweeps resume once either has grown well past it.
     evict_stall: Option<(usize, usize)>,
     swept_slots: u64,
+    /// The transient working memory that sort runs and spilled deltas are
+    /// sized from (`set_work`).
+    work: crate::memory::Work,
     trees: FxHashMap<TreeId, TreeState>,
     next_tree_id: TreeId,
     /// segment id -> (total bytes written, live bytes referenced)
@@ -354,6 +357,7 @@ impl Env {
         let (manifest, rec) = Manifest::open(dir)?;
         let (active_seg, active_len) = rec.as_ref().map(|r| (r.active_seg, r.active_len)).unwrap_or((1, 0));
         let segs = SegmentStore::open(dir, active_seg, active_len, opts.segment_bytes)?;
+        let opts_cache = opts.cache_bytes;
         let mut env = Env {
             dir: dir.to_path_buf(),
             opts,
@@ -366,6 +370,7 @@ impl Env {
             clock_hand: 0,
             evict_stall: None,
             swept_slots: 0,
+            work: crate::memory::Work::new(opts_cache / 8),
             trees: FxHashMap::default(),
             next_tree_id: 1,
             seg_live: BTreeMap::new(),
@@ -530,6 +535,18 @@ impl Env {
     /// next access evicts down to it.
     pub fn set_cache_bytes(&mut self, bytes: usize) {
         self.opts.cache_bytes = bytes;
+    }
+
+    /// The transient working memory the users of this environment size
+    /// their buffers from and charge them to (by default an eighth of the
+    /// pool's initial target, of its own; an engine's is its memory
+    /// budget's share).
+    pub fn work(&self) -> &crate::memory::Work {
+        &self.work
+    }
+
+    pub fn set_work(&mut self, work: crate::memory::Work) {
+        self.work = work;
     }
 
     /// The stored summary of the whole tree (MIN/MAX values too wide for
@@ -762,16 +779,16 @@ impl Env {
         }
         let summ = self.trees.get(&tree).ok_or_else(|| SqlError::internal(format!("no tree {tree}")))?.summarizer.clone();
         // A large batch is applied in runs of consecutive keys, each dirtying
-        // at most a quarter of the cache (a whole leaf per update at worst),
-        // and the pool makes room between runs: a batch never needs its
-        // dirty nodes to fit in memory at once.
-        let budget = (self.opts.cache_bytes / 4).max(4 * self.opts.leaf_bytes);
+        // at most a quarter of the pool's target (a whole leaf per update at
+        // worst, in memory), and the pool makes room between runs: a batch
+        // never needs its dirty nodes to fit in memory at once.
+        let budget = (self.opts.cache_bytes / 4).max(4 * self.leaf_mem(16));
         let mut start = 0;
         while start < updates.len() {
             let mut end = start;
             let mut cost = 0;
-            while end < updates.len() && (end == start || cost + self.opts.leaf_bytes + updates[end].0.len() <= budget) {
-                cost += self.opts.leaf_bytes + updates[end].0.len();
+            while end < updates.len() && (end == start || cost + self.leaf_mem(updates[end].0.len()) <= budget) {
+                cost += self.leaf_mem(updates[end].0.len());
                 end += 1;
             }
             if let Err(e) = self.apply_run(tree, &updates[start..end], gsn, &summ) {
@@ -783,6 +800,14 @@ impl Env {
         }
         updates.clear();
         Ok(())
+    }
+
+    /// Memory of a full leaf of entries with `key`-byte keys and one change
+    /// each (`Node::mem_size`): what an update dirties at most, besides
+    /// the path above it.
+    fn leaf_mem(&self, key: usize) -> usize {
+        let entries = self.opts.leaf_bytes / (key + 10) + 1;
+        SLOT_BYTES + entries * (std::mem::size_of::<LeafEntry>() + crate::memory::heap_block(key))
     }
 
     /// Apply sorted, consolidated updates (one descent from the root).

@@ -2,15 +2,16 @@
 //!
 //! One limit (`--memory-mb`) covers the memory the server keeps data in:
 //! the buffer pool of tree nodes, the group caches of aggregations, the
-//! records waiting to be applied, and the changes queued for subscriptions
-//! and sinks. Everything is measured in bytes of memory — the sizes of the
-//! structs and of the heap blocks they own ([`heap_block`]) — not in
-//! serialized bytes or in counts, so that a limit means the same for narrow
-//! and for wide rows.
+//! records waiting to be applied, the changes queued for subscriptions
+//! and sinks, and the dataflow's transient working memory (`Work`).
+//! Everything is measured in bytes of memory — the sizes of the structs and
+//! of the heap blocks they own ([`heap_block`]) — not in serialized bytes or
+//! in counts, so that a limit means the same for narrow and for wide rows.
 //!
-//! Queues and caches get limits derived from the total; the buffer pool gets
-//! what they leave over, but never less than a quarter of it (it is the only
-//! part that can always give memory back, by evicting clean nodes).
+//! Queues, caches and working memory get limits derived from the total; the
+//! buffer pool gets what they leave over, but never less than a quarter of
+//! it (it is the only part that can always give memory back, by evicting
+//! clean nodes and writing dirty ones).
 
 use crate::dataflow::{Delta, TableChange};
 use crate::log::LogRecord;
@@ -168,6 +169,18 @@ impl Charge {
     pub fn none() -> Charge {
         Charge::default()
     }
+
+    /// Count `n` more bytes (a charge counting nothing only notes them).
+    pub fn grow(&mut self, n: usize) {
+        if let Some(m) = &self.meter {
+            m.add(n);
+        }
+        self.bytes += n;
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 impl Drop for Charge {
@@ -251,6 +264,50 @@ impl CacheMeter {
     }
 }
 
+/// Transient working memory of the dataflow: deltas and key sets kept in
+/// memory for one GSN, sort buffers of indexes built or updated in bulk,
+/// and the rows joins look up at once. Every such buffer charges what it
+/// holds (`charge`) against one share of the budget, and spills (or
+/// applies) it to temporary trees or the target index once it is `full`:
+/// beyond its own cap, or, while the buffers together exceed the share,
+/// beyond a sixteenth of it. The share is set aside from the buffer pool's.
+#[derive(Clone, Debug)]
+pub struct Work {
+    meter: Arc<Meter>,
+    limit: Arc<AtomicUsize>,
+}
+
+impl Work {
+    /// Working memory of its own, within `limit` bytes (an environment
+    /// outside an engine).
+    pub fn new(limit: usize) -> Work {
+        Work { meter: Meter::new(), limit: Arc::new(AtomicUsize::new(limit)) }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    pub fn used(&self) -> usize {
+        self.meter.used()
+    }
+
+    /// The cap of one buffer: half the share, within `lo` and `hi`.
+    pub fn buffer(&self, lo: usize, hi: usize) -> usize {
+        (self.limit() / 2).clamp(lo, hi)
+    }
+
+    /// A charge to grow as a buffer fills (`Charge::grow`), released with it.
+    pub fn charge(&self) -> Charge {
+        self.meter.charge(0)
+    }
+
+    /// Should a buffer whose cap is `cap` spill what it holds (`own`)?
+    pub fn full(&self, own: usize, cap: usize) -> bool {
+        own > cap || (own > cap / 16 && self.used() > self.limit())
+    }
+}
+
 /// The process memory budget and the meters of the parts that are not the
 /// buffer pool (the pool's own use is `Env`'s accounting; the group caches
 /// are metered by the dataflow graph).
@@ -261,11 +318,18 @@ pub struct MemBudget {
     pub input: Meter,
     /// Changes queued for subscriptions and sinks (all of them).
     pub outputs: Arc<Meter>,
+    /// The dataflow's transient working memory: an eighth.
+    pub work: Work,
 }
 
 impl Default for MemBudget {
     fn default() -> Self {
-        MemBudget { total: AtomicUsize::new(DEFAULT_TOTAL), input: Meter::default(), outputs: Meter::new() }
+        MemBudget {
+            total: AtomicUsize::new(DEFAULT_TOTAL),
+            input: Meter::default(),
+            outputs: Meter::new(),
+            work: Work::new(DEFAULT_TOTAL / 8),
+        }
     }
 }
 
@@ -276,6 +340,7 @@ impl MemBudget {
 
     pub fn set_total(&self, bytes: usize) {
         self.total.store(bytes, Ordering::Relaxed);
+        self.work.limit.store(bytes / 8, Ordering::Relaxed);
     }
 
     /// Records the engine may still have to apply: an eighth of the total
@@ -295,11 +360,11 @@ impl MemBudget {
         self.total() / 8
     }
 
-    /// The buffer pool's share: what the other parts leave over, at least a
-    /// quarter of the total.
+    /// The buffer pool's share: what the other parts leave over (the
+    /// working memory's share set aside), at least a quarter of the total.
     pub fn pool_target(&self, caches: usize) -> usize {
         let total = self.total();
-        total.saturating_sub(self.input.used() + self.outputs.used() + caches).max(total / 4)
+        total.saturating_sub(self.input.used() + self.outputs.used() + caches + self.work.limit()).max(total / 4)
     }
 
     /// Wait until the records waiting to be applied are below their limit,
@@ -341,11 +406,31 @@ mod tests {
     fn the_pool_gets_what_the_others_leave_but_a_quarter_at_least() {
         let b = MemBudget::default();
         b.set_total(1000);
-        assert_eq!(b.pool_target(0), 1000);
+        assert_eq!(b.work.limit(), 125);
+        assert_eq!(b.pool_target(0), 875);
         b.input.add(100);
         let _c = b.outputs.charge(200);
-        assert_eq!(b.pool_target(50), 650);
+        assert_eq!(b.pool_target(50), 525);
         assert_eq!(b.pool_target(600), 250);
+    }
+
+    #[test]
+    fn working_buffers_spill_at_their_cap_or_when_together_over_the_share() {
+        let w = Work::new(1000);
+        assert_eq!(w.buffer(0, usize::MAX), 500);
+        assert_eq!(w.buffer(600, usize::MAX), 600);
+        let mut a = w.charge();
+        a.grow(400);
+        assert!(!w.full(400, 500));
+        assert!(w.full(501, 500), "over its cap");
+        let mut b = w.charge();
+        b.grow(700);
+        assert_eq!(w.used(), 1100);
+        assert!(w.full(400, 500), "together over the share");
+        assert!(!w.full(20, 500), "too small to be worth spilling");
+        drop(b);
+        assert_eq!(w.used(), 400);
+        assert!(!w.full(400, 500));
     }
 
     #[test]

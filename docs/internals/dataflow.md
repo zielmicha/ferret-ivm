@@ -27,10 +27,14 @@ sees a change that cancels within a GSN, and a GSN's changes appear
 atomically.
 
 A node's delta at a GSN (`delta::NodeDelta`) is held in memory
-(`delta::Rows::Mem`, a `Vec<(Row, i64)>`) while its rows' estimated size
-(`row_bytes`) stays within the *spill threshold*, an eighth of the cache
-(within 1 and 256 MiB; `IVM_DELTA_SPILL_BYTES` overrides it, and the tests
-run with 0, which spills every delta). A larger one is **spilled**
+(`delta::Rows::Mem`, a `Vec<(Row, i64)>`) while its rows' memory stays
+within the *spill threshold*: a buffer of the transient working memory,
+the memory budget's share that every in-memory delta, key set and sort
+buffer charges until it is freed (`memory::Work`: half the share, within 1
+and 256 MiB, and less while the buffers together exceed the share, see
+[Memory](architecture.md#memory); `IVM_DELTA_SPILL_BYTES` overrides it,
+and the tests run with 0, which spills every delta). A larger one is
+**spilled**
 (`delta::Rows::Tree`) into temporary storage trees, one per *target*: each
 hydrated arrangement of the node, in the arrangement's encoding, or, for a
 node without arrangements, an index by all columns (the encoding of a full

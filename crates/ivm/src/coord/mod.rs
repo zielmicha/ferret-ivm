@@ -423,9 +423,11 @@ pub fn start(cfg: Config) -> Result<Running> {
 
 impl Engine {
     /// An engine with an empty catalog over `env`, before recovery.
-    fn new(cfg: Config, env: Env, seq: Sender<SeqMsg>, shared: Arc<Shared>) -> Engine {
+    fn new(cfg: Config, mut env: Env, seq: Sender<SeqMsg>, shared: Arc<Shared>) -> Engine {
         let graph = Graph::new();
         graph.group_caches.set_limit(shared.mem.cache_limit());
+        // sort buffers and per-GSN deltas draw from the budget's share
+        env.set_work(shared.mem.work.clone());
         Engine {
             cfg,
             env,

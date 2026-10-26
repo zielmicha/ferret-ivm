@@ -24,7 +24,7 @@ Requirements and environment:
 | `IVM_TEST_TMP` | the `ivm` crate's tests | parent of their data directories (default: the temporary directory); a failing test keeps its directory for inspection |
 | `PROPTEST_CASES`, `PROPTEST_RNG_SEED` | property tests (proptest) | number of cases per property (each test has its own default), and a fixed seed for the random cases |
 | `SELFDIFF_VERBOSE` | `tests/selfdiff.rs` | print each case's views and actions as it runs |
-| `IVM_DELTA_SPILL_BYTES` | the engine | the size beyond which a per-GSN delta or key set is spilled into a temporary tree (default: an eighth of the cache); `0` spills every one, which runs every operator on spilled input (see below) |
+| `IVM_DELTA_SPILL_BYTES` | the engine | the size beyond which a per-GSN delta or key set is spilled into a temporary tree (default: half the working memory's share of the memory budget, within 1 and 256 MiB); `0` spills every one, which runs every operator on spilled input (see below) |
 
 Only the `pgproto` integration tests (`client`, `replication`,
 `server_codec`, `testutil`), the engine's replication tests
@@ -84,7 +84,7 @@ cargo test -p ivm --lib storage::tests -- --ignored     # 100 cases of up to 2,5
 cargo test -p ivm --release --test selfdiff -- --ignored  # 50 bigger cases (minutes)
 ```
 
-Large deltas (beyond an eighth of the cache) take other code paths than
+Large deltas (beyond the spill threshold) take other code paths than
 small ones: spilled into temporary trees, read in batches, their affected
 keys collected in temporary trees. Run the dataflow suites with every delta
 spilled too:

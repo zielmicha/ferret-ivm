@@ -286,10 +286,12 @@ fn lookup_prefix(
 }
 
 /// Estimated bytes of a path's frontier looked up at once (a lookup step's
-/// matches of that many rows are held at a time). Large enough that rows
-/// with equal keys share lookups and lookups in key order find their
-/// leaves in the cache.
-const PATH_BYTES: usize = 8 << 20;
+/// matches of that many rows are held at a time): a buffer of the working
+/// memory, at most 8 MiB. Large enough that rows with equal keys share
+/// lookups and lookups in key order find their leaves in the cache.
+fn path_bytes(env: &Env) -> usize {
+    env.work().buffer(256 << 10, 8 << 20)
+}
 
 /// Extend `start` (rows of the path's source) along the path, handing the
 /// joined rows to `out` in batches.
@@ -310,7 +312,7 @@ fn run_path(
     run_steps(env, cx, path, &path.steps, frontier, gsn, out)
 }
 
-/// Extend `frontier` along `steps`, depth first in chunks of `PATH_BYTES`
+/// Extend `frontier` along `steps`, depth first in chunks of `path_bytes`
 /// (so that the rows in flight stay bounded whatever the fan-out).
 fn run_steps(
     env: &mut Env,
@@ -339,7 +341,7 @@ fn run_steps(
     while start < frontier.len() {
         let mut end = start;
         let mut bytes = 0;
-        while end < frontier.len() && bytes < PATH_BYTES {
+        while end < frontier.len() && bytes < path_bytes(env) {
             bytes += row_bytes(&frontier[end].0);
             end += 1;
         }
@@ -350,7 +352,7 @@ fn run_steps(
 }
 
 /// The rows of `frontier` extended by one lookup step, handed to `emit` in
-/// chunks of `PATH_BYTES`.
+/// chunks of `path_bytes`.
 fn lookup_step(
     env: &mut Env,
     cx: &Ctx,
@@ -399,7 +401,7 @@ fn lookup_step(
                     if step.filters.iter().all(|f| f.eval_pred(&r).unwrap_or(false)) {
                         next_bytes += row_bytes(&r);
                         next.push((r, w * mw));
-                        if next_bytes >= PATH_BYTES {
+                        if next_bytes >= path_bytes(env) {
                             next_bytes = 0;
                             emit(env, std::mem::take(&mut next))?;
                         }
@@ -521,7 +523,7 @@ fn step_paths(env: &mut Env, cx: &Ctx, gsn: Gsn, all: &FxHashMap<NodeId, NodeDel
                     row[src.offset..src.offset + src.width].clone_from_slice(&kv);
                     bytes += row_bytes(&row);
                     start.push((row, if new > 0 { 1 } else { -1 }));
-                    if bytes >= PATH_BYTES {
+                    if bytes >= path_bytes(env) {
                         bytes = 0;
                         run(env, std::mem::take(&mut start))?;
                     }
@@ -608,7 +610,7 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut super::ops::Sn
             Ok(())
         })?;
     }
-    // the source's rows are extended in chunks of PATH_BYTES, so that rows
+    // the source's rows are extended in chunks of `path_bytes`, so that rows
     // with equal keys in a chunk share their lookups
     let mut start = Vec::new();
     let mut start_bytes = 0;
@@ -636,7 +638,7 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut super::ops::Sn
             consolidate_errs(&mut errs);
             errs_limit = (2 * errs.len()).max(super::ops::BATCH_ROWS);
         }
-        if start_bytes >= PATH_BYTES {
+        if start_bytes >= path_bytes(env) {
             start_bytes = 0;
             run_path(env, &cx, path, std::mem::take(&mut start), None, &mut emit)?;
         }

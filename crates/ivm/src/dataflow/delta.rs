@@ -14,17 +14,25 @@
 //! values) spill likewise.
 
 use super::*;
+use crate::memory::{heap_block, row_heap, Charge};
 use crate::storage::{CountSummarizer, TreeBuilder};
 use std::ops::Bound;
 
-/// Estimated bytes of rows (`row_bytes`) or keys a delta or key set holds
-/// in memory before it spills: an eighth of the cache, within 1 and
-/// 256 MiB, or `IVM_DELTA_SPILL_BYTES` (0 spills everything; the tests
-/// use it to run every operator on spilled input).
+/// Memory of rows or keys a delta or key set holds before it spills (and of
+/// a table's changes applied at once): a buffer of the working memory
+/// (`Work::buffer`, within 1 and 256 MiB; it spills sooner while the
+/// buffers together exceed their share, see `Work::full`), or
+/// `IVM_DELTA_SPILL_BYTES` (0 spills everything; the tests use it to run
+/// every operator on spilled input).
 pub fn spill_bytes(env: &Env) -> usize {
     static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("IVM_DELTA_SPILL_BYTES").ok().and_then(|v| v.parse().ok()))
-        .unwrap_or_else(|| (env.cache_capacity() / 8).clamp(1 << 20, 256 << 20))
+        .unwrap_or_else(|| env.work().buffer(1 << 20, 256 << 20))
+}
+
+/// Memory of a row in a delta: its place in the vector and what it owns.
+pub fn row_mem(row: &Row) -> usize {
+    std::mem::size_of::<(Row, i64)>() + row_heap(row)
 }
 
 /// Receives a delta's rows a batch at a time.
@@ -91,6 +99,8 @@ pub struct NodeDelta {
     /// Per target, an in-memory delta's entries in its encoding, sorted
     /// (computed when first read by key).
     sorted: Vec<std::sync::OnceLock<Entries>>,
+    /// The working memory an in-memory delta takes, until it is dropped.
+    _charge: Charge,
 }
 
 impl NodeDelta {
@@ -278,7 +288,8 @@ pub fn finish_all(env: &mut Env, builders: impl IntoIterator<Item = TreeBuilder>
 /// into the targets' trees.
 pub struct DeltaBuf {
     rows: Delta,
-    bytes: usize,
+    /// The rows' memory, charged to the working memory once rows arrive.
+    charge: Charge,
     gsn: Gsn,
     targets: Vec<Target>,
     direct: bool,
@@ -295,13 +306,13 @@ impl DeltaBuf {
     /// A delta kept, in memory or in temporary trees in the encodings of
     /// `targets`, until the consumers have read it.
     pub fn new(gsn: Gsn, targets: Vec<Target>) -> DeltaBuf {
-        DeltaBuf { rows: Vec::new(), bytes: 0, gsn, targets, direct: false, spill: None, spilled: 0, consolidated: false, extends: 0 }
+        DeltaBuf { rows: Vec::new(), charge: Charge::none(), gsn, targets, direct: false, spill: None, spilled: 0, consolidated: false, extends: 0 }
     }
 
     /// The output of a node nobody reads: past the spill threshold, rows
     /// go to the targets' trees directly.
     pub fn direct(gsn: Gsn, targets: Vec<Target>) -> DeltaBuf {
-        DeltaBuf { rows: Vec::new(), bytes: 0, gsn, targets, direct: true, spill: None, spilled: 0, consolidated: false, extends: 0 }
+        DeltaBuf { rows: Vec::new(), charge: Charge::none(), gsn, targets, direct: true, spill: None, spilled: 0, consolidated: false, extends: 0 }
     }
 
     pub fn push(&mut self, env: &mut Env, row: Row, w: i64) -> Result<()> {
@@ -312,9 +323,12 @@ impl DeltaBuf {
             }
             return Ok(());
         }
-        self.bytes += row_bytes(&row);
+        if self.rows.is_empty() {
+            self.charge = env.work().charge();
+        }
+        self.charge.grow(row_mem(&row));
         self.rows.push((row, w));
-        if self.bytes > spill_bytes(env) {
+        if env.work().full(self.charge.bytes(), spill_bytes(env)) {
             if self.direct {
                 self.targets.retain(|t| t.apply_to.is_some());
             }
@@ -329,9 +343,11 @@ impl DeltaBuf {
                 }
             }
             self.spill = Some(spill);
+            let held = std::mem::take(&mut self.charge);
             for (row, w) in std::mem::take(&mut self.rows) {
                 self.push(env, row, w)?;
             }
+            drop(held);
         }
         Ok(())
     }
@@ -357,7 +373,7 @@ impl DeltaBuf {
             if !self.consolidated {
                 consolidate(&mut self.rows);
             }
-            return Ok((Rows::Mem(self.rows), self.targets));
+            return Ok((Rows::Mem(std::mem::take(&mut self.rows)), std::mem::take(&mut self.targets)));
         };
         let (builders, trees): (Vec<TreeBuilder>, Vec<Option<TreeId>>) = spill.into_iter().unzip();
         let r = finish_all(env, builders);
@@ -389,10 +405,13 @@ impl DeltaBuf {
     }
 
     /// The node's output (without error records).
-    pub fn into_delta(self, env: &mut Env) -> Result<NodeDelta> {
+    pub fn into_delta(mut self, env: &mut Env) -> Result<NodeDelta> {
+        let charge = std::mem::take(&mut self.charge);
         let (rows, targets) = self.finish(env)?;
         let sorted = targets.iter().map(|_| std::sync::OnceLock::new()).collect();
-        Ok(NodeDelta { rows, errs: Vec::new(), targets, sorted })
+        // (an in-memory delta keeps its charge)
+        let charge = if matches!(rows, Rows::Mem(_)) { charge } else { Charge::none() };
+        Ok(NodeDelta { rows, errs: Vec::new(), targets, sorted, _charge: charge })
     }
 }
 
@@ -436,7 +455,8 @@ impl StepOut {
 /// memory while small, else through a `TreeBuilder` into a temporary tree.
 pub struct KeySet {
     keys: Vec<Vec<u8>>,
-    bytes: usize,
+    /// The keys' memory, charged to the working memory once keys arrive.
+    charge: Charge,
     gsn: Gsn,
     spill: Option<(TreeId, TreeBuilder)>,
 }
@@ -449,21 +469,26 @@ pub enum Keys {
 
 impl KeySet {
     pub fn new(gsn: Gsn) -> KeySet {
-        KeySet { keys: Vec::new(), bytes: 0, gsn, spill: None }
+        KeySet { keys: Vec::new(), charge: Charge::none(), gsn, spill: None }
     }
 
     pub fn push(&mut self, env: &mut Env, key: Vec<u8>) -> Result<()> {
         if let Some((_, b)) = &mut self.spill {
             return b.push(env, key, 1);
         }
-        self.bytes += key.len() + 24;
+        if self.keys.is_empty() {
+            self.charge = env.work().charge();
+        }
+        self.charge.grow(std::mem::size_of::<Vec<u8>>() + heap_block(key.len()));
         self.keys.push(key);
-        if self.bytes > spill_bytes(env) {
+        if env.work().full(self.charge.bytes(), spill_bytes(env)) {
             let tree = env.create_temp_tree(Arc::new(CountSummarizer));
             let mut b = TreeBuilder::new(env, tree, self.gsn);
+            let held = std::mem::take(&mut self.charge);
             for k in std::mem::take(&mut self.keys) {
                 b.push(env, k, 1)?;
             }
+            drop(held);
             self.spill = Some((tree, b));
         }
         Ok(())

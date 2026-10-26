@@ -276,16 +276,20 @@ do not depend on how wide rows are or how they serialize:
 | changes queued for a subscription | `Subscription::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB | the subscription ends with `53000` |
 | changes queued for a sink, until written | `SinkHandle::queue` (likewise) | a sixteenth, at least 4 MiB | the sink falls behind and is restarted |
 | aggregation group caches | `Graph::group_caches` | an eighth | the group is not cached, and all caches shrink after the record ([Dataflow](dataflow.md#reduce)) |
-| buffer pool | `Env`'s own accounting ([Storage](storage.md#the-node-arena-buffer-pool)) | the rest, at least a quarter | clean nodes are evicted |
+| transient working memory: in-memory deltas and key sets of a GSN, sort buffers of `TreeBuilder`s | `MemBudget::work` (`memory::Work`, which the engine gives its `Env`, `Env::set_work`) | an eighth, set aside from the pool's share | a buffer spills to temporary trees (or applies to its index) beyond half the share (`Work::buffer`, within per-use bounds), or beyond a sixteenth of that while the buffers together exceed the share (`Work::full`) |
+| buffer pool | `Env`'s own accounting ([Storage](storage.md#the-node-arena-buffer-pool)) | the rest, at least a quarter | clean nodes are evicted, dirty ones written and evicted |
 
 After every applied record and every message, the engine sets the buffer
 pool's target to what the other parts leave over (`rebalance_memory`,
 `MemBudget::pool_target`), so that memory used by queues and caches is
 taken from the pool, the one part that can always give memory back; it
-also shrinks the group caches when one of them could not take a group. A
-checkpoint is forced when dirty nodes, which cannot be evicted, exceed
-half of the pool's target, and the maintenance pass before a checkpoint
-rewrites no more nodes than the pool has room for besides the dirty ones
+also shrinks the group caches when one of them could not take a group. The
+working memory's share is set aside rather than measured: its buffers live
+within a record's processing, so between records it is mostly unused. The
+pool writes dirty nodes early to keep them within half of its target (a
+checkpoint is forced if they still exceed it after a message), and the
+maintenance pass before a checkpoint rewrites no more nodes than the pool
+has room for besides the dirty ones
 ([Storage](storage.md#space-reclamation)).
 
 Queued changes release their memory wherever they are dropped: a charge
@@ -314,7 +318,8 @@ once written. Consumers never make the engine wait:
   rewrites the target, as a sink created anew does
   ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)).
 
-Not covered: hydration snapshots, ad-hoc query results and the buffers of
+Not covered: the rows a hydration or a join has in flight (a few batches,
+sized from the working memory), ad-hoc query results and the buffers of
 session, source and sink threads.
 
 ## The GSN clock and frontiers

@@ -377,8 +377,11 @@ the dataflow uses it to build arrangements during hydration, to spill large
 deltas and key sets into temporary trees, and to apply large deltas of
 nodes nobody reads to their arrangements:
 
-- entries are buffered up to an eighth of the cache (at least 1 MiB, at
-  most 64 MiB, counting 40 bytes per entry besides its key);
+- entries are buffered up to a buffer of the environment's working memory
+  (`Env::work`, `memory::Work`: half its share, at least 1 MiB, at most
+  64 MiB, or less while the buffers together exceed the share), counting
+  each entry's place in the buffer and its key's heap block, which the
+  buffer charges to the working memory while it holds them;
 - a full buffer is sorted; if it lies wholly after everything applied to
   the target so far (the first buffer, or input arriving in key order or
   nearly so), it is applied to the target directly, at its right edge;

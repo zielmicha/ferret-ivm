@@ -28,14 +28,15 @@ Fixed internal parameters (not configurable):
 | records waiting to be applied, before sources wait | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | changes queued per subscription or sink | a sixteenth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | aggregation group caches, all together | an eighth of `--memory-mb` |
+| transient working memory of the dataflow (below) | an eighth of `--memory-mb` |
 | buffer pool | what the above leave of `--memory-mb`, at least a quarter of it |
 | unacknowledged commits per source | 10,000 |
 | initial-snapshot chunk | 10,000 rows |
 | maintenance pass budget (compaction, and relocation, each) | 8 MiB plus the bytes checkpoints wrote for updates since the previous pass |
-| sort buffer when building or updating an index in bulk (hydration, large changes) | an eighth of the buffer pool's share, within 1 MiB and 64 MiB |
-| change (delta) of a view or operator kept in memory per GSN, and changes of a table applied at once | an eighth of the buffer pool's share, within 1 MiB and 256 MiB (larger ones go to temporary trees) |
+| sort buffer when building or updating an index in bulk (hydration, large changes) | half the working memory, within 1 MiB and 64 MiB |
+| change (delta) of a view or operator kept in memory per GSN, and changes of a table applied at once | half the working memory, within 1 MiB and 256 MiB (larger ones go to temporary trees) |
 | rows per hydration batch | 1,024 (or 1 MiB of index entries) |
-| join rows looked up at once | about 8 MiB |
+| join rows looked up at once | about half the working memory, within 256 KiB and 8 MiB |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
 | clock ticks kept | those of the retention window |
@@ -54,14 +55,12 @@ Things to keep in mind when sizing:
   sequencer, one thread per source, sink and client session, and three
   threads for the web UI when it is enabled).
 - **Memory**: see [below](#memory). Outside the budget: hydration of a
-  new view holds a few batches of rows, a sort buffer per index it builds
-  and about 16 MiB of join rows in flight; applying a commit holds the
-  changes of operators with consumers still to run up to an eighth of the
-  pool's share each, and sort buffers for the indexes it updates in bulk (a
-  window partition or a recursive query's result is computed whole); a
-  large commit's log record itself, and the rows delivered to subscriptions
-  and sinks, are in memory whole; an ad-hoc query's result is built in
-  memory, and each session, source and sink thread has its own buffers.
+  new view holds a few batches of rows and join rows in flight (sized from
+  the working memory, but not counted in it); a window partition or a
+  recursive query's result is computed whole; a large commit's log record
+  itself, and the rows delivered to subscriptions and sinks, are in memory
+  whole; an ad-hoc query's result is built in memory, and each session,
+  source and sink thread has its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
 
@@ -78,7 +77,8 @@ the limits mean the same for narrow and wide rows:
 | changes queued for one subscription | a sixteenth (at least 4 MiB) | the subscription ends with `53000` and its queue is dropped ([Reads](reads.md#ending-a-subscription)) |
 | changes queued for one sink and not written yet | a sixteenth (at least 4 MiB) | the sink is sent nothing more, and once it has written what it holds it is restarted from a snapshot, rewriting its target ([Sinks](sinks.md#known-problems)) |
 | aggregation group caches (all of them) | an eighth | the group is not cached; after the record every cache drops the groups not used since the last time this happened, and at least half of its size, so idle aggregations give way |
-| buffer pool (index nodes) | the rest, at least a quarter | clean nodes are evicted (also between the leaves of a scan); dirty nodes stay until the next checkpoint, which is forced when they exceed half of the pool's share |
+| transient working memory: the changes of views and operators kept in memory for one GSN (until their consumers have run), the sets of groups or keys they affect, and the sort buffers of indexes built or updated in bulk (hydration, large changes) | an eighth, set aside | each buffer holds at most half of it (within the bounds [above](#configuration-and-tuning)), and spills what it holds to temporary trees (or applies it to its index) sooner, from a sixteenth of that, while the buffers together exceed the share |
+| buffer pool (index nodes) | the rest, at least a quarter | clean nodes are evicted (also between the leaves of a scan); dirty nodes are written to the segment files, and then evicted like clean ones, beyond the pool's share, or beyond half of it ahead of the next checkpoint |
 
 Queued changes are shared: a change delivered to several subscriptions and
 sinks is held once (each consumer's queue still counts it). The web UI's

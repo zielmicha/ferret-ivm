@@ -11,6 +11,7 @@
 
 use super::{CountSummarizer, Env, Gsn, TreeId};
 use crate::error::Result;
+use crate::memory::{heap_block, Charge, Work};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ops::Bound;
@@ -19,14 +20,18 @@ use std::sync::Arc;
 /// Runs merged at once by default (each one's cursor buffers a leaf).
 const FAN_IN: usize = 64;
 
-/// Bytes a buffered entry costs besides its key.
-const ENTRY_OVERHEAD: usize = 40;
+/// Memory of a buffered entry: its place in the buffer and its key's block.
+fn entry_mem(key: &[u8]) -> usize {
+    std::mem::size_of::<(Vec<u8>, i64)>() + heap_block(key.len())
+}
 
 pub struct TreeBuilder {
     target: TreeId,
     gsn: Gsn,
     buf: Vec<(Vec<u8>, i64)>,
-    buf_bytes: usize,
+    /// The buffer's memory, charged to the working memory.
+    charge: Charge,
+    work: Work,
     run_bytes: usize,
     fan_in: usize,
     runs: Vec<TreeId>,
@@ -35,21 +40,30 @@ pub struct TreeBuilder {
 }
 
 impl TreeBuilder {
-    /// A builder adding entries to `target` at `gsn`. Its buffer is an
-    /// eighth of the cache, within 1 and 64 MiB.
+    /// A builder adding entries to `target` at `gsn`. Its buffer is a
+    /// buffer of the environment's working memory (`Work::buffer`, within
+    /// 1 and 64 MiB), charged to it, and is sorted out as a run once it is
+    /// full (`Work::full`).
     pub fn new(env: &Env, target: TreeId, gsn: Gsn) -> TreeBuilder {
-        TreeBuilder::with_limits(target, gsn, (env.cache_capacity() / 8).clamp(1 << 20, 64 << 20), FAN_IN)
+        let work = env.work().clone();
+        TreeBuilder::with_work(target, gsn, work.buffer(1 << 20, 64 << 20), FAN_IN, work)
     }
 
-    /// A builder with the given buffer size and number of runs merged at once.
+    /// A builder with the given buffer size and number of runs merged at
+    /// once, and working memory of its own.
     pub fn with_limits(target: TreeId, gsn: Gsn, run_bytes: usize, fan_in: usize) -> TreeBuilder {
-        TreeBuilder { target, gsn, buf: Vec::new(), buf_bytes: 0, run_bytes, fan_in: fan_in.max(2), runs: Vec::new(), direct_max: None }
+        TreeBuilder::with_work(target, gsn, run_bytes, fan_in, Work::new(usize::MAX / 2))
+    }
+
+    fn with_work(target: TreeId, gsn: Gsn, run_bytes: usize, fan_in: usize, work: Work) -> TreeBuilder {
+        let charge = work.charge();
+        TreeBuilder { target, gsn, buf: Vec::new(), charge, work, run_bytes, fan_in: fan_in.max(2), runs: Vec::new(), direct_max: None }
     }
 
     pub fn push(&mut self, env: &mut Env, entry: Vec<u8>, w: i64) -> Result<()> {
-        self.buf_bytes += entry.len() + ENTRY_OVERHEAD;
+        self.charge.grow(entry_mem(&entry));
         self.buf.push((entry, w));
-        if self.buf_bytes >= self.run_bytes {
+        if self.work.full(self.charge.bytes(), self.run_bytes) {
             self.spill(env)?;
         }
         Ok(())
@@ -63,7 +77,8 @@ impl TreeBuilder {
     /// later runs overlap costs one more rewrite of its leaves.)
     fn spill(&mut self, env: &mut Env) -> Result<()> {
         let mut buf = std::mem::take(&mut self.buf);
-        self.buf_bytes = 0;
+        // (released once the buffer is applied)
+        let held = std::mem::replace(&mut self.charge, self.work.charge());
         buf.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let (Some((first, _)), Some((last, _))) = (buf.first(), buf.last()) else { return Ok(()) };
         if self.direct_max.as_ref().is_none_or(|m| first > m) {
@@ -73,6 +88,7 @@ impl TreeBuilder {
         let run = env.create_temp_tree(Arc::new(CountSummarizer));
         self.runs.push(run);
         env.apply(run, &mut buf, self.gsn)?;
+        drop(held);
         if self.runs.len() >= 2 * self.fan_in {
             self.merge_oldest(env)?;
         }
@@ -139,7 +155,7 @@ fn merge(env: &mut Env, runs: &[TreeId], into: TreeId, gsn: Gsn, batch_bytes: us
                     env.apply(into, &mut batch, gsn)?;
                     bytes = 0;
                 }
-                bytes += k.len() + ENTRY_OVERHEAD;
+                bytes += entry_mem(&k);
                 batch.push((k.into_vec(), w));
             }
         }
