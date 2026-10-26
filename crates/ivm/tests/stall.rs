@@ -663,3 +663,158 @@ fn large_subscription_snapshots_do_not_hold_up_commits() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A small deterministic generator (splitmix64).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// DDL, DML from several sessions, large and small reads, a subscription and
+/// checkpoints, all at once, with the hydrations, background checkpoints,
+/// shared log appends and off-thread reads they cause overlapping: every
+/// statement gets a proper result, and afterwards — also after a crash and
+/// recovery — every view equals its query and the subscription adds up to
+/// its view.
+#[test]
+fn concurrent_ddl_dml_reads_and_checkpoints_stay_consistent() {
+    let _serial = serial();
+    let dir = tmpdir("concurrent");
+    let cfg = coord::Config {
+        data_dir: dir.clone(),
+        sync: false,
+        tick: None,
+        checkpoint_interval: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let running = coord::start(cfg.clone()).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE a (id int PRIMARY KEY, x int, g int)");
+    exec(&h, "CREATE TABLE b (id int PRIMARY KEY, y int, k int)");
+    exec(&h, "INSERT INTO a SELECT i, (i * 37) % 20000, i % 13 FROM generate_series(0, 59999) i");
+    exec(&h, "INSERT INTO b SELECT i, i % 101, i % 13 FROM generate_series(0, 19999) i");
+    let defs = [
+        "SELECT g, count(*) AS n, sum(x) AS s FROM a GROUP BY g",
+        "SELECT a.g, count(*) AS n, sum(b.y) AS s FROM a JOIN b ON a.x = b.id GROUP BY a.g",
+        "SELECT b.k AS g, count(*) AS n, max(a.x) AS s FROM a JOIN b ON a.g = b.k WHERE b.y < 3 GROUP BY b.k",
+        "SELECT g, count(DISTINCT x) AS n, min(x) AS s FROM a WHERE x % 5 = 0 GROUP BY g",
+    ];
+    exec(&h, &format!("CREATE MATERIALIZED VIEW stable AS {}", defs[1]));
+    let ExecResult::Subscribe { rx, cancel, .. } = exec(&h, "SUBSCRIBE stable WITH (PROGRESS)") else { panic!("not a subscription") };
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fatal = |e: &str| e.contains("internal") || e.contains("shutting down") || e.contains("I/O");
+    let mut threads = Vec::new();
+    for c in 0..4u64 {
+        let (h, stop) = (h.clone(), stop.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut rng = Rng(c + 1);
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let id = rng.below(70_000);
+                let sql = match rng.below(6) {
+                    0 => format!("INSERT INTO a VALUES ({id}, {}, {})", rng.below(20_000), rng.below(13)),
+                    1 => format!("UPDATE a SET x = x + 1 WHERE id = {id}"),
+                    2 => format!("DELETE FROM a WHERE id = {id}"),
+                    3 => format!("INSERT INTO b VALUES ({}, {}, {})", id % 25_000, rng.below(101), rng.below(13)),
+                    4 => format!("UPDATE b SET y = (y + 1) % 101 WHERE id = {}", id % 25_000),
+                    _ => format!("UPDATE a SET g = (g + 1) % 13 WHERE id % 997 = {}", rng.below(997)),
+                };
+                if let Err(e) = try_exec(&h, &sql) {
+                    assert!(e.contains("duplicate key"), "{e}");
+                }
+            }
+        }));
+    }
+    {
+        let (h, stop) = (h.clone(), stop.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut rng = Rng(99);
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let sql = match rng.below(4) {
+                    0 => "SELECT g, count(*) FROM a GROUP BY g".to_string(),
+                    1 => format!("SELECT * FROM a WHERE id = {}", rng.below(60_000)),
+                    2 => format!("SELECT * FROM v{} LIMIT 3", rng.below(6)),
+                    _ => "SELECT count(*), sum(n) FROM stable".to_string(),
+                };
+                if let Err(e) = try_exec(&h, &sql) {
+                    assert!(e.contains("does not exist") && !fatal(&e), "{e}");
+                }
+            }
+        }));
+    }
+    // DDL from this thread, over the DML and reads: views (also over views,
+    // which replacements re-plan or drop), indexes, drops, checkpoints
+    let mut rng = Rng(7);
+    let mut views: std::collections::BTreeMap<String, String> = Default::default();
+    for step in 0..40 {
+        let name = format!("v{}", rng.below(6));
+        let def = match rng.below(4) {
+            0 => format!("SELECT g, sum(n) AS n, count(*) AS s FROM v{} GROUP BY g", rng.below(6)),
+            _ => defs[rng.below(defs.len() as u64) as usize].to_string(),
+        };
+        let sql = match rng.below(5) {
+            0 | 1 => format!("CREATE OR REPLACE MATERIALIZED VIEW {name} AS {def}"),
+            2 => format!("DROP MATERIALIZED VIEW IF EXISTS {name} CASCADE"),
+            3 => format!("CREATE INDEX IF NOT EXISTS {name}_n ON {name} (n)"),
+            _ => "CHECKPOINT".to_string(),
+        };
+        match try_exec(&h, &sql) {
+            Ok(_) if sql.starts_with("CREATE OR REPLACE") => {
+                views.insert(name, def);
+            }
+            Ok(_) => {}
+            // (a view reading itself, a replacement its dependents reject)
+            Err(e) => assert!(!fatal(&e), "step {step}: {e}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    for t in threads {
+        t.join().unwrap();
+    }
+    // (the views that exist: drops and re-planning removed some)
+    let check = |h: &EngineHandle, views: &std::collections::BTreeMap<String, String>| {
+        assert_eq!(rows(h, "SELECT * FROM stable"), rows(h, defs[1]));
+        for (name, def) in views {
+            if listed(h, name) {
+                assert_eq!(rows(h, &format!("SELECT * FROM {name}")), rows(h, def), "view {name}");
+            }
+        }
+    };
+    check(&h, &views);
+    // the subscription adds up to its view
+    exec(&h, "INSERT INTO b VALUES (-1, 0, 0)");
+    let last = gsn(&h);
+    let mut acc: std::collections::BTreeMap<String, i64> = Default::default();
+    for ev in rx.iter() {
+        match ev {
+            SubEvent::Data { rows, .. } => {
+                for (r, w) in rows {
+                    *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_default() += w;
+                }
+            }
+            SubEvent::Progress { gsn } if gsn >= last => break,
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => panic!("{e}"),
+        }
+    }
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    let got: Vec<String> = acc.into_iter().filter(|(_, w)| *w != 0).map(|(r, _)| r).collect();
+    assert_eq!(got, rows(&h, defs[1]));
+    running.crash();
+    let running = coord::start(cfg.clone()).unwrap();
+    check(&running.handle, &views);
+    running.shutdown();
+    let running = coord::start(cfg).unwrap();
+    check(&running.handle, &views);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
