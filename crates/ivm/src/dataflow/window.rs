@@ -832,7 +832,8 @@ fn reach_to(env: &mut Env, part: &Part, p: &WindowPlan, n: i64, key: &[u8], at: 
 }
 
 /// An entry of a partition changed by a step, with its weight before and
-/// after it and its position in the current version.
+/// after it (from the step's changes) and its position in the current
+/// version.
 struct Changed {
     key: Vec<u8>,
     before: i64,
@@ -852,7 +853,7 @@ fn data_error(e: SqlError) -> Result<SqlError> {
 /// run of rows their values depend on. None when that is not possible (the
 /// partition is or becomes in error, or its error state is unknown): the
 /// whole partition is recomputed instead.
-fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, keys: &[Vec<u8>], gsn: Gsn) -> Result<Option<Delta>> {
+fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDeltas) -> Result<Option<Delta>> {
     if !p.errors_known.load(std::sync::atomic::Ordering::Acquire) || p.errors.lock().contains_key(&part.lo) {
         return Ok(None);
     }
@@ -861,15 +862,10 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, keys: &[Vec<u8>], 
     if n <= SMALL_PARTITION {
         return Ok(None);
     }
-    let mut changed: Vec<Changed> = Vec::with_capacity(keys.len());
-    for key in keys {
-        let (before, after) = match env.get(part.tree, key)? {
-            Some(h) => (h.weight(ReadAt::Before(gsn)), h.total()),
-            None => (0, 0),
-        };
-        if before != after {
-            changed.push(Changed { key: key.clone(), before, after, rank: 0 });
-        }
+    let mut changed: Vec<Changed> = Vec::with_capacity(deltas.entries().len());
+    for (key, d) in deltas.entries() {
+        let after = env.get(part.tree, key)?.map(|h| h.total()).unwrap_or(0);
+        changed.push(Changed { key: key.clone(), before: after - d, after, rank: 0 });
     }
     if changed.is_empty() {
         return Ok(Some(vec![]));
@@ -940,7 +936,8 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, keys: &[Vec<u8>], 
     let mut entries: Vec<(Row, i64, i64, bool)> = Vec::new();
     env.for_each(part.tree, Bound::Included(&lo_key), Bound::Included(&hi_key), &mut |k, h| {
         visited(1);
-        let (before, after) = (h.weight(ReadAt::Before(gsn)), h.total());
+        let after = h.total();
+        let before = deltas.before(k, after);
         if before > 0 || after > 0 {
             let in_region = k >= reg_lo_key.as_slice() && k <= reg_hi_key.as_slice();
             entries.push((layout.decode_row(k)?, before, after, in_region));
@@ -987,11 +984,15 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, keys: &[Vec<u8>], 
     Ok(Some(out))
 }
 
-fn partition_rows(env: &mut Env, part: &Part, at: ReadAt) -> Result<Vec<(Row, i64)>> {
+/// A partition's rows, now or (with the step's changes) before the step.
+fn partition_rows(env: &mut Env, part: &Part, before: Option<&EntryDeltas>) -> Result<Vec<(Row, i64)>> {
     let mut out = Vec::new();
     env.for_each(part.tree, Bound::Included(&part.lo), part.hi(), &mut |k, h| {
         visited(1);
-        let w = h.weight(at);
+        let w = match before {
+            Some(d) => d.before(k, h.total()),
+            None => h.total(),
+        };
         if w > 0 {
             out.push((part.layout.decode_row(k)?, w));
         }
@@ -1002,9 +1003,9 @@ fn partition_rows(env: &mut Env, part: &Part, at: ReadAt) -> Result<Vec<(Row, i6
 
 /// Recompute a whole partition before and after the step, emitting the
 /// difference (an error record while it is in error).
-fn step_whole(env: &mut Env, p: &WindowPlan, part: &Part, gsn: Gsn, out: &mut Output) -> Result<()> {
-    let old = partition_rows(env, part, ReadAt::Before(gsn))?;
-    let new = partition_rows(env, part, ReadAt::Latest)?;
+fn step_whole(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDeltas, out: &mut Output) -> Result<()> {
+    let old = partition_rows(env, part, Some(deltas))?;
+    let new = partition_rows(env, part, None)?;
     let mut errors = p.errors.lock();
     match compute_partition(&old, &p.order, &p.funcs) {
         Ok(rows) => out.data.extend(rows.into_iter().map(|(r, w)| (r, -w))),
@@ -1024,23 +1025,25 @@ fn step_whole(env: &mut Env, p: &WindowPlan, part: &Part, gsn: Gsn, out: &mut Ou
     Ok(())
 }
 
-pub fn step(g: &Graph, env: &mut Env, p: &WindowPlan, delta: &Delta, gsn: Gsn, out: &mut Output) -> Result<()> {
+pub fn step(g: &Graph, env: &mut Env, p: &WindowPlan, delta: &Delta, _gsn: Gsn, out: &mut Output) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
-    // changed entries by partition
-    let mut parts: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    for (row, _) in delta {
+    // the changes by partition
+    let mut parts: BTreeMap<Vec<u8>, Vec<(&Row, i64)>> = BTreeMap::new();
+    for (row, w) in delta {
         let kv: Vec<Datum> = p.partition.iter().map(|c| row[*c].clone()).collect();
-        parts.entry(layout.encode_prefix(&kv)).or_default().push(layout.encode_row(row)?);
+        parts.entry(layout.encode_prefix(&kv)).or_default().push((row, *w));
     }
-    for (prefix, mut keys) in parts {
-        keys.sort();
-        keys.dedup();
+    for (prefix, rows) in parts {
+        let deltas = EntryDeltas::of(&layout, rows.into_iter())?;
+        if deltas.entries().is_empty() {
+            continue;
+        }
         let hi = crate::types::encoding::prefix_successor(&prefix);
         let part = Part { tree: a.tree, layout: &layout, lo: prefix, hi };
-        match step_partition(env, p, &part, &keys, gsn)? {
+        match step_partition(env, p, &part, &deltas)? {
             Some(d) => out.data.extend(d),
-            None => step_whole(env, p, &part, gsn, out)?,
+            None => step_whole(env, p, &part, &deltas, out)?,
         }
     }
     Ok(())

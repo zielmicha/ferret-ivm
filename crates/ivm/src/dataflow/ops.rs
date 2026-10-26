@@ -734,9 +734,9 @@ fn small_window(p: &TopKPlan) -> bool {
     p.limit.is_some_and(|l| p.offset.saturating_add(l) <= SMALL_WINDOW)
 }
 
-/// Rows of a group's top-k as of `at`, walking the group from its start
-/// (small windows).
-fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, at: ReadAt) -> Result<Delta> {
+/// Rows of a group's top-k, now or (with the step's changes) before the
+/// step, walking the group from its start (small windows).
+fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, before: Option<&EntryDeltas>) -> Result<Delta> {
     let mut out = Vec::new();
     let (mut skipped, mut taken) = (0u64, 0u64);
     let limit = p.limit.unwrap_or(u64::MAX);
@@ -746,7 +746,10 @@ fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, at: ReadAt) -> Result<D
     let mut last_key: Option<Vec<u8>> = None;
     g.for_each(env, &g.lo, &Bound::Unbounded, &mut |k, h| {
         visited(1);
-        let mut w = h.weight(at);
+        let mut w = match before {
+            Some(d) => d.before(k, h.total()),
+            None => h.total(),
+        };
         if w <= 0 {
             return Ok(true);
         }
@@ -787,7 +790,7 @@ fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, at: ReadAt) -> Result<D
 /// before it).
 fn topk_rows(env: &mut Env, g: &TopKGroup, p: &TopKPlan) -> Result<Delta> {
     if small_window(p) {
-        return topk_walk(env, g, p, ReadAt::Latest);
+        return topk_walk(env, g, p, None);
     }
     let mut out = Vec::new();
     if p.limit == Some(0) {
@@ -846,24 +849,19 @@ fn merge_ranges(mut ranges: Vec<(Vec<u8>, Bound<Vec<u8>>)>) -> Vec<(Vec<u8>, Bou
 /// order; entries whose rows are in neither window, or (unchanged) wholly
 /// in both, are not visited: those between the two windows' first rows,
 /// those between their last rows, and the changed entries are.
-fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, delta: &[Vec<u8>], gsn: Gsn, out: &mut Delta) -> Result<()> {
+fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, deltas: &EntryDeltas, out: &mut Delta) -> Result<()> {
     if p.limit == Some(0) {
         return Ok(());
     }
     if small_window(p) {
-        out.extend(topk_walk(env, g, p, ReadAt::Before(gsn))?.into_iter().map(|(r, w)| (r, -w)));
-        out.extend(topk_walk(env, g, p, ReadAt::Latest)?);
+        out.extend(topk_walk(env, g, p, Some(deltas))?.into_iter().map(|(r, w)| (r, -w)));
+        out.extend(topk_walk(env, g, p, None)?);
         return Ok(());
     }
-    let mut changed: Vec<Changed> = Vec::with_capacity(delta.len());
-    for key in delta {
-        let (before, after) = match env.get(g.tree, key)? {
-            Some(h) => (h.weight(ReadAt::Before(gsn)), h.total()),
-            None => (0, 0),
-        };
-        if before != after {
-            changed.push(Changed { key: key.clone(), before, after, rank: 0 });
-        }
+    let mut changed: Vec<Changed> = Vec::with_capacity(deltas.entries().len());
+    for (key, d) in deltas.entries() {
+        let after = env.get(g.tree, key)?.map(|h| h.total()).unwrap_or(0);
+        changed.push(Changed { key: key.clone(), before: after - d, after, rank: 0 });
     }
     if changed.is_empty() {
         return Ok(());
@@ -941,7 +939,8 @@ fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, delta: &[Vec<u8>], gsn
         let mut pos_old = pos_new - old_v.shift(&from);
         g.for_each(env, &from, &to, &mut |k, h| {
             visited(1);
-            let (wo, wn) = (h.weight(ReadAt::Before(gsn)), h.total());
+            let wn = h.total();
+            let wo = deltas.before(k, wn);
             let d = new.rows(k, pos_new, wn) - old.rows(k, pos_old, wo);
             if d != 0 {
                 out.push((g.layout.decode_row(k)?, d));
@@ -954,21 +953,20 @@ fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, delta: &[Vec<u8>], gsn
     Ok(())
 }
 
-fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &Delta, gsn: Gsn, out: &mut Output) -> Result<()> {
+fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &Delta, _gsn: Gsn, out: &mut Output) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
-    // changed entries by group
-    let mut groups: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    for (row, _) in delta {
+    // the changes by group
+    let mut groups: BTreeMap<Vec<u8>, Vec<(&Row, i64)>> = BTreeMap::new();
+    for (row, w) in delta {
         let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
-        groups.entry(layout.encode_prefix(&kv)).or_default().push(layout.encode_row(row)?);
+        groups.entry(layout.encode_prefix(&kv)).or_default().push((row, *w));
     }
-    for (prefix, mut keys) in groups {
-        keys.sort();
-        keys.dedup();
+    for (prefix, rows) in groups {
+        let deltas = EntryDeltas::of(&layout, rows.into_iter())?;
         let hi = crate::types::encoding::prefix_successor(&prefix);
         let grp = TopKGroup { tree: a.tree, layout: &layout, lo: prefix, hi };
-        topk_group(env, &grp, p, &keys, gsn, &mut out.data)?;
+        topk_group(env, &grp, p, &deltas, &mut out.data)?;
     }
     Ok(())
 }

@@ -409,9 +409,10 @@ For each changed group the operator compares the window before the GSN
 with the window after it, without reading either in full:
 
 - the positions before the GSN are those after it, shifted by the weight
-  changes of the changed entries before them (each changed entry's weights
-  before and after the GSN come from its history), so the window before
-  the GSN is located from the current counts as well;
+  changes of the changed entries before them, so the window before the GSN
+  is located from the current counts as well. An entry's weight before the
+  GSN is its current weight minus the step's change to it (the operator's
+  input delta, `EntryDeltas`), not read from its history;
 - if the first changed entry comes after the window (its position is past
   `offset + limit`, and with ties it is not tied with the last row), nothing
   changes;
@@ -457,8 +458,9 @@ values depend on — their frames, except the parts that summaries or row
 lookups provide; whole peer groups; from the partition's start for
 `dense_rank` — computes their values before and after the GSN, and emits
 the difference. Positions outside the changed rows are the same in both
-versions, so both are computed from one read of the run (with each entry's
-weight before and after the GSN). The work is proportional to the rows
+versions, so both are computed from one read of the run (an entry's weight
+before the GSN being its current weight minus the step's change to it,
+`EntryDeltas`). The work is proportional to the rows
 that change and the rows their frames reach: appending to a partition with
 a running sum reads a few rows, while a change that changes every row (an
 insert at the start with `row_number`, any change with frames reaching the
