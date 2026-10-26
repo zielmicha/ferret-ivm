@@ -211,6 +211,10 @@ impl Engine {
     /// (`exec::ExecCtx::run_query`; false from `out` ends the read). Returns
     /// the number of arrangement entries its scans visited.
     pub(crate) fn read_query(&mut self, q: &crate::sql::BoundQuery, at: ReadAt, out: &mut dyn FnMut(Row) -> Result<bool>) -> Result<u64> {
+        if self.reads_hydrating(&q.rel) {
+            // (the request is parked until the hydration is done)
+            return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
+        }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
         let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default(), visited: 0 };
@@ -407,6 +411,8 @@ impl Engine {
         match r {
             // (it sent nothing yet: it runs again there)
             Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, at, vars, reply)?,
+            // (parked, to run again once the relation is hydrated)
+            Err(e) if e.code == super::hydrate::HYDRATING => return Err(e),
             r => {
                 let mut res = ChunkedReply::new(columns, reply);
                 for row in rows {

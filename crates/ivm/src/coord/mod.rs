@@ -1817,8 +1817,10 @@ mod tests {
     fn limits_stop_scans_early() {
         let tmp = crate::testkit::TempDir::new("coord-limit-pushdown");
         let mut e = engine(tmp.path());
-        e.apply_ddl(1, "CREATE TABLE t (id int PRIMARY KEY, g int, v text)", "").unwrap();
-        e.apply_ddl(2, "CREATE INDEX t_g ON t (g, id)", "").unwrap();
+        // (applied as records: the index is hydrated then)
+        let ddl = |sql: &str| LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() };
+        e.apply_record(1, ddl("CREATE TABLE t (id int PRIMARY KEY, g int, v text)")).unwrap();
+        e.apply_record(2, ddl("CREATE INDEX t_g ON t (g, id)")).unwrap();
         let t = e.catalog.by_name("t").unwrap().id;
         let row = |i: i32| vec![Datum::Int4(i), Datum::Int4(i % 10), Datum::text(&format!("v{i}"))];
         let n = 100_000;
