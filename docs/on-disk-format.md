@@ -521,7 +521,7 @@ with `serde_json`):
 | `catalog.history` | `[gsn, statement]` of the successfully applied DDL statements (`ivm.catalog_history`), oldest first: the most recent 10,000; when a statement makes it longer than 11,000, the oldest entries are dropped down to 10,000. Trimming happens when a statement is applied, so replay trims identically |
 | `catalog.instance_id` | 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted; `null` before that (and if absent) |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
-| `view_errors` | per materialized view with a dataflow: its error records `[[sqlstate, message], count]` |
+| `view_errors` | per materialized view with a hydrated dataflow: its error records `[[sqlstate, message], count]`; a view without an entry (being hydrated at the checkpoint, or broken) takes its root's error records when recovery hydrates it |
 | `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records) |
 | `source_lsns` | per source: the end LSN of its last logged commit (resume point); `[]` if absent |
 | `next_req` | request counter |
