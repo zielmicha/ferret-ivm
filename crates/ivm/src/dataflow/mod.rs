@@ -641,6 +641,73 @@ impl Graph {
         Ok(out)
     }
 
+    /// The change from the contents of arrangement `old` to those of `new`
+    /// (consolidated). Arrangements that encode rows alike (same key and
+    /// columns) are merged in key order, so that only the entries that
+    /// differ are decoded and kept; others are read and consolidated.
+    pub fn diff_arrangements(&self, env: &mut Env, old: ArrId, new: ArrId) -> Result<Delta> {
+        let (a, b) = (self.arr(old), self.arr(new));
+        if old == new {
+            return Ok(vec![]);
+        }
+        let (la, lb) = (&a.layout, &b.layout);
+        let fps = |l: &Layout| {
+            let mut fp = Vec::new();
+            for k in &l.key {
+                k.fingerprint(&mut fp);
+            }
+            fp
+        };
+        let alike = la.key_types == lb.key_types
+            && la.specs == lb.specs
+            && la.payload == lb.payload
+            && la.row_len == lb.row_len
+            && fps(la) == fps(lb);
+        if !alike {
+            let mut diff = self.scan_arr(env, new, ReadAt::Latest)?;
+            diff.extend(self.scan_arr(env, old, ReadAt::Latest)?.into_iter().map(|(r, w)| (r, -w)));
+            consolidate(&mut diff);
+            return Ok(diff);
+        }
+        let (u, v) = (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+        let mut ca = env.cursor(a.tree, u, v);
+        let mut cb = env.cursor(b.tree, u, v);
+        let (mut x, mut y) = (env.cursor_next(&mut ca)?, env.cursor_next(&mut cb)?);
+        let mut diff = Vec::new();
+        loop {
+            let (key, w) = match (&x, &y) {
+                (None, None) => break,
+                (Some((ka, ha)), Some((kb, hb))) if ka == kb => {
+                    let r = (ka.clone(), hb.total() - ha.total());
+                    (x, y) = (env.cursor_next(&mut ca)?, env.cursor_next(&mut cb)?);
+                    r
+                }
+                (Some((ka, ha)), Some((kb, _))) if ka < kb => {
+                    let r = (ka.clone(), -ha.total());
+                    x = env.cursor_next(&mut ca)?;
+                    r
+                }
+                (Some((ka, ha)), None) => {
+                    let r = (ka.clone(), -ha.total());
+                    x = env.cursor_next(&mut ca)?;
+                    r
+                }
+                (_, Some((kb, hb))) => {
+                    let r = (kb.clone(), hb.total());
+                    y = env.cursor_next(&mut cb)?;
+                    r
+                }
+            };
+            visited(1);
+            if w != 0 {
+                diff.push((lb.decode_row(&key)?, w));
+            }
+        }
+        // (equal rows are equal entries, but consolidation also orders them)
+        consolidate(&mut diff);
+        Ok(diff)
+    }
+
     /// Rows matching a key prefix.
     pub fn lookup(&self, env: &mut Env, arr: ArrId, key: &[crate::types::Datum], at: ReadAt) -> Result<Delta> {
         let a = self.arr(arr);

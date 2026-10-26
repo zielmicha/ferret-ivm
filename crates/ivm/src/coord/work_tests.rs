@@ -216,3 +216,27 @@ fn join_hydration_reads_the_driven_input_only() {
         assert_eq!(t.e.graph.errors_of(node), vec![(("22012".to_string(), "division by zero".to_string()), 715)], "{v}");
     }
 }
+
+/// CREATE OR REPLACE of a materialized view with its definition reads
+/// nothing (the new version is the old dataflow), and a different
+/// definition reads the two versions only for subscribers, merging them.
+#[test]
+fn view_replacement_reads_only_for_subscribers() {
+    let mut t = T::new("work-replace");
+    t.ddl("CREATE TABLE r (id bigint PRIMARY KEY, v bigint)");
+    t.upsert("r", (0..3000).map(|i| vec![int(i), int(i)]).collect());
+    t.ddl("CREATE MATERIALIZED VIEW m AS SELECT id, v FROM r WHERE v >= 0");
+    t.ddl("CREATE MATERIALIZED VIEW d AS SELECT count(*) AS n FROM m");
+    let (entries, _) = t.work(|t| t.ddl("CREATE OR REPLACE MATERIALIZED VIEW m AS SELECT id, v FROM r WHERE v >= 0"));
+    assert_eq!(entries, 0);
+    let ExecResult::Subscribe { rx, .. } = t.e.subscribe(crate::sql::parser::SubscribeTarget::Name("m".into()), false, false, vec![]).unwrap() else {
+        panic!("not a subscription")
+    };
+    let (entries, _) = t.work(|t| t.ddl("CREATE OR REPLACE MATERIALIZED VIEW m AS SELECT id, v FROM r WHERE v >= 10"));
+    // hydrating the new version (it reads r) and merging the two versions
+    assert!(entries <= 3 * 3000 + 100, "{entries} entries");
+    let mut diff: Vec<(Row, i64)> = rx.try_iter().flat_map(|e| if let SubEvent::Data { rows, .. } = e { rows } else { vec![] }).collect();
+    diff.sort_by(|a, b| crate::types::datum::exact_row_cmp(&a.0, &b.0));
+    assert_eq!(diff, (0..10).map(|i| (vec![int(i), int(i)], -1)).collect::<Vec<_>>());
+    assert_eq!(t.rows("d"), vec![vec![int(2990)]]);
+}

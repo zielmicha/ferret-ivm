@@ -218,7 +218,12 @@ Otherwise:
   modifiers) are unchanged, subscriptions to the view and sinks from it
   receive the difference between the old and the new contents as one change
   at that GSN; otherwise subscriptions to the view end with
-  `materialized view "x" changed its columns` (SQLSTATE `55000`).
+  `materialized view "x" changed its columns` (SQLSTATE `55000`). The
+  difference is only computed for such subscriptions and sinks (merging the
+  two versions' indexes when they are keyed alike, so that only the rows
+  that differ are decoded), and not at all when the new version is the old
+  dataflow (the same definition, or one that plans the same): replacing a
+  large view then reads none of its rows.
 - **Every other combination** (virtual by materialized, materialized by
   virtual, virtual by virtual): the old object is dropped and the new one is
   created under the same id. Subscriptions reading the old object end as for
@@ -227,7 +232,8 @@ Otherwise:
 - In both cases the materialized views that read the replaced view —
   directly, through other materialized views, or through virtual views they
   expand — are re-planned at the same GSN, in dependency order, so that they
-  read the new definition, as a restart would plan them.
+  read the new definition, as a restart would plan them. (Only they are
+  planned; finding them binds every view's definition once.)
 - A subscription to a query (`SUBSCRIBE (query)`) that reads the replaced
   materialized view — directly, through virtual views or through other
   materialized views — has a dataflow built over the old version: it ends

@@ -677,17 +677,29 @@ impl Engine {
                 _ => {}
             }
         }
-        let mut cat = self.catalog.clone();
+        // (a broken view does not plan, whatever the replacement; a view
+        // that does not read the replaced one is not re-planned, and may
+        // predate rules that are stricter now)
+        let readers: Vec<&CatalogObject> = self
+            .catalog
+            .objects
+            .values()
+            .filter(|o| {
+                matches!(&o.kind, ObjectKind::MaterializedView(v)
+                    if o.id != old.id && !self.rt.broken.contains_key(&o.id) && self.catalog.query_reads(&v.sql, old.id))
+            })
+            .collect();
+        if readers.is_empty() {
+            return Ok(());
+        }
+        // the catalog with the replacement (planning a maintained view never
+        // reads the DDL history: maintained views cannot read the catalog)
+        let mut cat = Catalog { objects: self.catalog.objects.clone(), history: Vec::new(), ..Catalog::new() };
+        cat.next_id = self.catalog.next_id;
+        cat.instance_id = self.catalog.instance_id.clone();
         cat.insert(CatalogObject { kind: new.clone(), ..old.clone() });
-        for o in self.catalog.objects.values() {
-            // (a broken view does not plan, whatever the replacement; a view
-            // that does not read the replaced one is not re-planned, and may
-            // predate rules that are stricter now)
-            if let ObjectKind::MaterializedView(v) = &o.kind
-                && o.id != old.id
-                && !self.rt.broken.contains_key(&o.id)
-                && self.catalog.query_reads(&v.sql, old.id)
-            {
+        for o in readers {
+            if let ObjectKind::MaterializedView(v) = &o.kind {
                 let q = crate::sql::parser::parse_single_query(&v.sql)?;
                 // (it inlines the views it reads: they must keep it deterministic)
                 if let Err(e) = crate::sql::plan_stored_query(&cat, &q).and_then(|bq| {
@@ -708,25 +720,61 @@ impl Engine {
     /// (and, in turn, the views reading it); a broken view is rebuilt if it
     /// plans now, and otherwise stays broken.
     pub(crate) fn replan_dependents(&mut self, gsn: Gsn, changed: ObjectId) -> Result<()> {
-        let objects: Vec<CatalogObject> = self.catalog.objects.values().cloned().collect();
-        let order: Vec<(CatalogObject, Result<Vec<ObjectId>>)> =
-            self.dependency_order(&objects).into_iter().map(|(o, d)| (o.clone(), d)).collect();
-        let mut affected = std::collections::HashSet::from([changed]);
+        // what each view reads, as the binder resolves it (bound once here,
+        // not per test); conservatively by name for one that does not bind
+        let reads: Vec<(CatalogObject, Option<Vec<ObjectId>>)> = self
+            .catalog
+            .objects
+            .values()
+            .filter_map(|o| match &o.kind {
+                ObjectKind::View(v) | ObjectKind::MaterializedView(v) => Some((o.clone(), self.catalog.references(&v.sql))),
+                _ => None,
+            })
+            .collect();
+        let reads_any = |o: &CatalogObject, refs: &Option<Vec<ObjectId>>, set: &std::collections::HashSet<ObjectId>| match refs {
+            Some(r) => r.iter().any(|x| set.contains(x)),
+            None => match &o.kind {
+                ObjectKind::View(v) | ObjectKind::MaterializedView(v) => {
+                    set.iter().any(|a| self.catalog.get(*a).is_some_and(|ao| crate::catalog::sql_mentions(&v.sql, &ao.name)))
+                }
+                _ => false,
+            },
+        };
         // views (inlined into queries) over a changed object change with it
+        let mut affected = std::collections::HashSet::from([changed]);
         loop {
-            let more: Vec<ObjectId> = objects
+            let more: Vec<ObjectId> = reads
                 .iter()
-                .filter(|o| !affected.contains(&o.id))
-                .filter(|o| matches!(&o.kind, ObjectKind::View(v) if affected.iter().any(|a| self.catalog.query_reads(&v.sql, *a))))
-                .map(|o| o.id)
+                .filter(|(o, refs)| matches!(o.kind, ObjectKind::View(_)) && !affected.contains(&o.id) && reads_any(o, refs, &affected))
+                .map(|(o, _)| o.id)
                 .collect();
             if more.is_empty() {
                 break;
             }
             affected.extend(more);
         }
+        // the materialized views reading them, and those reading these in
+        // turn (re-planned after them): only those are planned
+        let mut reached = affected.clone();
+        let mut replan: Vec<CatalogObject> = Vec::new();
+        loop {
+            let more: Vec<&CatalogObject> = reads
+                .iter()
+                .filter(|(o, refs)| matches!(o.kind, ObjectKind::MaterializedView(_)) && !reached.contains(&o.id) && reads_any(o, refs, &reached))
+                .map(|(o, _)| o)
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            for o in more {
+                reached.insert(o.id);
+                replan.push(o.clone());
+            }
+        }
+        let order: Vec<(CatalogObject, Result<Vec<ObjectId>>)> =
+            self.dependency_order(&replan).into_iter().map(|(o, d)| (o.clone(), d)).collect();
         for (o, deps) in order {
-            if o.id == changed || !matches!(o.kind, ObjectKind::MaterializedView(_)) || self.catalog.get(o.id).is_none() {
+            if self.catalog.get(o.id).is_none() {
                 continue;
             }
             let res = match deps {
@@ -791,7 +839,6 @@ impl Engine {
             return self.repair_view(gsn, id, name, sql, def);
         }
         let old = self.rt.views.remove(&id).expect("view runtime");
-        let old_rows = self.graph.scan_arr(&mut self.env, old.arr, crate::storage::ReadAt::Latest)?;
         let old_cat = self.catalog.get(id).cloned();
         self.catalog.insert(CatalogObject {
             id,
@@ -822,13 +869,21 @@ impl Engine {
         let errs = self.graph.errors_of(new_node);
         merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
         let new_arr = self.rt.views[&id].arr;
-        let new_rows = self.graph.scan_arr(&mut self.env, new_arr, crate::storage::ReadAt::Latest)?;
-        // subscribers see the change from the old to the new definition
-        let mut diff: Vec<(crate::types::Row, i64)> = new_rows;
-        diff.extend(old_rows.into_iter().map(|(r, w)| (r, -w)));
-        crate::dataflow::consolidate(&mut diff);
-        // (by view: other views and ad hoc subscriptions may share the old node)
         let same = same_columns(&def.columns, &old_cols);
+        // the view's sinks (not those of other views sharing the old node)
+        let sinks: Vec<ObjectId> = self
+            .sink_handles
+            .keys()
+            .copied()
+            .filter(|sid| matches!(self.catalog.get(*sid).map(|o| &o.kind), Some(ObjectKind::Sink(sd)) if sd.from == id))
+            .collect();
+        // Subscribers and sinks see the change from the old to the new
+        // definition, computed only for them, and not at all when the new
+        // definition has the old one's contents (its read index).
+        let consumers = same
+            && (!sinks.is_empty() || self.subs.iter().any(|s| s.view == Some(id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire)));
+        let diff = if consumers { self.graph.diff_arrangements(&mut self.env, old.arr, new_arr)? } else { vec![] };
+        // (by view: other views and ad hoc subscriptions may share the old node)
         let mut moved = false;
         for s in self.subs.iter_mut() {
             if s.view != Some(id) {
@@ -865,13 +920,6 @@ impl Engine {
                 s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        // the view's sinks (not those of other views sharing the old node)
-        let sinks: Vec<ObjectId> = self
-            .sink_handles
-            .keys()
-            .copied()
-            .filter(|sid| matches!(self.catalog.get(*sid).map(|o| &o.kind), Some(ObjectKind::Sink(sd)) if sd.from == id))
-            .collect();
         if same {
             for sid in &sinks {
                 if let Some(sink) = self.sink_handles.get_mut(sid) {
