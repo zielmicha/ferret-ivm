@@ -444,6 +444,9 @@ impl Engine {
                         let cols = v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect();
                         (rt.node, None, cols, vec![obj.id])
                     }
+                    ObjectKind::Table(_) if self.hydration.is_some() && !self.graph.node(self.rt.tables[&obj.id]).hydrated => {
+                        return Err(SqlError::new(super::hydrate::HYDRATING, "the table is being rebuilt"));
+                    }
                     ObjectKind::Table(t) => (
                         self.rt.tables[&obj.id],
                         None,

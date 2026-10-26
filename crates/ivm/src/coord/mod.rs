@@ -90,6 +90,9 @@ pub(crate) struct Subscription {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
+    /// Changes are held back: its view is being replaced, and it gets the
+    /// change to the new version once that is hydrated.
+    pub held: bool,
     pub progress: bool,
     /// The materialized view subscribed to by name (its node may be shared
     /// with other views, so dropping it is matched by view, not by node).
@@ -217,8 +220,12 @@ pub struct Engine {
     pub(crate) hydration_next: Vec<hydrate::Then>,
     /// Hydrations finished so far.
     pub(crate) hydrations_done: u64,
-    /// The DDL record being applied left its reply to a hydration.
-    pub(crate) reply_deferred: bool,
+    /// What the record being applied leaves for after the hydration of what
+    /// it built (`hydrate::Then`).
+    pub(crate) record_then: Vec<hydrate::Then>,
+    /// Sinks whose changes are held back: their view is being replaced and
+    /// they get the change to its new version once it is hydrated.
+    pub(crate) held_sinks: rustc_hash::FxHashSet<ObjectId>,
     /// Durable records not applied yet: those from a DDL or schema record
     /// that must not be applied while a hydration is in progress on.
     held: VecDeque<(Gsn, LogRecord)>,
@@ -488,7 +495,8 @@ impl Engine {
             hydration: None,
             hydration_next: Vec::new(),
             hydrations_done: 0,
-            reply_deferred: false,
+            record_then: Vec::new(),
+            held_sinks: Default::default(),
             held: VecDeque::new(),
             checkpointing: None,
             checkpoint_waiters: Vec::new(),
@@ -882,7 +890,7 @@ impl Engine {
                 }
             }
             LogRecord::Ddl { req, sql, extra } => {
-                self.reply_deferred = false;
+                let before = self.pending_set();
                 let res = self.apply_ddl(gsn, &sql, &extra);
                 self.processed = gsn;
                 self.snap_epoch += 1;
@@ -899,14 +907,15 @@ impl Engine {
                 {
                     log::warn!("DDL at gsn {gsn} failed on replay: {e}");
                 }
-                // its dataflow is being hydrated (or will be, after the
+                // what it built is hydrated (in the background, or after the
                 // hydration in progress): the reply waits for it
-                match self.hydration.as_mut().filter(|h| h.gsn == gsn) {
-                    Some(h) if self.reply_deferred => h.then.push(hydrate::Then::Reply { req, res }),
-                    _ if self.reply_deferred => self.hydration_next.push(hydrate::Then::Reply { req, res }),
-                    _ => self.reply_pending(req, res),
+                let mut then = std::mem::take(&mut self.record_then);
+                if then.is_empty() && self.pending_set() == before {
+                    self.reply_pending(req, res);
+                } else {
+                    then.push(hydrate::Then::Reply { req, res });
+                    self.hydrate(gsn, then)?;
                 }
-                self.reply_deferred = false;
                 self.drain_dml_queue();
             }
             LogRecord::Progress { source, lsn: _, state } => {
@@ -919,6 +928,8 @@ impl Engine {
             LogRecord::Schema { source, table, columns, pk } => {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
                 self.processed = gsn;
+                let then = std::mem::take(&mut self.record_then);
+                self.hydrate(gsn, then)?;
                 // The source snapshots the table again to fill in the new
                 // columns. It logs its reset state (with the truncate a key
                 // change needs) just before this record; the record resets
@@ -977,10 +988,13 @@ impl Engine {
                 merge_errors(&mut v.errors, &o.errs);
             }
         }
-        for s in self.subs.iter() {
+        for s in self.subs.iter().filter(|s| !s.held) {
             deliver_to(s, gsn, outputs.get(&s.node));
         }
-        for sink in self.sink_handles.values() {
+        for (id, sink) in self.sink_handles.iter() {
+            if self.held_sinks.contains(id) {
+                continue;
+            }
             if let Some(o) = outputs.get(&sink.node) {
                 sink.send(gsn, &o.data);
             } else {
@@ -1009,7 +1023,7 @@ impl Engine {
     /// Begin a checkpoint in the background when one is due or asked for
     /// (`checkpoint.rs`).
     fn maybe_checkpoint(&mut self) -> Result<()> {
-        if self.checkpointing.is_some() {
+        if self.checkpointing.is_some() || self.rebuilding_table() {
             return Ok(());
         }
         let asked = !self.checkpoint_waiters.is_empty();
@@ -1027,9 +1041,21 @@ impl Engine {
     /// progress (at shutdown, and in an engine without threads).
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
         self.poll_checkpoint(true)?;
+        if self.rebuilding_table() {
+            // (replay rebuilds it from the schema record after the last one)
+            log::info!("no checkpoint while a table is rebuilt after a schema change");
+            return Ok(());
+        }
         let bytes = serde_json::to_vec(&self.app_state()).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;
         self.after_checkpoint(self.processed)
+    }
+
+    /// Is a table being rebuilt in the background (`apply_schema_change`)?
+    /// No checkpoint is taken meanwhile: its rows are in neither version's
+    /// index alone, and a table's rows exist nowhere else.
+    fn rebuilding_table(&self) -> bool {
+        self.hydration.is_some() && self.graph.live_nodes().any(|n| !n.hydrated && matches!(n.kind, crate::dataflow::NodeKind::Table { .. }))
     }
 
     /// GC and log truncation after a checkpoint at `gsn` was committed.

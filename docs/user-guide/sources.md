@@ -378,7 +378,11 @@ different key — the source:
    are matched **by name**; existing values are cast to the new type (a
    failing cast gives NULL); new columns are NULL; a row whose new key
    would contain a NULL (a new key column) is left to the re-snapshot. The
-   table's version is incremented;
+   table's version is incremented. The rebuild, and the hydration of the
+   re-planned views, run off the engine thread: other tables' changes go on
+   being applied, reads of the table and of the re-planned views wait for
+   it, and no checkpoint is taken until it is done (the table's rows would
+   be in neither version alone);
 4. at the same GSN: indexes on the table move to its new version, following
    their columns by name (an index whose column is gone is dropped, one that
    cannot be built is marked broken; both are logged); subscriptions that

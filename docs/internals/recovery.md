@@ -189,6 +189,11 @@ Back on the engine thread, once it is written (the thread sends `Wake`):
 7. send `Truncate(checkpoint GSN − retention)` to the sequencer, which
    deletes log segments whose records all lie at or before that GSN.
 
+No checkpoint is begun while a table is being rebuilt off the engine thread
+after an upstream schema change (its rows are in neither version's index
+alone; the final checkpoint at shutdown is skipped then too, and recovery
+replays the schema record).
+
 The engine thread is held up only by building the application state and
 freezing the dirty nodes (one reference-count increment per dirty node);
 nodes it modifies while the checkpoint is written are copied first (once

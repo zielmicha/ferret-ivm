@@ -220,6 +220,117 @@ fn ddl_during_a_hydration_does_not_hold_up_commits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Replacing a view hydrates the new version off the engine thread too:
+/// commits are applied and answered meanwhile, and a subscription to the
+/// view gets the change from the old to the new contents and then the new
+/// version's changes, adding up to the new contents.
+#[test]
+fn replacing_a_view_does_not_hold_up_commits() {
+    let _serial = serial();
+    let dir = tmpdir("replace");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    load_big(&h);
+    exec(&h, &format!("CREATE MATERIALIZED VIEW slow AS {SLOW_VIEW}"));
+    let ExecResult::Subscribe { rx, cancel, .. } = exec(&h, "SUBSCRIBE slow WITH (PROGRESS)") else { panic!("not a subscription") };
+    // (another join: a key computed by an index of its own)
+    let replacement = "SELECT a.g, count(*) AS n, sum(b.x) AS s FROM big a JOIN big b ON a.x = b.id + 0 WHERE b.g < 50 GROUP BY a.g";
+    let (h2, sql) = (h.clone(), format!("CREATE OR REPLACE MATERIALIZED VIEW slow AS {replacement}"));
+    let replace = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        try_exec(&h2, &sql).unwrap();
+        t0.elapsed()
+    });
+    let (mut i, mut slowest) = (0, Duration::ZERO);
+    while !replace.is_finished() {
+        let t0 = Instant::now();
+        exec(&h, &format!("INSERT INTO big VALUES ({}, {}, {})", -1 - i, i * 13, i % 5));
+        i += 1;
+        if !replace.is_finished() {
+            slowest = slowest.max(t0.elapsed());
+        }
+    }
+    let took = replace.join().unwrap();
+    assert!(i >= 3, "{i} commits answered while the view was replaced");
+    assert!(slowest * 3 < took, "a commit took {slowest:?} of the replacement's {took:?}");
+    exec(&h, "INSERT INTO big VALUES (-1000000, 3, 3)");
+    let last = gsn(&h);
+    let mut acc: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut progress = 0;
+    for ev in rx.iter() {
+        match ev {
+            SubEvent::Data { gsn, rows } => {
+                assert!(gsn > progress || gsn == progress && progress > 0, "data at {gsn} after progress {progress}");
+                for (r, w) in rows {
+                    *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_default() += w;
+                }
+            }
+            SubEvent::Progress { gsn } => {
+                assert!(gsn >= progress, "progress {gsn} after {progress}");
+                progress = gsn;
+                if gsn >= last {
+                    break;
+                }
+            }
+            SubEvent::Error(e) => panic!("{e}"),
+        }
+    }
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    let got: Vec<String> = acc.into_iter().filter(|(_, w)| *w != 0).map(|(r, _)| r).collect();
+    assert_eq!(got, rows(&h, replacement));
+    assert_eq!(rows(&h, "SELECT * FROM slow"), rows(&h, replacement));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upstream schema change rebuilds the table, from its old version's
+/// rows, and re-plans the views over it off the engine thread: commits to
+/// other tables are applied meanwhile, reads of the table wait for it, and
+/// no checkpoint is taken until it is rebuilt (one asked for meanwhile
+/// waits): its rows are in neither version's index alone. A crash in the
+/// middle recovers it from the log.
+#[test]
+fn schema_changes_rebuild_tables_off_the_engine_thread() {
+    let _serial = serial();
+    for crash in [false, true] {
+        let dir = tmpdir(&format!("schema-{crash}"));
+        let running = start(&dir);
+        let h = running.handle.clone();
+        load_big(&h);
+        exec(&h, "CREATE MATERIALIZED VIEW sv AS SELECT a.g, count(*) AS n, sum(b.x) AS s FROM big a JOIN big b ON a.x = b.id GROUP BY a.g");
+        let oid: u64 = rows(&h, "SELECT oid FROM ivm.objects WHERE name = 'big'")[0].parse().unwrap();
+        use ivm::types::{Column, ColumnType, SqlType};
+        let col = |n: &str, ty: SqlType, nullable: bool| Column::new(n, ColumnType { nullable, ..ColumnType::new(ty) });
+        let columns = vec![col("id", SqlType::Int8, false), col("x", SqlType::Int8, true), col("g", SqlType::Int4, true), col("y", SqlType::Int4, true)];
+        h.log(ivm::log::LogRecord::Schema { source: 0, table: oid - 16384, columns, pk: vec![0] }).unwrap();
+        let (h2, h3) = (h.clone(), h.clone());
+        // (an error when the engine crashes first)
+        let read = std::thread::spawn(move || try_exec(&h2, "SELECT count(*), count(y) FROM big").map(|_| ()));
+        let ck = std::thread::spawn(move || h3.checkpoint());
+        let mut i = 0;
+        while !read.is_finished() && i < 20 {
+            exec(&h, &format!("INSERT INTO small VALUES ({i}, {i})"));
+            i += 1;
+        }
+        assert!(!read.is_finished(), "the table was rebuilt before 20 commits were applied");
+        let running = if crash {
+            running.crash();
+            let _ = (read.join(), ck.join());
+            start(&dir)
+        } else {
+            read.join().unwrap().unwrap();
+            ck.join().unwrap().unwrap();
+            running
+        };
+        let h = running.handle.clone();
+        assert_eq!(rows(&h, "SELECT count(*), count(y) FROM big"), vec![format!("{BIG}|0")]);
+        assert_eq!(rows(&h, "SELECT * FROM sv"), rows(&h, "SELECT a.g, count(*) AS n, sum(b.x) AS s FROM big a JOIN big b ON a.x = b.id GROUP BY a.g"));
+        assert_eq!(rows(&h, "SELECT count(*) FROM small"), vec![i.to_string()]);
+        running.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A crash while a view is being hydrated (after its DDL record, with
 /// commits to its tables and a checkpoint meanwhile) recovers to the state
 /// an uninterrupted run reaches: recovery replays the DDL record and

@@ -183,9 +183,9 @@ column list — not lowering or hydration), `CREATE SOURCE` and `ALTER SOURCE
 ... REFRESH` (the discovered tables; `CREATE SOURCE` also writes the data
 directory's instance id into `extra`), and `CREATE SINK` (its relation and
 `KEY` columns). The engine then submits a `Ddl { req, sql, extra }` record
-and applies it when it comes back durable; the reply is sent then (for
-`CREATE MATERIALIZED VIEW` and `CREATE INDEX`, once their dataflow has been
-hydrated off the engine thread, see
+and applies it when it comes back durable; the reply is sent then (for a
+statement that built dataflow — `CREATE [OR REPLACE] MATERIALIZED VIEW`,
+`CREATE INDEX` — once it has been hydrated off the engine thread, see
 [Dataflow](dataflow.md#hydration-off-the-engine-thread)). Other
 checks happen only while applying: `DROP` (which resolves and checks every
 name before dropping anything), `CREATE INDEX`, the rules of
@@ -264,7 +264,7 @@ far; the checkpoint thread when it has written its checkpoint.
 | `Commit` | group the changes by table (changes to tables that no longer exist are skipped), `Graph::step` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); reply |
 | `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
-| `Schema` | rebuild the table in its new shape and re-plan dependent views ([Sources](../user-guide/sources.md#upstream-schema-changes)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged |
+| `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
 Delivering outputs (`deliver`): the error records of each materialized

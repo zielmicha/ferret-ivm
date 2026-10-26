@@ -20,6 +20,7 @@
 //! Replay and recovery hydrate inline: the result is the same.
 
 use super::*;
+use crate::dataflow::Delta;
 use crate::storage::TreeId;
 use rustc_hash::FxHashSet;
 use std::sync::atomic::AtomicBool;
@@ -86,6 +87,86 @@ pub(crate) enum Then {
     ViewErrors(ObjectId),
     /// Start a subscription as of the hydration's GSN.
     Subscribe(PendingSub),
+    /// The rest of a materialized view's replacement (`finish_replace`).
+    Replaced(Box<Replaced>),
+    /// A broken materialized view built again: its sinks start.
+    Repaired(ObjectId),
+    /// The rest of a table's rebuild after an upstream schema change
+    /// (`Engine::apply_schema_change`): its new version is filled from the
+    /// old one before the hydration (`fill_rebuilt`); after it, the table's
+    /// sinks start over and the old version is released.
+    Rebuilt(Box<Rebuilt>),
+}
+
+/// A table rebuilt in a new shape.
+pub(crate) struct Rebuilt {
+    pub old_node: NodeId,
+    pub new_node: NodeId,
+    /// Per new column, the old column of the same name.
+    pub mapping: Vec<Option<usize>>,
+    pub columns: Vec<crate::types::Column>,
+    pub pk: Vec<usize>,
+    pub old_index_arrs: Vec<ArrId>,
+    /// The table's sinks (held meanwhile).
+    pub sinks: Vec<ObjectId>,
+}
+
+/// What filling a rebuilt table's new version needs (`fill_rebuilt`).
+#[derive(Clone)]
+struct Conversion {
+    old_node: NodeId,
+    new_node: NodeId,
+    mapping: Vec<Option<usize>>,
+    columns: Vec<crate::types::Column>,
+    pk: Vec<usize>,
+}
+
+/// Fill a rebuilt table's new primary index, as of `gsn`, with the old
+/// version's rows in the new shape: columns mapped by name and cast to their
+/// new types (NULL where that fails); rows without their (new) key are left
+/// to the re-snapshot, which upserts by key.
+fn fill_rebuilt(graph: &mut Graph, env: &mut Env, c: &Conversion, gsn: Gsn) -> Result<()> {
+    let old_rows = graph.snapshot(env, c.old_node)?.data;
+    let crate::dataflow::NodeKind::Table { primary, .. } = graph.node(c.new_node).kind else {
+        return Err(SqlError::internal("rebuilt table without a table node"));
+    };
+    let arr = graph.arr(primary);
+    let mut ups = Vec::with_capacity(old_rows.len());
+    for (r, w) in old_rows {
+        let nr: crate::types::Row = c
+            .mapping
+            .iter()
+            .zip(&c.columns)
+            .map(|(m, col)| match m {
+                Some(i) => crate::expr::cast::cast_datum(&r[*i], &col.ty.ty, col.ty.typmod, true).unwrap_or(crate::types::Datum::Null),
+                None => crate::types::Datum::Null,
+            })
+            .collect();
+        if c.pk.iter().any(|k| nr[*k].is_null()) {
+            continue;
+        }
+        ups.push((arr.layout.encode_row(&nr)?, w));
+    }
+    env.apply(arr.tree, &mut ups, gsn)?;
+    let a = graph.arrs[primary].as_mut().unwrap();
+    a.hydrated = true;
+    a.since = gsn;
+    graph.node_mut(c.new_node).hydrated = true;
+    Ok(())
+}
+
+/// A replaced materialized view (`Engine::replace_view`): its old version,
+/// released once the new one is hydrated, and what follows it.
+pub(crate) struct Replaced {
+    pub id: ObjectId,
+    pub old: ViewRt,
+    /// Arrangements of the indexes on the old version.
+    pub old_index_arrs: Vec<ArrId>,
+    /// The new version has the old one's columns: its subscribers (held
+    /// meanwhile) and sinks follow it; else the sinks start over.
+    pub same: bool,
+    /// The view's sinks (held meanwhile).
+    pub sinks: Vec<ObjectId>,
 }
 
 /// A subscription waiting for its query's dataflow to be hydrated.
@@ -112,8 +193,33 @@ struct Hydrated {
     graph: Graph,
     /// Snapshots of subscribed nodes as of the hydration's GSN.
     snapshots: FxHashMap<NodeId, Output>,
+    /// Per replaced view, the change from its old to its new contents as of
+    /// the hydration's GSN.
+    diffs: FxHashMap<ObjectId, Delta>,
     /// Outputs of subscribed nodes at every record applied after it.
     steps: Vec<(Gsn, FxHashMap<NodeId, Output>)>,
+}
+
+/// What a hydration thread does besides hydrating.
+struct ForkWork {
+    /// Its fragment's nodes and those owning its arrangements: what it goes
+    /// on stepping.
+    roots: Vec<NodeId>,
+    arrs: Vec<ArrId>,
+    /// Nodes whose outputs at every record are kept (and whose snapshot).
+    watch: Vec<(NodeId, bool)>,
+    /// Replaced views: (view, old read arrangement, new read arrangement).
+    diffs: Vec<(ObjectId, ArrId, ArrId)>,
+    /// Rebuilt tables, filled before hydrating.
+    conversions: Vec<Conversion>,
+}
+
+/// The change from the rows of arrangement `old` to those of `new`.
+fn diff_arrangements(graph: &Graph, env: &mut Env, old: ArrId, new: ArrId) -> Result<Delta> {
+    let mut diff = graph.scan_arr(env, new, crate::storage::ReadAt::Latest)?;
+    diff.extend(graph.scan_arr(env, old, crate::storage::ReadAt::Latest)?.into_iter().map(|(r, w)| (r, -w)));
+    crate::dataflow::consolidate(&mut diff);
+    Ok(diff)
 }
 
 /// Hydrate the fork's pending fragment as of `gsn`, then apply forwarded
@@ -123,13 +229,16 @@ fn run(
     mut env: Env,
     mut graph: Graph,
     gsn: Gsn,
-    arrs: Vec<ArrId>,
-    watch: Vec<(NodeId, bool)>,
+    work: ForkWork,
     rx: Receiver<ToFork>,
     hydrated: Arc<AtomicBool>,
     applied: Arc<Applied>,
     wake: Sender<EngineMsg>,
 ) -> Result<Hydrated> {
+    let ForkWork { roots, arrs, watch, diffs: to_diff, conversions } = work;
+    for c in &conversions {
+        fill_rebuilt(&mut graph, &mut env, c, gsn)?;
+    }
     graph.hydrate(&mut env, gsn)?;
     let mut snapshots = FxHashMap::default();
     for (n, snap) in &watch {
@@ -137,6 +246,12 @@ fn run(
             snapshots.insert(*n, graph.snapshot(&mut env, *n)?);
         }
     }
+    let mut diffs = FxHashMap::default();
+    for (view, old, new) in to_diff {
+        diffs.insert(view, diff_arrangements(&graph, &mut env, old, new)?);
+    }
+    // (the old versions of replaced views are not stepped here)
+    graph.retain_closure(&roots);
     graph.prune_arrangements(&arrs);
     applied.set(gsn);
     hydrated.store(true, Ordering::Release);
@@ -156,7 +271,7 @@ fn run(
                     let _ = wake.send(EngineMsg::Wake);
                 }
             }
-            Ok(ToFork::Finish) => return Ok(Hydrated { env, graph, snapshots, steps }),
+            Ok(ToFork::Finish) => return Ok(Hydrated { env, graph, snapshots, diffs, steps }),
             Err(_) => return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "hydration abandoned")),
         }
     }
@@ -172,13 +287,28 @@ impl Engine {
     pub(crate) fn hydrate(&mut self, gsn: Gsn, then: Vec<Then>) -> Result<()> {
         if self.hydration.is_some() {
             self.hydration_next.extend(then);
-            self.reply_deferred = true;
             return Ok(());
         }
         let (nodes, arrs) = self.graph.pending();
+        let conversions: Vec<Conversion> = then
+            .iter()
+            .filter_map(|t| match t {
+                Then::Rebuilt(r) => Some(Conversion {
+                    old_node: r.old_node,
+                    new_node: r.new_node,
+                    mapping: r.mapping.clone(),
+                    columns: r.columns.clone(),
+                    pk: r.pk.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
         let wake = match &self.handle {
             Some(h) if !self.replaying && !(nodes.is_empty() && arrs.is_empty()) => h.tx.clone(),
             _ => {
+                for c in &conversions {
+                    fill_rebuilt(&mut self.graph, &mut self.env, c, gsn)?;
+                }
                 self.graph.hydrate(&mut self.env, gsn)?;
                 for t in then {
                     self.then_inline(t)?;
@@ -186,28 +316,43 @@ impl Engine {
                 return Ok(());
             }
         };
+        let mut roots = nodes.clone();
+        roots.extend(arrs.iter().map(|a| self.graph.arr(*a).node));
+        let mut watch: Vec<(NodeId, bool)> = Vec::new();
+        let mut diffs = Vec::new();
+        let mut fork_roots = roots.clone();
+        for t in &then {
+            match t {
+                Then::Subscribe(p) => watch.push((p.node, p.snapshot)),
+                Then::Rebuilt(r) => fork_roots.push(r.old_node),
+                Then::Replaced(r) => {
+                    // the old version too, for the change to the new one
+                    fork_roots.push(r.old.node);
+                    if let Some(v) = self.rt.views.get(&r.id) {
+                        diffs.push((r.id, r.old.arr, v.arr));
+                        if r.same {
+                            watch.push((v.node, false));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let env = self.env.fork()?;
-        let graph = self.graph.fork_pending();
+        let graph = self.graph.fork_of(&fork_roots);
         let tables = graph.live_nodes().filter(|n| matches!(n.kind, crate::dataflow::NodeKind::Table { .. })).map(|n| n.id).collect();
-        let watch: Vec<(NodeId, bool)> = then
-            .iter()
-            .filter_map(|t| match t {
-                Then::Subscribe(p) => Some((p.node, p.snapshot)),
-                _ => None,
-            })
-            .collect();
         let (tx, rx) = unbounded();
         let (dtx, done) = bounded(1);
         let hydrated = Arc::new(AtomicBool::new(false));
         let applied = Arc::new(Applied::default());
-        let (h2, a2, fork_arrs) = (hydrated.clone(), applied.clone(), arrs.clone());
+        let (h2, a2) = (hydrated.clone(), applied.clone());
+        let work = ForkWork { roots, arrs: arrs.clone(), watch, diffs, conversions };
         // (the engine thread's stack: the same operators run here)
         std::thread::Builder::new().name("ivm-hydrate".into()).stack_size(64 << 20).spawn(move || {
-            let r = run(env, graph, gsn, fork_arrs, watch, rx, h2, a2, wake);
+            let r = run(env, graph, gsn, work, rx, h2, a2, wake);
             let _ = dtx.send(r);
         })?;
         log::debug!("hydrating {} nodes and {} arrangements as of gsn {gsn} in the background", nodes.len(), arrs.len());
-        self.reply_deferred = true;
         self.hydration = Some(Hydration { gsn, nodes, arrs, tables, tx, done, hydrated, applied, forwarded: gsn, allowed: u64::MAX, then });
         Ok(())
     }
@@ -224,8 +369,105 @@ impl Engine {
                 }
             }
             Then::Subscribe(p) => self.start_subscription(p, self.processed, None, &[]),
+            Then::Replaced(r) => {
+                let diff = match self.rt.views.get(&r.id).map(|v| v.arr) {
+                    Some(new) => diff_arrangements(&self.graph, &mut self.env, r.old.arr, new)?,
+                    None => Vec::new(),
+                };
+                self.finish_replace(*r, self.processed, diff, &[])?;
+            }
+            Then::Repaired(id) => self.finish_repair(id),
+            Then::Rebuilt(r) => self.finish_rebuild(*r)?,
         }
         Ok(())
+    }
+
+    /// The rest of a table's rebuild (`apply_schema_change`) once its new
+    /// version is filled and hydrated: its sinks start over with the new
+    /// columns, and the old version is released.
+    fn finish_rebuild(&mut self, r: Rebuilt) -> Result<()> {
+        for sid in &r.sinks {
+            self.held_sinks.remove(sid);
+        }
+        self.restart_sinks(r.sinks)?;
+        for a in r.old_index_arrs {
+            self.graph.release_arr(&mut self.env, a)?;
+        }
+        self.graph.release_node(&mut self.env, r.old_node)
+    }
+
+    /// The rest of a view replacement (`replace_view`) once the new version
+    /// is hydrated: the view takes its new root's error records; held
+    /// subscribers and sinks follow the new version, getting the change
+    /// `diff` from the old to the new contents as of `gsn` and the new
+    /// version's outputs at the records applied since (`steps`), as they
+    /// would have had it been hydrated inline (sinks of a view whose columns
+    /// changed start over); the old version is released.
+    pub(crate) fn finish_replace(&mut self, r: Replaced, gsn: Gsn, diff: Delta, steps: &[(Gsn, FxHashMap<NodeId, Output>)]) -> Result<()> {
+        if let Some(new_node) = self.rt.views.get(&r.id).map(|v| v.node) {
+            self.take_root_errors(r.id);
+            for s in self.subs.iter_mut().filter(|s| s.view == Some(r.id) && s.held) {
+                s.node = new_node;
+                s.held = false;
+                if !diff.is_empty() {
+                    let _ = s.tx.send(SubEvent::Data { gsn, rows: diff.clone() });
+                }
+                for (g, outs) in steps {
+                    deliver_to(s, *g, outs.get(&new_node));
+                }
+            }
+            for sid in &r.sinks {
+                self.held_sinks.remove(sid);
+            }
+            if r.same {
+                for sid in &r.sinks {
+                    if let Some(sink) = self.sink_handles.get_mut(sid) {
+                        sink.node = new_node;
+                        sink.send(gsn, &diff);
+                        for (g, outs) in steps {
+                            match outs.get(&new_node) {
+                                Some(o) => sink.send(*g, &o.data),
+                                None => sink.progress(*g),
+                            }
+                        }
+                    }
+                }
+            } else {
+                // (re-planned after an upstream change) new rows, new columns
+                self.restart_sinks(r.sinks)?;
+            }
+        }
+        for a in r.old_index_arrs {
+            self.graph.release_arr(&mut self.env, a)?;
+        }
+        self.graph.release_arr(&mut self.env, r.old.arr)?;
+        self.graph.release_node(&mut self.env, r.old.node)
+    }
+
+    /// A broken view built again (`repair_view`) is hydrated: it takes its
+    /// root's error records and its sinks start.
+    fn finish_repair(&mut self, id: ObjectId) {
+        self.take_root_errors(id);
+        // (also while replaying: sinks receive replayed records)
+        if let Some(handle) = self.handle.clone() {
+            let sinks: Vec<(ObjectId, String, crate::catalog::SinkDef)> = self
+                .catalog
+                .objects
+                .values()
+                .filter_map(|o| match &o.kind {
+                    ObjectKind::Sink(s) if s.from == id && self.rt.broken.contains_key(&o.id) => Some((o.id, o.name.clone(), s.clone())),
+                    _ => None,
+                })
+                .collect();
+            for (sid, sname, sdef) in sinks {
+                self.start_sink_or_mark_broken(sid, &sname, &sdef, &handle);
+            }
+        }
+    }
+
+    /// Nodes and arrangements not hydrated yet.
+    pub(crate) fn pending_set(&self) -> (Vec<NodeId>, Vec<ArrId>) {
+        self.graph.pending()
     }
 
     /// A new materialized view takes the error records of its root (also
@@ -270,14 +512,21 @@ impl Engine {
         Ok(())
     }
 
-    /// Is a relation that `rel` reads still being hydrated?
+    /// Is a relation that `rel` reads still being hydrated (a view, or a
+    /// table rebuilt after a schema change)?
     pub(crate) fn reads_hydrating(&self, rel: &crate::sql::Rel) -> bool {
         fn walk(e: &Engine, r: &crate::sql::Rel) -> bool {
-            if let crate::sql::Rel::Get { id, .. } = r
-                && let Some(v) = e.rt.views.get(id)
-                && !e.graph.arr(v.arr).hydrated
-            {
-                return true;
+            if let crate::sql::Rel::Get { id, .. } = r {
+                if let Some(v) = e.rt.views.get(id)
+                    && !e.graph.arr(v.arr).hydrated
+                {
+                    return true;
+                }
+                if let Some(n) = e.rt.tables.get(id)
+                    && !e.graph.node(*n).hydrated
+                {
+                    return true;
+                }
             }
             r.inputs().into_iter().any(|i| walk(e, i))
         }
@@ -350,7 +599,7 @@ impl Engine {
         self.env.adopt_trees(&mut res.env, &trees)?;
         self.graph.adopt_hydrated(&res.graph, &h.nodes, &h.arrs);
         log::debug!("hydration as of gsn {} is live at gsn {}", h.gsn, self.processed);
-        let Hydrated { env, graph, mut snapshots, steps } = res;
+        let Hydrated { env, graph, mut snapshots, mut diffs, steps } = res;
         drop((env, graph));
         for t in h.then {
             match t {
@@ -360,6 +609,12 @@ impl Engine {
                     let snapshot = snapshots.remove(&p.node);
                     self.start_subscription(p, h.gsn, snapshot, &steps);
                 }
+                Then::Replaced(r) => {
+                    let diff = diffs.remove(&r.id).unwrap_or_default();
+                    self.finish_replace(*r, h.gsn, diff, &steps)?;
+                }
+                Then::Repaired(id) => self.finish_repair(id),
+                Then::Rebuilt(r) => self.finish_rebuild(*r)?,
             }
         }
         Ok(())
@@ -377,7 +632,8 @@ impl Engine {
             let _ = tx.send(SubEvent::Data { gsn, rows: s.data });
         }
         let _ = tx.send(SubEvent::Progress { gsn });
-        let sub = Subscription { node: p.node, tx, cancel: cancel.clone(), pinned: p.pinned, progress: p.progress, view: p.view, reads: p.reads };
+        let sub =
+            Subscription { node: p.node, tx, cancel: cancel.clone(), pinned: p.pinned, held: false, progress: p.progress, view: p.view, reads: p.reads };
         for (g, outs) in steps {
             deliver_to(&sub, *g, outs.get(&sub.node));
         }

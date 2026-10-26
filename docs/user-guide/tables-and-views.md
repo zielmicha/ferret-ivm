@@ -229,7 +229,11 @@ Otherwise:
   modifiers) are unchanged, subscriptions to the view and sinks from it
   receive the difference between the old and the new contents as one change
   at that GSN; otherwise subscriptions to the view end with
-  `materialized view "x" changed its columns` (SQLSTATE `55000`).
+  `materialized view "x" changed its columns` (SQLSTATE `55000`). The new
+  version is hydrated off the engine thread, as a new view is: reads of the
+  view wait for it, its subscribers and sinks get the difference and then
+  the new version's changes once it is hydrated, and the statement returns
+  then.
 - **Every other combination** (virtual by materialized, materialized by
   virtual, virtual by virtual): the old object is dropped and the new one is
   created under the same id. Subscriptions reading the old object end as for

@@ -855,16 +855,7 @@ impl Graph {
     /// fork of the storage). Operator state is copied, not shared; node and
     /// arrangement ids stay the same.
     pub fn fork_of(&self, roots: &[NodeId]) -> Graph {
-        let mut keep_nodes: FxHashSet<NodeId> = FxHashSet::default();
-        let mut stack: Vec<NodeId> = roots.to_vec();
-        while let Some(id) = stack.pop() {
-            if !keep_nodes.insert(id) {
-                continue;
-            }
-            let n = self.node(id);
-            stack.extend(n.inputs.iter().copied());
-            stack.extend(operator_arrangements(&n.kind).into_iter().map(|a| self.arr(a).node));
-        }
+        let keep_nodes = self.closure(roots);
         let mut g = Graph { now: self.now, stepped_now: self.stepped_now, topo_dirty: true, ..Graph::default() };
         g.nodes = self
             .nodes
@@ -896,6 +887,41 @@ impl Graph {
         g.arr_by_fp = g.live_arrangements().map(|a| (a.fp.clone(), a.id)).collect();
         g.node_errors = self.node_errors.iter().filter(|(id, _)| keep_nodes.contains(id)).map(|(k, v)| (*k, v.clone())).collect();
         g
+    }
+
+    /// Nodes `roots` and what they read, transitively: their inputs and the
+    /// nodes owning the arrangements their operators read.
+    fn closure(&self, roots: &[NodeId]) -> FxHashSet<NodeId> {
+        let mut keep: FxHashSet<NodeId> = FxHashSet::default();
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        while let Some(id) = stack.pop() {
+            if !keep.insert(id) {
+                continue;
+            }
+            let n = self.node(id);
+            stack.extend(n.inputs.iter().copied());
+            stack.extend(operator_arrangements(&n.kind).into_iter().map(|a| self.arr(a).node));
+        }
+        keep
+    }
+
+    /// Drop the nodes that `roots` do not read (`closure`), with their
+    /// arrangements (in a fork, so that its steps leave them alone).
+    pub fn retain_closure(&mut self, roots: &[NodeId]) {
+        let keep = self.closure(roots);
+        for id in 0..self.nodes.len() {
+            if self.nodes[id].is_some() && !keep.contains(&id) {
+                let n = self.nodes[id].take().unwrap();
+                self.node_by_fp.remove(&n.fp);
+                self.node_errors.remove(&id);
+                for a in n.arrangements {
+                    if let Some(arr) = self.arrs[a].take() {
+                        self.arr_by_fp.remove(&arr.fp);
+                    }
+                }
+            }
+        }
+        self.topo_dirty = true;
     }
 
     /// Drop the arrangements that no operator reads, except `keep` (in a

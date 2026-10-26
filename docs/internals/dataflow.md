@@ -455,9 +455,12 @@ next GSN on.
 
 ### Hydration off the engine thread
 
-`CREATE MATERIALIZED VIEW` (not replacing a view), `CREATE INDEX` and
-`SUBSCRIBE (query)` hydrate their new nodes and arrangements without
-stopping the engine (`coord/hydrate.rs`). At the GSN *g* the statement is
+`CREATE MATERIALIZED VIEW`, `CREATE INDEX`, `CREATE OR REPLACE` (with the
+re-planning of the views reading the replaced view), upstream schema changes
+and `SUBSCRIBE (query)` hydrate their new nodes and arrangements without
+stopping the engine (`coord/hydrate.rs`). A DDL or schema record collects
+what has to follow the hydration of what it built (`hydrate::Then`) and
+starts the hydration once it has been applied. At the GSN *g* the statement is
 applied at (its DDL record, or the last applied record for `SUBSCRIBE`), the
 engine takes a fork of the storage — every tree as of *g*
 ([Storage](storage.md#forks)) — and a copy of the part of the graph the new
@@ -515,10 +518,34 @@ Meanwhile:
 - At most a million forwarded records are kept for a thread still
   hydrating; beyond, the engine waits for it.
 
-Replay and recovery hydrate inline (nothing waits for them); so do
-`CREATE OR REPLACE MATERIALIZED VIEW`, the re-planning of dependent views and
-upstream schema changes, which compare the old and new contents at their
-GSN. A failure of a background hydration (an internal or I/O error) stops
+Replacements need more than the new contents:
+
+- A replaced materialized view (`replace_view`) is switched to its new
+  version at the record's GSN *g*; the old version is kept (and maintained)
+  until the hydration is done. Its subscribers (same columns) and sinks are
+  held — they get nothing — until then; the thread computes the change from
+  the old to the new contents as of *g* on the fork, right after hydrating,
+  and the engine then delivers it at *g*, followed by the new version's
+  outputs at the records applied since, before releasing the holds and the
+  old version (`finish_replace`). Subscribers and sinks get exactly what an
+  inline replacement at *g* would have given them, at the same GSNs, which
+  sinks need: they are idempotent by GSN. Sinks of a view whose columns
+  changed start over then (they were held too, so that their targets did
+  not get the old version's later changes).
+- A table rebuilt after an upstream schema change (`apply_schema_change`)
+  gets a new, empty Table node at *g*, to which the table's changes are
+  routed from then on; the thread first fills its primary index with the
+  old version's rows as of *g* converted to the new shape (`fill_rebuilt`)
+  and then hydrates the re-planned views. Reads of the table wait meanwhile,
+  its sinks are held and start over afterwards, and no checkpoint is taken
+  until it is done: the table's rows are in neither version's index alone,
+  and a table's rows exist nowhere else (a crash replays the schema record).
+- These records must start their hydration as of their own GSN (the switch
+  is at *g* in every run, so that the change delivered at *g* is the same):
+  they wait while another hydration is in progress (above).
+
+Replay and recovery hydrate inline, with the same steps (nothing waits for
+them). A failure of a background hydration (an internal or I/O error) stops
 the engine, as one inline would.
 
 ## Errors
