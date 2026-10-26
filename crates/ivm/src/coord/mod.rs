@@ -697,11 +697,16 @@ impl Engine {
         }
         // ask sources and sinks to stop, without waiting for them here
         let mut threads: Vec<JoinHandle<()>> = self.source_handles.drain().filter_map(|(_, s)| s.stop()).collect();
-        for (_, s) in self.sink_handles.drain() {
+        for (id, s) in self.sink_handles.drain() {
             // everything applied is delivered: the sink records it as its
             // progress, matching the final checkpoint, so that the next
-            // start does not resynchronize it
-            s.progress(self.processed);
+            // start does not resynchronize it — unless it is held for a
+            // replacement still being hydrated, which it was sent nothing
+            // since (it must not record records it never got: the next start
+            // gives it the replacement again, or resynchronizes it)
+            if !self.held_sinks.contains(&id) {
+                s.progress(self.processed);
+            }
             threads.extend(s.stop());
         }
         let _ = self.seq.send(SeqMsg::Shutdown);

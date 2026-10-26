@@ -1013,6 +1013,49 @@ fn sinks_keep_their_columns_across_view_replacements() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sink whose view is being replaced is held (sent nothing) until the
+/// new version is hydrated. The engine stopping meanwhile recorded the last
+/// applied GSN as the sink's progress all the same, and the restart resumed
+/// the sink past the replacement's change: its target kept the old version's
+/// rows. Now a held sink records nothing then, and after the restart the
+/// target equals the view.
+#[test]
+fn a_sink_held_by_a_replacement_is_not_resumed_past_it() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-held");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE big (id bigint PRIMARY KEY, x bigint, g int)");
+    for lo in (0..300_000).step_by(50_000) {
+        ivm.exec(&format!("INSERT INTO big SELECT i, (i::bigint * 7919) % 300000, i % 97 FROM generate_series({lo}, {}) i", lo + 49_999));
+    }
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT g, count(*) AS n, sum(x) AS s FROM big GROUP BY g");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy' KEY (g)", up.conninfo));
+    // (rows as text; the target table is created by the sink)
+    let copy = |up: &mut Upstream| up.client.query("SELECT g, n, s FROM v_copy ORDER BY g").map(|r| r.rows).unwrap_or_default();
+    let view = |ivm: &mut Ivm| ivm.client.query("SELECT g, n, s FROM v ORDER BY g").unwrap().rows;
+    let want = view(&mut ivm);
+    eventually("the snapshot", || copy(&mut up) == want);
+    // the same columns, other contents; a join, hydrated off the engine
+    // thread for a while
+    let mut other = ivm.connect();
+    let replace = std::thread::spawn(move || {
+        other.simple_query("CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT a.g, count(*) AS n, sum(b.x) AS s FROM big a JOIN big b ON a.x = b.id GROUP BY a.g")
+    });
+    // its record applied (in the history), while it is hydrated
+    eventually("the replacement's record", || {
+        ivm.rows("SELECT count(*) FROM ivm.catalog_history WHERE statement LIKE 'CREATE OR REPLACE%'") == ["1"]
+    });
+    assert!(!replace.is_finished(), "the replacement was hydrated before the engine stopped");
+    ivm.shutdown();
+    let _ = replace.join();
+    let mut ivm = Ivm::start(&dir);
+    let new = view(&mut ivm);
+    assert_ne!(new, want, "the replacement changed nothing");
+    eventually("the target to follow the replacement", || copy(&mut up) == new);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Changes produced while a sink cannot connect yet are delivered once it
 /// can; retrying the connection used to read (and drop) a queued change
 /// each time.

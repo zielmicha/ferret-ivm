@@ -257,7 +257,7 @@ round):
 | `Request(Checkpoint)` | ask for a checkpoint: answered with its GSN once one begun after the request is committed |
 | `Request(Inspect)` | build a snapshot for the web UI (`coord/inspect.rs`) between two records, so that it is consistent at one GSN, and hand it to the requester's callback |
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
-| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress (except one that fell behind) and ask it to stop, stop the sequencer, take a final checkpoint after the one being written, if any (not after a simulated crash, which only waits for that one to be written), wait up to 5 s for sources and sinks, exit |
+| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress (except one that fell behind, or one held for a replacement still being hydrated, which was not sent the records since) and ask it to stop, stop the sequencer, take a final checkpoint after the one being written, if any (not after a simulated crash, which only waits for that one to be written), wait up to 5 s for sources and sinks, exit |
 
 After every round it runs deferred requests (queued DML, woken reads),
 sends the records submitted in the round to the sequencer as one
