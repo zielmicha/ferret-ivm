@@ -56,11 +56,24 @@ pub struct DeltaPath {
     pub steps: Vec<LookupStep>,
 }
 
+/// Counts the expression errors of a regular input's MFP (which may fail)
+/// once per input row: an Mfp node over the input's node, an input of the
+/// join, applying the MFP and keeping no rows (`arr`, its arrangement, stays
+/// empty; it makes the node's error records authoritative).
+#[derive(Clone, Debug)]
+pub struct JoinTracker {
+    pub input: usize,
+    pub node: NodeId,
+    pub arr: ArrId,
+}
+
 #[derive(Clone, Debug)]
 pub struct JoinPlan {
     pub inputs: Vec<JoinInput>,
     pub paths: Vec<DeltaPath>,
     pub width: usize,
+    /// Error trackers of the inputs whose MFP may fail (the others' cannot).
+    pub trackers: Vec<JoinTracker>,
 }
 
 impl JoinPlan {
@@ -76,7 +89,13 @@ impl JoinPlan {
                 v.push(a);
             }
         }
+        v.extend(self.trackers.iter().map(|t| t.arr));
         v
+    }
+
+    /// Are input `i`'s expression errors counted by an error tracker?
+    fn tracked(&self, i: usize) -> bool {
+        self.trackers.iter().any(|t| t.input == i)
     }
 
     pub fn fingerprint(&self, cx: &FpCtx, fp: &mut Vec<u8>) {
@@ -331,8 +350,11 @@ pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all:
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        // input expression errors count once per input row
-                        if path.source == first_path_of(p, path.source) {
+                        // Input expression errors count once per input row,
+                        // by the input's error tracker. (An input without
+                        // one has an MFP that cannot fail; were it to fail
+                        // anyway, its error is not dropped.)
+                        if !p.tracked(path.source) {
                             out.errs.push((err_record(&e), *w));
                         }
                     }
@@ -372,10 +394,6 @@ fn presence_key_exprs(p: &JoinPlan, i: usize) -> Option<&[Expr]> {
     p.paths.iter().filter(|pa| pa.source != i).flat_map(|pa| pa.steps.iter()).find(|s| s.input == i).map(|s| s.key.as_slice())
 }
 
-fn first_path_of(_p: &JoinPlan, source: usize) -> usize {
-    source
-}
-
 /// Full join contents (latest): drive the cheapest regular input's path.
 pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Result<()> {
     let cx = Ctx { g, p, pres_delta: p.inputs.iter().map(|_| None).collect() };
@@ -397,19 +415,8 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Res
     let path = p.paths.iter().find(|pa| pa.source == src).expect("path for every input");
     let inp = &p.inputs[src];
     let mut cache = FxHashMap::default();
-    // expression errors in the other regular inputs' maps count once per
-    // input row, as on their delta paths (lookups skip the failing rows)
-    for (i, other) in p.inputs.iter().enumerate() {
-        if i == src || other.presence.is_some() || other.mfp.steps.is_empty() {
-            continue;
-        }
-        let snap = super::ops::snapshot_node(g, env, other.node, &mut cache)?;
-        for (raw, w) in &snap.data {
-            if let Err(e) = other.mfp.eval(raw) {
-                out.errs.push((err_record(&e), *w));
-            }
-        }
-    }
+    // (the inputs' expression errors are their error trackers', which are
+    // inputs of the join: lookups skip the failing rows)
     let snap = super::ops::owned(super::ops::snapshot_node(g, env, inp.node, &mut cache)?);
     let mut start = Vec::with_capacity(snap.data.len());
     for (raw, w) in snap.data {
@@ -420,7 +427,11 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Res
                 start.push((row, w));
             }
             Ok(None) => {}
-            Err(e) => out.errs.push((err_record(&e), w)),
+            Err(e) => {
+                if !p.tracked(src) {
+                    out.errs.push((err_record(&e), w));
+                }
+            }
         }
     }
     run_path(env, &cx, path, start, None, &mut out.data)

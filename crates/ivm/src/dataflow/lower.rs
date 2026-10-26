@@ -7,7 +7,7 @@
 //! outer joins and NOT EXISTS are built from semijoins.
 
 use super::agg::AggSpec;
-use super::join::{DeltaPath, JoinInput, JoinPlan, LookupStep};
+use super::join::{DeltaPath, JoinInput, JoinPlan, JoinTracker, LookupStep};
 use super::mfp::Mfp;
 use super::ops::{RecursivePlan, TopKPlan};
 use super::reduce::ReducePlan;
@@ -441,6 +441,29 @@ impl<'a> Lowerer<'a> {
             inputs[j] = JoinInputSpec { node, mfp, width, schema, presence: None, exact: false };
             extra_keys[j] = extra;
         }
+        // Expression errors of an input's MFP count once per input row. An
+        // input whose MFP can fail gets an error tracker: an Mfp node that
+        // evaluates the MFP on the input's rows and keeps none (its
+        // arrangement stays empty). As an arranged node, its error records
+        // are maintained by its steps, checkpointed, and read rather than
+        // recomputed when a join over it hydrates; they reach the join as an
+        // input's do.
+        let mut trackers = Vec::new();
+        for (j, s) in inputs.iter().enumerate() {
+            if s.presence.is_some() {
+                continue;
+            }
+            let input_schema = self.node_schema(s.node);
+            if !s.mfp.may_fail(&input_schema) {
+                continue;
+            }
+            let mut mfp = s.mfp.clone();
+            mfp.add_filter(Expr::Literal(Datum::Bool(false), SqlType::Bool));
+            let schema = mfp.schema(&input_schema);
+            let node = self.g.add_node(NodeKind::Mfp { mfp }, vec![s.node], schema);
+            let arr = self.arrange(node, vec![], vec![], vec![]);
+            trackers.push(JoinTracker { input: j, node, arr });
+        }
         let mut join_inputs = Vec::with_capacity(n);
         let mut nodes = Vec::with_capacity(n);
         for (i, s) in inputs.iter().enumerate() {
@@ -561,7 +584,8 @@ impl<'a> Lowerer<'a> {
             }
             paths.push(DeltaPath { source: src, source_filters, steps });
         }
-        Ok((JoinPlan { inputs: join_inputs, paths, width }, nodes, schema))
+        nodes.extend(trackers.iter().map(|t| t.node));
+        Ok((JoinPlan { inputs: join_inputs, paths, width, trackers }, nodes, schema))
     }
 
     /// Is the set of j-side key expressions a superset of a unique key of j?

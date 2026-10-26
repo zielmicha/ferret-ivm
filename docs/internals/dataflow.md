@@ -276,9 +276,20 @@ extended along *i*'s path. Input *j* is read *after* the GSN if `j < i` and
   below).
 - When all inputs are bound, the joined row goes to the output.
 - For hydration, the join drives the path of its smallest regular input
-  (by index size) over that input's snapshot; the MFPs of the other regular
-  inputs are evaluated over their contents too, so that their expression
-  errors are counted once per row, as the steps count them.
+  (by index size) over that input's snapshot; the other inputs are only
+  looked up.
+- Expression errors of an input's MFP count once per input row, by the
+  input's **error tracker**: an input whose MFP may fail (every step but
+  columns, constants, comparisons of two values of one scalar type, null
+  tests, `AND`/`OR`/`NOT`, `CASE` and `COALESCE` over those) gets an `Mfp`
+  node applying the MFP to the input's rows and keeping none, with an
+  arrangement that stays empty. It is an input of the join, so its error
+  records reach the join's output and contents like any input's; being
+  arranged, its error records are authoritative and checkpointed: a join
+  hydrated later over the same input reads them instead of evaluating the
+  MFP over the input again (only the tracker's own hydration does, once).
+  Joins whose input MFPs cannot fail have no trackers, and their
+  hydration reads no input but the one it drives.
 
 Lookup order is chosen per path by the planner ([Planner](planner.md#delta-join-planning)):
 the next input is the one with the most equality conditions to the bound
@@ -512,10 +523,11 @@ next GSN on.
 ## Errors
 
 Error records are produced by `Mfp` and `FlatMap` (per row), `Reduce` (per
-group), `Window` (per partition), `TemporalFilter` (per row), `Recursive`
-(per query) and `DeltaJoin` (errors in the MFP of the delta's own input; a
-looked-up row whose MFP fails is skipped, as that input's own path counts
-its error). They pass through every other operator. Errors in a join's
+group), `Window` (per partition), `TemporalFilter` (per row) and `Recursive`
+(per query). Errors in the MFPs of a `DeltaJoin`'s inputs are counted by
+the inputs' error trackers (`Mfp` nodes, see [DeltaJoin](#deltajoin)); a
+looked-up row whose MFP fails is skipped. They pass through every other
+operator. Errors in a join's
 residual conditions (those that are not equalities between two inputs) are
 not records: the condition counts as false, so the joined row is missing
 where PostgreSQL would fail.

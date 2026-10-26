@@ -190,3 +190,29 @@ fn percentiles_do_not_scan_their_group() {
     }
     assert_eq!(t.rows("pv"), vec![vec![int(0), int(2498), int(2500)], vec![int(1), int(2499), int(2500)]]);
 }
+
+/// Hydrating a join reads the input it drives, not the other inputs to
+/// count their expression errors: a filter that cannot fail has none, and
+/// the errors of one that can are kept by its error tracker (computed when
+/// the tracker is created, then read).
+#[test]
+fn join_hydration_reads_the_driven_input_only() {
+    let mut t = T::new("work-join");
+    t.ddl("CREATE TABLE small (id bigint PRIMARY KEY, hid bigint)");
+    t.ddl("CREATE TABLE huge (id bigint PRIMARY KEY, status bigint, x bigint)");
+    t.upsert("huge", (0..5000).map(|i| vec![int(i), int(i % 3), int(i % 7)]).collect());
+    t.upsert("small", (1..=10).map(|i| vec![int(i), int(i * 7)]).collect());
+    let (entries, _) = t.work(|t| t.ddl("CREATE MATERIALIZED VIEW j1 AS SELECT s.id, h.status FROM small s JOIN huge h ON h.id = s.hid WHERE h.status = 1"));
+    assert!(entries < 100, "{entries} entries");
+    assert_eq!(t.rows("j1").len(), 4);
+    // (a division by zero for every row with x = 0)
+    let q = "SELECT s.id, h.status FROM small s JOIN huge h ON h.id = s.hid WHERE 10 / h.x > 1";
+    let (entries, _) = t.work(|t| t.ddl(&format!("CREATE MATERIALIZED VIEW j2 AS {q}")));
+    assert!((5000..6000).contains(&entries), "{entries} entries: the tracker reads huge once");
+    let (entries, _) = t.work(|t| t.ddl(&format!("CREATE MATERIALIZED VIEW j3 AS SELECT * FROM ({q}) j WHERE id > 0")));
+    assert!(entries < 100, "{entries} entries");
+    for v in ["j2", "j3"] {
+        let node = t.e.rt.views[&t.id(v)].node;
+        assert_eq!(t.e.graph.errors_of(node), vec![(("22012".to_string(), "division by zero".to_string()), 715)], "{v}");
+    }
+}
