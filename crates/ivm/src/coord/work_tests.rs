@@ -151,3 +151,27 @@ fn temporal_filters_skip_released_events() {
     assert_eq!(entries, 1);
     assert!(t.rows("live").is_empty());
 }
+
+/// A change after a top-k window (in a group with a large OFFSET) visits no
+/// entries; one before it visits the few entries entering and leaving the
+/// window, not the rows skipped by OFFSET.
+#[test]
+fn topk_reads_only_where_the_window_changes() {
+    let mut t = T::new("work-topk");
+    t.ddl("CREATE TABLE k (id bigint PRIMARY KEY, v bigint)");
+    let n = 5000;
+    t.upsert("k", (0..n).map(|i| vec![int(i), int(i * 10)]).collect());
+    t.ddl("CREATE MATERIALIZED VIEW top AS SELECT id, v FROM k ORDER BY v LIMIT 10 OFFSET 2000");
+    let window = |t: &mut T| t.rows("top").into_iter().map(|r| r[0].clone()).collect::<Vec<_>>();
+    assert_eq!(window(&mut t), (2000..2010).map(int).collect::<Vec<_>>());
+    let (entries, _) = t.work(|t| t.upsert("k", vec![vec![int(4000), int(40_001)]]));
+    assert_eq!(entries, 0, "a change after the window");
+    let (entries, _) = t.work(|t| t.upsert("k", vec![vec![int(10), int(-1)]]));
+    assert_eq!(entries, 0, "a change before the window that moves nothing in or out");
+    let (entries, _) = t.work(|t| t.upsert("k", vec![vec![int(10), int(40_005)]]));
+    assert!(entries <= 6, "{entries} entries for a row leaving the rows before the window");
+    assert_eq!(window(&mut t), (2001..2011).map(int).collect::<Vec<_>>());
+    let (entries, _) = t.work(|t| t.upsert("k", vec![vec![int(2003), int(1)]]));
+    assert!(entries <= 6, "{entries} entries for a row leaving the window");
+    assert_eq!(window(&mut t), (2000..2011).filter(|i| *i != 2003).map(int).collect::<Vec<_>>());
+}

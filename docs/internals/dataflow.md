@@ -381,11 +381,33 @@ as `Distinct(Union)`.)
 ### TopK
 
 `ORDER BY ... LIMIT/OFFSET`, `FETCH ... WITH TIES` and `DISTINCT ON` (limit
-1 per group). The input is arranged by (group columns, sort columns). For
-each changed group the operator reads the group's first `offset + limit`
-rows before and after the GSN (walking entries and multiplicities) and emits
-the difference. `WITH TIES` keeps rows whose canonical sort key equals the
-last kept row's.
+1 per group). The input is arranged by (group columns, sort columns). A
+group's output is its *window*: the rows (counted with their
+multiplicities, in index order) at positions `offset` to
+`offset + limit − 1`; `WITH TIES` extends it with the rest of the last row's
+entry and the entries whose canonical sort key equals that entry's.
+Positions are found with the count summaries (`Env::nth`, `range_summary`),
+never by walking the rows before them.
+
+For each changed group the operator compares the window before the GSN
+with the window after it, without reading either in full:
+
+- the positions before the GSN are those after it, shifted by the weight
+  changes of the changed entries before them (each changed entry's weights
+  before and after the GSN come from its history), so the window before
+  the GSN is located from the current counts as well;
+- if the first changed entry comes after the window (its position is past
+  `offset + limit`, and with ties it is not tied with the last row), nothing
+  changes;
+- otherwise only the entries where the two windows can differ are visited:
+  between the two windows' first rows, between their last rows (or through
+  the tie groups), and the changed entries inside either window. Every
+  other entry has all or none of its rows in both windows. Each visited
+  entry contributes the difference of its rows in the two windows.
+
+The work is proportional to the number of changes and to how far the
+window moves, not to `offset` or `limit` (when the window moves past its
+own length, the two windows are read).
 
 ### Window
 

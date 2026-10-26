@@ -529,3 +529,109 @@ fn numeric_aggregates_beyond_the_numeric_range() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A small deterministic random generator (xorshift64*).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// Random changes to `t (id int PRIMARY KEY, g int, v int)` with few
+/// distinct values (ties, duplicate rows in projections, NULLs): inserts,
+/// updates and deletes of one row or of many in one statement. After each,
+/// every view must equal its query run ad hoc.
+fn random_changes_keep_views_equal(name: &str, queries: &[&str], steps: usize, seed: u64) {
+    let dir = tmpdir(name);
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+    let mut rng = Rng(seed);
+    let mut ids: Vec<i64> = Vec::new();
+    let mut next_id = 1;
+    let val = |rng: &mut Rng| if rng.below(10) == 0 { "NULL".to_string() } else { rng.below(8).to_string() };
+    for _ in 0..20 {
+        exec(&h, &format!("INSERT INTO t VALUES ({next_id}, {}, {})", rng.below(3), val(&mut rng)));
+        ids.push(next_id);
+        next_id += 1;
+    }
+    for (i, q) in queries.iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    for step in 0..steps {
+        let pick = |rng: &mut Rng, ids: &[i64]| ids[rng.below(ids.len() as u64) as usize];
+        let sql = match rng.below(9) {
+            0 | 1 if ids.len() < 60 || ids.is_empty() => {
+                let n = 1 + rng.below(3);
+                let mut vals = Vec::new();
+                for _ in 0..n {
+                    vals.push(format!("({next_id}, {}, {})", rng.below(3), val(&mut rng)));
+                    ids.push(next_id);
+                    next_id += 1;
+                }
+                format!("INSERT INTO t VALUES {}", vals.join(", "))
+            }
+            _ if ids.is_empty() => continue,
+            0..=2 => format!("UPDATE t SET v = {} WHERE id = {}", val(&mut rng), pick(&mut rng, &ids)),
+            3 => format!("UPDATE t SET g = {} WHERE id = {}", rng.below(3), pick(&mut rng, &ids)),
+            4 => format!("UPDATE t SET v = v + 1 WHERE id % {} = {}", 2 + rng.below(4), rng.below(2)),
+            5 => format!("UPDATE t SET v = v - 1, g = (g + 1) % 3 WHERE v > {}", rng.below(8)),
+            6 | 7 => {
+                let id = pick(&mut rng, &ids);
+                ids.retain(|x| *x != id);
+                format!("DELETE FROM t WHERE id = {id}")
+            }
+            _ => {
+                let g = rng.below(3);
+                let gone = rows(&h, &format!("SELECT id FROM t WHERE g = {g}"));
+                ids.retain(|x| !gone.contains(&x.to_string()));
+                format!("DELETE FROM t WHERE g = {g}")
+            }
+        };
+        exec(&h, &sql);
+        for (i, q) in queries.iter().enumerate() {
+            let want = sorted(rows(&h, q));
+            let got = sorted(rows(&h, &format!("SELECT * FROM v{i}")));
+            assert_eq!(got, want, "step {step} ({sql}): view {i}: {q}");
+        }
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Top-k windows (LIMIT, OFFSET, WITH TIES, per group) follow random
+/// changes, multiplicities and ties included: a change is applied where the
+/// window before and after it can differ, found through the count
+/// summaries.
+#[test]
+fn topk_follows_random_changes() {
+    let queries = [
+        "SELECT id, v FROM t ORDER BY v, id LIMIT 3 OFFSET 2",
+        "SELECT g, v FROM t ORDER BY v DESC NULLS LAST OFFSET 4 FETCH FIRST 3 ROWS WITH TIES",
+        "SELECT v FROM t ORDER BY v LIMIT 5 OFFSET 3",
+        "SELECT v FROM t ORDER BY v NULLS FIRST OFFSET 6",
+        "SELECT g, v FROM t ORDER BY v FETCH FIRST 1 ROWS WITH TIES",
+        "SELECT DISTINCT ON (g) g, v FROM t ORDER BY g, v DESC",
+        "SELECT v FROM t ORDER BY v LIMIT 0",
+        "SELECT g FROM t ORDER BY g LIMIT 7 OFFSET 7",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v LIMIT 2 OFFSET 1) x",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v DESC FETCH FIRST 2 ROWS WITH TIES) x",
+    ];
+    for seed in [1, 2, 3] {
+        random_changes_keep_views_equal(&format!("topk-random-{seed}"), &queries, 150, seed * 7919);
+    }
+}
