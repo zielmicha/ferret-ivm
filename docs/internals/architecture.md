@@ -57,7 +57,8 @@ Where the implementation differs from the design:
 | `ivm-sequencer` | the input-log writer | assigns GSNs, appends and `fsync`s records in batches, generates clock ticks, acknowledges submitters, forwards durable records to the engine |
 | `ivm-engine` (64 MiB stack) | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, takes checkpoints, builds the web UI's snapshots |
 | `ivm-session-<n>` (one per client, 16 MiB stack) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
-| `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
+| `ivm-source-<name>` (one per source) | the replication connection | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot; never blocks on a snapshot query or on the log |
+| `ivm-copy-<source id>` (one per source, from its first snapshot chunk on) | the snapshot connection | reads snapshot chunks and writes their watermarks for the source thread ([Recovery](recovery.md#the-dblog-snapshot-algorithm)) |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
 | `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, removes it and requests a shutdown |
 | `ivm-http` (with `--http-listen`: a driver thread and the two worker threads of its own tokio runtime) | the HTTP listener | the web UI's server, its once-a-second metrics sampler and the SQL console ([Web UI](../web-ui.md)); engine snapshots are requested with a callback, so no async thread blocks on the engine |
@@ -133,8 +134,11 @@ snapshot requests queued at the engine.
    that GSN (`Graph::step`), and the outputs are delivered to subscriptions
    and sinks.
 
-Source progress (snapshot bookkeeping) and schema records are logged with
-the blocking `EngineHandle::log`, which returns once the record is durable.
+Source progress (snapshot bookkeeping, as `ProgressDelta` records) and
+schema records are sent the same way and count as in flight, at the LSN of
+the commit before them, until durable. A source with 10,000 records in
+flight stops reading the stream until some are durable, but goes on sending
+status updates, so its session stays up.
 
 ### Local DML
 
@@ -199,8 +203,9 @@ segments; `SeqMsg::Shutdown` stops the sequencer after the current batch.
 Backpressure: before each batch the sequencer waits while the engine has
 `MAX_ENGINE_LAG` (10,000) or more durable records still to apply
 (`durable_gsn - processed_gsn`; not while shutting down). Acknowledgements
-then stop, sources block once 10,000 of their commits are unacknowledged,
-and the engine's queue of durable batches stays bounded. The engine never
+then stop, sources stop reading their streams once 10,000 of their records
+are unacknowledged (keeping their sessions), and the engine's queue of
+durable batches stays bounded. The engine never
 waits for the sequencer (its appends are not acknowledged synchronously),
 so it always catches up.
 

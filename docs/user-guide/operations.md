@@ -26,8 +26,8 @@ Fixed internal parameters (not configurable):
 | input-log segment size (roll-over threshold) | 64 MiB |
 | maximum records per sequencer batch (group commit) | 4096 |
 | durable records the engine may lag behind before the sequencer stops taking appends | 10,000 |
-| unacknowledged commits per source | 10,000 |
-| initial-snapshot chunk | 10,000 rows |
+| records a source has in flight to the input log before it stops reading the stream until they are durable | 10,000 |
+| initial-snapshot chunk (and piece of a table without a key) | 10,000 rows |
 | groups cached in memory per aggregation | 2^18 (half evicted when full) |
 | nodes relocated per garbage-collection pass | 1000 |
 | manifest rewrite threshold | 8 MiB |

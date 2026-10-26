@@ -290,6 +290,198 @@ fn text_replicated_keys_snapshot_in_chunks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Upstream changes to `t` (keyed by `k text, n int`) spread over its key
+/// space, from a thread of their own until `stop` is set; returns how many
+/// transactions it made.
+fn churn(conninfo: String, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<u64> {
+    std::thread::spawn(move || {
+        let mut c = connect(&conninfo);
+        let mut i = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let (k, n) = (KEY_PREFIXES[(i % 7) as usize], (i * 7919) % 5000);
+            c.simple_query(&match i % 4 {
+                0 => format!("UPDATE t SET a = a + 1 WHERE k = '{k}{n}' AND n = {}", n % 7),
+                1 => format!("DELETE FROM t WHERE k = '{k}{}' AND n = {}", n + 1, (n + 1) % 7),
+                2 => format!("INSERT INTO t VALUES ('{k}x{i}', 0, -1) ON CONFLICT DO NOTHING"),
+                _ => format!("UPDATE t SET k = k || 'y', a = 0 WHERE k = '{k}{}' AND n = {}", n + 2, (n + 2) % 7),
+            })
+            .unwrap();
+            i += 1;
+        }
+        i
+    })
+}
+
+/// First characters of `t`'s keys: their order under a linguistic collation
+/// differs from their byte order.
+const KEY_PREFIXES: [&str; 7] = ["a", "B", "c", "D", "é", "f", "Z"];
+
+/// The rows of `t` in byte order (as the engine orders text).
+const T_ROWS: &str = "SELECT k, n, a FROM t ORDER BY k COLLATE \"C\", n";
+
+/// A table keyed by text under a linguistic collation (ICU) is copied in the
+/// order of its primary key index, whose order and comparison with the
+/// last copied key upstream compute: chunks used to be ordered and filtered
+/// by `k::text COLLATE "C"`, the engine's byte order, which no index serves,
+/// so that every chunk was a scan and sort of the whole table (quadratic).
+/// The copy stays exact while the table changes all over its key space.
+#[test]
+fn collated_text_keys_are_copied_through_the_key_index() {
+    let mut up = Upstream::start_with(&["shared_preload_libraries = 'pg_stat_statements'"]);
+    up.exec("CREATE EXTENSION pg_stat_statements");
+    up.exec(r#"CREATE TABLE t (k text COLLATE "und-x-icu", n int, a int, PRIMARY KEY (k, n))"#);
+    let keys = KEY_PREFIXES.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ");
+    up.exec(&format!("INSERT INTO t SELECT (ARRAY[{keys}])[1 + g % 7] || (g / 7), g / 7 % 7, g FROM generate_series(0, 34999) g"));
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    up.exec("SELECT pg_stat_statements_reset()");
+    let dir = tmpdir("collation");
+    let mut ivm = Ivm::start(&dir);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = churn(up.conninfo.clone(), stop.clone());
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    eventually("the snapshot", || ivm.rows("SHOW SOURCES")[0].split('|').nth(4) != Some("0/0"));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(writer.join().unwrap() > 20, "changes during the snapshot");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT k, n, a FROM t ORDER BY k, n"), up.rows(T_ROWS));
+    // every chunk query can be answered from the index alone, in its order
+    // (with sorts and sequential scans off, a plan that needs them shows a
+    // Sort or a Seq Scan anyway)
+    let chunks = up.rows(r#"SELECT query FROM pg_stat_statements WHERE query LIKE 'SELECT %FROM "public"."t"%'"#);
+    assert!(chunks.len() >= 2, "{chunks:?}");
+    for q in chunks {
+        let plan = up.rows(&format!("SET enable_seqscan = off; SET enable_sort = off; EXPLAIN (GENERIC_PLAN) {q}")).join("\n");
+        assert!(plan.contains("Index Scan using t_pkey") && !plan.contains("Sort") && !plan.contains("Seq Scan"), "{q}:\n{plan}");
+    }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A table without a key (REPLICA IDENTITY FULL) is read in one snapshot in
+/// pieces of 10,000 rows, logged as they arrive; it used to be read in one
+/// query and logged as one commit of the whole table. Changes during the
+/// copy apply after it when its snapshot does not contain them.
+#[test]
+fn keyless_tables_are_copied_in_pieces() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE m (a int, b text)");
+    up.exec("ALTER TABLE m REPLICA IDENTITY FULL");
+    up.exec("INSERT INTO m SELECT g % 9000, 'x' FROM generate_series(1, 25000) g");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("keyless-pieces");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    for i in 0..30 {
+        up.exec(&format!("UPDATE m SET b = 'y{i}' WHERE a = {}", i * 300));
+        up.exec(&format!("DELETE FROM m WHERE ctid = (SELECT min(ctid) FROM m WHERE a = {})", i * 300 + 1));
+        up.exec(&format!("INSERT INTO m VALUES ({i}, 'z')"));
+    }
+    let q = "SELECT a, b, count(*) FROM m GROUP BY a, b ORDER BY a, b";
+    assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    ivm.shutdown();
+    let mut inserts = Vec::new();
+    for (_, r) in ivm::log::read_from(&dir.join("log"), 0).unwrap() {
+        if let ivm::log::LogRecord::Commit { source: 1000, changes, .. } = r {
+            let n = changes.iter().filter(|(_, c)| matches!(c, ivm::dataflow::TableChange::Insert { .. })).count();
+            if n > 0 {
+                inserts.push(n);
+            }
+        }
+    }
+    assert!(inserts.iter().filter(|n| **n >= 1000).count() >= 3 && inserts.iter().all(|n| *n <= 10_000), "{inserts:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Snapshot chunks are read by a thread of their own: a chunk that waits
+/// upstream (here for a lock) holds up neither the other tables' changes nor
+/// the replication session. The chunk query used to run on the replication
+/// thread, which sent no status meanwhile: the stream stood still, and the
+/// session was dropped after wal_sender_timeout (and again after every
+/// reconnection). A failure of the copy connection does not end the session
+/// either: the chunk is retried after a delay.
+#[test]
+fn chunk_reads_do_not_hold_up_the_stream() {
+    let mut up = Upstream::start_with(&["wal_sender_timeout = '2s'"]);
+    up.exec("CREATE TABLE a (id int PRIMARY KEY)");
+    up.exec("CREATE TABLE z (id int PRIMARY KEY, v int)");
+    up.exec("INSERT INTO z SELECT g, g FROM generate_series(1, 100) g");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("chunk-thread");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM z");
+    ivm.shutdown();
+    // z is copied again (a new column) after a restart, and its chunk waits
+    // for this lock
+    up.exec("ALTER TABLE z ADD COLUMN w int; UPDATE z SET v = -1 WHERE id = 1");
+    let mut locker = connect(&up.conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE z IN ACCESS EXCLUSIVE MODE").unwrap();
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("SET read_mode = latest");
+    let blocked = |up: &mut Upstream| up.rows("SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND application_name = 'ivm'");
+    eventually("the chunk to wait for the lock", || !blocked(&mut up).is_empty());
+    let session = walsenders(&mut up);
+    up.exec("INSERT INTO a VALUES (1)");
+    eventually("a's change", || ivm.rows("SELECT count(*) FROM a") == ["1"]);
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(walsenders(&mut up), session, "the replication session outlived wal_sender_timeout");
+    // the copy connection fails
+    for pid in blocked(&mut up) {
+        up.exec(&format!("SELECT pg_terminate_backend({pid})"));
+    }
+    eventually("the failure in the status", || ivm.rows("SHOW SOURCES")[0].contains("cannot read snapshot chunks"));
+    up.exec("INSERT INTO a VALUES (2)");
+    eventually("a's change", || ivm.rows("SELECT count(*) FROM a") == ["2"]);
+    assert_eq!(walsenders(&mut up), session);
+    locker.simple_query("COMMIT").unwrap();
+    for q in ["SELECT * FROM z ORDER BY id", "SELECT * FROM a ORDER BY id"] {
+        assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    }
+    assert_eq!(ivm.rows("SHOW SOURCES")[0].split('|').nth(5), Some("streaming"));
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The engine restarts in the middle of a snapshot (a chunk waits for a
+/// lock, after earlier chunks were logged), with changes before and after
+/// the restart: the copy resumes after the logged boundary, in the key
+/// index's order, and ends equal to the upstream table.
+#[test]
+fn snapshots_resume_after_a_restart() {
+    let mut up = Upstream::start();
+    up.exec(r#"CREATE TABLE t (k text COLLATE "und-x-icu", n int, a int, PRIMARY KEY (k, n))"#);
+    let keys = KEY_PREFIXES.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ");
+    up.exec(&format!("INSERT INTO t SELECT (ARRAY[{keys}])[1 + g % 7] || (g / 7), g / 7 % 7, g FROM generate_series(0, 199999) g"));
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("snapshot-restart");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("SET read_mode = latest");
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = churn(up.conninfo.clone(), stop.clone());
+    eventually("some chunks", || ivm.rows("SELECT count(*) >= 20000 FROM t") == ["t"]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    // the next chunk waits for the lock, whose transaction changes rows too
+    let mut locker = connect(&up.conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE; UPDATE t SET a = -a WHERE n = 3 AND a % 1000 = 0").unwrap();
+    eventually("the chunk to wait for the lock", || {
+        !up.rows("SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND application_name = 'ivm'").is_empty()
+    });
+    assert_eq!(ivm.rows("SHOW SOURCES")[0].split('|').nth(5), Some("snapshotting public.t"));
+    ivm.shutdown();
+    locker.simple_query("COMMIT").unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = churn(up.conninfo.clone(), stop.clone());
+    std::thread::sleep(Duration::from_millis(300));
+    let mut ivm = Ivm::start(&dir);
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT k, n, a FROM t ORDER BY k, n"), up.rows(T_ROWS));
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Changes to a table added by ALTER SOURCE REFRESH are replicated even when
 /// PostgreSQL announced the table (a Relation message, sent once per
 /// session) before the source knew it; they used to be ignored for good.

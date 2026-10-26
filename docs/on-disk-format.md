@@ -170,8 +170,10 @@ Changes apply in order. Tables with a key receive `Upsert`, `Delete` and
 `Truncate` (an `Insert` or `Remove` there sets or deletes the row's key);
 multiset tables receive `Insert`, `Remove` and `Truncate` (an `Upsert` or
 `Delete` there adds or removes one instance of the row; an
-`UpsertIfPresent` adds one, as `Upsert`). The DBLog snapshot
-of a multiset table is logged as `Truncate` followed by an `Insert` per row.
+`UpsertIfPresent` adds one, as `Upsert`). The DBLog snapshot of a multiset
+table is logged as a commit holding a `Truncate`, followed by commits of up
+to 10,000 `Insert`s each (one per row; earlier versions logged the
+`Truncate` and all the `Insert`s in one commit).
 
 `row` is a row in the [row codec](#row-codec). Example (local
 `INSERT INTO customers VALUES (1, 'eu'), (2, 'us')`, table id 1001):
@@ -217,20 +219,35 @@ table 1000, `Delete`, key row with one value, int4 4.
   by versions without instance ids) means a default name without it,
   `ivm_<name>_<id>`.
 
-**Progress** — a source's bookkeeping without data.
+**Progress** — a source's bookkeeping without data (written by earlier
+versions; the current code writes `ProgressDelta` records instead, and still
+reads these).
 
 - `lsn`: the end LSN of the commit after which it was logged (informational;
   not used on replay).
 - `state`: JSON `SourceState` (`source::postgres`):
-  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...], "truncate": bool}}}`
+  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...], "truncate": bool, "index_order": bool, "scanned": bool, "reread": [[str, ...], ...]}}}`
   where `boundary` holds the text values of the last key copied by the
   table's snapshot, and `truncate` (absent: `false`) says that the table's
   next snapshot chunk starts by logging a commit that truncates it (set for
   tables with a key after a key change upstream or a lost replication
-  slot). The whole state replaces the previous one; a state that does not
-  parse is taken as empty (the slot counts as not created and every table
-  is copied again). Progress records of a source that is no longer in the
-  catalog are ignored.
+  slot). `index_order` (absent: `false`; written only when `true`) says that
+  `boundary` is in the order of the upstream key index, in which the
+  current code reads chunks. Boundaries without it were logged by earlier
+  versions, which read chunks in the engine's key order (string key columns
+  compared as `col::text COLLATE "C"`): when the source starts, it keeps
+  such a boundary if no key column is of a string type (the two orders are
+  the same then), and otherwise drops it, so that the table's copy starts
+  again from its first key. `scanned` (absent: `false`; written only when
+  `true`) says that every key range has been copied, and `reread` (absent:
+  empty; written only when not) lists keys, as text values, whose rows are
+  to be read again before the table is done: keys the stream moved a row to
+  leaving TOASTed values unchanged that the source could not supply. Both
+  are absent in states of earlier versions (a table not done has its ranges
+  still to copy then). The whole state replaces the previous one; a
+  state that does not parse is taken as empty (the slot counts as not
+  created and every table is copied again). Progress records of a source
+  that is no longer in the catalog are ignored.
 
 **ProgressDelta** — a change of a source's bookkeeping: the entries of its
 state that changed since its previous progress record, so that copying `T`
@@ -251,7 +268,7 @@ the table `ObjectId`, the new columns as a JSON array of `Column` (key
 columns `NOT NULL`), and the new key as column indexes (the replica
 identity's columns, as for `pk` above). Applying it also resets the table's
 entry in the source's stored state to `{"done": false, "boundary": null}`,
-keeping its `truncate` flag (which the source's `Progress` record logged just
+keeping its `truncate` flag (which the source's progress record logged just
 before sets after a key change), so that the table is copied again, from an
 empty table after a key change, even if the engine restarts before the
 copy starts.
@@ -933,7 +950,7 @@ Consequences of code changes for an existing data directory:
 | Change | Consequence |
 |---|---|
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag truncates the newest log segment at the first such record (see above), losing it and everything after it |
-| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#checkpoint-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array.) |
+| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate`, `index_order`, `scanned` and `reread` in `SourceState` were added with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#checkpoint-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array.) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
@@ -946,7 +963,9 @@ Consequences of code changes for an existing data directory:
 Data directories written by earlier versions of the engine are compatible:
 the formats have only gained fields with defaults, and records and change
 kinds with tags of their own (`ProgressDelta`, `UpsertIfPresent`), which
-earlier versions cannot read. New functions (registered
+earlier versions cannot read. A table whose snapshot an upgrade interrupts
+is copied again from its first key if its key has a string column (see
+`index_order` under [Progress](#logrecord)). New functions (registered
 among the existing ones, which renumbers the later ones) and planner fixes
 did change the fingerprints of many views' arrangements (for example joins
 on computed keys, whose keys are materialized in an `Mfp` node, semijoins
