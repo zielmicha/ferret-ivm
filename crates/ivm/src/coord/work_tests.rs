@@ -116,6 +116,43 @@ fn steps_consider_only_nodes_that_can_change() {
     assert_eq!(nodes, 0);
 }
 
+/// A record's steps and delivery cost what it changes, not what consumes
+/// the graph: with many subscriptions to other views, a commit to a table
+/// nobody reads and a clock tick do no bookkeeping, and a change to one
+/// subscribed view reaches its subscription only. (The set of nodes whose
+/// rows steps return was collected from every subscription and sink for
+/// every record: 3 µs per record with 1,000 subscriptions, on top of the
+/// 0.05 µs of a tick.)
+#[test]
+fn records_cost_what_they_change_not_what_subscribes() {
+    use crate::dataflow::BOOKKEEPING;
+    let mut t = T::new("work-consumers");
+    let mut subs = Vec::new();
+    for i in 0..100 {
+        t.ddl(&format!("CREATE TABLE t{i} (id bigint PRIMARY KEY, v bigint)"));
+        t.ddl(&format!("CREATE MATERIALIZED VIEW v{i} AS SELECT id, v FROM t{i} WHERE v > 0"));
+        let ExecResult::Subscribe { rx, .. } = t.subscribe(crate::sql::parser::SubscribeTarget::Name(format!("v{i}"))) else {
+            panic!("not a subscription")
+        };
+        subs.push(rx);
+    }
+    t.ddl("CREATE TABLE hot (id bigint PRIMARY KEY, v bigint)");
+    // (the index of consumers is built once after they changed)
+    t.upsert("hot", vec![vec![int(0), int(0)]]);
+    BOOKKEEPING.with(|b| b.set(0));
+    let (_, nodes) = t.work(|t| {
+        t.upsert("hot", vec![vec![int(1), int(1)]]);
+        t.tick(1_767_225_600_000_000);
+    });
+    assert_eq!((BOOKKEEPING.with(|b| b.get()), nodes), (0, 1));
+    let (_, nodes) = t.work(|t| t.upsert("t7", vec![vec![int(1), int(2)]]));
+    assert_eq!((BOOKKEEPING.with(|b| b.get()), nodes), (0, 2));
+    for (i, rx) in subs.iter().enumerate() {
+        let rows: Vec<(Row, i64)> = rx.try_iter().flat_map(|e| if let SubEvent::Data { rows, .. } = e { rows.to_vec() } else { vec![] }).collect();
+        assert_eq!(rows, if i == 7 { vec![(vec![int(1), int(2)], 1)] } else { vec![] }, "subscription {i}");
+    }
+}
+
 /// The bookkeeping of a DDL statement visits what the statement changes,
 /// not the graph or the catalog: the metadata tree's records (only the
 /// changed objects and arrangements), the mirrored error state (only the

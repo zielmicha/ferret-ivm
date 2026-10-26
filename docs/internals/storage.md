@@ -126,7 +126,8 @@ about 80 in memory.)
   that is shared is copied before it is modified — its contents, and also
   the child pointers that loading and eviction rewrite — so a fork or a
   checkpoint job keeps the version it was taken with; the copy's memory is
-  counted anew (its blocks may have other capacities). Each slot carries a
+  counted anew (its blocks may have other capacities). An unshared node is
+  rewritten in its allocation. Each slot carries a
   modification stamp, renewed whenever the node's contents may change or it
   becomes dirty.
 - **Eviction.** A CLOCK sweep (at most two passes over all slots) runs after
@@ -221,7 +222,14 @@ changes at one GSN:
    nodes are removed; children the update made smaller than a quarter of
    their target are merged with a neighbour (loading it if needed).
 5. Update summaries on the way back up (incrementally where possible, see
-   below), and the tree's total summary.
+   below), and the tree's total summary. The sizes, `min_seg` and `due` of
+   the internal nodes on the path follow the children that changed: a
+   node's `min_seg` and `due` are the minimums of its children's, and they
+   are computed from all of its children only when a child that may have
+   held a minimum got a higher one (the first update of a clean leaf after
+   a checkpoint, which makes it dirty), children were merged, or the node
+   splits. (So they never exceed the minimums: between the scans and the
+   writes that make them exact, they are only lowered.)
 
 ## Reads
 

@@ -203,6 +203,11 @@ impl Arrangement {
 /// Recovered arrangement trees, by fingerprint.
 pub type RecoveryMap = FxHashMap<Vec<u8>, TreeId>;
 
+/// An arrangement's durable record as `Graph::take_arrangement_changes`
+/// returns it: its fingerprint, and the tree and `since` of the hydrated
+/// arrangement with it (None: there is none).
+pub type ArrangementChange = (Vec<u8>, Option<(TreeId, Gsn)>);
+
 /// Nodes and arrangements live in slots indexed by their ids; the slots of
 /// freed ones are reused (a subscription to a query would otherwise leave
 /// its slots behind for good), so creation order is kept as sequence
@@ -1181,7 +1186,7 @@ impl Graph {
     /// Returns the output of every node that produced something (spilled
     /// rows among them are the caller's to release).
     pub fn step(&mut self, env: &mut Env, gsn: Gsn, changes: FxHashMap<NodeId, Vec<TableChange>>) -> Result<FxHashMap<NodeId, Output>> {
-        let all = self.live_nodes().map(|n| n.id).collect();
+        let all = Arc::new(self.live_nodes().map(|n| n.id).collect());
         self.step_observed(env, gsn, changes, all)
     }
 
@@ -1192,7 +1197,7 @@ impl Graph {
         env: &mut Env,
         gsn: Gsn,
         changes: FxHashMap<NodeId, Vec<TableChange>>,
-        observed: FxHashSet<NodeId>,
+        observed: Arc<FxHashSet<NodeId>>,
     ) -> Result<FxHashMap<NodeId, Output>> {
         let mut input = self.step_begin(gsn, observed);
         for (node, ch) in changes {
@@ -1207,7 +1212,7 @@ impl Graph {
     /// Start processing a GSN, whose base-table changes are then fed in
     /// batches (`step_feed`) before the GSN is propagated (`step_finish`),
     /// which returns the rows of the `observed` nodes.
-    pub fn step_begin(&self, gsn: Gsn, observed: FxHashSet<NodeId>) -> StepInput {
+    pub fn step_begin(&self, gsn: Gsn, observed: Arc<FxHashSet<NodeId>>) -> StepInput {
         StepInput { gsn, tables: FxHashMap::default(), observed }
     }
 
@@ -1771,8 +1776,8 @@ impl Graph {
     /// The durable records of the arrangements that may have changed since
     /// the last call: by fingerprint, the tree and `since` of the hydrated
     /// arrangement with it, or None if there is none (any more).
-    pub fn take_arrangement_changes(&mut self) -> Vec<(Vec<u8>, Option<(TreeId, Gsn)>)> {
-        let mut out: Vec<(Vec<u8>, Option<(TreeId, Gsn)>)> = std::mem::take(&mut self.arr_changes)
+    pub fn take_arrangement_changes(&mut self) -> Vec<ArrangementChange> {
+        let mut out: Vec<ArrangementChange> = std::mem::take(&mut self.arr_changes)
             .into_iter()
             .map(|fp| {
                 bookkept(1);
@@ -1804,7 +1809,7 @@ impl Graph {
 pub struct StepInput {
     gsn: Gsn,
     tables: FxHashMap<NodeId, FedTable>,
-    observed: FxHashSet<NodeId>,
+    observed: Arc<FxHashSet<NodeId>>,
 }
 
 impl StepInput {

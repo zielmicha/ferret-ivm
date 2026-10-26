@@ -299,7 +299,7 @@ fn run(
     applied.set(gsn);
     hydrated.store(true, Ordering::Release);
     let _ = wake.send(EngineMsg::Wake);
-    let watched: rustc_hash::FxHashSet<NodeId> = changes.iter().map(|(_, n, _)| *n).collect();
+    let watched: Arc<rustc_hash::FxHashSet<NodeId>> = Arc::new(changes.iter().map(|(_, n, _)| *n).collect());
     // (the record being fed)
     let mut input: Option<crate::dataflow::StepInput> = None;
     loop {
@@ -508,7 +508,7 @@ impl Engine {
                 self.subs[i].node = new_node;
                 self.subs[i].held = false;
             }
-            self.subs_changed();
+            self.consumers_changed();
             for sid in &r.sinks {
                 self.held_sinks.remove(sid);
             }
@@ -516,6 +516,7 @@ impl Engine {
             for sid in &sinks {
                 self.sink_handles.get_mut(sid).unwrap().node = new_node;
             }
+            self.consumers_changed();
             // (one that asked for a snapshot while it was held gets it now)
             let asked: Vec<ObjectId> = sinks.iter().filter(|s| self.snapshot_asked.remove(s)).copied().collect();
             if let Some(c) = &changes {
@@ -826,7 +827,7 @@ impl Engine {
             reads: p.reads,
         };
         self.subs.push(sub);
-        self.subs_changed();
+        self.consumers_changed();
         // (a client that is gone no longer reads it: it ends)
         if p.reply.send(Ok(ExecResult::Subscribe { columns: p.columns, rx, cancel: cancel.clone(), progress: p.progress })).is_err() {
             cancel.store(true, Ordering::Release);

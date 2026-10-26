@@ -320,7 +320,9 @@ checkpoint.
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
 Delivering outputs (`deliver`) visits only the consumers of the nodes that
-produced something (subscriptions are indexed by node): the error records
+produced something (subscriptions and sinks are indexed by node, an index
+kept until one of them is added, removed or moved; its set of nodes is the
+`observed` set steps return the rows of): the error records
 of each materialized view's root are merged into the view's error counts
 (views are only visited for records with errors); each subscription gets
 the data changes of its node and ends at the first error record that is

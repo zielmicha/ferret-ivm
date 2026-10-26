@@ -706,18 +706,22 @@ impl Env {
 
     /// Take the node out of slot `id` (a copy if it is shared; the slot's
     /// memory is then the copy's, which may own blocks of other capacities).
+    /// An unshared node is moved out of its allocation, which stays in the
+    /// slot (holding an empty leaf) for `put_node` to put the new version
+    /// in: an update rewrites every node on its path, and allocating each
+    /// anew took as long as a tenth of it.
     fn take_node(&mut self, id: u32) -> Node {
         self.own(id);
-        let n = self.slot_mut(id).node.take().expect("node taken");
-        match Arc::try_unwrap(n) {
-            Ok(n) => n,
-            Err(shared) => {
-                let n = (*shared).clone();
-                let mem = n.mem_size() + SLOT_BYTES;
-                self.set_mem(id, mem);
-                n
-            }
+        let slot = self.slot_mut(id);
+        let n = slot.node.as_mut().expect("node taken");
+        if let Some(n) = Arc::get_mut(n) {
+            return std::mem::replace(n, Node::Leaf(Vec::new()));
         }
+        let shared = slot.node.take().unwrap();
+        let n = (*shared).clone();
+        let mem = n.mem_size() + SLOT_BYTES;
+        self.set_mem(id, mem);
+        n
     }
 
     /// In a fork: the node in slot `id` is about to change, or nobody else
@@ -866,7 +870,12 @@ impl Env {
         slot.bytes = bytes;
         slot.mem = mem;
         slot.version = version;
-        slot.node = Some(Arc::new(node));
+        // (into the slot's allocation unless a fork or checkpoint job
+        // shares it)
+        match slot.node.as_mut().and_then(Arc::get_mut) {
+            Some(n) => *n = node,
+            None => slot.node = Some(Arc::new(node)),
+        }
         self.mem_bytes = self.mem_bytes + mem - old;
         if dirty {
             self.dirty_bytes = self.dirty_bytes + mem - old;
@@ -1012,8 +1021,10 @@ impl Env {
             None => self.alloc_slot(Node::Leaf(Vec::new()), None, NONE, tree),
         };
         // the tree's summary is replaced below
-        let old = std::mem::take(&mut self.trees.get_mut(&tree).unwrap().summary);
-        let parts = self.apply_node(root, updates, gsn, summ, Some(&old));
+        let t = self.trees.get_mut(&tree).unwrap();
+        let old = std::mem::take(&mut t.summary);
+        let space = (t.min_seg, t.due);
+        let parts = self.apply_node(root, updates, gsn, summ, Some(&old), space);
         let parts = match parts {
             Ok(p) => p,
             Err(e) => {
@@ -1089,7 +1100,9 @@ impl Env {
     }
 
     /// Apply sorted, consolidated updates below node `id`, whose summary is
-    /// `old` when known. Returns the nodes now covering its key range.
+    /// `old` when known, and whose subtree's `min_seg` and `due` are at
+    /// least `space` (as its entry above holds them). Returns the nodes now
+    /// covering its key range.
     fn apply_node(
         &mut self,
         id: u32,
@@ -1097,6 +1110,7 @@ impl Env {
         gsn: Gsn,
         summ: &Arc<dyn Summarizer>,
         old: Option<&Summary>,
+        space: (u32, Gsn),
     ) -> Result<Parts> {
         let was_dirty = self.slot(id).dirty;
         let edits = self.slot(id).edits;
@@ -1249,6 +1263,13 @@ impl Env {
                 self.put_node(id, Node::Internal(Vec::new()));
                 let mut size = old_bytes;
                 let mut incr = old.cloned();
+                // The subtree's min_seg and due, the minimums of the
+                // children's, follow the children that changed, like its
+                // size and summary (computed from all the children only
+                // when a child that may have held a minimum got a higher
+                // one, or children were merged): scanning a node's children
+                // for them took a tenth of a single-row update.
+                let mut incr_space = Some(space);
                 let n = children.len();
                 // (child, update range) for each child receiving updates
                 let mut runs: smallvec::SmallVec<[(usize, usize, usize); 4]> = smallvec::SmallVec::new();
@@ -1275,11 +1296,22 @@ impl Env {
                 for &(ci, start, end) in runs.iter().rev() {
                     let cid = self.load(children[ci].ptr, id, tree)?;
                     let before = self.slot(cid).bytes;
-                    let parts = self.apply_node(cid, &ups[start..end], gsn, summ, Some(&children[ci].summary))?;
+                    let was = (children[ci].min_seg, children[ci].due);
+                    let parts = self.apply_node(cid, &ups[start..end], gsn, summ, Some(&children[ci].summary), was)?;
                     if let [p] = &parts[..]
                         && self.slot(p.id).bytes < before
                     {
                         shrunk.push(p.id);
+                    }
+                    if let Some((min_seg, due)) = incr_space.as_mut() {
+                        let now_seg = parts.iter().map(|p| p.min_seg).min().unwrap_or(u32::MAX);
+                        let now_due = parts.iter().map(|p| p.due).min().unwrap_or(Gsn::MAX);
+                        if (was.0 <= *min_seg && now_seg > was.0) || (was.1 <= *due && now_due > was.1) {
+                            incr_space = None;
+                        } else {
+                            *min_seg = (*min_seg).min(now_seg);
+                            *due = (*due).min(now_due);
+                        }
                     }
                     if let Some(s) = incr.as_mut() {
                         let news: smallvec::SmallVec<[&Summary; 2]> = parts.iter().map(|p| &p.summary).collect();
@@ -1311,11 +1343,13 @@ impl Env {
                 }
                 if !shrunk.is_empty() {
                     let mut unlimited = u64::MAX;
-                    self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut heap, &mut unlimited, false)?;
+                    if self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut heap, &mut unlimited, false)? > 0 {
+                        incr_space = None;
+                    }
                 }
                 // splits of the last child only: an append at the right edge
                 let append = runs.len() == 1 && runs[0].0 + 1 == n;
-                self.finish_internal_sized(id, children, incr, summ, size, heap, append)
+                self.finish_internal_sized(id, children, incr, incr_space, summ, size, heap, append)
             }
         }
     }
@@ -1454,6 +1488,7 @@ impl Env {
         id: u32,
         children: Vec<Child>,
         summary: Option<Summary>,
+        space: Option<(u32, Gsn)>,
         summ: &Arc<dyn Summarizer>,
         size: usize,
         heap: usize,
@@ -1476,8 +1511,14 @@ impl Env {
             Some(s) => s,
             None => children_summary(&children, summ),
         };
-        let min_seg = children.iter().map(|c| c.min_seg).fold(u32::MAX, u32::min);
-        let due = children.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX);
+        let (min_seg, due) = match space {
+            Some(s) => s,
+            None => {
+                #[cfg(test)]
+                SPACE_SCANS.with(|c| c.set(c.get() + children.len() as u64));
+                (children.iter().map(|c| c.min_seg).fold(u32::MAX, u32::min), children.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX))
+            }
+        };
         self.put_node_sized(id, Node::Internal(children), size, heap);
         // the first part keeps the node's place (and separator) in the parent
         Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary: s, min_seg, due }])
@@ -2982,7 +3023,7 @@ impl Env {
             self.free_slot(id);
             return Ok(Visit::New(Parts::new()));
         }
-        Ok(Visit::New(self.finish_internal_sized(id, children, Some(old.clone()), summ, size, heap, false)?))
+        Ok(Visit::New(self.finish_internal_sized(id, children, Some(old.clone()), None, summ, size, heap, false)?))
     }
 
     pub fn stats(&self) -> EnvStats {
@@ -3237,6 +3278,13 @@ fn shortest_separator(a: &[u8], b: &[u8]) -> Box<[u8]> {
     let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
     let n = (common + 1).min(b.len());
     b[..n].to_vec().into_boxed_slice()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Children scanned for an internal node's `min_seg` and `due` by
+    /// `finish_internal_sized` (counted by tests).
+    static SPACE_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

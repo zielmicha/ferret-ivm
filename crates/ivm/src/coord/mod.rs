@@ -112,23 +112,36 @@ pub(crate) struct Subscription {
     pub reads: Vec<ObjectId>,
 }
 
-/// Subscriptions by the node they receive the changes of, and those that
-/// want a progress mark after every record (indexes into `Engine::subs`).
+/// The consumers of nodes' changes: subscriptions (indexes into
+/// `Engine::subs`) and sinks by the node they receive the changes of, the
+/// subscriptions that want a progress mark after every record, and the
+/// nodes consumed, whose rows steps return (`Graph::step_begin`). Kept
+/// while they stay the same, so that a record costs what it changes, not
+/// what consumes the graph.
 #[derive(Default, PartialEq, Debug)]
-struct SubIndex {
-    by_node: FxHashMap<NodeId, Vec<usize>>,
+struct Consumers {
+    subs: FxHashMap<NodeId, Vec<usize>>,
     progress: Vec<usize>,
+    sinks: FxHashMap<NodeId, Vec<ObjectId>>,
+    nodes: Arc<rustc_hash::FxHashSet<NodeId>>,
 }
 
-impl SubIndex {
-    fn of(subs: &[Subscription]) -> SubIndex {
-        let mut ix = SubIndex::default();
+impl Consumers {
+    fn of(subs: &[Subscription], sinks: &HashMap<ObjectId, crate::sink::SinkHandle>) -> Consumers {
+        let mut ix = Consumers::default();
         for (i, s) in subs.iter().enumerate() {
-            ix.by_node.entry(s.node).or_default().push(i);
+            ix.subs.entry(s.node).or_default().push(i);
             if s.progress {
                 ix.progress.push(i);
             }
         }
+        for (id, s) in sinks {
+            ix.sinks.entry(s.node).or_default().push(*id);
+        }
+        for v in ix.sinks.values_mut() {
+            v.sort_unstable();
+        }
+        ix.nodes = Arc::new(ix.subs.keys().chain(ix.sinks.keys()).copied().collect());
         ix
     }
 }
@@ -180,9 +193,9 @@ pub struct Engine {
     pending: HashMap<u64, Sender<Result<ExecResult>>>,
     pub(crate) parked: Vec<Parked>,
     pub(crate) subs: Vec<Subscription>,
-    /// `subs` by node, for delivery; None after `subs` changed (see
-    /// `subs_changed`).
-    sub_index: Option<SubIndex>,
+    /// `subs` and `sink_handles` by node, for steps and delivery; None
+    /// after they changed (see `consumers_changed`).
+    consumers: Option<Consumers>,
     pub(crate) next_req: u64,
     /// DML logged but not applied yet, with the rows it writes (`dml.rs`).
     dml_pending: Vec<(u64, dml::Touched)>,
@@ -578,7 +591,7 @@ impl Engine {
             pending: HashMap::new(),
             parked: Vec::new(),
             subs: Vec::new(),
-            sub_index: None,
+            consumers: None,
             next_req: 1,
             dml_pending: Vec::new(),
             dml_queue: VecDeque::new(),
@@ -798,6 +811,7 @@ impl Engine {
         }
         // ask sources and sinks to stop, without waiting for them here
         let mut threads: Vec<JoinHandle<()>> = self.source_handles.drain().filter_map(|(_, s)| s.stop()).collect();
+        self.consumers_changed();
         for (id, s) in self.sink_handles.drain() {
             // everything applied is delivered: the sink records it as its
             // progress, matching the final checkpoint, so that the next
@@ -1224,10 +1238,22 @@ impl Engine {
         if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
     }
 
+    /// The index of subscriptions and sinks by node (rebuilt after they
+    /// changed).
+    fn consumers(&mut self) -> &Consumers {
+        let ix = self.consumers.get_or_insert_with(|| {
+            crate::dataflow::bookkept((self.subs.len() + self.sink_handles.len()) as u64);
+            Consumers::of(&self.subs, &self.sink_handles)
+        });
+        #[cfg(debug_assertions)]
+        assert_eq!(*ix, Consumers::of(&self.subs, &self.sink_handles), "stale consumer index");
+        ix
+    }
+
     /// Nodes whose rows `deliver` hands on (subscriptions and sinks); of the
     /// other nodes it only needs the error records.
-    fn delivered_nodes(&self) -> rustc_hash::FxHashSet<NodeId> {
-        self.subs.iter().map(|s| s.node).chain(self.sink_handles.values().map(|s| s.node)).collect()
+    fn delivered_nodes(&mut self) -> Arc<rustc_hash::FxHashSet<NodeId>> {
+        self.consumers().nodes.clone()
     }
 
     /// Route outputs to views (errors), subscriptions and sinks. Only the
@@ -1256,29 +1282,32 @@ impl Engine {
         // node freed since, whose id was reused) and sinks
         let mut consumers: FxHashMap<NodeId, (Vec<usize>, Vec<ObjectId>)> = FxHashMap::default();
         let mut progress = Vec::new();
-        if !self.subs.is_empty() {
-            let index = self.sub_index.get_or_insert_with(|| SubIndex::of(&self.subs));
-            #[cfg(debug_assertions)]
-            assert_eq!(*index, SubIndex::of(&self.subs), "stale subscription index");
-            // smaller of the two: the subscribed nodes, or the nodes that changed
-            let changed: Vec<usize> = if index.by_node.len() <= outputs.len() {
-                index.by_node.iter().filter(|(n, _)| outputs.contains_key(n)).flat_map(|(_, subs)| subs.iter().copied()).collect()
-            } else {
-                outputs.keys().filter_map(|n| index.by_node.get(n)).flatten().copied().collect()
-            };
-            for i in changed {
+        if !self.subs.is_empty() || !self.sink_handles.is_empty() {
+            self.consumers();
+            let index = self.consumers.as_ref().unwrap();
+            // (the smaller of the two: the nodes consumed, or the nodes
+            // that produced something)
+            fn changed<'a, T: Copy>(by_node: &'a FxHashMap<NodeId, Vec<T>>, outputs: &'a FxHashMap<NodeId, Output>) -> Vec<(NodeId, T)> {
+                if by_node.len() <= outputs.len() {
+                    by_node.iter().filter(|(n, _)| outputs.contains_key(n)).flat_map(|(n, c)| c.iter().map(|c| (*n, *c))).collect()
+                } else {
+                    outputs.keys().filter_map(|n| by_node.get(n).map(|c| (n, c))).flat_map(|(n, c)| c.iter().map(|c| (*n, *c))).collect()
+                }
+            }
+            for (node, i) in changed(&index.subs, &outputs) {
                 let s = &self.subs[i];
                 if !s.held && !s.cancel.load(Ordering::Acquire) {
-                    consumers.entry(s.node).or_default().0.push(i);
+                    consumers.entry(node).or_default().0.push(i);
+                }
+            }
+            for (node, id) in changed(&index.sinks, &outputs) {
+                let sink = &self.sink_handles[&id];
+                if !sink.behind() && !self.held_sinks.contains(&id) && outputs[&node].has_rows() {
+                    consumers.entry(node).or_default().1.push(id);
                 }
             }
             // the progress marks of the others
             progress.extend(index.progress.iter().copied().filter(|&i| !self.subs[i].held && !outputs.contains_key(&self.subs[i].node)));
-        }
-        for (id, sink) in &self.sink_handles {
-            if !sink.behind() && !self.held_sinks.contains(id) && outputs.get(&sink.node).is_some_and(|o| o.has_rows()) {
-                consumers.entry(sink.node).or_default().1.push(*id);
-            }
         }
         let mut r = Ok(());
         for (node, (subs, sinks)) in consumers {
@@ -1333,10 +1362,10 @@ impl Engine {
         }
     }
 
-    /// `subs` changed (added, removed, or moved to another node): the
-    /// delivery index is rebuilt.
-    pub(crate) fn subs_changed(&mut self) {
-        self.sub_index = None;
+    /// `subs` or `sink_handles` changed (one added, removed, or moved to
+    /// another node): the index of consumers is rebuilt.
+    pub(crate) fn consumers_changed(&mut self) {
+        self.consumers = None;
     }
 
     fn prune_subscriptions(&mut self) {
@@ -1344,7 +1373,7 @@ impl Engine {
         while i < self.subs.len() {
             if self.subs[i].cancel.load(Ordering::Acquire) {
                 let s = self.subs.swap_remove(i);
-                self.sub_index = None;
+                self.consumers_changed();
                 if let Some(n) = s.pinned {
                     let _ = self.graph.release_node(&mut self.env, n);
                 }

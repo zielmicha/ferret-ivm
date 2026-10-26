@@ -1929,6 +1929,47 @@ fn appends_fill_leaves() {
     assert!(avg * 10 >= 16 * 1024 * 8, "average leaf {avg} bytes ({leaves} leaves, {internal} internal)");
 }
 
+/// An update keeps the `min_seg` and `due` of the internal nodes on its
+/// path from the children it changed, like their sizes and summaries,
+/// rather than from all their children (scanning them took a tenth of a
+/// single-row update): only where a child that held a minimum got a higher
+/// one, as a clean leaf does when an update first dirties it, are the
+/// children scanned.
+#[test]
+fn updates_keep_subtree_space_from_the_children_changed() {
+    let tmp = TempDir::new("storage-space");
+    let opts = EnvOptions { leaf_bytes: 1024, internal_bytes: 1024, ..EnvOptions::default() };
+    let (mut env, _) = Env::open(tmp.path(), opts).unwrap();
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    env.apply(t, &mut (0..20_000u64).map(|i| (key8(2 * i, 8), 1)).collect(), 1).unwrap();
+    let (_, internal, _, _) = shape(&mut env, t);
+    assert!(internal > 10, "{internal} internal nodes");
+    env.checkpoint(1, b"").unwrap();
+    let scans = || SPACE_SCANS.with(|c| c.replace(0));
+    let mut g = 1;
+    for k in [17u64, 9_001, 19_999] {
+        // the first update of a clean leaf dirties it (its min_seg goes up)
+        g += 1;
+        env.apply(t, &mut vec![(key8(2 * k + 1, 8), 1)], g).unwrap();
+        scans();
+        for i in 0..20 {
+            g += 1;
+            env.apply(t, &mut vec![(key8(2 * k, 8), if i % 2 == 0 { -1 } else { 1 })], g).unwrap();
+            assert_eq!(scans(), 0, "update {i} of key {k}");
+        }
+    }
+    // appends at the right edge (whose splits size the new nodes anew)
+    scans();
+    for i in 0..2000u64 {
+        g += 1;
+        env.apply(t, &mut vec![(key8(40_000 + i, 8), 1)], g).unwrap();
+    }
+    assert_eq!(scans(), 0);
+    check_structure(&mut env, false, None);
+    env.checkpoint(g, b"").unwrap();
+    check_structure(&mut env, false, None);
+}
+
 /// A row updated at every GSN whose versions sort after each other (entry =
 /// key ++ payload): a lookup of its key visits the versions within the
 /// retention window and since the last pass, not every version ever

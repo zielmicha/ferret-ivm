@@ -124,7 +124,8 @@ table node) and every `Tick` record (with no changes), in two phases:
 changes (a table's changes may come in several batches, in their order),
 then `step_finish`; `Graph::step_observed(env, gsn, changes, observed)` does
 all three. `observed` names the nodes whose rows the caller needs (the
-engine passes the nodes of subscriptions and sinks). Only the nodes that
+engine passes the nodes of subscriptions and sinks, a set it keeps, shared,
+until one of them is added, removed or moved). Only the nodes that
 can produce something are considered, so the cost of a step does not
 depend on the size of the graph:
 

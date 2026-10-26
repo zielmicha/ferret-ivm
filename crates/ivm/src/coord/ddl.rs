@@ -1129,6 +1129,7 @@ impl Engine {
                 if let Some(h) = self.sink_handles.remove(&id) {
                     let _ = h.stop();
                 }
+                self.consumers_changed();
                 self.snapshot_asked.remove(&id);
             }
             ObjectKind::View(_) => {}
@@ -1191,6 +1192,7 @@ impl Engine {
             if let Some(h) = self.sink_handles.remove(&id) {
                 let _ = h.stop();
             }
+            self.consumers_changed();
             self.snapshot_asked.remove(&id);
             if let (Some(o), Some(handle)) = (self.catalog.get(id).cloned(), self.handle.clone())
                 && let ObjectKind::Sink(sd) = &o.kind
@@ -1214,6 +1216,7 @@ impl Engine {
         // (no snapshot: the sink asks for one when its target is behind)
         let h = crate::sink::start(id, name.to_string(), def.clone(), node, columns, self.processed, self.cfg.sink_limits, handle.clone())?;
         self.sink_handles.insert(id, h);
+        self.consumers_changed();
         Ok(())
     }
 }
