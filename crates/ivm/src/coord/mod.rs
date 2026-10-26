@@ -853,9 +853,11 @@ impl Engine {
                 }
                 // temporal filters release the events that became due
                 let observed = self.delivered_nodes();
+                let rows_before = self.graph.step_totals.out_rows;
                 let outputs = self.graph.step_observed(&mut self.env, gsn, FxHashMap::default(), observed)?;
                 self.processed = gsn;
-                changed = !outputs.is_empty();
+                // (outputs hold the rows of observed nodes only)
+                changed = self.graph.step_totals.out_rows != rows_before || !outputs.is_empty();
                 self.deliver(gsn, outputs);
             }
         }
