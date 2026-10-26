@@ -312,7 +312,9 @@ do not depend on how wide rows are or how they serialize:
 | changes queued for a subscription | `Subscription::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB | the subscription ends with `53000` |
 | changes queued for a sink, until written | `SinkHandle::queue` (likewise) | a sixteenth, at least 4 MiB | the sink falls behind and is restarted |
 | aggregation group caches | `Graph::group_caches` | an eighth | the group is not cached, and all caches shrink after the record ([Dataflow](dataflow.md#reduce)) |
-| transient working memory: in-memory deltas and key sets of a GSN, sort buffers of `TreeBuilder`s | `MemBudget::work` (`memory::Work`, which the engine gives its `Env`, `Env::set_work`) | an eighth, set aside from the pool's share | a buffer spills to temporary trees (or applies to its index) beyond half the share (`Work::buffer`, within per-use bounds), or beyond a sixteenth of that while the buffers together exceed the share (`Work::full`) |
+| transient working memory: in-memory deltas and key sets of a GSN, sort buffers of `TreeBuilder`s (the engine's and its forks') | `MemBudget::work` (`memory::Work`, which the engine gives its `Env`, `Env::set_work`, and forks share) | an eighth, set aside from the pool's share | a buffer spills to temporary trees (or applies to its index) beyond half the share (`Work::buffer`, within per-use bounds), or beyond a sixteenth of that while the buffers together exceed the share (`Work::full`) |
+| the buffer pool of a fork of the storage (a hydration, a large read or snapshot) | `MemBudget::forks` (a charge each fork holds while it lives, `Env::hold`) | a sixteenth each (at least 1 MiB) | the fork writes and evicts its own nodes; those it shares with the engine are not counted |
+| table changes forwarded to a hydration, not applied there yet | `MemBudget::forwarded` (a charge per forwarded record) | an eighth, at least 4 MiB | the engine waits for the hydration |
 | buffer pool | `Env`'s own accounting ([Storage](storage.md#the-node-arena-buffer-pool)) | the rest, at least a quarter | clean nodes are evicted, dirty ones written and evicted |
 
 After every applied record and every message, the engine sets the buffer
@@ -354,9 +356,13 @@ once written. Consumers never make the engine wait:
   rewrites the target, as a sink created anew does
   ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)).
 
-Not covered: the rows a hydration or a join has in flight (a few batches,
-sized from the working memory), ad-hoc query results and the buffers of
-session, source and sink threads.
+Not covered: the nodes a fork still shares with the engine once the
+engine has evicted or replaced its own copies, the rows a hydration or a
+join has in flight (a few batches, sized from the working memory), what a
+hydration keeps for a `SUBSCRIBE` it hydrates (its snapshot and the changes
+until the handoff) and what the engine keeps for a snapshot taken on a
+reader thread, ad-hoc query results and the buffers of session, source and
+sink threads.
 
 ## The GSN clock and frontiers
 

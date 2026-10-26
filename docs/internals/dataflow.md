@@ -605,8 +605,14 @@ Meanwhile:
   arrangement of it): recovery rebuilds it as of the checkpoint, and the
   view takes its root's error records then, as every view does
   ([Recovery](recovery.md#hydrations-in-progress)).
-- At most a million forwarded records are kept for a thread still
-  hydrating; beyond, the engine waits for it.
+- The changes forwarded to the thread and not applied there yet are kept
+  in memory, each `Step` message charging its bytes to the memory budget's
+  part for them (`MemBudget::forwarded`, an eighth, at least 4 MiB); beyond
+  it the engine waits for the thread (also while it is still hydrating).
+  The thread steps its graph observing only the nodes whose outputs it
+  keeps for subscriptions and replaced views, so the outputs of the others
+  stay spilled or are freed as the step goes, as in the engine; its group
+  caches count in the engine's share.
 
 What "the view exists as of *g*" means: from *g* on its name is taken, it
 is listed, and DDL can build on it; its contents at every GSN after *g* are

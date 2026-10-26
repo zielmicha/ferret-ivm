@@ -440,8 +440,9 @@ nothing, and it neither writes nor evicts them (it would only write the
 environment's dirty nodes again). The bytes it appends are added to the
 environment's segment totals (`count_foreign`, before a checkpoint, a
 maintenance pass or an adoption), and every segment it appends to is
-pinned — not deleted, also once dead — until it is dropped. It cannot take
-checkpoints. Taking a fork copies the slot table (one reference count
+pinned — not deleted, also once dead — until it is dropped. Its target is
+set by its user (the engine gives each fork a share of the memory budget
+while it lives, `Env::hold`). It cannot take checkpoints. Taking a fork copies the slot table (one reference count
 increment per loaded node), not the nodes.
 
 A tree created empty in the environment before the fork and filled in the

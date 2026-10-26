@@ -235,6 +235,9 @@ pub struct Env {
     /// with the environment it was forked from, which its buffer pool
     /// does not count against its target.
     inherited: (usize, usize),
+    /// The share of a memory budget this environment's pool takes while it
+    /// lives (`hold`; a fork's).
+    held: crate::memory::Charge,
 }
 
 /// A node a checkpoint job wrote: its slot and stamp in the parent
@@ -479,6 +482,7 @@ impl Env {
             read_budget: None,
             frozen_at: None,
             inherited: (0, 0),
+            held: crate::memory::Charge::none(),
         };
         let recovered = match rec {
             None => None,
@@ -647,6 +651,14 @@ impl Env {
 
     pub fn set_work(&mut self, work: crate::memory::Work) {
         self.work = work;
+    }
+
+    /// Give the buffer pool a target of `charge`'s bytes, which the charge
+    /// holds in a memory budget for as long as this environment lives (a
+    /// fork's pool, taken from the budget while it exists).
+    pub fn hold(&mut self, charge: crate::memory::Charge) {
+        self.opts.cache_bytes = charge.bytes();
+        self.held = charge;
     }
 
     /// The stored summary of the whole tree (MIN/MAX values too wide for
@@ -2395,6 +2407,7 @@ impl Env {
             read_budget: None,
             frozen_at: None,
             inherited: (0, 0),
+            held: crate::memory::Charge::none(),
         };
         Ok(CheckpointJob { env, gsn })
     }
@@ -2617,6 +2630,7 @@ impl Env {
             read_budget: None,
             frozen_at: None,
             inherited: (self.mem_bytes, self.dirty_bytes),
+            held: crate::memory::Charge::none(),
         })
     }
 

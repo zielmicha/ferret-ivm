@@ -101,12 +101,19 @@ fn commits_are_applied_while_a_view_hydrates() {
     let h = running.handle.clone();
     load_big(&h);
     let create = start_ddl(&h, &format!("CREATE MATERIALIZED VIEW slow AS {SLOW_VIEW}"), "slow");
+    let mem = &h.shared.mem;
     for i in 0..20 {
         exec(&h, &format!("INSERT INTO small VALUES ({i}, {i})"));
         assert_eq!(rows(&h, "SELECT count(*) FROM small"), vec![(i + 1).to_string()]);
+        // the fork's pool and the changes forwarded to it are in the budget
+        if !create.is_finished() {
+            assert_eq!(mem.forks.used(), mem.fork_pool(), "the hydration's fork holds its pool's share");
+        }
+        assert!(mem.forwarded.used() <= mem.forwarded_limit() + (64 << 10), "{} bytes forwarded", mem.forwarded.used());
     }
     assert!(!create.is_finished(), "the view was done before 20 single-row commits were applied (they waited for it?)");
     create.join().unwrap().unwrap();
+    assert_eq!((mem.forks.used(), mem.forwarded.used()), (0, 0), "a finished hydration still holds memory");
     let want = rows(&h, SLOW_VIEW);
     assert_eq!(want.len(), 97);
     assert_eq!(rows(&h, "SELECT * FROM slow"), want);

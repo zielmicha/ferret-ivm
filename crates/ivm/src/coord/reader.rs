@@ -89,7 +89,7 @@ impl Engine {
             .filter_map(|id| self.rt.tables.get(&id).copied().or_else(|| self.rt.views.get(&id).map(|v| v.node)).map(|n| (id, n)))
             .collect();
         let graph = self.graph.fork_of(&objects.iter().map(|(_, n)| *n).collect::<Vec<_>>());
-        let env = self.env.fork()?;
+        let env = self.fork_env()?;
         self.send_to_reader(ReadJob::Query { env, graph, objects, bq: Box::new(bq), at, settings: vars.settings, reply })
     }
 
@@ -130,7 +130,7 @@ impl Engine {
             r => return Ok(Some((r?, then))),
         }
         let graph = self.graph.fork_of(&[node]);
-        let env = self.env.fork()?;
+        let env = self.fork_env()?;
         let (tx, done) = bounded(1);
         self.send_to_reader(ReadJob::Snapshot { env, graph, node, done: tx, wake })?;
         self.snapshotting.push(Snapshotting { gsn: self.processed, node, done, outputs: Vec::new(), then });

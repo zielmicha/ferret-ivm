@@ -1118,6 +1118,17 @@ impl Engine {
         }
     }
 
+    /// A fork of the storage for another thread (a hydration, a large read
+    /// or snapshot), with a buffer pool of its own taken from the memory
+    /// budget while it lives (`MemBudget::fork_pool`; the nodes it shares
+    /// with the engine are not counted in it).
+    pub(crate) fn fork_env(&mut self) -> Result<Env> {
+        let mut env = self.env.fork()?;
+        env.hold(self.shared.mem.forks.charge(self.shared.mem.fork_pool()));
+        self.rebalance_memory();
+        Ok(env)
+    }
+
     /// Give the buffer pool what the other parts of the memory budget leave
     /// over (the next access evicts down to it), and shrink the group caches
     /// if they ran out of room.

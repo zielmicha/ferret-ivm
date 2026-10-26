@@ -1198,7 +1198,8 @@ impl Graph {
     /// arrangement ids stay the same.
     pub fn fork_of(&self, roots: &[NodeId]) -> Graph {
         let keep_nodes = self.closure(roots);
-        let mut g = Graph { now: self.now, stepped_now: self.stepped_now, topo_dirty: true, ..Graph::default() };
+        // (its group caches count in the engine's share of the budget)
+        let mut g = Graph { now: self.now, stepped_now: self.stepped_now, topo_dirty: true, group_caches: self.group_caches.clone(), ..Graph::default() };
         g.nodes = self
             .nodes
             .iter()

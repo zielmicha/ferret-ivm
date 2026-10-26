@@ -29,6 +29,8 @@ Fixed internal parameters (not configurable):
 | changes queued per subscription or sink | a sixteenth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | aggregation group caches, all together | an eighth of `--memory-mb` |
 | transient working memory of the dataflow (below) | an eighth of `--memory-mb` |
+| buffer pool of a fork of the storage (a hydration, a large read), each while it lives | a sixteenth of `--memory-mb` (at least 1 MiB) |
+| changes forwarded to a hydration that it has not applied yet | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | buffer pool | what the above leave of `--memory-mb`, at least a quarter of it |
 | unacknowledged commits per source | 10,000 |
 | initial-snapshot chunk | 10,000 rows |
@@ -50,22 +52,23 @@ Fixed internal parameters (not configurable):
 
 Things to keep in mind when sizing:
 
-- **One dataflow thread.** All maintenance and all reads run on the engine
-  thread, so the engine uses about one core for its work (plus the
-  sequencer, one thread per source, sink and client session, and three
-  threads for the web UI when it is enabled).
-- **Memory**: see [below](#memory). Outside the budget: hydration of a
-  new view runs in a fork of the storage with a buffer pool of its own (of
-  the same target; nodes are shared with the engine's until one side
-  modifies them), holds a few batches of rows and join rows in flight
-  (sized from the working memory, but not counted in it), and keeps the
-  changes of the tables it reads applied meanwhile (at most a million
-  records' worth) until it has caught up; a large read runs on a fork too
-  (up to four at a time); a window partition or a recursive query's result
-  is computed whole; a large commit's log record itself, and the rows
-  delivered to subscriptions and sinks, are in memory whole; an ad-hoc
-  query's result is built in memory, and each session, source and sink
-  thread has its own buffers.
+- **One dataflow thread.** All maintenance and most reads run on the engine
+  thread, so the engine uses about one core for its work; the hydration of
+  new views, indexes and subscriptions, reads too large for the engine
+  thread (up to four at a time) and writing checkpoints run on threads of
+  their own, as do the sequencer, one thread per source, sink and client
+  session, and three threads for the web UI when it is enabled.
+- **Memory**: see [below](#memory). Outside the budget: the nodes a fork
+  of the storage (a hydration, a large read) shares with the engine's
+  buffer pool stay in memory while the fork lives, also once the engine has
+  evicted or modified its own copies (up to the pool's contents when the
+  fork was taken); a hydration holds a few batches of rows and join rows in
+  flight (sized from the working memory, but not counted in it), and the
+  snapshot and changes of a query it hydrates for `SUBSCRIBE`; a window
+  partition or a recursive query's result is computed whole; a large
+  commit's log record itself, and the rows delivered to subscriptions and
+  sinks, are in memory whole; an ad-hoc query's result is built in memory,
+  and each session, source and sink thread has its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
 

@@ -1,9 +1,10 @@
 //! The process memory budget.
 //!
 //! One limit (`--memory-mb`) covers the memory the server keeps data in:
-//! the buffer pool of tree nodes, the group caches of aggregations, the
-//! records waiting to be applied, the changes queued for subscriptions
-//! and sinks, and the dataflow's transient working memory (`Work`).
+//! the buffer pool of tree nodes (and those of forks of the storage), the
+//! group caches of aggregations, the records waiting to be applied (also by
+//! a hydration), the changes queued for subscriptions and sinks, and the
+//! dataflow's transient working memory (`Work`).
 //! Everything is measured in bytes of memory — the sizes of the structs and
 //! of the heap blocks they own ([`heap_block`]) — not in serialized bytes or
 //! in counts, so that a limit means the same for narrow and for wide rows.
@@ -83,20 +84,21 @@ pub fn delta_bytes(d: &Delta) -> usize {
     size_of::<Delta>() + heap_block(d.capacity() * size_of::<(Row, i64)>()) + d.iter().map(|(r, _)| row_heap(r)).sum::<usize>()
 }
 
+/// Heap bytes owned by a table change.
+pub fn change_heap(c: &TableChange) -> usize {
+    match c {
+        TableChange::Upsert { row, unchanged } => row_heap(row) + heap_block(unchanged.capacity() * size_of::<usize>()),
+        TableChange::Delete { key: row } | TableChange::Insert { row } | TableChange::Remove { row } => row_heap(row),
+        TableChange::Truncate => 0,
+    }
+}
+
 /// Bytes of a log record in memory, from its submission to the sequencer
 /// until the engine has applied it (with its place in the queues).
 pub fn record_bytes(rec: &LogRecord) -> usize {
     let own = match rec {
         LogRecord::Commit { changes, .. } => {
-            heap_block(changes.capacity() * size_of::<(u64, TableChange)>())
-                + changes
-                    .iter()
-                    .map(|(_, c)| match c {
-                        TableChange::Upsert { row, unchanged } => row_heap(row) + heap_block(unchanged.capacity() * size_of::<usize>()),
-                        TableChange::Delete { key: row } | TableChange::Insert { row } | TableChange::Remove { row } => row_heap(row),
-                        TableChange::Truncate => 0,
-                    })
-                    .sum::<usize>()
+            heap_block(changes.capacity() * size_of::<(u64, TableChange)>()) + changes.iter().map(|(_, c)| change_heap(c)).sum::<usize>()
         }
         LogRecord::Ddl { sql, extra, .. } => heap_block(sql.capacity()) + heap_block(extra.capacity()),
         LogRecord::Progress { state, .. } => heap_block(state.capacity()),
@@ -320,6 +322,11 @@ pub struct MemBudget {
     pub outputs: Arc<Meter>,
     /// The dataflow's transient working memory: an eighth.
     pub work: Work,
+    /// The buffer pools of forks of the storage (hydrations, large reads),
+    /// each `fork_pool` while it lives.
+    pub forks: Arc<Meter>,
+    /// Table changes forwarded to a hydration and not applied there yet.
+    pub forwarded: Arc<Meter>,
 }
 
 impl Default for MemBudget {
@@ -329,6 +336,8 @@ impl Default for MemBudget {
             input: Meter::default(),
             outputs: Meter::new(),
             work: Work::new(DEFAULT_TOTAL / 8),
+            forks: Meter::new(),
+            forwarded: Meter::new(),
         }
     }
 }
@@ -360,11 +369,25 @@ impl MemBudget {
         self.total() / 8
     }
 
+    /// The buffer pool of a fork of the storage: a sixteenth (at least
+    /// 1 MiB), taken from the engine's pool's share while the fork lives
+    /// (the nodes a fork shares with the engine are not counted in it).
+    pub fn fork_pool(&self) -> usize {
+        (self.total() / 16).max(1 << 20)
+    }
+
+    /// Table changes forwarded to a hydration that it has not applied
+    /// yet: an eighth (at least 4 MiB); beyond, the engine waits for it.
+    pub fn forwarded_limit(&self) -> usize {
+        (self.total() / 8).max(MIN_QUEUE)
+    }
+
     /// The buffer pool's share: what the other parts leave over (the
     /// working memory's share set aside), at least a quarter of the total.
     pub fn pool_target(&self, caches: usize) -> usize {
         let total = self.total();
-        total.saturating_sub(self.input.used() + self.outputs.used() + caches + self.work.limit()).max(total / 4)
+        let others = self.input.used() + self.outputs.used() + caches + self.work.limit() + self.forks.used() + self.forwarded.used();
+        total.saturating_sub(others).max(total / 4)
     }
 
     /// Wait until the records waiting to be applied are below their limit,
@@ -412,6 +435,21 @@ mod tests {
         let _c = b.outputs.charge(200);
         assert_eq!(b.pool_target(50), 525);
         assert_eq!(b.pool_target(600), 250);
+    }
+
+    #[test]
+    fn forks_and_forwarded_changes_come_out_of_the_pools_share() {
+        let b = MemBudget::default();
+        b.set_total(64 << 20);
+        let base = b.pool_target(0);
+        assert_eq!(b.fork_pool(), 4 << 20);
+        let fork = b.forks.charge(b.fork_pool());
+        let fwd = b.forwarded.charge(1 << 20);
+        assert_eq!(b.pool_target(0), base - (5 << 20));
+        drop((fork, fwd));
+        assert_eq!(b.pool_target(0), base);
+        b.set_total(4 << 20);
+        assert_eq!((b.fork_pool(), b.forwarded_limit()), (1 << 20, 4 << 20), "at least 1 and 4 MiB");
     }
 
     #[test]
