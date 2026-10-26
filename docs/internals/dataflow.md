@@ -318,7 +318,9 @@ of a group.
 At a GSN, the changed rows are grouped by group key. For each affected
 group: the old output row comes from the output index (or the group cache);
 the new one from one **range summary** over the group's key range in the
-input index — O(log n) whatever the group size — with the group's key
+input index — O(log n) whatever the group size (a `min`/`max` value wider
+than node summaries hold takes a second descent to its entry, see
+[Storage](storage.md#wide-min-and-max-values)) — with the group's key
 values taken from its first live entry (so the representation is that of the
 first entry in index order). Ordered aggregates additionally scan the group.
 Percentiles read the values at the required ranks with `Env::nth`; when the
@@ -345,10 +347,10 @@ comparison), `−old, +new` is emitted.
   a structure that counts NaN/±Infinity and display scales separately and is
   not limited to numeric's range (only the value read from it is checked),
   so that removing a value restores the exact previous result; float sums as
-  a big integer multiple of 2^-1074 (the smallest subnormal), so addition is
-  exact and associative and the result is rounded once. Variance and
-  standard deviation are computed from exact sums of squares. Maintaining a
-  summary therefore never fails on data. See [Storage](storage.md#summaries).
+  exact dyadic rationals, so addition is exact and associative and the
+  result is rounded once. Variance and standard deviation are computed from
+  exact sums of squares. Maintaining a summary therefore never fails on
+  data. See [Storage](storage.md#summaries).
 
 ### Distinct
 

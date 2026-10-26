@@ -6,8 +6,6 @@ use crate::expr::Expr;
 use crate::sql::plan::AggFunc;
 use crate::storage::{AggKind, AggState, FloatSum, Summary};
 use crate::types::{ArrayValue, ColumnType, Datum, Row, SqlType};
-use num_bigint::BigInt;
-use num_traits::Signed;
 use pgfuncs::json::Jsonb;
 use pgnumeric::Numeric;
 
@@ -383,16 +381,7 @@ fn finalize_var(sum: &AggState, sumsq: &AggState, n: i64, arg: &SqlType, varianc
             if s.nan > 0 || s.pos_inf > 0 || s.neg_inf > 0 {
                 return Ok(Datum::Float8(f64::NAN));
             }
-            // exact: (N*Q - S^2) / (N*(N-1) or N^2), S and Q on the 2^-1074 grid
-            let nb = BigInt::from(n);
-            let num: BigInt = &nb * &q.fixed * (BigInt::from(1) << 1074usize) - &s.fixed * &s.fixed;
-            let var = if num.is_negative() || num == BigInt::from(0) {
-                0.0
-            } else {
-                let denom = if sample { &nb * BigInt::from(n - 1) } else { &nb * &nb };
-                let scaled: BigInt = (num << 128usize) / denom;
-                crate::storage::summary::bigint_scaled_to_f64(&scaled, -2148 - 128)
-            };
+            let var = s.variance(q, n, sample);
             Ok(Datum::Float8(if variance { var } else { var.sqrt() }))
         }
         _ => Ok(Datum::Null),

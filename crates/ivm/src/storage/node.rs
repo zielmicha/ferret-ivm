@@ -181,8 +181,10 @@ pub fn entry_size(e: &LeafEntry) -> usize {
     e.key.len() + 4 + e.hist.0.len() * 6
 }
 
+/// The separator and summary as encoded, plus the child's location and
+/// `min_seg`.
 pub fn child_size(c: &Child) -> usize {
-    c.sep.len() + 24 + 8 * c.summary.aggs.len() + 8
+    c.sep.len() + 24 + c.summary.encoded_len()
 }
 
 /// Compaction state of a leaf: the smallest frontier at which compacting it
