@@ -453,6 +453,66 @@ and recovery (for arrangements whose checkpointed tree could not be
 matched). After hydration the new nodes are stepped like all others from the
 next GSN on.
 
+### Hydration off the engine thread
+
+`CREATE MATERIALIZED VIEW` (not replacing a view), `CREATE INDEX` and
+`SUBSCRIBE (query)` hydrate their new nodes and arrangements without
+stopping the engine (`coord/hydrate.rs`). At the GSN *g* the statement is
+applied at (its DDL record, or the last applied record for `SUBSCRIBE`), the
+engine takes a fork of the storage — every tree as of *g*
+([Storage](storage.md#forks)) — and a copy of the part of the graph the new
+fragment needs (`Graph::fork_pending`: the pending nodes and arrangements,
+the nodes owning those arrangements, and everything they read, transitively,
+with the arrangements their operators read and one arrangement per node to
+snapshot it from; operator error state copied, not shared), and hands both
+to a thread of its own (`ivm-hydrate`). That thread runs `Graph::hydrate` as
+of *g* there — the same computation as inline — and then applies every
+`Commit` and `Tick` record after *g*: the engine forwards each one's table
+changes (of the fork's tables), the clock and the retention frontier before
+applying it itself, and the thread runs `Graph::step` on its copy of the
+graph, which steps the new fragment and the existing nodes it reads. Once the
+thread has hydrated the fragment, the engine makes it catch up: before
+forwarding a record it waits until the thread is one record less behind
+than at the previous record (so the engine goes on at about half the speed
+of maintaining everything including the new fragment, which it will have to
+do once it is live). When the thread is at most 100 records behind, the
+engine waits for it to apply them and adopts the new trees
+(`Env::adopt_trees`, which moves their nodes) and the new nodes' state —
+hydration flags, `since` (= *g*), error records and per-group error state
+(`Graph::adopt_hydrated`); from the next record on the fragment is stepped
+by the engine with the rest. Its contents are exactly those of an inline
+hydration at *g* followed by the same steps, and its arrangements' history
+starts at *g*.
+
+Meanwhile:
+
+- The engine applies records, maintaining the existing views, and answers
+  requests. It stops at the next `Ddl` or `Schema` record (and holds the
+  records after it) until the hydration is done: DDL is applied against a
+  graph without a hydration in progress.
+- The statement's view or index is in the catalog from *g* on; its DDL
+  reply is sent once the fragment is live (a `SUBSCRIBE` is answered then
+  too, with its snapshot as of *g* followed by the changes of the records
+  applied since, as if it had been running from *g*).
+- Requests that read a relation still being hydrated — reads of the view,
+  DML reading it, `SUBSCRIBE` to it — are parked (`Wait::Hydration`) and run
+  again once it is live (a fresh read then reads at a newer GSN; a read
+  `AS OF` a GSN at or after *g* reads that GSN, which its history covers).
+  A `SUBSCRIBE` to a query waits for the hydration in progress to be done
+  before its own begins.
+- A checkpoint saves the view or index in the catalog without its trees
+  (they are not hydrated in the engine yet), and not the view's error
+  counts: recovery rebuilds it as of the checkpoint and takes its root's
+  error records then, as a new view does ([Recovery](recovery.md)).
+- At most a million forwarded records are kept for a thread still
+  hydrating; beyond, the engine waits for it.
+
+Replay and recovery hydrate inline (nothing waits for them); so do
+`CREATE OR REPLACE MATERIALIZED VIEW`, the re-planning of dependent views and
+upstream schema changes, which compare the old and new contents at their
+GSN. A failure of a background hydration (an internal or I/O error) stops
+the engine, as one inline would.
+
 ## Errors
 
 Error records are produced by `Mfp` and `FlatMap` (per row), `Reduce` (per

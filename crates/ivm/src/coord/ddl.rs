@@ -631,12 +631,19 @@ impl Engine {
         }
         if cv.materialized {
             self.create_view_rt(id, &query_sql)?;
-            self.graph.hydrate(&mut self.env, gsn)?;
-            // the errors in the root's contents (also when it is shared with
-            // other views and was hydrated long ago)
-            let errs = self.graph.errors_of(self.rt.views[&id].node);
-            merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::MaterializedView(def), created_gsn: gsn, create_sql: sql.to_string() });
+            // (a replaced virtual view's dependents are re-planned below,
+            // reading the new view: hydrated inline)
+            let r = if existing.is_some() {
+                self.graph.hydrate(&mut self.env, gsn).map(|_| self.take_root_errors(id))
+            } else {
+                // in the background; the statement's reply waits for it
+                self.hydrate(gsn, vec![hydrate::Then::ViewErrors(id)])
+            };
+            if let Err(e) = r {
+                self.drop_object(id)?;
+                return Err(e);
+            }
         } else {
             self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::View(def), created_gsn: gsn, create_sql: sql.to_string() });
         }
@@ -999,8 +1006,12 @@ impl Engine {
         let id = self.catalog.alloc_id();
         let def = IndexDef { on: target.id, columns: key };
         self.create_index_rt(id, &def)?;
-        self.graph.hydrate(&mut self.env, gsn)?;
         self.catalog.insert(CatalogObject { id, name, kind: ObjectKind::Index(def), created_gsn: gsn, create_sql: sql.to_string() });
+        // in the background; the statement's reply waits for it
+        if let Err(e) = self.hydrate(gsn, vec![]) {
+            self.drop_object(id)?;
+            return Err(e);
+        }
         Ok(ExecResult::Command { tag: "CREATE INDEX".into() })
     }
 

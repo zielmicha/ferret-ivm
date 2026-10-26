@@ -65,7 +65,10 @@ with status 1 at once) and accepts connections only once recovery is done.
 6. **Hydrate** everything that was not matched, from the recovered state at
    the checkpoint GSN (`Graph::hydrate`; the rebuilt arrangements' history
    starts there), then **drop** recovered trees that nothing attached
-   (arrangements that no longer exist) and set the retention frontier.
+   (arrangements that no longer exist) and set the retention frontier. A
+   view whose error counts the checkpoint does not hold (it was still being
+   hydrated, [below](#hydrations-in-progress)) takes its root's error
+   records, as a new view does.
 7. **Start the sinks** from the recovered state (each takes a snapshot at
    the checkpoint GSN; a target at least that far resumes, one behind it is
    resynchronised, see
@@ -91,6 +94,28 @@ with status 1 at once) and accepts connections only once recovery is done.
 
 A data directory without a checkpoint replays the whole log from GSN 1 (the
 log is only truncated after checkpoints).
+
+### Hydrations in progress
+
+A view or index hydrated off the engine thread
+([Dataflow](dataflow.md#hydration-off-the-engine-thread)) exists from its
+DDL record's GSN *g* on, but its trees are adopted only when the hydration
+has caught up, at some later GSN *p*. Nothing about it is durable but the
+DDL record and the checkpoints:
+
+- A checkpoint taken between *g* and *p* holds the object in the catalog,
+  but not its trees (they are not hydrated in the engine), and not a view's
+  error counts. Recovery from it rebuilds the object as of the checkpoint
+  GSN and the view takes its root's error records, as a new view does; the
+  rebuilt arrangements' history starts at the checkpoint instead of at *g*.
+- A crash before a checkpoint after *g* replays the DDL record, which
+  hydrates inline as of *g*; the records after it are replayed as usual.
+
+Either way the state at every GSN after the recovery point is the one an
+uninterrupted run reaches: a background hydration computes exactly what an
+inline one followed by the same steps does (`tests/stall.rs` crashes in the
+middle of one). Its client gets no reply (the connection breaks); the
+statement takes effect.
 
 ### Matching checkpointed indexes
 
@@ -137,7 +162,7 @@ dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
 
 1. build `AppState`: the catalog (with its DDL history), the fingerprint →
    tree id and fingerprint → `since` maps of all hydrated arrangements, each
-   materialized view's error counts, the error records of arranged nodes and
+   materialized view's error counts (of those not being hydrated), the error records of arranged nodes and
    the per-group error state of operators, each source's opaque state (JSON)
    and last logged LSN, the request counter, the logical clock and its ticks
    in the retention window (at most the last 100,000), and the pending slot

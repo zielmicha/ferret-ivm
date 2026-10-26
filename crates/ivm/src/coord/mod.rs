@@ -4,6 +4,7 @@
 pub mod api;
 pub mod ddl;
 mod dml;
+mod hydrate;
 pub mod inspect;
 mod read;
 pub mod seq;
@@ -111,6 +112,8 @@ pub(crate) enum Wait {
     Lsn,
     /// The initial snapshots of the tables it reads (rechecked on wake).
     Snapshot,
+    /// The hydration of a relation it reads (re-run when it is done).
+    Hydration,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -189,6 +192,11 @@ pub struct Engine {
     pub clock: i64,
     /// Recent (gsn, clock) ticks, for now() in reads as of a past GSN.
     pub ticks: VecDeque<(Gsn, i64)>,
+    /// The hydration in progress off the engine thread (`hydrate.rs`).
+    pub(crate) hydration: Option<hydrate::Hydration>,
+    /// Durable records not applied yet: those from a DDL or schema record
+    /// on wait while a hydration is in progress.
+    held: VecDeque<(Gsn, LogRecord)>,
 }
 
 /// Handle used by sessions and sources.
@@ -444,6 +452,8 @@ impl Engine {
             sink_handles: HashMap::new(),
             clock: 0,
             ticks: VecDeque::new(),
+            hydration: None,
+            held: VecDeque::new(),
         }
     }
 
@@ -491,15 +501,24 @@ impl Engine {
                 self.rt.broken.insert(obj.id, e.message);
             }
         }
+        let mut saved_errors = std::collections::HashSet::new();
         for (id, errs) in app.view_errors {
             if let Some(v) = self.rt.views.get_mut(&id) {
                 v.errors = errs.into_iter().collect();
+                saved_errors.insert(id);
             }
         }
         self.graph.restore_error_state(app.errors);
         // anything that could not be matched to a recovered tree is rebuilt
         // from the recovered state
         self.graph.hydrate(&mut self.env, self.processed)?;
+        // views that were still being hydrated at the checkpoint (their
+        // errors were not saved) start with their root's, as new views do
+        let unsaved: Vec<ObjectId> = self.rt.views.keys().filter(|id| !saved_errors.contains(id)).copied().collect();
+        for id in unsaved {
+            let errs = self.graph.errors_of(self.rt.views[&id].node);
+            merge_errors(&mut self.rt.views.get_mut(&id).unwrap().errors, &errs);
+        }
         for t in self.env.unattached_trees() {
             self.env.drop_tree(t)?;
         }
@@ -578,31 +597,8 @@ impl Engine {
             };
             match msg {
                 Some(EngineMsg::Durable(batch)) => {
-                    for (gsn, rec) in batch {
-                        let dml = match &rec {
-                            LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
-                            _ => None,
-                        };
-                        if let Err(e) = self.apply_record(gsn, rec) {
-                            log::error!("failed to apply gsn {gsn}: {e}");
-                            if e.code.starts_with("XX") || e.code.starts_with("58") {
-                                return Err(e);
-                            }
-                            // (data errors are error records, so this is a
-                            // bug) The record is not applied again: its
-                            // statement fails instead of leaving the client,
-                            // the DML queued behind it and fresh reads
-                            // waiting forever.
-                            self.processed = self.processed.max(gsn);
-                            if let Some(req) = dml {
-                                self.dml_counts.remove(&req);
-                                self.reply_pending(req, Err(e));
-                                self.drain_dml_queue();
-                            }
-                        }
-                    }
-                    self.shared.processed_gsn.store(self.processed, Ordering::Release);
-                    self.wake_parked(&handle);
+                    self.held.extend(batch);
+                    self.apply_durable(&handle)?;
                 }
                 Some(EngineMsg::Request(req)) => self.handle_request(req, &handle),
                 Some(EngineMsg::Shutdown) => break,
@@ -614,6 +610,7 @@ impl Engine {
                     self.handle_request(r, &handle);
                 }
             }
+            self.poll_hydration(&handle)?;
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
@@ -640,6 +637,46 @@ impl Engine {
             if t.is_finished() {
                 let _ = t.join();
             }
+        }
+        Ok(())
+    }
+
+    /// Apply the durable records received, in GSN order, up to a DDL or
+    /// schema record while a hydration is in progress (it is applied once
+    /// the hydration is done).
+    fn apply_durable(&mut self, handle: &EngineHandle) -> Result<()> {
+        let mut applied = false;
+        while let Some((_, rec)) = self.held.front() {
+            if self.hydration.is_some() && matches!(rec, LogRecord::Ddl { .. } | LogRecord::Schema { .. }) {
+                break;
+            }
+            let (gsn, rec) = self.held.pop_front().unwrap();
+            applied = true;
+            let dml = match &rec {
+                LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
+                _ => None,
+            };
+            if let Err(e) = self.apply_record(gsn, rec) {
+                log::error!("failed to apply gsn {gsn}: {e}");
+                if e.code.starts_with("XX") || e.code.starts_with("58") {
+                    return Err(e);
+                }
+                // (data errors are error records, so this is a
+                // bug) The record is not applied again: its
+                // statement fails instead of leaving the client,
+                // the DML queued behind it and fresh reads
+                // waiting forever.
+                self.processed = self.processed.max(gsn);
+                if let Some(req) = dml {
+                    self.dml_counts.remove(&req);
+                    self.reply_pending(req, Err(e));
+                    self.drain_dml_queue();
+                }
+            }
+        }
+        if applied {
+            self.shared.processed_gsn.store(self.processed, Ordering::Release);
+            self.wake_parked(handle);
         }
         Ok(())
     }
@@ -696,6 +733,9 @@ impl Engine {
     fn run_execute(&mut self, req: Request, handle: &EngineHandle) {
         match req {
             Request::Execute { stmt, params, vars, extra, reply } => {
+                // (a statement reading a relation still being hydrated is
+                // parked until it is done: kept to be run again)
+                let retry = self.hydration.is_some().then(|| (stmt.clone(), params.clone(), vars.clone(), extra.clone()));
                 // (current_setting() in the statement reads the session's settings)
                 let settings = vars.settings.clone();
                 let r = crate::expr::with_session_settings(settings, || self.execute(*stmt, params, vars, extra, reply.clone(), handle));
@@ -704,6 +744,10 @@ impl Engine {
                         let _ = reply.send(Ok(res));
                     }
                     Ok(None) => {} // deferred (submitted or parked)
+                    Err(e) if e.code == hydrate::HYDRATING && retry.is_some() => {
+                        let (stmt, params, vars, extra) = retry.unwrap();
+                        self.parked.push(Parked { wait: Wait::Hydration, req: Request::Execute { stmt, params, vars, extra, reply } });
+                    }
                     Err(e) => {
                         let _ = reply.send(Err(e));
                     }
@@ -731,6 +775,9 @@ impl Engine {
                     if let Some(n) = self.rt.tables.get(&table) {
                         by_node.entry(*n).or_default().push(ch);
                     }
+                }
+                if self.hydration.is_some() {
+                    self.forward_to_hydration(gsn, &by_node)?;
                 }
                 let outputs = self.graph.step(&mut self.env, gsn, by_node)?;
                 self.processed = gsn;
@@ -769,7 +816,11 @@ impl Engine {
                 {
                     log::warn!("DDL at gsn {gsn} failed on replay: {e}");
                 }
-                self.reply_pending(req, res);
+                match self.hydration.as_mut().filter(|h| h.gsn == gsn) {
+                    // its dataflow is being hydrated: the reply waits for it
+                    Some(h) => h.then.push(hydrate::Then::Reply { req, res }),
+                    None => self.reply_pending(req, res),
+                }
                 self.drain_dml_queue();
             }
             LogRecord::Progress { source, lsn: _, state } => {
@@ -806,6 +857,9 @@ impl Engine {
                 while self.ticks.len() > 1 && self.ticks[1].0 <= frontier {
                     self.ticks.pop_front();
                 }
+                if self.hydration.is_some() {
+                    self.forward_to_hydration(gsn, &FxHashMap::default())?;
+                }
                 // temporal filters release the events that became due
                 let outputs = self.graph.step(&mut self.env, gsn, FxHashMap::default())?;
                 self.processed = gsn;
@@ -841,23 +895,7 @@ impl Engine {
             }
         }
         for s in self.subs.iter() {
-            if let Some(o) = outputs.get(&s.node) {
-                // a new error record ends the subscription, as it fails
-                // reads (a retracted one does not)
-                if !o.errs.is_empty() {
-                    let mut errs = o.errs.clone();
-                    crate::dataflow::consolidate_errs(&mut errs);
-                    if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
-                        let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
-                    }
-                }
-                if !o.data.is_empty() {
-                    let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
-                }
-            }
-            if s.progress {
-                let _ = s.tx.send(SubEvent::Progress { gsn });
-            }
+            deliver_to(s, gsn, outputs.get(&s.node));
         }
         for sink in self.sink_handles.values() {
             if let Some(o) = outputs.get(&sink.node) {
@@ -897,7 +935,15 @@ impl Engine {
         let app = AppState {
             catalog: self.catalog.clone(),
             trees: self.graph.arrangement_trees().into_iter().collect(),
-            view_errors: self.rt.views.iter().map(|(id, v)| (*id, v.errors.clone().into_iter().collect())).collect(),
+            // (not of a view still being hydrated: recovery rebuilds it and
+            // takes its root's error records then)
+            view_errors: self
+                .rt
+                .views
+                .iter()
+                .filter(|(_, v)| self.graph.arr(v.arr).hydrated)
+                .map(|(id, v)| (*id, v.errors.clone().into_iter().collect()))
+                .collect(),
             source_states: self.source_states.iter().map(|(k, v)| (*k, v.clone())).collect(),
             source_lsns: self.source_lsns.iter().map(|(k, v)| (*k, *v)).collect(),
             next_req: self.next_req,
@@ -1003,6 +1049,27 @@ impl Engine {
     }
 }
 
+/// Deliver the output of a subscription's node at `gsn` (if it changed).
+pub(crate) fn deliver_to(s: &Subscription, gsn: Gsn, out: Option<&Output>) {
+    if let Some(o) = out {
+        // a new error record ends the subscription, as it fails
+        // reads (a retracted one does not)
+        if !o.errs.is_empty() {
+            let mut errs = o.errs.clone();
+            crate::dataflow::consolidate_errs(&mut errs);
+            if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
+                let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+            }
+        }
+        if !o.data.is_empty() {
+            let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
+        }
+    }
+    if s.progress {
+        let _ = s.tx.send(SubEvent::Progress { gsn });
+    }
+}
+
 pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &ErrDelta) {
     for (e, w) in errs {
         let v = map.entry(e.clone()).or_default();
@@ -1045,7 +1112,8 @@ mod tests {
         let (nodes, arrs) = (e.graph.live_nodes().count(), e.graph.live_arrangements().count());
         let text = "SELECT s.a, s.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) s JOIN m ON m.id = s.a";
         let q = crate::sql::parser::parse_single_query(text).unwrap();
-        let err = e.subscribe(SubscribeTarget::Query(Box::new(q), text.to_string()), true, false, vec![]).unwrap_err();
+        let (reply, _) = bounded(1);
+        let err = e.subscribe(SubscribeTarget::Query(Box::new(q), text.to_string()), true, false, vec![], reply).unwrap_err();
         assert!(err.message.contains("has no dataflow"), "{}", err.message);
         assert_eq!((e.graph.live_nodes().count(), e.graph.live_arrangements().count()), (nodes, arrs));
         assert!(e.subs.is_empty());

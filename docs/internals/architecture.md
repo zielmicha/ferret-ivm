@@ -59,12 +59,14 @@ Where the implementation differs from the design:
 | `ivm-session-<n>` (one per client, 16 MiB stack) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
+| `ivm-hydrate` (while a view, index or subscription is hydrated; 64 MiB stack) | a fork of the storage and of part of the graph | hydrates the new dataflow fragment as of its statement's GSN, then applies the records the engine forwards until it has caught up ([Dataflow](dataflow.md#hydration-off-the-engine-thread)) |
 | `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, removes it and requests a shutdown |
 | `ivm-http` (with `--http-listen`: a driver thread and the two worker threads of its own tokio runtime) | the HTTP listener | the web UI's server, its once-a-second metrics sampler and the SQL console ([Web UI](../web-ui.md)); engine snapshots are requested with a callback, so no async thread blocks on the engine |
 | `ivm-slot-drop-<slot>` | | drop the replication slot of a dropped source, retrying with a delay doubling from 250 ms to 10 s (also while the stopping source's session still holds it) until it is dropped or gone; pending drops are saved in checkpoints and started again after recovery |
 
 There is exactly one engine thread: all dataflow maintenance, all index
-reads and writes, and all query execution happen on it. Everything that
+reads and writes, and all query execution happen on it, except the
+hydration of new views, indexes and subscriptions, which runs on a fork. Everything that
 talks to the network (sessions, sources, sinks) runs on other threads, so
 the engine never blocks on a remote server: stopping a source or a sink
 (`DROP SOURCE`, `DROP SINK`, a cascading drop, a sink restarted after a
@@ -161,7 +163,10 @@ column list — not lowering or hydration), `CREATE SOURCE` and `ALTER SOURCE
 ... REFRESH` (the discovered tables; `CREATE SOURCE` also writes the data
 directory's instance id into `extra`), and `CREATE SINK` (its relation and
 `KEY` columns). The engine then submits a `Ddl { req, sql, extra }` record
-and applies it when it comes back durable; the reply is sent then. Other
+and applies it when it comes back durable; the reply is sent then (for
+`CREATE MATERIALIZED VIEW` and `CREATE INDEX`, once their dataflow has been
+hydrated off the engine thread, see
+[Dataflow](dataflow.md#hydration-off-the-engine-thread)). Other
 checks happen only while applying: `DROP` (which resolves and checks every
 name before dropping anything), `CREATE INDEX`, the rules of
 `CREATE OR REPLACE`, and lowering and hydration. A statement that fails there
@@ -211,7 +216,7 @@ handles:
 
 | Message | Action |
 |---|---|
-| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
+| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. While a hydration is in progress, a `Ddl` or `Schema` record and the records after it are held until it is done; `Commit` and `Tick` records are forwarded to it before they are applied. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
@@ -220,7 +225,11 @@ handles:
 | `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
-takes a checkpoint if one is due, and removes cancelled subscriptions.
+finishes the hydration in progress if it has caught up (then applies the
+records held behind it), takes a checkpoint if one is due, and removes
+cancelled subscriptions. The hydration thread sends `Wake` when it has
+hydrated its fragment and whenever it has applied every record forwarded so
+far.
 
 `apply_record` dispatches on the record kind:
 
@@ -287,6 +296,7 @@ and a wait condition:
 | `Gsn(g)` | the engine has applied `g` (checked after every batch) |
 | `Lsn` | every source of the catalog has a frontier ≥ the read's LSN (`lsn_reached`; checked on `Wake` messages, which sources send when a frontier moves while `lsn_waiters` is set, after every batch and on the 200 ms timeout). When the last source is dropped, the read is re-run and fails |
 | `Snapshot` | something changed that could finish a snapshot (source progress, a schema change or DDL); the read is re-run and parks again if a table it reads, directly or through views, is still loading |
+| `Hydration` | the hydration in progress is done; a statement (read, DML or `SUBSCRIBE`) that read a view still being hydrated is re-run |
 
 While an LSN read waits, `want_keepalive` makes the sources request a
 keepalive from the upstream, so that the frontier advances to the server's

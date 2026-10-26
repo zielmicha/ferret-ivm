@@ -19,9 +19,13 @@
   at once.
 - **`AS OF <gsn>` in the future** waits until the engine reaches that GSN.
 - **The engine thread is busy.** All statements run on one thread: while it
-  hydrates a large new view (`CREATE MATERIALIZED VIEW`, `CREATE INDEX`,
-  `SUBSCRIBE (query)`), applies a large upstream transaction or takes a
-  checkpoint, every other statement waits.
+  applies a large upstream transaction, rebuilds a view
+  (`CREATE OR REPLACE MATERIALIZED VIEW`, an upstream schema change), runs
+  a long read or takes a checkpoint, every other statement waits. (New views, indexes and
+  subscriptions are hydrated on a thread of their own.)
+- **A view is being hydrated.** Statements that read a view that is still
+  being hydrated wait until it is maintained; DDL logged while a view is
+  being hydrated waits for it, and so do the changes logged after that DDL.
 - **DML** is serialized: a statement waits for the one before it.
 - **`SUBSCRIBE` in psql** never prints anything: psql waits for the end of
   the result. Use `COPY (SUBSCRIBE ...) TO STDOUT`.

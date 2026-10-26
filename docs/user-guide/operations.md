@@ -47,8 +47,11 @@ Things to keep in mind when sizing:
   sequencer, one thread per source, sink and client session, and three
   threads for the web UI when it is enabled).
 - **Memory outside the cache**: hydration of a new view holds snapshots of
-  intermediate results; aggregation group caches; subscription and sink
-  queues are unbounded. The queue of logged records the engine has yet to
+  intermediate results, in a fork of the storage with a buffer pool of its
+  own (as large as the cache; nodes are shared with the engine's until one
+  side modifies them), and keeps the changes of the tables it reads applied
+  meanwhile (at most a million records' worth) until it has caught up;
+  aggregation group caches; subscription and sink queues are unbounded. The queue of logged records the engine has yet to
   apply is bounded: when the engine is 10,000 records behind, the log stops
   taking new records until it catches up (sources then pause reading the
   replication stream, and the upstream keeps the WAL).

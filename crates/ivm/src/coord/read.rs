@@ -59,9 +59,7 @@ impl Engine {
         }
         match stmt {
             Statement::Select { query, as_of, .. } => self.select(query, as_of, params, vars, reply),
-            Statement::Subscribe { target, snapshot, progress, as_of: _, copy: _ } => {
-                self.subscribe(target, snapshot, progress, params).map(Some)
-            }
+            Statement::Subscribe { target, snapshot, progress, as_of: _, copy: _ } => self.subscribe(target, snapshot, progress, params, reply),
             Statement::Show(k) => self.show(k).map(Some),
             Statement::Explain { kind, target } => self.explain(kind, target, params).map(Some),
             Statement::Checkpoint => {
@@ -97,6 +95,10 @@ impl Engine {
 
     /// Run a logical plan against current (or historical) state.
     pub(crate) fn execute_rel(&mut self, rel: &Rel, at: ReadAt) -> Result<Rows> {
+        if self.reads_hydrating(rel) {
+            // (the request is parked until the hydration is done)
+            return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
+        }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
         let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default() };
@@ -377,6 +379,7 @@ impl Engine {
                 // re-run: it parks again if a snapshot is still loading
                 Wait::Snapshot => snapshots_changed,
                 Wait::Gsn(g) => self.processed >= g,
+                Wait::Hydration => self.hydration.is_none(),
             };
             if ready {
                 self.deferred.push(p.req);
@@ -393,7 +396,16 @@ impl Engine {
         self.parked = still;
     }
 
-    pub(super) fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
+    /// Start a subscription; the reply is sent once a query's dataflow is
+    /// hydrated (Ok(None)).
+    pub(super) fn subscribe(
+        &mut self,
+        target: SubscribeTarget,
+        snapshot: bool,
+        progress: bool,
+        params: Vec<ParamSlot>,
+        reply: Sender<Result<ExecResult>>,
+    ) -> Result<Option<ExecResult>> {
         let mut view = None;
         let (node, pinned, columns, reads): (NodeId, Option<NodeId>, Vec<ResultColumn>, Vec<ObjectId>) = match target {
             SubscribeTarget::Name(name) => {
@@ -407,6 +419,9 @@ impl Engine {
                     ObjectKind::MaterializedView(v) => {
                         view = Some(obj.id);
                         let rt = &self.rt.views[&obj.id];
+                        if self.hydration.is_some() && !self.graph.arr(rt.arr).hydrated {
+                            return Err(SqlError::new(super::hydrate::HYDRATING, "the view is being hydrated"));
+                        }
                         let cols = v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect();
                         (rt.node, None, cols, vec![obj.id])
                     }
@@ -421,12 +436,16 @@ impl Engine {
                         // names the columns, as in reads of it
                         let text = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
                         let q = crate::sql::parser::parse_single_query(&text)?;
-                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params);
+                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params, reply);
                     }
                     _ => sql_bail!(codes::WRONG_OBJECT_TYPE, "cannot subscribe to {} \"{name}\"", obj.kind.name()),
                 }
             }
             SubscribeTarget::Query(q, _) => {
+                if self.hydration.is_some() {
+                    // (its dataflow is hydrated after the one in progress)
+                    return Err(SqlError::new(super::hydrate::HYDRATING, "a hydration is in progress"));
+                }
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
                 super::ddl::check_catalog_reads(&bq)?;
@@ -470,25 +489,22 @@ impl Engine {
                 };
                 self.graph.retain_node(node);
                 self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-                if let Err(e) = self.graph.hydrate(&mut self.env, self.processed) {
-                    let _ = self.graph.release_node(&mut self.env, node);
-                    return Err(e);
-                }
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
                 (node, Some(node), cols, reads)
             }
         };
-        let (tx, rx) = unbounded();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if snapshot {
-            let snap = self.graph.snapshot(&mut self.env, node)?;
-            if !snap.data.is_empty() {
-                let _ = tx.send(SubEvent::Data { gsn: self.processed, rows: snap.data });
+        // as of the last record: in the background if it has a new dataflow
+        let p = super::hydrate::PendingSub { node, pinned, columns, reads, view, snapshot, progress, reply };
+        if pinned.is_none() {
+            // (a view or table: nothing to hydrate)
+            self.then_inline(super::hydrate::Then::Subscribe(p))?;
+        } else if let Err(e) = self.hydrate(self.processed, vec![super::hydrate::Then::Subscribe(p)]) {
+            if let Some(n) = pinned {
+                let _ = self.graph.release_node(&mut self.env, n);
             }
+            return Err(e);
         }
-        let _ = tx.send(SubEvent::Progress { gsn: self.processed });
-        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
-        Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
+        Ok(None)
     }
 
     /// Add to `reads` the relations that the materialized views in it read
