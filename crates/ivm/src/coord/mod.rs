@@ -145,7 +145,7 @@ pub struct Engine {
     last_checkpoint: Instant,
     records_since_checkpoint: u64,
     /// Records since the last checkpoint other than clock ticks that changed
-    /// nothing but the clock (and nodes relocated by garbage collection).
+    /// nothing but the clock (and 1 when its maintenance pass left work).
     changes_since_checkpoint: u64,
     /// What the metadata tree holds.
     pub(crate) meta: meta::Meta,
@@ -895,9 +895,10 @@ impl Engine {
 
     /// A checkpoint is due every `checkpoint_interval` (or as soon as dirty
     /// nodes exceed half the cache) once something durable changed: records
-    /// other than clock ticks that changed nothing but the clock, or nodes
-    /// relocated by garbage collection. Ticks alone only add replay work:
-    /// they make one due after MAX_TICKS_WITHOUT_CHECKPOINT of them.
+    /// other than clock ticks that changed nothing but the clock — or the
+    /// last checkpoint's maintenance pass left space to reclaim for lack of
+    /// budget, which the next one continues. Ticks alone only add replay
+    /// work: they make one due after MAX_TICKS_WITHOUT_CHECKPOINT of them.
     fn maybe_checkpoint(&mut self) -> Result<()> {
         if self.changes_since_checkpoint == 0 && self.records_since_checkpoint < MAX_TICKS_WITHOUT_CHECKPOINT {
             return Ok(());
@@ -914,7 +915,7 @@ impl Engine {
         // manifest record names that tree in a small header
         self.persist_meta(self.processed)?;
         // reclaim space first, so that this checkpoint writes what it rewrote
-        self.env.maintain()?;
+        let maint = self.env.maintain()?;
         let header = meta::encode_header(&self.meta, self.next_req);
         self.env.checkpoint(self.processed, &header)?;
         // recovery replays the log after the checkpoint, and nothing else
@@ -922,7 +923,9 @@ impl Engine {
         let _ = self.seq.send(SeqMsg::Truncate(self.processed));
         self.last_checkpoint = Instant::now();
         self.records_since_checkpoint = 0;
-        self.changes_since_checkpoint = 0;
+        // (an idle engine goes on reclaiming, a budget per checkpoint, until
+        // a pass finds nothing left)
+        self.changes_since_checkpoint = maint.unfinished as u64;
         Ok(())
     }
 
@@ -1119,5 +1122,48 @@ mod tests {
         e.checkpoint().unwrap();
         let truncated: Vec<Gsn> = rx.try_iter().filter_map(|m| if let SeqMsg::Truncate(g) = m { Some(g) } else { None }).collect();
         assert_eq!(truncated, [5]);
+    }
+
+    /// The metadata tree is maintained like any other: error records that
+    /// go away leave retracted entries in leaves that nothing writes again,
+    /// which the checkpoints' maintenance passes compact away once the
+    /// retention frontier passes them.
+    #[test]
+    fn the_metadata_tree_is_compacted_by_maintenance() {
+        use crate::types::Datum;
+        let tmp = crate::testkit::TempDir::new("coord-meta-maintenance");
+        let mut e = engine(tmp.path());
+        e.cfg.retention_gsns = 1;
+        let ddl = |sql: &str| LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() };
+        e.apply_record(1, ddl("CREATE TABLE t (id int PRIMARY KEY, v text)")).unwrap();
+        e.apply_record(2, ddl("CREATE MATERIALIZED VIEW m AS SELECT id, v::int AS n FROM t")).unwrap();
+        let t = e.catalog.by_name("t").unwrap().id;
+        // an error record per row (the message names the value)
+        let rows = (0..20_000)
+            .map(|i| (t, TableChange::Upsert { row: vec![Datum::Int4(i), Datum::Text(format!("x{i}").into())], unchanged: vec![] }))
+            .collect();
+        e.apply_record(3, LogRecord::Commit { source: 1, lsn: 0, changes: rows }).unwrap();
+        e.checkpoint().unwrap();
+        e.apply_record(4, LogRecord::Commit { source: 1, lsn: 0, changes: vec![(t, TableChange::Truncate)] }).unwrap();
+        e.checkpoint().unwrap();
+        let meta_entries = |e: &mut Engine| {
+            let tree = e.meta.tree.unwrap();
+            let (mut entries, mut live) = (0, 0);
+            e.env
+                .for_each(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |_, h| {
+                    entries += 1;
+                    live += (h.total() != 0) as usize;
+                    Ok(true)
+                })
+                .unwrap();
+            (entries, live)
+        };
+        let (entries, live) = meta_entries(&mut e);
+        assert!(entries > 20_000 && live < 100, "{entries} entries, {live} live");
+        // the frontier passes the retractions
+        e.apply_record(5, LogRecord::Tick { micros: 1_767_225_600_000_000 }).unwrap();
+        e.checkpoint().unwrap();
+        let (entries, live) = meta_entries(&mut e);
+        assert!(entries < 2 * live + 100, "{entries} entries left for {live} live ones");
     }
 }

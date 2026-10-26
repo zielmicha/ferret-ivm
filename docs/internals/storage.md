@@ -329,7 +329,9 @@ Reading and rewriting clean nodes is budgeted (`MaintBudget`; rewriting the
 path to a rewritten node and anything dirty is not counted): for compaction
 (and merges) and for evacuation each, 8 MiB plus the bytes checkpoints
 wrote for the engine's own updates since the previous pass, which is the
-rate at which garbage arises. What does not fit waits for the next pass.
+rate at which garbage arises. What does not fit waits for the next pass:
+the pass reports that it left work (`MaintStats::unfinished`), which makes
+the engine's next checkpoint due even if nothing else changes.
 `maintain_with` takes an explicit budget (a zero budget compacts only dirty
 leaves). Once a segment has no live bytes it is deleted at the end of a
 checkpoint. The active segment itself is never evacuated.

@@ -179,11 +179,12 @@ A checkpoint is taken every `--checkpoint-secs` seconds, or as soon as
 dirty index nodes exceed half of `--cache-mb`, if something durable changed
 since the last one: anything applied but clock ticks that changed nothing
 but the clock (a tick that changes a view through a temporal filter
-counts). Clock ticks alone make one due only after 3,600 of them (an hour
-at the default `--tick-ms`), so an idle engine writes nothing but its ticks
-to the log, and a restart replays at most that many. A checkpoint is also
-taken on the `CHECKPOINT` statement and as the final step of a requested
-shutdown. It:
+counts), or space the last maintenance pass (below) could not reclaim
+within its budget. Clock ticks alone make one due only after 3,600 of them
+(an hour at the default `--tick-ms`), so an idle engine writes nothing but
+its ticks to the log once its space is reclaimed, and a restart replays at
+most that many. A checkpoint is also taken on the `CHECKPOINT` statement
+and as the final step of a requested shutdown. It:
 
 1. writes what changed in the catalog and the engine state since the last
    one (DDL history entries, source states and LSNs, index fingerprints →

@@ -1748,10 +1748,10 @@ impl Env {
     /// continues). No summary changes: compaction keeps every entry's
     /// current weight, and merging keeps the entries.
     pub fn maintain_with(&mut self, budget: MaintBudget) -> Result<MaintStats> {
-        let victims = self.gc_victims(budget.gc);
+        let (victims, left_out) = self.gc_victims(budget.gc);
         let mut m = Maint {
             frontier: self.frontier,
-            stats: MaintStats { victims: victims.clone(), ..Default::default() },
+            stats: MaintStats { victims: victims.clone(), unfinished: left_out, ..Default::default() },
             victims,
             compact: budget.compact,
             gc: budget.gc,
@@ -1792,11 +1792,9 @@ impl Env {
     /// the cost-benefit of cleaning them — free space gained per byte moved
     /// (1 − u) / (1 + u), weighted by age (cold data stays put once moved,
     /// so old segments are worth more) — while their live bytes fit in
-    /// `budget` (the first one always does, unless `budget` is 0).
-    fn gc_victims(&self, budget: u64) -> Vec<u32> {
-        if budget == 0 {
-            return Vec::new();
-        }
+    /// `budget` (the first one always does, unless `budget` is 0). Also
+    /// whether a segment to evacuate was left out.
+    fn gc_victims(&self, budget: u64) -> (Vec<u32>, bool) {
         let active = self.segs.active_id();
         let mut cands: Vec<(f64, u32, u64)> = self
             .seg_live
@@ -1809,16 +1807,17 @@ impl Env {
             })
             .collect();
         cands.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        let (mut out, mut sum) = (Vec::new(), 0u64);
+        let (mut out, mut sum, mut left_out) = (Vec::new(), 0u64, false);
         for (_, id, live) in cands {
-            if !out.is_empty() && sum.saturating_add(live) > budget {
+            if budget == 0 || (!out.is_empty() && sum.saturating_add(live) > budget) {
+                left_out = true;
                 continue;
             }
             out.push(id);
             sum += live;
         }
         out.sort_unstable();
-        out
+        (out, left_out)
     }
 
     /// Visit node `id` of a maintenance pass (`depth` below the root; `old`
@@ -1939,6 +1938,8 @@ impl Env {
         }
         if !shrunk.is_empty() {
             m.stats.merged += self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut m.compact, true)?;
+            // (merges are tried only while there is budget)
+            m.stats.unfinished |= m.compact == 0;
         }
         if !changed {
             self.put_node_sized(id, Node::Internal(children), size);
@@ -2053,6 +2054,10 @@ pub struct MaintStats {
     pub merged: usize,
     /// Segments chosen for evacuation.
     pub victims: Vec<u32>,
+    /// The pass left work it found for lack of budget (nodes it did not
+    /// read or rewrite, merges it did not try, segments it did not choose):
+    /// the next pass continues it.
+    pub unfinished: bool,
 }
 
 /// State of a maintenance pass.
@@ -2078,6 +2083,7 @@ impl Maint {
     fn charge(&mut self, gc: bool, bytes: u64) -> bool {
         let b = if gc { &mut self.gc } else { &mut self.compact };
         if *b == 0 {
+            self.stats.unfinished = true;
             return false;
         }
         *b = b.saturating_sub(bytes);

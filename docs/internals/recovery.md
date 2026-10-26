@@ -161,10 +161,13 @@ A checkpoint is taken on `CHECKPOINT`, on shutdown, and when one is due
 `--checkpoint-secs`, or as soon as dirty nodes exceed half the cache, once
 something durable changed since the last one — a record was applied other
 than a clock tick that changed nothing but the clock (a tick that releases
-temporal-filter events counts). Ticks alone only add replay work (and 25
-bytes of log each): they make a checkpoint due after 3,600 of them (an hour
-at the default `--tick-ms`), which bounds the replay of an idle engine. An
-engine that is idle takes no checkpoints otherwise.
+temporal-filter events counts), or the last checkpoint's maintenance pass
+left space to reclaim for lack of budget (`MaintStats::unfinished`), so that
+the next pass continues it. Ticks alone only add replay work (and 25 bytes
+of log each): they make a checkpoint due after 3,600 of them (an hour at
+the default `--tick-ms`), which bounds the replay of an idle engine. An
+engine that is idle takes no checkpoints otherwise, once it has reclaimed
+what its passes found.
 
 `Engine::checkpoint`:
 

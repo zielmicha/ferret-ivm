@@ -1434,6 +1434,44 @@ fn mass_delete_is_compacted_and_merged() {
     assert!(leaves <= 8 && internal <= 2, "{leaves} leaves ({bytes} bytes) and {internal} internal nodes left of {split} leaves: {st:?}");
 }
 
+/// A pass short of budget says that it left work (the engine then makes its
+/// next checkpoint due, so that an idle engine goes on reclaiming), and the
+/// passes that follow finish it; a pass that did everything it found does
+/// not say so.
+#[test]
+fn a_pass_short_of_budget_reports_work_left() {
+    let tmp = TempDir::new("storage-maint-unfinished");
+    let opts = EnvOptions { segment_bytes: 256 << 10, ..EnvOptions::default() };
+    let (mut env, _) = Env::open(tmp.path(), opts).unwrap();
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    let n = 50_000u64;
+    env.apply(t, &mut (0..n).map(|i| (key8(i, 20), 1)).collect(), 1).unwrap();
+    env.checkpoint(1, b"").unwrap();
+    env.apply(t, &mut (0..n).filter(|i| i % 10 != 0).map(|i| (key8(i, 20), -1)).collect(), 2).unwrap();
+    env.checkpoint(2, b"").unwrap();
+    env.set_frontier(2);
+    let budget = MaintBudget { compact: 64 << 10, gc: 64 << 10 };
+    let mut passes = 0;
+    loop {
+        let st = env.maintain_with(budget).unwrap();
+        env.checkpoint(2, b"").unwrap();
+        passes += 1;
+        if !st.unfinished {
+            break;
+        }
+        assert!(passes < 1000, "the passes do not finish: {st:?}");
+    }
+    assert!(passes > 1, "a pass of 64 KiB compacted a 1.6 MB tree");
+    let (_, _, entries, _) = shape(&mut env, t);
+    assert_eq!(entries as u64, n / 10, "dead entries left");
+    check_live_accounting(&mut env);
+    // a zero budget leaves the work it finds
+    env.apply(t, &mut (0..n).filter(|i| i % 10 == 0).map(|i| (key8(i, 20), -1)).collect(), 3).unwrap();
+    env.checkpoint(3, b"").unwrap();
+    env.set_frontier(3);
+    assert!(env.maintain_with(MaintBudget { compact: 0, gc: 0 }).unwrap().unfinished);
+}
+
 /// Appending keys in small batches fills leaves to 90% (they used to split
 /// in half and stay half full, since nothing is inserted on the left again).
 #[test]
