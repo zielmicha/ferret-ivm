@@ -376,6 +376,7 @@ fn hydration(h: &EngineHandle, cache: usize) {
         exec(h, &format!("CREATE MATERIALIZED VIEW {name} AS {q}"));
         let (_, peak) = heap();
         let used = peak.saturating_sub(before);
+        println!("hydrating {name}: peak {} MiB above the start", used / MB);
         assert!(used < cache + 40 * MB, "hydrating {name} used {} MiB above {} MiB", used / MB, before / MB);
         assert_eq!(rows(h, &format!("SELECT count(*) FROM {name}")), [count], "{name}");
     }
@@ -409,6 +410,7 @@ fn large_commit(h: &EngineHandle, cache: usize) {
     };
     let alone = insert("plain");
     let with_views = insert("q");
+    println!("a commit of 150,000 wide rows: peak {} MiB without views, {} MiB with views", alone / MB, with_views / MB);
     assert!(
         with_views < alone + cache + 40 * MB,
         "the commit used {} MiB with views, {} MiB without",
