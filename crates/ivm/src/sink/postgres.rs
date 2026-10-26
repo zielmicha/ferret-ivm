@@ -516,6 +516,10 @@ impl Sink<'_> {
             }
             if self.failed.is_none() {
                 self.flush();
+                // stopping: everything received is written first
+                while self.stop && self.failed.is_none() && self.writable() && !self.pending.is_empty() {
+                    self.flush();
+                }
             }
             if let Some((e, progress)) = self.failed.take() {
                 // A batch stays pending; after reconnecting, the committed
