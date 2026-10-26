@@ -337,6 +337,8 @@ impl Case {
             }
             state.insert(v.name.clone(), got);
         }
+        // (one the engine ended gets nothing more: an error was its last event)
+        self.subs.retain(|s| !s.cancel.load(std::sync::atomic::Ordering::Acquire));
         for n in notes {
             self.note(n);
         }
@@ -468,16 +470,11 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
                         v.created = created;
                         // Subscriptions to the view continue with the change to
                         // the new contents; their result columns cannot change,
-                        // so subscribe again if the replacement's did.
-                        let Ok(ExecResult::Query { columns, .. }) = execute(&case.h(), &format!("SELECT * FROM {name}")) else { continue };
-                        let same = |a: &[ResultColumn]| {
-                            a.len() == columns.len() && a.iter().zip(&columns).all(|(x, y)| x.name == y.name && x.ty == y.ty && x.typmod == y.typmod)
-                        };
-                        let changed = case.subs.iter().any(|s| s.view == name && s.to_query.is_none() && !same(&s.columns));
-                        if changed {
-                            for sub in case.subs.iter().filter(|s| s.view == name && s.to_query.is_none()) {
-                                sub.cancel.store(true, std::sync::atomic::Ordering::Release);
-                            }
+                        // so the engine ends them (an error, and cancelled) if
+                        // the replacement's did: subscribe again then. (Not
+                        // judged by reading the view, which may fail.)
+                        let ended = case.subs.iter().any(|s| s.view == name && s.to_query.is_none() && s.cancel.load(std::sync::atomic::Ordering::Acquire));
+                        if ended {
                             case.subs.retain(|s| !(s.view == name && s.to_query.is_none()));
                             case.note(format!("-- {name}: columns changed, subscribing again"));
                             case.subscribe(i, false);
