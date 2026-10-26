@@ -5,7 +5,8 @@
 //! counts, and numeric / float / integer / text summaries over a value
 //! embedded in the key) at increasing GSNs, retention frontier advances, tree
 //! creation and drops, checkpoints, maintenance passes (compaction, merges,
-//! segment GC) with random budgets, clean reopens and simulated crashes:
+//! segment GC) with random budgets, changes of the buffer pool's target (as
+//! the memory budget makes them), clean reopens and simulated crashes:
 //! - no final checkpoint;
 //! - garbage after the durable end of the manifest or of the active segment,
 //!   and stray segment files;
@@ -18,8 +19,8 @@
 //! Point lookups are checked after every step; full verification compares
 //! scans (current and AS OF retained GSNs), range and prefix scans, range
 //! summaries, `nth`, the tree structure (key ranges, parent links,
-//! `min_seg`, `due`) and the segment liveness accounting (per segment and
-//! per tree) with the model. Dropping a tree must not read anything. After a
+//! `min_seg`, `due`), each loaded node's byte size and memory, and the
+//! segment liveness accounting (per segment and per tree) with the model. Dropping a tree must not read anything. After a
 //! crash the recovered state must equal the model as of the last checkpoint;
 //! the operations since then are then replayed (as the engine replays its
 //! input log) and must reproduce the state before the crash. Some cases
@@ -1030,6 +1031,9 @@ enum Action {
     Reopen,
     Crash,
     Verify,
+    /// The buffer pool's target changes (`Env::set_cache_bytes`, as the
+    /// memory budget rebalances it); the next access evicts down to it.
+    Cache,
 }
 
 /// An action with the seed of the random choices it makes.
@@ -1045,6 +1049,7 @@ fn arb_action() -> impl Strategy<Value = (Action, u64)> {
         2 => Just(Reopen),
         5 => Just(Crash),
         4 => Just(Verify),
+        2 => Just(Cache),
     ];
     (kind, any::<u64>())
 }
@@ -1074,6 +1079,11 @@ fn run(setup: &Setup, actions: &[(Action, u64)], name: &str) {
             }
             Action::Crash => h.crash(),
             Action::Verify => h.verify(),
+            Action::Cache => {
+                h.event("cache target");
+                let bytes = *h.rng.pick(&[64 << 20, 256 << 10, 32 << 10, 8 << 10, 2 << 10]);
+                h.env().set_cache_bytes(bytes);
+            }
         }
         let (frontier, now) = (h.frontier, h.gsn);
         verify_points(h.env.as_mut().unwrap(), &mut h.rng, &h.model, frontier, now);

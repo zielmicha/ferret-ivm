@@ -99,10 +99,12 @@ size in memory (`Node::mem_size`, plus its slot) is its vector of entries or
 children by capacity — 56 bytes per leaf entry, whatever the entry's
 serialized size — plus the heap blocks they own: each key or separator, a
 history of more than two changes, and the values of summaries (`min`/`max`
-datums, exact sums). A heap block of *n* bytes is counted as *n* + 8
-rounded up to 16 (`memory::heap_block`, close to what glibc and mimalloc
-take). In-place leaf edits maintain the size incrementally, as they do the
-serialized size. (Counting serialized bytes undercounted narrow entries
+datums or the boxes of their prefixes, exact sums with a float sum's
+magnitude once it outgrows its four inline limbs). A heap block of *n*
+bytes is counted as *n* + 8 rounded up to 16 (`memory::heap_block`, close
+to what glibc and mimalloc take). In-place leaf edits maintain the size
+incrementally, as they do the serialized size, and so do merges and the
+maintenance pass for the children they change. (Counting serialized bytes undercounted narrow entries
 about fourfold: an 8-byte key with one change is 18 serialized bytes and
 about 80 in memory.)
 

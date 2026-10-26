@@ -1021,6 +1021,11 @@ pub struct Dyadic {
 type Limbs = SmallVec<[u64; 4]>;
 
 impl Dyadic {
+    /// Heap bytes of the magnitude: none while it fits inline.
+    pub fn heap_size(&self) -> usize {
+        if self.mag.spilled() { crate::memory::heap_block(self.mag.capacity() * 8) } else { 0 }
+    }
+
     /// `±mag·2^e` (`mag` of any parity), normalized.
     fn new(neg: bool, mut mag: Limbs, e: i32) -> Dyadic {
         trim(&mut mag);
@@ -1399,8 +1404,9 @@ impl Summary {
             AggState::SumNumeric(s) => {
                 heap_block(size_of::<NumSum>()) + if s.scales.spilled() { heap_block(s.scales.capacity() * size_of::<(u32, i64)>()) } else { 0 }
             }
-            AggState::SumFloat(f) => heap_block(size_of::<FloatSum>()) + heap_block((f.fixed.bits() as usize).div_ceil(64) * 8),
+            AggState::SumFloat(f) => heap_block(size_of::<FloatSum>()) + f.finite.heap_size(),
             AggState::Min(d) | AggState::Max(d) => d.as_ref().map_or(0, crate::memory::datum_heap),
+            AggState::MinPrefix(w) | AggState::MaxPrefix(w) => heap_block(size_of::<WideExtreme>()) + heap_block(w.prefix.len()),
         });
         heap_block(self.aggs.capacity() * size_of::<AggState>()) + states.sum::<usize>()
     }

@@ -158,6 +158,33 @@ fn wide_entries_and_summaries_are_accounted() {
     assert_close("wide entries and summaries", r);
 }
 
+/// SUM over a float derived from the key: values spanning the whole
+/// exponent range, so that the exact sums in the child pointers hold
+/// magnitudes of hundreds of limbs, beyond the four kept inline.
+struct WideFloatSum;
+
+impl Summarizer for WideFloatSum {
+    fn spec(&self) -> &[AggKind] {
+        &[AggKind::SumFloat]
+    }
+    fn add_entry(&self, acc: &mut Summary, key: &[u8], weight: i64) -> ivm::Result<()> {
+        acc.count += weight;
+        let i = u64::from_be_bytes(key[..8].try_into().unwrap());
+        let x = if i % 2 == 0 { 1e300 * (1 + i % 7) as f64 } else { 1e-300 * (1 + i % 5) as f64 };
+        AggKind::SumFloat.add(&mut acc.aggs[0], &Datum::Float8(x), weight)
+    }
+}
+
+/// Exact float sums whose magnitudes no longer fit inline: the summary of
+/// every child pointer owns a heap block for them, which the pool counts.
+#[test]
+fn spilled_float_sums_are_accounted() {
+    // leaves of a few entries: the child pointers hold most of the memory
+    let opts = EnvOptions { leaf_bytes: 64, internal_bytes: 1 << 10, ..big_cache() };
+    let r = loaded("float-sums", 50_000, 1, opts, || Arc::new(WideFloatSum), |i| i.to_be_bytes().to_vec());
+    assert_close("float sums with spilled magnitudes", r);
+}
+
 /// A full scan keeps the pool at its target: it evicts after every leaf
 /// instead of loading the whole tree first (a 128 MiB cache used to grow by
 /// 1.5 GB during one scan).
