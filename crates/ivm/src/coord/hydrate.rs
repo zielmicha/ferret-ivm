@@ -472,10 +472,6 @@ impl Engine {
         }
     }
 
-    /// Nodes and arrangements not hydrated yet.
-    pub(crate) fn pending_set(&self) -> (Vec<NodeId>, Vec<ArrId>) {
-        self.graph.pending()
-    }
 
     /// A new materialized view takes the error records of its root (also
     /// when the root is shared with other views and was hydrated long ago).

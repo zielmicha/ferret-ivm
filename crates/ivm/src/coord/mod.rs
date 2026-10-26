@@ -2,9 +2,9 @@
 //! fed by the sequencer with durable log records in GSN order.
 
 pub mod api;
+mod checkpoint;
 pub mod ddl;
 mod dml;
-mod checkpoint;
 mod hydrate;
 pub mod inspect;
 mod read;
@@ -226,8 +226,9 @@ pub struct Engine {
     /// Sinks whose changes are held back: their view is being replaced and
     /// they get the change to its new version once it is hydrated.
     pub(crate) held_sinks: rustc_hash::FxHashSet<ObjectId>,
-    /// Durable records not applied yet: those from a DDL or schema record
-    /// that must not be applied while a hydration is in progress on.
+    /// Durable records not applied yet: one that must wait for the
+    /// hydration in progress (or for snapshots being taken) and those after
+    /// it.
     held: VecDeque<(Gsn, LogRecord)>,
     /// The checkpoint being written in the background (`checkpoint.rs`).
     checkpointing: Option<checkpoint::InFlight>,
@@ -779,10 +780,9 @@ impl Engine {
         let (reqs, recs): (Vec<u64>, Vec<LogRecord>) = std::mem::take(&mut self.outbox).into_iter().unzip();
         if self.seq.send(SeqMsg::AppendAll(recs)).is_err() {
             for req in reqs {
-                if let Some(r) = self.pending.remove(&req) {
-                    let _ = r.send(Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
-                }
+                self.reply_pending(req, Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
             }
+            self.drain_dml_queue();
         }
     }
 
@@ -817,7 +817,7 @@ impl Engine {
             Request::Execute { stmt, params, vars, extra, reply } => {
                 // (a statement reading a relation still being hydrated is
                 // parked until it is done: kept to be run again)
-                let retry = (self.hydration.is_some() || !self.dml_pending.is_empty())
+                let retry = (self.hydration.is_some() || (!self.dml_pending.is_empty() && self.is_dml(&stmt)))
                     .then(|| (stmt.clone(), params.clone(), vars.clone(), extra.clone()));
                 // (current_setting() in the statement reads the session's settings)
                 let settings = vars.settings.clone();
@@ -890,7 +890,7 @@ impl Engine {
                 }
             }
             LogRecord::Ddl { req, sql, extra } => {
-                let before = self.pending_set();
+                let before = self.graph.pending();
                 let res = self.apply_ddl(gsn, &sql, &extra);
                 self.processed = gsn;
                 self.snap_epoch += 1;
@@ -910,7 +910,7 @@ impl Engine {
                 // what it built is hydrated (in the background, or after the
                 // hydration in progress): the reply waits for it
                 let mut then = std::mem::take(&mut self.record_then);
-                if then.is_empty() && self.pending_set() == before {
+                if then.is_empty() && self.graph.pending() == before {
                     self.reply_pending(req, res);
                 } else {
                     then.push(hydrate::Then::Reply { req, res });
@@ -1048,6 +1048,8 @@ impl Engine {
         }
         let bytes = serde_json::to_vec(&self.app_state()).map_err(|e| SqlError::internal(e.to_string()))?;
         self.env.checkpoint(self.processed, &bytes)?;
+        self.last_checkpoint = Instant::now();
+        self.records_since_checkpoint = 0;
         self.after_checkpoint(self.processed)
     }
 
