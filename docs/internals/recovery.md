@@ -158,16 +158,17 @@ fingerprint mismatch only costs a rebuild.
 
 A checkpoint is taken on `CHECKPOINT`, on shutdown, and when one is due
 (`Engine::maybe_checkpoint`, after every message the engine handles): every
-`--checkpoint-secs`, or as soon as dirty nodes exceed half the cache, once
-something durable changed since the last one — a record was applied other
-than a clock tick that changed nothing but the clock (a tick that releases
-temporal-filter events counts), or the last checkpoint's maintenance pass
-left space to reclaim for lack of budget (`MaintStats::unfinished`), so that
-the next pass continues it. Ticks alone only add replay work (and 25 bytes
-of log each): they make a checkpoint due after 3,600 of them (an hour at
-the default `--tick-ms`), which bounds the replay of an idle engine. An
-engine that is idle takes no checkpoints otherwise, once it has reclaimed
-what its passes found.
+`--checkpoint-secs`, or as soon as the memory of dirty nodes exceeds half of
+the buffer pool's share of the memory budget (they cannot be evicted until
+a checkpoint writes them), once something durable changed since the last
+one — a record was applied other than a clock tick that changed nothing but
+the clock (a tick that releases temporal-filter events counts), or the last
+checkpoint's maintenance pass left space to reclaim for lack of budget
+(`MaintStats::unfinished`), so that the next pass continues it. Ticks alone
+only add replay work (and 25 bytes of log each): they make a checkpoint due
+after 3,600 of them (an hour at the default `--tick-ms`), which bounds the
+replay of an idle engine. An engine that is idle takes no checkpoints
+otherwise, once it has reclaimed what its passes found.
 
 `Engine::checkpoint`:
 

@@ -78,14 +78,14 @@ type Rows = Result<Vec<String>, String>;
 /// `as_of_history_survives_restart_after_table_sizes_change`).
 const AS_OF_ACROSS_RESTARTS: bool = false;
 
-fn config(dir: &Path, cache_bytes: usize) -> coord::Config {
+fn config(dir: &Path, memory_bytes: usize) -> coord::Config {
     coord::Config {
         data_dir: dir.to_path_buf(),
         sync: false,
         tick: None,
         // checkpoints only on request or under memory pressure: reproducible
         checkpoint_interval: Duration::from_secs(24 * 3600),
-        cache_bytes,
+        memory_bytes,
         retention_gsns: 100_000,
     }
 }
@@ -203,7 +203,7 @@ struct View {
 struct Case {
     _tmp: TempDir,
     dir: PathBuf,
-    cache_bytes: usize,
+    memory_bytes: usize,
     running: Option<coord::Running>,
     tables: Vec<sqlgen::Table>,
     views: Vec<View>,
@@ -292,7 +292,7 @@ impl Case {
         let resubscribe: Vec<(usize, bool)> =
             (0..self.views.len()).map(|i| (i, self.subs.iter().any(|s| s.to_query.is_some() && s.view == self.views[i].name))).collect();
         self.subs.clear();
-        self.running = Some(coord::start(config(&self.dir, self.cache_bytes)).expect("engine restarts"));
+        self.running = Some(coord::start(config(&self.dir, self.memory_bytes)).expect("engine restarts"));
         for (i, q) in resubscribe {
             self.subscribe(i, q);
         }
@@ -385,10 +385,10 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
     let mut rng = Rng::new(schema_seed);
     let tmp = TempDir::new(name);
     let dir = tmp.path().join("data");
-    let cache_bytes = if rng.chance(30) { 256 << 10 } else { 1 << 30 };
-    let running = coord::start(config(&dir, cache_bytes)).expect("engine starts");
+    let memory_bytes = if rng.chance(30) { 1 << 20 } else { 1 << 30 };
+    let running = coord::start(config(&dir, memory_bytes)).expect("engine starts");
     let tables = sqlgen::gen_schema(&mut rng);
-    let mut case = Case { _tmp: tmp, dir, cache_bytes, running: Some(running), tables, views: vec![], next_view: 0, history: vec![], subs: vec![], log: vec![] };
+    let mut case = Case { _tmp: tmp, dir, memory_bytes, running: Some(running), tables, views: vec![], next_view: 0, history: vec![], subs: vec![], log: vec![] };
     let h = case.h();
     for sql in case.tables.iter().map(sqlgen::create_table_sql).collect::<Vec<_>>() {
         execute(&h, &sql).unwrap_or_else(|e| panic!("{sql}: {e}"));

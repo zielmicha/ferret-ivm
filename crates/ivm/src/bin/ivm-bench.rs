@@ -135,7 +135,7 @@ struct Opts {
     sub_txns: u64,
     upstream: Option<String>,
     data_dir: Option<PathBuf>,
-    cache_mb: usize,
+    memory_mb: usize,
     sync: bool,
     skip: Vec<String>,
     json: Option<PathBuf>,
@@ -146,7 +146,7 @@ struct Opts {
 fn usage() -> ! {
     eprintln!(
         "usage: ivm-bench [--accounts N] [--txns N] [--small N] [--large N] [--point-reads N]\n\
-         \x20                [--sub-txns N] [--upstream CONNINFO] [--data-dir DIR] [--cache-mb N]\n\
+         \x20                [--sub-txns N] [--upstream CONNINFO] [--data-dir DIR] [--memory-mb N]\n\
          \x20                [--no-sync] [--skip PHASE,...] [--json FILE] [--keep-data] [--repeat N]\n\
          phases: small, recovery, large, reads, subscribe (load, checkpoint and hydrate always run)\n\
          --repeat N: run hydration, small and large transactions N times each"
@@ -164,7 +164,7 @@ fn parse_opts() -> Opts {
         sub_txns: 5_000,
         upstream: None,
         data_dir: None,
-        cache_mb: 1024,
+        memory_mb: 2048,
         sync: true,
         skip: vec![],
         json: None,
@@ -183,7 +183,7 @@ fn parse_opts() -> Opts {
             "--sub-txns" => o.sub_txns = val().parse().unwrap_or_else(|_| usage()),
             "--upstream" => o.upstream = Some(val()),
             "--data-dir" => o.data_dir = Some(PathBuf::from(val())),
-            "--cache-mb" => o.cache_mb = val().parse().unwrap_or_else(|_| usage()),
+            "--memory-mb" | "--cache-mb" => o.memory_mb = val().parse().unwrap_or_else(|_| usage()),
             "--no-sync" => o.sync = false,
             "--skip" => o.skip = val().split(',').map(|s| s.trim().to_string()).collect(),
             "--json" => o.json = Some(PathBuf::from(val())),
@@ -889,7 +889,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&data);
     let cfg = Config {
         data_dir: data.clone(),
-        cache_bytes: o.cache_mb << 20,
+        memory_bytes: o.memory_mb << 20,
         // only explicit checkpoints (and the one at shutdown), so phases are separable
         checkpoint_interval: Duration::from_secs(24 * 3600),
         sync: o.sync,
@@ -897,8 +897,8 @@ fn main() {
         ..Default::default()
     };
     println!(
-        "ivm-bench: {} accounts, {} txns, {} small txns, {} large, sync={}, cache {} MB",
-        o.accounts, o.txns, o.small, o.large, o.sync, o.cache_mb
+        "ivm-bench: {} accounts, {} txns, {} small txns, {} large, sync={}, memory {} MB",
+        o.accounts, o.txns, o.small, o.large, o.sync, o.memory_mb
     );
     let mut eng = Engine::start(cfg.clone());
     let mut c = eng.client();

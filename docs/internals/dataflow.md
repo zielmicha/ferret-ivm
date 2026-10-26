@@ -328,13 +328,24 @@ Percentiles read the values at the required ranks with `Env::nth`; when the
 group's NULL entries first. If old and new rows differ (by exact
 comparison), `−old, +new` is emitted.
 
-- **Group cache**: the summaries of up to 2^18 recently touched groups per
-  `Reduce` are kept in memory. A small change to a large group is folded into
-  the cached summary instead of summarising the range again. When folding is
+- **Group cache**: the summaries (and key values) of recently touched groups
+  are kept in memory. A small change to a large group is folded into the
+  cached summary instead of summarising the range again. When folding is
   not exact — a `min`/`max` loses its extreme, or the group key has types with
   several representations and a row is retracted or arrives in another
   representation — the group is summarised from the index. Disabled for
-  ordered aggregates and with `IVM_NO_GROUP_CACHE`.
+  ordered aggregates and with `IVM_NO_GROUP_CACHE`. The caches of all
+  `Reduce`s share one byte budget, an eighth of the memory budget
+  (`Graph::group_caches`, see [Memory](architecture.md#memory)); an entry is
+  counted at its size in memory (the map's slot, the key, the summary's
+  values and the key values). A cache that would exceed the budget does not
+  cache the group and marks the budget squeezed; after the record the engine
+  shrinks every cache (`reduce::trim_caches`): it evicts the groups not used
+  since the previous shrink (entries remember the shrink epoch they were
+  last cached in), and a cache still holding more than half of what it held
+  loses every other remaining group. So the caches of aggregations that no
+  longer change give way to those in use, and a cache in use keeps its
+  recently used groups.
 - **Errors**: if finalising a group fails (for example `sum(float8)`
   overflows, or a `numeric` sum leaves numeric's range), the group's row is
   retracted and an error record emitted; the group's error is remembered in

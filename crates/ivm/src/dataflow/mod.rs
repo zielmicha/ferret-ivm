@@ -180,6 +180,9 @@ pub struct Graph {
     errs_mirrored: rustc_hash::FxHashSet<NodeId>,
     /// Changes to the mirrored error state not yet taken.
     err_changes: BTreeMap<ErrorKey, i64>,
+    /// Memory of the group caches of all `Reduce`s, against their share of
+    /// the memory budget (`reduce::trim_caches`).
+    pub group_caches: Arc<crate::memory::CacheMeter>,
 }
 
 /// Error state that must survive restarts, by node fingerprint: the error

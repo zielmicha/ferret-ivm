@@ -1389,5 +1389,22 @@ fn ldexp(x: f64, e: i32) -> f64 {
     x * 2f64.powi(e)
 }
 
+impl Summary {
+    /// Heap bytes the summary owns (memory accounting of loaded nodes).
+    pub fn heap_size(&self) -> usize {
+        use crate::memory::heap_block;
+        use std::mem::size_of;
+        let states = self.aggs.iter().map(|a| match a {
+            AggState::Count(_) | AggState::SumInt(_) => 0,
+            AggState::SumNumeric(s) => {
+                heap_block(size_of::<NumSum>()) + if s.scales.spilled() { heap_block(s.scales.capacity() * size_of::<(u32, i64)>()) } else { 0 }
+            }
+            AggState::SumFloat(f) => heap_block(size_of::<FloatSum>()) + heap_block((f.fixed.bits() as usize).div_ceil(64) * 8),
+            AggState::Min(d) | AggState::Max(d) => d.as_ref().map_or(0, crate::memory::datum_heap),
+        });
+        heap_block(self.aggs.capacity() * size_of::<AggState>()) + states.sum::<usize>()
+    }
+}
+
 #[cfg(test)]
 mod tests;

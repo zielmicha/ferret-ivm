@@ -2,6 +2,7 @@
 
 use crate::error::{Result, SqlError};
 use crate::log::LogRecord;
+use crate::memory::Charge;
 use crate::sql::parser::Statement;
 use crate::sql::ParamSlot;
 use crate::storage::Gsn;
@@ -23,10 +24,49 @@ pub struct ResultColumn {
 #[derive(Debug)]
 pub enum SubEvent {
     /// Changes at a GSN (row, diff).
-    Data { gsn: Gsn, rows: Vec<(Row, i64)> },
-    /// All changes up to and including `gsn` have been delivered.
-    Progress { gsn: Gsn },
+    Data { gsn: Gsn, rows: SharedRows },
+    /// All changes up to and including `gsn` have been delivered. `charge`
+    /// holds the event's bytes in the subscription's queue.
+    Progress { gsn: Gsn, charge: Charge },
     Error(SqlError),
+}
+
+/// The changes of one node at one GSN as delivered to a subscription or a
+/// sink: one copy shared by all of them (not one per consumer), with the
+/// receiving consumer's charge on its queue's memory, which is released
+/// when the consumer drops the event (or the queue holding it).
+#[derive(Debug)]
+pub struct SharedRows {
+    rows: Arc<Vec<(Row, i64)>>,
+    _charge: Charge,
+}
+
+impl SharedRows {
+    /// Rows counted in no queue (e.g. a snapshot).
+    pub fn new(rows: Vec<(Row, i64)>) -> SharedRows {
+        SharedRows { rows: Arc::new(rows), _charge: Charge::none() }
+    }
+
+    pub fn shared(rows: &Arc<Vec<(Row, i64)>>, charge: Charge) -> SharedRows {
+        SharedRows { rows: rows.clone(), _charge: charge }
+    }
+}
+
+impl std::ops::Deref for SharedRows {
+    type Target = Vec<(Row, i64)>;
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+impl IntoIterator for SharedRows {
+    type Item = (Row, i64);
+    type IntoIter = std::vec::IntoIter<(Row, i64)>;
+    /// The rows, copied unless this was the last holder (rows clone
+    /// cheaply: their large values are reference counted).
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::unwrap_or_clone(self.rows).into_iter()
+    }
 }
 
 pub enum ExecResult {
@@ -124,6 +164,8 @@ pub struct Shared {
     pub failed: AtomicBool,
     /// Stop without the final checkpoint (simulated crash, for tests).
     pub crash: AtomicBool,
+    /// The memory budget, and the memory of queued records and changes.
+    pub mem: crate::memory::MemBudget,
 }
 
 impl Shared {

@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 pub struct TreeResidency {
     /// Nodes of the tree currently in memory.
     pub nodes: usize,
-    /// Bytes of those nodes.
+    /// Bytes of memory of those nodes.
     pub bytes: usize,
     /// Nodes modified since the last checkpoint.
     pub dirty: usize,
@@ -25,7 +25,7 @@ impl Env {
             if slot.node.is_some() {
                 r.nodes += 1;
             }
-            r.bytes += slot.bytes;
+            r.bytes += slot.mem;
             if slot.dirty {
                 r.dirty += 1;
             }
@@ -33,12 +33,12 @@ impl Env {
         out
     }
 
-    /// Bytes of nodes currently in the buffer pool (O(1), unlike `stats`).
+    /// Memory of the nodes currently in the buffer pool (O(1), unlike `stats`).
     pub fn resident_bytes(&self) -> usize {
         self.mem_bytes
     }
 
-    /// Configured buffer-pool capacity.
+    /// The buffer pool's target: its current share of the memory budget.
     pub fn cache_capacity(&self) -> usize {
         self.opts.cache_bytes
     }

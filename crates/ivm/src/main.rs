@@ -16,7 +16,7 @@ use std::time::Duration;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ivm [--data-dir DIR] [--listen ADDR] [--password PW] [--cache-mb N]\n\
+        "usage: ivm [--data-dir DIR] [--listen ADDR] [--password PW] [--memory-mb N]\n\
          \x20          [--checkpoint-secs N] [--retention-gsns N] [--tick-ms N] [--no-sync]\n\
          \x20          [--http-listen ADDR]\n\
          \n\
@@ -26,6 +26,9 @@ fn usage() -> ! {
          --http-listen ADDR  serve the web UI and JSON API on ADDR (e.g. 127.0.0.1:6876);\n\
          \x20                   off by default. With --password, it requires HTTP Basic\n\
          \x20                   auth with that password (any user name).\n\
+         --memory-mb N       memory budget in MiB (default 2048): the buffer pool of\n\
+         \x20                   index nodes, aggregation caches and queues together\n\
+         \x20                   (--cache-mb is an older name of it).\n\
          \n\
          SIGINT, SIGTERM or a file named .ivm-stop in the working directory stop the\n\
          server after a final checkpoint; a second signal exits at once."
@@ -53,7 +56,7 @@ fn main() {
             "--data-dir" => cfg.data_dir = PathBuf::from(val()),
             "--listen" => scfg.listen = val(),
             "--password" => scfg.password = Some(val()),
-            "--cache-mb" => cfg.cache_bytes = val().parse::<usize>().unwrap_or_else(|_| usage()) << 20,
+            "--memory-mb" | "--cache-mb" => cfg.memory_bytes = val().parse::<usize>().unwrap_or_else(|_| usage()) << 20,
             "--checkpoint-secs" => cfg.checkpoint_interval = Duration::from_secs(val().parse().unwrap_or_else(|_| usage())),
             "--retention-gsns" => cfg.retention_gsns = val().parse().unwrap_or_else(|_| usage()),
             "--tick-ms" => {

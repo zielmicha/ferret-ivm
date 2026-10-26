@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
-    pub cache_bytes: usize,
+    /// The memory budget (`--memory-mb`): the buffer pool, group caches and
+    /// queues together (`crate::memory`).
+    pub memory_bytes: usize,
     pub checkpoint_interval: Duration,
     /// fsync the input log on every commit batch.
     pub sync: bool,
@@ -44,7 +46,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             data_dir: PathBuf::from("ivm-data"),
-            cache_bytes: 1 << 30,
+            memory_bytes: crate::memory::DEFAULT_TOTAL,
             checkpoint_interval: Duration::from_secs(10),
             sync: true,
             retention_gsns: 1000,
@@ -85,6 +87,9 @@ pub struct Runtime {
 pub(crate) struct Subscription {
     pub node: NodeId,
     pub tx: Sender<SubEvent>,
+    /// Memory of the events queued for the client (each event holds its
+    /// charge until the session drops it).
+    pub queue: Arc<crate::memory::Meter>,
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Nodes pinned for this subscription (ad hoc queries).
     pub pinned: Option<NodeId>,
@@ -260,12 +265,20 @@ impl EngineHandle {
         rx.recv().map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))
     }
 
-    /// Append a record without waiting; the receiver yields its GSN once durable.
+    /// Append a record without waiting for it to be durable; the receiver
+    /// yields its GSN once it is. Waits first while the records the engine
+    /// has yet to apply fill their part of the memory budget: this is the
+    /// backpressure on sources, in bytes of memory.
     pub fn log_async(&self, rec: LogRecord) -> Result<Receiver<Gsn>> {
+        let bytes = crate::memory::record_bytes(&rec);
+        if !self.shared.mem.admit_input(bytes, || self.shared.shutdown.load(Ordering::Acquire)) {
+            return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "engine is shutting down"));
+        }
         let (tx, rx) = bounded(1);
-        self.seq
-            .send(SeqMsg::Append { rec, ack: Some(tx) })
-            .map_err(|_| SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"))?;
+        if self.seq.send(SeqMsg::Append { rec, ack: Some(tx) }).is_err() {
+            self.shared.mem.input.sub(bytes);
+            return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped"));
+        }
         Ok(rx)
     }
 
@@ -342,12 +355,13 @@ pub fn start(cfg: Config) -> Result<Running> {
         }
     };
     let shared = Arc::new(Shared::default());
+    shared.mem.set_total(cfg.memory_bytes);
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
     let mut writer = LogWriter::open(&cfg.data_dir.join("log"), cfg.sync)?;
     let (env, recovered) = Env::open(
         &cfg.data_dir.join("store"),
-        EnvOptions { cache_bytes: cfg.cache_bytes, ..Default::default() },
+        EnvOptions { cache_bytes: shared.mem.pool_target(0), ..Default::default() },
     )?;
     let mut engine = Engine::new(cfg.clone(), env, stx.clone(), shared.clone());
     engine.recover(recovered)?;
@@ -410,10 +424,12 @@ pub fn start(cfg: Config) -> Result<Running> {
 impl Engine {
     /// An engine with an empty catalog over `env`, before recovery.
     fn new(cfg: Config, env: Env, seq: Sender<SeqMsg>, shared: Arc<Shared>) -> Engine {
+        let graph = Graph::new();
+        graph.group_caches.set_limit(shared.mem.cache_limit());
         Engine {
             cfg,
             env,
-            graph: Graph::new(),
+            graph,
             catalog: Catalog::new(),
             rt: Runtime::default(),
             processed: 0,
@@ -587,7 +603,12 @@ impl Engine {
                             LogRecord::Commit { source: 0, lsn, .. } => Some(*lsn),
                             _ => None,
                         };
-                        if let Err(e) = self.apply_record(gsn, rec) {
+                        // (counted from its submission until it is applied)
+                        let bytes = crate::memory::record_bytes(&rec);
+                        let r = self.apply_record(gsn, rec);
+                        self.shared.mem.input.sub(bytes);
+                        self.rebalance_memory();
+                        if let Err(e) = r {
                             log::error!("failed to apply gsn {gsn}: {e}");
                             if e.code.starts_with("XX") || e.code.starts_with("58") {
                                 return Err(e);
@@ -618,6 +639,8 @@ impl Engine {
                     self.handle_request(r, &handle);
                 }
             }
+            self.rebalance_memory();
+            self.restart_lagging_sinks();
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
@@ -660,11 +683,23 @@ impl Engine {
         if matches!(rec, LogRecord::Commit { source: 0, .. }) {
             self.dml_inflight = Some(req);
         }
-        if self.seq.send(SeqMsg::Append { rec, ack: None }).is_err()
+        if !self.append(rec)
             && let Some(r) = self.pending.remove(&req)
         {
             let _ = r.send(Err(SqlError::new(codes::ADMIN_SHUTDOWN, "sequencer stopped")));
         }
+    }
+
+    /// Hand a record to the sequencer, counted in the input queue's memory
+    /// but without waiting for room: the engine is what empties the queue.
+    fn append(&mut self, rec: LogRecord) -> bool {
+        let bytes = crate::memory::record_bytes(&rec);
+        self.shared.mem.input.add(bytes);
+        let sent = self.seq.send(SeqMsg::Append { rec, ack: None }).is_ok();
+        if !sent {
+            self.shared.mem.input.sub(bytes);
+        }
+        sent
     }
 
     pub(crate) fn reply_pending(&mut self, req: u64, res: Result<ExecResult>) {
@@ -690,7 +725,7 @@ impl Engine {
                 let _ = reply.send(r);
             }
             Request::Log { rec } => {
-                let _ = self.seq.send(SeqMsg::Append { rec, ack: None });
+                self.append(rec);
             }
             Request::Inspect(r) => self.inspect(r),
             other => self.run_execute(other, handle),
@@ -740,7 +775,7 @@ impl Engine {
                 }
                 let outputs = self.graph.step(&mut self.env, gsn, by_node)?;
                 self.processed = gsn;
-                self.deliver(gsn, &outputs);
+                self.deliver(gsn, outputs);
                 if source == 0 {
                     // local DML: lsn carries the request id
                     let n = self.dml_counts.remove(&lsn).unwrap_or_default();
@@ -818,8 +853,8 @@ impl Engine {
                 // temporal filters release the events that became due
                 let outputs = self.graph.step(&mut self.env, gsn, FxHashMap::default())?;
                 self.processed = gsn;
-                self.deliver(gsn, &outputs);
                 changed = !outputs.is_empty();
+                self.deliver(gsn, outputs);
             }
         }
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
@@ -844,14 +879,24 @@ impl Engine {
         if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
     }
 
-    /// Route outputs to views (errors) and subscriptions.
-    fn deliver(&mut self, gsn: Gsn, outputs: &FxHashMap<NodeId, Output>) {
+    /// Route outputs to views (errors), subscriptions and sinks. Each node's
+    /// changes are delivered as one copy shared by all its consumers, and
+    /// each consumer's queue is bounded in bytes: a subscription whose
+    /// client does not keep up ends with an error, a sink that does not
+    /// keep up is restarted from a new snapshot once it has caught up with
+    /// what it holds.
+    fn deliver(&mut self, gsn: Gsn, mut outputs: FxHashMap<NodeId, Output>) {
         for v in self.rt.views.values_mut() {
             if let Some(o) = outputs.get(&v.node) {
                 merge_errors(&mut v.errors, &o.errs);
             }
         }
+        let limit = self.shared.mem.consumer_limit();
+        let mut shared = FxHashMap::default();
         for s in self.subs.iter() {
+            if s.cancel.load(Ordering::Acquire) {
+                continue;
+            }
             if let Some(o) = outputs.get(&s.node) {
                 // a new error record ends the subscription, as it fails
                 // reads (a retracted one does not)
@@ -862,19 +907,58 @@ impl Engine {
                         let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
                     }
                 }
-                if !o.data.is_empty() {
-                    let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
+                if let Some((rows, bytes)) = shared_rows(&mut shared, &mut outputs, s.node) {
+                    if s.queue.used() + bytes > limit {
+                        end_slow_subscription(s, bytes, limit);
+                        continue;
+                    }
+                    let _ = s.tx.send(SubEvent::Data { gsn, rows: SharedRows::shared(&rows, s.queue.charge(bytes)) });
                 }
             }
             if s.progress {
-                let _ = s.tx.send(SubEvent::Progress { gsn });
+                if s.queue.used() + SUB_EVENT_BYTES > limit {
+                    end_slow_subscription(s, SUB_EVENT_BYTES, limit);
+                    continue;
+                }
+                let _ = s.tx.send(SubEvent::Progress { gsn, charge: s.queue.charge(SUB_EVENT_BYTES) });
             }
         }
-        for sink in self.sink_handles.values() {
-            if let Some(o) = outputs.get(&sink.node) {
-                sink.send(gsn, &o.data);
-            } else {
-                sink.progress(gsn);
+        for (id, sink) in self.sink_handles.iter_mut() {
+            if sink.behind() {
+                continue;
+            }
+            let sent = match shared_rows(&mut shared, &mut outputs, sink.node) {
+                Some((rows, bytes)) => sink.send(gsn, &rows, bytes, limit),
+                None => {
+                    sink.progress(gsn);
+                    true
+                }
+            };
+            if !sent {
+                log::warn!(
+                    "sink {id} fell behind: its unwritten changes reached {} MiB; it is restarted from a new snapshot once it has written them",
+                    limit >> 20
+                );
+            }
+        }
+    }
+
+    /// Restart the sinks that fell behind and have written (or dropped)
+    /// what they held: from a new snapshot, which they write over their
+    /// targets (they were sent nothing since they fell behind, so their
+    /// targets' progress is older).
+    fn restart_lagging_sinks(&mut self) {
+        let Some(handle) = self.handle.clone() else { return };
+        let idle: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.behind_and_idle()).map(|(id, _)| *id).collect();
+        for id in idle {
+            let Some(h) = self.sink_handles.remove(&id) else { continue };
+            // (it has nothing left to write: no need to wait for it)
+            let _ = h.stop();
+            if let Some(obj) = self.catalog.get(id).cloned()
+                && let ObjectKind::Sink(def) = &obj.kind
+            {
+                log::info!("restarting sink {} from a snapshot at gsn {}", obj.name, self.processed);
+                self.start_sink_or_mark_broken(id, &obj.name, def, &handle);
             }
         }
     }
@@ -893,18 +977,30 @@ impl Engine {
         }
     }
 
+    /// Give the buffer pool what the other parts of the memory budget leave
+    /// over (the next access evicts down to it), and shrink the group caches
+    /// if they ran out of room.
+    pub(crate) fn rebalance_memory(&mut self) {
+        let target = self.shared.mem.pool_target(self.graph.group_caches.used());
+        self.env.set_cache_bytes(target);
+        crate::dataflow::reduce::trim_caches(&self.graph);
+    }
+
     /// A checkpoint is due every `checkpoint_interval` (or as soon as dirty
-    /// nodes exceed half the cache) once something durable changed: records
-    /// other than clock ticks that changed nothing but the clock — or the
-    /// last checkpoint's maintenance pass left space to reclaim for lack of
-    /// budget, which the next one continues. Ticks alone only add replay
-    /// work: they make one due after MAX_TICKS_WITHOUT_CHECKPOINT of them.
+    /// nodes exceed half the pool's share of the memory budget, since they
+    /// cannot be evicted until a checkpoint writes them) once something
+    /// durable changed: records other than clock ticks that changed nothing
+    /// but the clock — or the last checkpoint's maintenance pass left space
+    /// to reclaim for lack of budget, which the next one continues. Ticks
+    /// alone only add replay work: they make one due after
+    /// MAX_TICKS_WITHOUT_CHECKPOINT of them.
     fn maybe_checkpoint(&mut self) -> Result<()> {
         if self.changes_since_checkpoint == 0 && self.records_since_checkpoint < MAX_TICKS_WITHOUT_CHECKPOINT {
             return Ok(());
         }
+        // dirty nodes cannot be evicted until a checkpoint writes them
         let dirty = self.env.dirty_bytes();
-        if self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.cfg.cache_bytes / 2 {
+        if self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.env.cache_capacity() / 2 {
             self.checkpoint()?;
         }
         Ok(())
@@ -1015,6 +1111,44 @@ impl Engine {
     }
 }
 
+/// Bytes of a subscription event without rows in its queue.
+const SUB_EVENT_BYTES: usize = std::mem::size_of::<SubEvent>() + 8;
+
+/// The changes of `node` in `outputs`, moved into one shared copy (made at
+/// the first consumer that asks) with its bytes in memory; None if empty.
+fn shared_rows(
+    shared: &mut FxHashMap<NodeId, (Arc<crate::dataflow::Delta>, usize)>,
+    outputs: &mut FxHashMap<NodeId, Output>,
+    node: NodeId,
+) -> Option<(Arc<crate::dataflow::Delta>, usize)> {
+    if let Some((rows, bytes)) = shared.get(&node) {
+        return Some((rows.clone(), *bytes));
+    }
+    let o = outputs.get_mut(&node).filter(|o| !o.data.is_empty())?;
+    let rows = Arc::new(std::mem::take(&mut o.data));
+    let bytes = crate::memory::delta_bytes(&rows);
+    shared.insert(node, (rows.clone(), bytes));
+    Some((rows, bytes))
+}
+
+/// End a subscription whose queue would exceed its limit with `more`
+/// bytes: its client does not read as fast as changes come.
+fn end_slow_subscription(s: &Subscription, more: usize, limit: usize) {
+    let queued = s.queue.used() + more;
+    let _ = s.tx.send(SubEvent::Error(
+        SqlError::new(
+            codes::INSUFFICIENT_RESOURCES,
+            format!(
+                "subscription ended: its client does not read changes as fast as they come ({:.1} MiB queued, the limit is {:.1} MiB)",
+                queued as f64 / (1 << 20) as f64,
+                limit as f64 / (1 << 20) as f64
+            ),
+        )
+        .with_hint("Read subscriptions promptly, or give the server more memory (--memory-mb; each subscription may queue a sixteenth of it)."),
+    ));
+    s.cancel.store(true, Ordering::Release);
+}
+
 pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &ErrDelta) {
     for (e, w) in errs {
         let v = map.entry(e.clone()).or_default();
@@ -1038,6 +1172,115 @@ mod tests {
         let mut e = Engine::new(Config { data_dir: dir.to_path_buf(), ..Default::default() }, env, seq, Arc::new(Shared::default()));
         e.replaying = false;
         e
+    }
+
+    /// Sources wait for room before submitting a record: by the bytes the
+    /// records still to be applied take in memory (an eighth of the
+    /// budget), not by their number (10,000 commits of any size per source
+    /// were let in, and the sequencer's queue was unbounded).
+    #[test]
+    fn source_records_wait_for_room_by_their_bytes() {
+        use crate::dataflow::TableChange;
+        use crate::memory::record_bytes;
+        fn rec(kb: usize) -> LogRecord {
+            let row = vec![crate::types::Datum::Text("x".repeat(kb << 10).into())];
+            LogRecord::Commit { source: 1, lsn: 0, changes: vec![(1, TableChange::Insert { row })] }
+        }
+        let shared = Arc::new(Shared::default());
+        shared.mem.set_total(64 << 20);
+        assert_eq!(shared.mem.input_limit(), 8 << 20);
+        let (seq, seq_rx) = unbounded();
+        let (tx, _rx) = unbounded();
+        let h = EngineHandle { tx, seq, shared: shared.clone() };
+        // the engine applying what was submitted
+        let apply_all = || {
+            while let Ok(SeqMsg::Append { rec, .. }) = seq_rx.try_recv() {
+                shared.mem.input.sub(record_bytes(&rec));
+            }
+        };
+        // small records: many more than 10,000 get in
+        for _ in 0..20_000 {
+            h.log_async(rec(0)).unwrap();
+        }
+        assert!(shared.mem.input.used() < 8 << 20);
+        apply_all();
+        assert_eq!(shared.mem.input.used(), 0);
+        // 3 MiB records: the third gets in while the queue is below the
+        // limit, the fourth waits until the engine applies some
+        for _ in 0..3 {
+            h.log_async(rec(3 << 10)).unwrap();
+        }
+        let h2 = h.clone();
+        let waiting = std::thread::spawn(move || h2.log_async(rec(3 << 10)).is_ok());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiting.is_finished(), "a record got in with {} bytes queued", shared.mem.input.used());
+        apply_all();
+        assert!(waiting.join().unwrap());
+        apply_all();
+        // a shutdown releases a waiting source
+        for _ in 0..3 {
+            h.log_async(rec(3 << 10)).unwrap();
+        }
+        let h2 = h.clone();
+        let waiting = std::thread::spawn(move || h2.log_async(rec(3 << 10)).map_err(|e| e.code));
+        std::thread::sleep(Duration::from_millis(50));
+        shared.shutdown.store(true, Ordering::Release);
+        assert_eq!(waiting.join().unwrap().unwrap_err(), codes::ADMIN_SHUTDOWN);
+    }
+
+    /// The group caches of all aggregations share one byte budget: they
+    /// never hold more than it, and the cache of an aggregation that no
+    /// longer changes gives way to one in use (each Reduce used to cache up
+    /// to 2^18 groups of any size, never giving any back).
+    #[test]
+    fn group_caches_share_a_byte_budget() {
+        use crate::dataflow::{NodeKind, TableChange};
+        use crate::types::Datum;
+        let tmp = crate::testkit::TempDir::new("coord-group-caches");
+        let mut e = engine(tmp.path());
+        let limit = 1 << 20;
+        e.graph.group_caches.set_limit(limit);
+        e.apply_ddl(1, "CREATE TABLE ta (id int PRIMARY KEY, g int)", "").unwrap();
+        e.apply_ddl(2, "CREATE TABLE tb (id int PRIMARY KEY, g int)", "").unwrap();
+        e.apply_ddl(3, "CREATE MATERIALIZED VIEW va AS SELECT g, count(*) AS n, sum(id) AS s FROM ta GROUP BY g", "").unwrap();
+        e.apply_ddl(4, "CREATE MATERIALIZED VIEW vb AS SELECT g, count(*) AS n, sum(id) AS s FROM tb GROUP BY g", "").unwrap();
+        e.processed = 4;
+        let ids = |e: &Engine| ["ta", "tb"].map(|n| e.catalog.by_name(n).unwrap().id);
+        let [ta, tb] = ids(&e);
+        let cache_bytes = |e: &Engine, view: &str| {
+            let node = e.rt.views[&e.catalog.by_name(view).unwrap().id].node;
+            let mut n = node;
+            // the view's node, or the Reduce under its projection
+            loop {
+                match &e.graph.node(n).kind {
+                    NodeKind::Reduce(p) => return p.cache.bytes(),
+                    _ => n = e.graph.node(n).inputs[0],
+                }
+            }
+        };
+        let mut gsn = 4;
+        let mut insert = |e: &mut Engine, table, from: i32, version: i32| {
+            for chunk in 0..20 {
+                gsn += 1;
+                let changes = (from + chunk * 1000..from + (chunk + 1) * 1000)
+                    .map(|i| (table, TableChange::Upsert { row: vec![Datum::Int4(i), Datum::Int4(i + version)], unchanged: vec![] }))
+                    .collect();
+                e.apply_record(gsn, LogRecord::Commit { source: 1, lsn: 0, changes }).unwrap();
+                e.rebalance_memory();
+                assert!(e.graph.group_caches.used() <= limit, "{} bytes cached", e.graph.group_caches.used());
+            }
+        };
+        // 20,000 groups: more than the budget holds
+        insert(&mut e, ta, 0, 0);
+        let a = cache_bytes(&e, "va");
+        assert!(a > limit / 2, "va caches {a} bytes");
+        // only vb changes from now on: va's cache gives way
+        for round in 0..3 {
+            insert(&mut e, tb, 0, round);
+        }
+        let (a, b) = (cache_bytes(&e, "va"), cache_bytes(&e, "vb"));
+        assert!(b > 4 * a, "vb caches {b} bytes, the idle va {a}");
+        assert_eq!(e.graph.group_caches.used(), a + b);
     }
 
     /// A subscription whose query fails to lower releases the operators

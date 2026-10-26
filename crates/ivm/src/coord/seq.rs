@@ -1,6 +1,11 @@
 //! The sequencer: assigns GSNs in arrival order, appends to the input log,
 //! makes batches durable (group commit), acknowledges submitters and hands
 //! durable records to the engine in order.
+//!
+//! It never waits for the engine: the memory of the records between their
+//! submission and their application is bounded where they are submitted
+//! (`EngineHandle::log_async` waits for room in the memory budget's input
+//! queue), so that its own queue cannot grow without limit either.
 
 use super::api::Shared;
 use super::EngineMsg;
@@ -27,16 +32,6 @@ pub struct Sequencer {
     pub tick: Option<Duration>,
 }
 
-/// Most durable records the engine may still have to apply (checked before
-/// each batch, so give or take a batch). Beyond it the sequencer takes no
-/// more appends until the engine catches up: sources
-/// then wait for their acknowledgements (and stop reading the replication
-/// stream; the upstream keeps the WAL), so the engine's queue of durable
-/// batches stays bounded instead of growing without limit when the engine
-/// cannot keep up. The engine never waits for the sequencer, so it always
-/// catches up.
-const MAX_ENGINE_LAG: u64 = 10_000;
-
 fn wall_micros() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as i64).unwrap_or(0)
 }
@@ -47,12 +42,6 @@ impl Sequencer {
         let mut next_tick = Instant::now();
         let mut last_micros = 0i64;
         loop {
-            // backpressure (not while shutting down: the engine stops applying)
-            while self.shared.durable().saturating_sub(self.shared.processed()) >= MAX_ENGINE_LAG
-                && !self.shared.shutdown.load(Ordering::Acquire)
-            {
-                std::thread::sleep(Duration::from_millis(1));
-            }
             // the wall clock enters the log as a tick stream, so time is as
             // deterministic on replay as any other input
             let first = match self.tick {
@@ -74,7 +63,10 @@ impl Sequencer {
             {
                 next_tick = Instant::now() + every;
                 last_micros = wall_micros().max(last_micros + 1);
-                batch.push(SeqMsg::Append { rec: LogRecord::Tick { micros: last_micros }, ack: None });
+                let rec = LogRecord::Tick { micros: last_micros };
+                // (in the input queue's memory until applied, like any record)
+                self.shared.mem.input.add(crate::memory::record_bytes(&rec));
+                batch.push(SeqMsg::Append { rec, ack: None });
             }
             while batch.len() < 4096 {
                 match self.rx.try_recv() {
@@ -153,45 +145,6 @@ mod tests {
         drop(erx);
         let ticks = read_from(&dir, 0).unwrap().iter().filter(|(_, r)| matches!(r, LogRecord::Tick { .. })).count();
         assert!(ticks >= 10, "only {ticks} ticks in 300ms at a 5ms interval");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The sequencer stops taking appends while the engine is MAX_ENGINE_LAG
-    /// records behind (give or take a batch), and goes on when it catches up
-    /// (the queue of durable batches used to grow without bound).
-    #[test]
-    fn appends_wait_for_a_lagging_engine() {
-        let base = std::env::var("IVM_TEST_TMP").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let dir = base.join(format!("ivm-seq-lag-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let writer = LogWriter::open(&dir, false).unwrap();
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let (etx, _erx) = crossbeam_channel::unbounded();
-        let shared = Arc::new(Shared::default());
-        let seq = Sequencer { writer, rx, engine: etx, shared: shared.clone(), tick: None };
-        let t = std::thread::spawn(move || seq.run().unwrap());
-        let n = MAX_ENGINE_LAG + 10_000;
-        let (atx, arx) = crossbeam_channel::unbounded();
-        for _ in 0..n {
-            tx.send(SeqMsg::Append { rec: LogRecord::Progress { source: 1, lsn: 0, state: String::new() }, ack: Some(atx.clone()) }).unwrap();
-        }
-        let durable_after = |ms: u64| {
-            std::thread::sleep(Duration::from_millis(ms));
-            shared.durable()
-        };
-        // (checked between batches of up to 4096 records)
-        let stalled = durable_after(300);
-        assert!((MAX_ENGINE_LAG..MAX_ENGINE_LAG + 4096).contains(&stalled), "durable {stalled} of {n} with nothing applied");
-        assert_eq!(arx.len() as u64, stalled, "only durable records are acknowledged");
-        // the engine catches up
-        shared.processed_gsn.store(stalled, Ordering::Release);
-        let t0 = Instant::now();
-        while shared.durable() < n {
-            assert!(t0.elapsed() < Duration::from_secs(10), "the sequencer does not go on");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        tx.send(SeqMsg::Shutdown).unwrap();
-        t.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

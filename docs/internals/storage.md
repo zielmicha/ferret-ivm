@@ -88,10 +88,23 @@ arena.
 
 Loaded nodes live in `slots`. A slot holds the node, its disk location (if it
 has an up-to-date copy on disk), a dirty flag, its parent slot, its tree, the
-number of loaded children, a CLOCK reference bit, its estimated size, and
-(for leaves) the number of in-place edits since it was last rebuilt.
-Accessing a child through a `Disk` pointer reads and decodes the frame,
-allocates a slot and replaces the pointer by `Mem(slot)`.
+number of loaded children, a CLOCK reference bit, its estimated serialized
+size (for splits), its size in memory, and (for leaves) the number of
+in-place edits since it was last rebuilt. Accessing a child through a `Disk`
+pointer reads and decodes the frame, allocates a slot and replaces the
+pointer by `Mem(slot)`.
+
+The pool is accounted in bytes of memory, not in serialized bytes: a node's
+size in memory (`Node::mem_size`, plus its slot) is its vector of entries or
+children by capacity — 56 bytes per leaf entry, whatever the entry's
+serialized size — plus the heap blocks they own: each key or separator, a
+history of more than two changes, and the values of summaries (`min`/`max`
+datums, exact sums). A heap block of *n* bytes is counted as *n* + 8
+rounded up to 16 (`memory::heap_block`, close to what glibc and mimalloc
+take). In-place leaf edits maintain the size incrementally, as they do the
+serialized size. (Counting serialized bytes undercounted narrow entries
+about fourfold: an 8-byte key with one change is 18 serialized bytes and
+about 80 in memory.)
 
 - **Copy-on-write at checkpoint granularity.** Modifying a node marks it
   dirty; a dirty node has no disk location (its previous on-disk copy becomes
@@ -99,11 +112,21 @@ allocates a slot and replaces the pointer by `Mem(slot)`.
   children before parents, to the end of the active segment. On-disk nodes
   are never overwritten, so the last checkpoint stays intact until the next
   one is committed.
-- **Eviction.** When the arena's bytes exceed `--cache-mb`, a CLOCK sweep
-  (at most two passes over all slots) evicts clean nodes that have no loaded
-  children, giving a second chance to nodes whose reference bit is set;
-  the parent's pointer reverts to `Disk`. Dirty nodes are never evicted; a
-  checkpoint is forced when they exceed half of the cache.
+- **Eviction.** When the arena's memory exceeds its target — the buffer
+  pool's share of the memory budget, which the engine adjusts
+  (`Env::set_cache_bytes`, see [Memory](architecture.md#memory)) — a CLOCK
+  sweep (at most two passes over all slots) evicts clean nodes that have no
+  loaded children, giving a second chance to nodes whose reference bit is
+  set; the parent's pointer reverts to `Disk`. Every read and write checks
+  the target when it is done. A large scan — one that has read more than a
+  quarter of the target from disk — also evicts, while the pool is over its
+  target, the nodes it read as soon as it is done with them
+  (`evict_scanned`, after each leaf): it recycles its own nodes, at
+  O(depth) per leaf, instead of loading the whole tree or pushing the
+  pool's working set out (what a smaller scan reads is cached like any
+  other node, a sweep running after every 1/64 of the target it reads).
+  Dirty nodes are never evicted; the engine forces a checkpoint when they
+  exceed half of the target.
 
 There is no separate in-memory mode: a tree that fits in the cache is served
 from memory, a larger one degrades gradually as nodes are re-read from the
@@ -167,7 +190,7 @@ changes at one GSN:
 | Operation | Algorithm |
 |---|---|
 | `get(key)` | descend to the leaf, binary search |
-| `for_each(lo, hi, f)` / `for_each_prefix(p, f)` | call `f` with each entry of the range in key order, where it lies in its leaf (nothing is copied), until `f` returns false. One leaf at a time: after a leaf it descends again from the root with the next separator as its new lower bound, so it never pins nodes and tolerates eviction between leaves. A key prefix `p` is the range `[p, successor(p))`. The dataflow's lookups and scans use these |
+| `for_each(lo, hi, f)` / `for_each_prefix(p, f)` | call `f` with each entry of the range in key order, where it lies in its leaf (nothing is copied), until `f` returns false. One leaf at a time: after a leaf it descends again from the root with the next separator as its new lower bound, so it never pins nodes; a large scan evicts the nodes it read once it is done with them, while the pool is over its target (see [eviction](#the-node-arena-buffer-pool)), so a scan of a tree larger than the pool holds about the pool's target plus one path. A key prefix `p` is the range `[p, successor(p))`. The dataflow's lookups and scans use these |
 | `scan` / `scan_prefix` | `for_each` collecting copies of the entries |
 | `cursor(lo, hi)` | a stateless range cursor with the same descent that buffers one leaf's entries at a time (for callers that interleave other work between entries) |
 | `range_summary(lo, hi)` | combine the stored summaries of children that lie entirely inside the range and recurse into the (at most two per level) partially covered children, folding leaf entries at the edges: O(log n) nodes. The whole-tree summary is stored. A `min`/`max` that the result holds as a prefix is then resolved to the value ([below](#wide-min-and-max-values)) |

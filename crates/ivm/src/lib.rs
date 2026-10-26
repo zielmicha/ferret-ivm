@@ -12,6 +12,7 @@ pub mod exec;
 pub mod expr;
 pub mod http;
 pub mod log;
+pub mod memory;
 pub mod server;
 pub mod sink;
 pub mod source;

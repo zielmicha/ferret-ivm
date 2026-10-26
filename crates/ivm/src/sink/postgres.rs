@@ -9,6 +9,7 @@
 
 use super::SinkMsg;
 use crate::catalog::SinkDef;
+use crate::coord::api::SharedRows;
 use crate::dataflow::Delta;
 use crate::error::Result;
 use crate::sql::plan::ObjectId;
@@ -249,7 +250,7 @@ impl Writer {
 
     /// Apply a batch and record that the target is as of `progress` (at
     /// least the batch's last GSN; the committed progress is `applied`).
-    fn apply(&mut self, batch: &[(Gsn, Delta)], progress: Gsn, applied: Gsn) -> Result<()> {
+    fn apply(&mut self, batch: &[(Gsn, SharedRows)], progress: Gsn, applied: Gsn) -> Result<()> {
         self.begin(Check::Is(applied))?;
         let mut sql = String::new();
         for (_, delta) in batch {
@@ -282,7 +283,7 @@ pub fn run(
     rx: Receiver<SinkMsg>,
     status: Arc<Mutex<String>>,
 ) {
-    let mut pending: Vec<(Gsn, Delta)> = Vec::new();
+    let mut pending: Vec<(Gsn, SharedRows)> = Vec::new();
     let mut writer: Option<Writer> = None;
     // GSNs at or below this are already in the target
     let mut applied: Option<Gsn> = None;
@@ -302,7 +303,7 @@ pub fn run(
     let mut last_progress = Instant::now();
     // Wait out a backoff, still taking messages: changes are kept for later
     // (they used to be read and dropped), a Stop ends the sink. False on Stop.
-    let wait = |backoff: Duration, applied: Option<Gsn>, pending: &mut Vec<(Gsn, Delta)>, seen: &mut Gsn| -> bool {
+    let wait = |backoff: Duration, applied: Option<Gsn>, pending: &mut Vec<(Gsn, SharedRows)>, seen: &mut Gsn| -> bool {
         let deadline = Instant::now() + backoff;
         loop {
             match rx.recv_deadline(deadline) {
@@ -312,7 +313,7 @@ pub fn run(
                         pending.push((g, d));
                     }
                 }
-                Ok(SinkMsg::Progress(g)) => *seen = (*seen).max(g),
+                Ok(SinkMsg::Progress(g, _)) => *seen = (*seen).max(g),
                 Ok(SinkMsg::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
                 Err(RecvTimeoutError::Timeout) => return true,
             }
@@ -379,7 +380,7 @@ pub fn run(
                 }
                 false
             }
-            Ok(SinkMsg::Progress(g)) => {
+            Ok(SinkMsg::Progress(g, _)) => {
                 seen = seen.max(g);
                 false
             }

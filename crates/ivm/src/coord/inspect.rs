@@ -80,8 +80,14 @@ pub struct EngineStats {
     /// Logical clock (latest logged tick) as Unix ms.
     pub clock_ms: Option<f64>,
     pub cache_used_bytes: usize,
+    /// The buffer pool's current share of the memory budget.
     pub cache_capacity_bytes: usize,
     pub dirty_bytes: usize,
+    /// The other parts of the memory budget: group caches, records waiting
+    /// to be applied, changes queued for subscriptions and sinks.
+    pub group_cache_bytes: usize,
+    pub input_queue_bytes: usize,
+    pub output_queue_bytes: usize,
     pub nodes: usize,
     pub arrangements: usize,
     /// Monotonic: change whenever nodes or arrangements are created.
@@ -110,7 +116,7 @@ pub struct Overview {
 #[derive(Serialize, Debug)]
 pub struct ConfigInfo {
     pub data_dir: String,
-    pub cache_bytes: usize,
+    pub memory_bytes: usize,
     pub checkpoint_interval_secs: f64,
     pub retention_gsns: u64,
     pub sync: bool,
@@ -686,6 +692,9 @@ impl Engine {
             cache_used_bytes: self.env.resident_bytes(),
             cache_capacity_bytes: self.env.cache_capacity(),
             dirty_bytes: self.env.dirty_bytes(),
+            group_cache_bytes: self.graph.group_caches.used(),
+            input_queue_bytes: self.shared.mem.input.used(),
+            output_queue_bytes: self.shared.mem.outputs.used(),
             nodes: self.graph.live_nodes().count(),
             arrangements: self.graph.live_arrangements().count(),
             nodes_created: self.graph.node_count(),
@@ -720,7 +729,7 @@ impl Engine {
             stats: self.inspect_stats(),
             config: ConfigInfo {
                 data_dir: self.cfg.data_dir.display().to_string(),
-                cache_bytes: self.cfg.cache_bytes,
+                memory_bytes: self.cfg.memory_bytes,
                 checkpoint_interval_secs: self.cfg.checkpoint_interval.as_secs_f64(),
                 retention_gsns: self.cfg.retention_gsns,
                 sync: self.cfg.sync,

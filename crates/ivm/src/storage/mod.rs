@@ -3,8 +3,9 @@
 //! monoid summaries per subtree.
 //!
 //! The tree is copy-on-write at checkpoint granularity. Nodes live in a node
-//! arena that acts as the buffer pool: clean nodes are evicted under memory
-//! pressure (CLOCK), dirty nodes stay until the next checkpoint writes them
+//! arena that acts as the buffer pool, accounted in bytes of memory: clean
+//! nodes are evicted under memory pressure (CLOCK), also between the leaves
+//! of a scan; dirty nodes stay until the next checkpoint writes them
 //! into the active append-only segment. A checkpoint is: write dirty nodes
 //! bottom-up, fsync, append a manifest record naming the new roots. Sealed
 //! segments are immutable. A budgeted maintenance pass before each
@@ -27,7 +28,7 @@ pub use summary::{AggKind, AggState, FloatSum, Summary};
 
 use crate::error::{Result, SqlError};
 use manifest::{CheckpointRecord, Manifest, TreeRecord, TreeSpace};
-use node::{entry_size, leaf_compaction, leaf_due, Child, DiskLoc, LeafEntry, Node, NodePtr};
+use node::{child_heap, entry_heap, entry_size, leaf_compaction, leaf_due, Child, DiskLoc, LeafEntry, Node, NodePtr};
 use rustc_hash::FxHashMap;
 use segment::SegmentStore;
 use std::collections::{BTreeMap, VecDeque};
@@ -76,6 +77,10 @@ impl Summarizer for CountSummarizer {
 
 #[derive(Clone, Debug)]
 pub struct EnvOptions {
+    /// Target of the buffer pool: bytes of memory of the loaded nodes
+    /// (`Node::mem_size`), beyond which clean nodes are evicted. The engine
+    /// adjusts it to the pool's share of the memory budget
+    /// (`Env::set_cache_bytes`).
     pub cache_bytes: usize,
     pub leaf_bytes: usize,
     pub internal_bytes: usize,
@@ -90,6 +95,9 @@ impl Default for EnvOptions {
 
 const NONE: u32 = u32::MAX;
 
+/// Memory of an arena slot itself, counted with its node.
+const SLOT_BYTES: usize = std::mem::size_of::<Option<Slot>>();
+
 struct Slot {
     node: Option<Node>,
     disk: Option<DiskLoc>,
@@ -100,10 +108,14 @@ struct Slot {
     tree: TreeId,
     loaded_children: u32,
     refbit: bool,
+    /// The node's estimated serialized size (split decisions).
     bytes: usize,
     /// Dirtied by the maintenance pass and not modified since (its write
     /// does not count towards the next pass's budget).
     by_maint: bool,
+    /// The node's memory (`Node::mem_size`) plus the slot's: what the
+    /// buffer pool's accounting counts.
+    mem: usize,
 }
 
 struct TreeState {
@@ -146,8 +158,9 @@ pub struct Env {
     manifest: Manifest,
     slots: Vec<Option<Slot>>,
     free_slots: Vec<u32>,
+    /// Memory of the loaded nodes (`Slot::mem`).
     mem_bytes: usize,
-    /// Bytes of dirty nodes (maintained with the dirty flags).
+    /// Memory of the dirty nodes (maintained with the dirty flags).
     dirty_bytes: usize,
     clock_hand: usize,
     trees: FxHashMap<TreeId, TreeState>,
@@ -479,6 +492,12 @@ impl Env {
         self.checkpoint_gsn
     }
 
+    /// Set the buffer pool's target (its share of the memory budget); the
+    /// next access evicts down to it.
+    pub fn set_cache_bytes(&mut self, bytes: usize) {
+        self.opts.cache_bytes = bytes;
+    }
+
     /// The stored summary of the whole tree (MIN/MAX values too wide for
     /// node summaries as prefixes; `range_summary` resolves them).
     pub fn tree_summary(&self, tree: TreeId) -> Summary {
@@ -506,9 +525,10 @@ impl Env {
 
     fn alloc_slot(&mut self, node: Node, disk: Option<DiskLoc>, parent: u32, tree: TreeId) -> u32 {
         let bytes = node.byte_size();
-        self.mem_bytes += bytes;
+        let mem = node.mem_size() + SLOT_BYTES;
+        self.mem_bytes += mem;
         if disk.is_none() {
-            self.dirty_bytes += bytes;
+            self.dirty_bytes += mem;
         }
         let slot = Slot {
             node: Some(node),
@@ -521,6 +541,7 @@ impl Env {
             refbit: true,
             bytes,
             by_maint: false,
+            mem,
         };
         if let Some(id) = self.free_slots.pop() {
             self.slots[id as usize] = Some(slot);
@@ -536,9 +557,9 @@ impl Env {
         if let Some(loc) = slot.disk {
             self.dec_live(slot.tree, loc);
         }
-        self.mem_bytes -= slot.bytes;
+        self.mem_bytes -= slot.mem;
         if slot.dirty {
-            self.dirty_bytes -= slot.bytes;
+            self.dirty_bytes -= slot.mem;
         }
         if slot.parent != NONE
             && let Some(p) = self.slots[slot.parent as usize].as_mut()
@@ -577,8 +598,8 @@ impl Env {
         let slot = self.slot_mut(id);
         if !slot.dirty {
             slot.dirty = true;
-            let (bytes, disk, tree) = (slot.bytes, slot.disk.take(), slot.tree);
-            self.dirty_bytes += bytes;
+            let (mem, disk, tree) = (slot.mem, slot.disk.take(), slot.tree);
+            self.dirty_bytes += mem;
             if let Some(loc) = disk {
                 self.dec_live(tree, loc);
             }
@@ -586,21 +607,25 @@ impl Env {
     }
 
     fn put_node(&mut self, id: u32, node: Node) {
-        let bytes = node.byte_size();
-        self.put_node_sized(id, node, bytes);
+        let (bytes, heap) = (node.byte_size(), node.heap_size());
+        self.put_node_sized(id, node, bytes, heap);
     }
 
-    /// `put_node` with the node's byte size already known.
-    fn put_node_sized(&mut self, id: u32, node: Node, bytes: usize) {
+    /// `put_node` with the node's byte size and heap size (`Node::heap_size`)
+    /// already known.
+    fn put_node_sized(&mut self, id: u32, node: Node, bytes: usize, heap: usize) {
         debug_assert_eq!(bytes, node.byte_size());
+        debug_assert_eq!(heap, node.heap_size());
+        let mem = node.mem_base() + heap + SLOT_BYTES;
         let slot = self.slot_mut(id);
-        let old = slot.bytes;
+        let old = slot.mem;
         let dirty = slot.dirty;
         slot.bytes = bytes;
+        slot.mem = mem;
         slot.node = Some(node);
-        self.mem_bytes = self.mem_bytes + bytes - old;
+        self.mem_bytes = self.mem_bytes + mem - old;
         if dirty {
-            self.dirty_bytes = self.dirty_bytes + bytes - old;
+            self.dirty_bytes = self.dirty_bytes + mem - old;
         }
     }
 
@@ -797,6 +822,8 @@ impl Env {
         // its write is the update's now
         self.slot_mut(id).by_maint = false;
         let node = self.slot_mut(id).node.take().expect("node taken");
+        // what the entries or children own, kept up to date by in-place edits
+        let mut heap = self.slot(id).mem - SLOT_BYTES - node.mem_base();
         match node {
             Node::Leaf(entries) => {
                 let frontier = self.frontier;
@@ -823,11 +850,13 @@ impl Env {
                             let e = &mut entries[pos];
                             let before = e.hist.total();
                             size -= entry_size(e);
+                            heap -= entry_heap(e);
                             e.hist.add(gsn, *w, frontier);
                             if e.hist.is_empty() {
                                 entries.remove(pos);
                             } else {
                                 size += entry_size(&entries[pos]);
+                                heap += entry_heap(&entries[pos]);
                                 pos += 1;
                             }
                             before
@@ -837,6 +866,7 @@ impl Env {
                             if !h.is_empty() {
                                 let e = LeafEntry { key: k.as_slice().into(), hist: h };
                                 size += entry_size(&e);
+                                heap += entry_heap(&e);
                                 entries.insert(pos, e);
                                 pos += 1;
                             }
@@ -897,7 +927,7 @@ impl Env {
                 if in_place && size <= self.opts.leaf_bytes {
                     // common case: no split, size already known
                     let summary = summary_after(old, &out, ups, &changes, summ)?;
-                    self.put_node_sized(id, Node::Leaf(out), size);
+                    self.put_node_sized(id, Node::Leaf(out), size, heap);
                     // the first part keeps the node's place (and separator) in the parent
                     return Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary, min_seg: u32::MAX, due: 0 }]);
                 }
@@ -976,6 +1006,7 @@ impl Env {
                     }
                     // the first part keeps the child's separator
                     size -= node::child_size(&children[ci]);
+                    heap -= child_heap(&children[ci]);
                     let nparts = parts.len();
                     let mut sep = Some(std::mem::take(&mut children[ci].sep));
                     children.splice(
@@ -988,6 +1019,7 @@ impl Env {
                         }),
                     );
                     size += children[ci..ci + nparts].iter().map(node::child_size).sum::<usize>();
+                    heap += children[ci..ci + nparts].iter().map(child_heap).sum::<usize>();
                 }
                 if children.is_empty() {
                     self.slot_mut(id).loaded_children = 0;
@@ -996,11 +1028,11 @@ impl Env {
                 }
                 if !shrunk.is_empty() {
                     let mut unlimited = u64::MAX;
-                    self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut unlimited, false)?;
+                    self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut heap, &mut unlimited, false)?;
                 }
                 // splits of the last child only: an append at the right edge
                 let append = runs.len() == 1 && runs[0].0 + 1 == n;
-                self.finish_internal_sized(id, children, incr, summ, size, append)
+                self.finish_internal_sized(id, children, incr, summ, size, heap, append)
             }
         }
     }
@@ -1011,14 +1043,17 @@ impl Env {
     /// result does not split again soon). Loading a neighbour and rewriting
     /// a clean one take their bytes from `budget`; no merge is tried once it
     /// is exhausted. `maint`: on behalf of the maintenance pass. The
-    /// summary of `id` is unchanged; `size` is kept up to date. Returns the
-    /// number of merges.
+    /// summary of `id` is unchanged; `size` and `heap` (its byte size and
+    /// what its children own, `child_heap`) are kept up to date. Returns
+    /// the number of merges.
+    #[allow(clippy::too_many_arguments)]
     fn merge_underfull(
         &mut self,
         id: u32,
         children: &mut Vec<Child>,
         shrunk: &[u32],
         size: &mut usize,
+        heap: &mut usize,
         budget: &mut u64,
         maint: bool,
     ) -> Result<usize> {
@@ -1060,7 +1095,7 @@ impl Env {
                     self.slot_mut(nid).by_maint = maint;
                 }
                 let l = i.min(j);
-                merged = Some((l, self.merge_pair(children, l, size)));
+                merged = Some((l, self.merge_pair(children, l, size, heap)));
                 break;
             }
             match merged {
@@ -1077,17 +1112,19 @@ impl Env {
     }
 
     /// Merge loaded child `l + 1` of an internal node (whose children are
-    /// `children` and size `size`) into loaded child `l`; returns the slot
-    /// of the merged node.
-    fn merge_pair(&mut self, children: &mut Vec<Child>, l: usize, size: &mut usize) -> u32 {
+    /// `children`, byte size `size` and heap size `heap`) into loaded child
+    /// `l`; returns the slot of the merged node.
+    fn merge_pair(&mut self, children: &mut Vec<Child>, l: usize, size: &mut usize, heap: &mut usize) -> u32 {
         let (NodePtr::Mem(a), NodePtr::Mem(b)) = (children[l].ptr, children[l + 1].ptr) else {
             unreachable!("merging a child that is not loaded")
         };
         self.make_dirty(a);
         self.make_dirty(b);
         let right = children.remove(l + 1);
-        // (the merged child's summary and `due` change, and with them its size)
+        // (the merged child's summary and `due` change, and with them its
+        // sizes)
         *size -= node::child_size(&right) + node::child_size(&children[l]);
+        *heap -= child_heap(&right) + child_heap(&children[l]);
         let nb = self.slot_mut(b).node.take().expect("node taken");
         let na = self.slot_mut(a).node.take().expect("node taken");
         let c = &mut children[l];
@@ -1117,15 +1154,17 @@ impl Env {
             _ => unreachable!("siblings at different depths"),
         };
         *size += node::child_size(c);
+        *heap += child_heap(c);
         self.put_node(a, merged);
         self.put_node(b, Node::Leaf(Vec::new()));
         self.free_slot(b);
         a
     }
 
-    /// `finish_internal` for a node whose byte size is known: when it does
-    /// not need to split, its children's parent links and the loaded count
-    /// are already right (maintained by load, allocation and free).
+    /// `finish_internal` for a node whose byte and heap sizes are known:
+    /// when it does not need to split, its children's parent links and the
+    /// loaded count are already right (maintained by load, allocation and
+    /// free).
     fn finish_internal_sized(
         &mut self,
         id: u32,
@@ -1133,6 +1172,7 @@ impl Env {
         summary: Option<Summary>,
         summ: &Arc<dyn Summarizer>,
         size: usize,
+        heap: usize,
         append: bool,
     ) -> Result<Parts> {
         if size > self.opts.internal_bytes {
@@ -1154,7 +1194,7 @@ impl Env {
         };
         let min_seg = children.iter().map(|c| c.min_seg).fold(u32::MAX, u32::min);
         let due = children.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX);
-        self.put_node_sized(id, Node::Internal(children), size);
+        self.put_node_sized(id, Node::Internal(children), size, heap);
         // the first part keeps the node's place (and separator) in the parent
         Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary: s, min_seg, due }])
     }
@@ -1344,7 +1384,13 @@ impl Env {
 
     /// Visit entries from `lo` while `in_range` (true up to some key, false
     /// after it) holds, one leaf at a time: each leaf is found from the root,
-    /// so nothing is pinned between leaves.
+    /// so nothing is pinned between leaves. Once the walk has read more than
+    /// a quarter of the pool's target from disk, it is a large scan: while
+    /// the pool is over its target, the nodes it read are evicted as soon as
+    /// it is done with them (`evict_scanned`), so that it recycles its own
+    /// nodes instead of loading the whole tree or pushing the pool's working
+    /// set out. Before that, what it reads is cached like any other node,
+    /// the pool evicting (CLOCK) after every 1/64 of its target read.
     fn walk(
         &mut self,
         tree: TreeId,
@@ -1353,6 +1399,10 @@ impl Env {
         f: &mut dyn FnMut(&[u8], &History) -> Result<bool>,
     ) -> Result<()> {
         let mut resume: Option<Vec<u8>> = None;
+        // bytes read from disk, and the nodes read that a large scan may
+        // still evict (top down)
+        let (mut read, mut swept) = (0usize, 0usize);
+        let mut scanned: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
         loop {
             let Some(mut id) = self.root_slot(tree)? else { return Ok(()) };
             let lo = match &resume {
@@ -1360,7 +1410,7 @@ impl Env {
                 None => lo,
             };
             // the deepest internal node with a child after the path (slots
-            // stay put until maybe_evict runs at the end)
+            // stay put until the leaf is done)
             let mut next: Option<(u32, usize)> = None;
             loop {
                 match self.node(id) {
@@ -1373,7 +1423,12 @@ impl Env {
                         if idx + 1 < children.len() {
                             next = Some((id, idx + 1));
                         }
+                        let from_disk = matches!(children[idx].ptr, NodePtr::Disk(_));
                         id = self.load_child(id, idx)?;
+                        if from_disk {
+                            read += self.slot(id).mem;
+                            scanned.push(id);
+                        }
                     }
                 }
             }
@@ -1396,13 +1451,58 @@ impl Env {
                 },
                 None => None,
             };
+            let large = read > self.opts.cache_bytes / 4;
             match sep {
-                Some(s) => resume = Some(s),
+                Some(s) => {
+                    // done with the nodes not on the path to the next leaf
+                    if large {
+                        self.evict_scanned(&mut scanned, next.map(|(pid, _)| pid));
+                    } else {
+                        scanned.clear();
+                        // (a sweep per leaf would cost a pass over the arena
+                        // per leaf whenever dirty nodes leave little to evict)
+                        if read - swept > self.opts.cache_bytes / 64 {
+                            swept = read;
+                            self.maybe_evict();
+                        }
+                    }
+                    resume = Some(s);
+                }
                 None => {
+                    if large {
+                        self.evict_scanned(&mut scanned, None);
+                    }
                     self.maybe_evict();
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// For a large scan: of the nodes it read (`scanned`, top down), those
+    /// not on the path to `keep` (the node it goes on from) are done; evict
+    /// them, deepest first, while the pool is over its target, and stop
+    /// tracking them either way. O(depth) per leaf, and the pool's other
+    /// nodes stay where they are.
+    fn evict_scanned(&mut self, scanned: &mut smallvec::SmallVec<[u32; 8]>, keep: Option<u32>) {
+        let mut path: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
+        let mut k = keep.unwrap_or(NONE);
+        while k != NONE {
+            path.push(k);
+            k = self.slot(k).parent;
+        }
+        let mut i = scanned.len();
+        while i > 0 {
+            i -= 1;
+            let id = scanned[i];
+            if path.contains(&id) {
+                continue;
+            }
+            let slot = self.slot(id);
+            if self.mem_bytes > self.opts.cache_bytes && !slot.dirty && slot.loaded_children == 0 {
+                self.evict(id);
+            }
+            scanned.remove(i);
         }
     }
 
@@ -1701,7 +1801,7 @@ impl Env {
                 }
             }
         }
-        self.mem_bytes -= slot.bytes;
+        self.mem_bytes -= slot.mem;
         self.free_slots.push(id);
     }
 
@@ -1770,8 +1870,10 @@ impl Env {
         }
         let mut node = self.slot_mut(id).node.take().unwrap();
         let mut locs = Vec::new();
-        // the node's byte size, which counts its children's `due`
+        // the node's byte size, which counts its children's `due`, and what
+        // its entries or children own (which writing does not change)
         let mut bytes = self.slot(id).bytes;
+        let heap = self.slot(id).mem - SLOT_BYTES - node.mem_base();
         if let Node::Internal(children) = &mut node {
             locs.reserve(children.len());
             for c in children.iter_mut() {
@@ -1805,14 +1907,14 @@ impl Env {
                 ch.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX),
             ),
         };
-        self.put_node_sized(id, node, bytes);
+        self.put_node_sized(id, node, bytes, heap);
         let slot = self.slot_mut(id);
         slot.disk = Some(loc);
         slot.by_maint = false;
         if slot.dirty {
             slot.dirty = false;
-            let bytes = slot.bytes;
-            self.dirty_bytes -= bytes;
+            let mem = slot.mem;
+            self.dirty_bytes -= mem;
         }
         Ok((loc, min_seg, due))
     }
@@ -2004,7 +2106,10 @@ impl Env {
         }
         let relocate = in_victim && m.charge(true, bytes);
         let tree = self.slot(id).tree;
-        let Some(Node::Internal(mut children)) = self.slot_mut(id).node.take() else { unreachable!() };
+        let node = self.slot_mut(id).node.take().expect("node taken");
+        // what the children own, kept up to date like the byte size
+        let mut heap = self.slot(id).mem - SLOT_BYTES - node.mem_base();
+        let Node::Internal(mut children) = node else { unreachable!() };
         // a placeholder, so that loading children counts them on this slot
         self.put_node(id, Node::Internal(Vec::new()));
         let mut size = bytes as usize;
@@ -2053,6 +2158,7 @@ impl Env {
                     }
                     // the first part keeps the child's separator
                     size -= node::child_size(&children[i]);
+                    heap -= child_heap(&children[i]);
                     let n = parts.len();
                     let mut sep = Some(std::mem::take(&mut children[i].sep));
                     children.splice(
@@ -2065,17 +2171,18 @@ impl Env {
                         }),
                     );
                     size += children[i..i + n].iter().map(node::child_size).sum::<usize>();
+                    heap += children[i..i + n].iter().map(child_heap).sum::<usize>();
                     i += n;
                 }
             }
         }
         if !shrunk.is_empty() {
-            m.stats.merged += self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut m.compact, true)?;
+            m.stats.merged += self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut heap, &mut m.compact, true)?;
             // (merges are tried only while there is budget)
             m.stats.unfinished |= m.compact == 0;
         }
         if !changed {
-            self.put_node_sized(id, Node::Internal(children), size);
+            self.put_node_sized(id, Node::Internal(children), size, heap);
             return Ok(Visit::Same);
         }
         if relocate {
@@ -2091,7 +2198,7 @@ impl Env {
             self.free_slot(id);
             return Ok(Visit::New(Parts::new()));
         }
-        Ok(Visit::New(self.finish_internal_sized(id, children, Some(old.clone()), summ, size, false)?))
+        Ok(Visit::New(self.finish_internal_sized(id, children, Some(old.clone()), summ, size, heap, false)?))
     }
 
     pub fn stats(&self) -> EnvStats {
@@ -2109,7 +2216,7 @@ impl Env {
     }
 
     pub fn dirty_bytes(&self) -> usize {
-        debug_assert_eq!(self.dirty_bytes, self.slots.iter().flatten().filter(|s| s.dirty).map(|s| s.bytes).sum::<usize>());
+        debug_assert_eq!(self.dirty_bytes, self.slots.iter().flatten().filter(|s| s.dirty).map(|s| s.mem).sum::<usize>());
         self.dirty_bytes
     }
 }
