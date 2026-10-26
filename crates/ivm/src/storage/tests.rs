@@ -2034,6 +2034,54 @@ fn dropping_a_tree_reads_nothing() {
     assert_eq!(env.get(keep, b"k").unwrap().map(|h| h.total()), Some(1));
 }
 
+/// A fork reads a tree that the environment dropped after it was taken,
+/// whose segments a checkpoint deleted since (the fork holds their files
+/// open); a segment a fork wrote to is kept while the fork lives, and a
+/// tree it filled there is adopted with its nodes on disk.
+#[test]
+fn forks_read_dropped_trees_and_pin_what_they_write() {
+    let tmp = TempDir::new("storage-fork-drop");
+    let opts = EnvOptions { cache_bytes: 128 << 10, leaf_bytes: 2048, internal_bytes: 2048, segment_bytes: 256 << 10 };
+    let (mut env, _) = Env::open(tmp.path(), opts).unwrap();
+    let keep = env.create_tree(Arc::new(CountSummarizer));
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    env.apply(keep, &mut vec![(b"k".to_vec(), 1)], 1).unwrap();
+    env.apply(t, &mut (0..40_000u64).map(|i| (key8(i, 20), 1)).collect(), 1).unwrap();
+    env.checkpoint(1, b"").unwrap();
+    let filled = env.create_tree(Arc::new(CountSummarizer));
+    let mut fork = env.fork().unwrap();
+    env.drop_tree(t).unwrap();
+    env.checkpoint(2, b"").unwrap();
+    let left: Vec<u32> = env.stats().segments.iter().map(|s| s.0).collect();
+    assert!(left.len() <= 2, "the dropped tree's segments were kept: {left:?}");
+    // the fork still reads all of it, from files deleted since
+    let mut n = 0;
+    fork.for_each(t, Bound::Unbounded, Bound::Unbounded, &mut |_, _| {
+        n += 1;
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(n, 40_000);
+    // a tree filled in the fork, larger than its pool: written early
+    fork.apply(filled, &mut (0..30_000u64).map(|i| (key8(i, 20), 1)).collect(), 3).unwrap();
+    assert!(!fork.trees[&filled].seg_live.is_empty(), "the fork wrote nothing early");
+    let written: Vec<u32> = fork.trees[&filled].seg_live.keys().copied().collect();
+    // (checkpoints of the environment keep the segments the fork wrote to)
+    env.checkpoint(4, b"").unwrap();
+    for s in &written {
+        assert!(env.segs.pinned(*s) && segment::segment_path(tmp.path(), *s).exists(), "segment {s} the fork wrote to");
+    }
+    env.adopt_trees(&mut fork, &[filled]).unwrap();
+    drop(fork);
+    assert_eq!(env.tree_count(filled), 30_000);
+    check_structure(&mut env, false, None);
+    env.checkpoint(5, b"").unwrap();
+    check_segment_files(&mut env, true);
+    check_live_accounting(&mut env);
+    assert_eq!(env.scan(filled, Bound::Unbounded, Bound::Unbounded).unwrap().len(), 30_000);
+    assert_eq!(env.get(keep, b"k").unwrap().map(|h| h.total()), Some(1));
+}
+
 /// A store written by an earlier version (kind-2 internal nodes, checkpoint
 /// records without tree space) opens, learns each tree's live bytes per
 /// segment from its internal nodes (not reading the leaves), and one pass
