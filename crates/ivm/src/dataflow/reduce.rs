@@ -193,7 +193,7 @@ fn group_row(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8], summary: &
             };
             super::agg::percentile(agg.func, agg.fraction.unwrap_or(0.5), n, &mut get)
         } else if agg.func.is_ordered() {
-            agg.finalize_ordered(&mut scanned.expect("scanned group").iter().cloned())
+            agg.finalize_ordered(&mut scanned.expect("scanned group").iter().map(|(r, w)| (r, *w)))
         } else {
             agg.finalize(summary, &p.slots[i])
         };

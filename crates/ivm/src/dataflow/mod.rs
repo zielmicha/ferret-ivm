@@ -222,6 +222,7 @@ fn operator_errors(kind: &NodeKind) -> Option<&OpErrors> {
     match kind {
         NodeKind::Reduce(p) => Some(&p.errors),
         NodeKind::Recursive(p) => Some(&p.errors),
+        NodeKind::Window(p) => Some(&p.errors),
         _ => None,
     }
 }
@@ -775,7 +776,10 @@ impl Graph {
             }
             if let Some(errs) = operator_errors(&n.kind) {
                 let errs = errs.lock();
-                if !errs.is_empty() {
+                // (a window operator's state is saved when known, also
+                // without partitions in error: restored, it is known)
+                let known = matches!(&n.kind, NodeKind::Window(p) if p.errors_known.load(std::sync::atomic::Ordering::Acquire));
+                if !errs.is_empty() || known {
                     st.operators.push((n.fp.clone(), errs.iter().map(|(k, e)| (k.clone(), e.clone())).collect()));
                 }
             }
@@ -796,6 +800,9 @@ impl Graph {
                 && let Some(errs) = operator_errors(&self.node(id).kind)
             {
                 *errs.lock() = groups.into_iter().collect();
+                if let NodeKind::Window(p) = &self.node(id).kind {
+                    p.errors_known.store(true, std::sync::atomic::Ordering::Release);
+                }
             }
         }
     }

@@ -211,7 +211,6 @@ impl<'a> Lowerer<'a> {
                         key.push(Expr::Column(k.col));
                         specs.push(k.spec);
                     }
-                    let arr = self.arrange(node, key, specs, vec![]);
                     let specs_w: Vec<WinSpec> = funcs[i..j]
                         .iter()
                         .map(|f| WinSpec {
@@ -223,9 +222,11 @@ impl<'a> Lowerer<'a> {
                             range: f.range.clone(),
                         })
                         .collect();
+                    // (summaries for the parts of frames up to the partitions' ends)
+                    let arr = self.arrange(node, key, specs, super::window::input_summaries(&specs_w));
                     let mut schema = cur_schema.clone();
                     schema.extend(funcs[i..j].iter().map(|f| f.ret.clone()));
-                    let plan = WindowPlan { partition: part.clone(), order: order.clone(), funcs: specs_w, input_arr: arr };
+                    let plan = WindowPlan::new(part.clone(), order.clone(), specs_w, arr);
                     node = self.g.add_node(NodeKind::Window(plan), vec![node], schema.clone());
                     cur_schema = schema;
                     i = j;

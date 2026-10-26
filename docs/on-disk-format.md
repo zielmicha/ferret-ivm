@@ -526,7 +526,7 @@ with `serde_json`):
 | `source_lsns` | per source: the end LSN of its last logged commit (resume point); `[]` if absent |
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
-| `errors` | error state of the dataflow, by node fingerprint. `nodes`: for every node that has an arrangement and error records, the error records in its contents (`[[sqlstate, message], count]`), so that views created later over the node start with them (an arrangement holds rows only). `operators`: for every `Reduce` and `Recursive` node with groups in error, `[group key, [sqlstate, message]]`, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers. Restored by fingerprint before hydration; `{"nodes": [], "operators": []}` if absent (`operators` may also be absent alone) |
+| `errors` | error state of the dataflow, by node fingerprint. `nodes`: for every node that has an arrangement and error records, the error records in its contents (`[[sqlstate, message], count]`), so that views created later over the node start with them (an arrangement holds rows only). `operators`: for every `Reduce` and `Recursive` node with groups in error, `[group key, [sqlstate, message]]`, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers; and for every `Window` node whose state is known, also with an empty list, its partitions in error by the canonical key encoding of the partition columns (a `Window` node absent from the list, as in older checkpoints, recomputes whole partitions until a snapshot computes its state). Restored by fingerprint before hydration; `{"nodes": [], "operators": []}` if absent (`operators` may also be absent alone) |
 | `arr_since` | `[fingerprint, gsn]` for every hydrated arrangement: the GSN from which its history is complete (when it was hydrated, or created with its table). `AS OF` reads of earlier GSNs do not use the arrangement. `[]` if absent: recovered arrangements then count as complete from GSN 0 |
 | `ticks` | `[gsn, clock]` of recent clock ticks, for `now()` in reads as of earlier GSNs: the last tick at or before the retention frontier and every later one, at most the last 100,000; `[]` if absent (recovery then starts from `[[checkpoint gsn, clock]]`) |
 | `slot_drops` | replication slots of dropped sources not dropped upstream yet (`conninfo`, `slot`), retried after the start; `[]` if absent |
@@ -932,9 +932,11 @@ among the existing ones, which renumbers the later ones) and planner fixes
 did change the fingerprints of many views' arrangements (for example joins
 on computed keys, whose keys are materialized in an `Mfp` node, semijoins
 whose presence inputs match exactly, the summaries of `var*`/`stddev*`
-over `bigint`, and joins whose input filters or maps can fail, which have
-error-tracker inputs), so such a data directory keeps its tables and
-rebuilds those arrangements once at its first start.
+over `bigint`, joins whose input filters or maps can fail, which have
+error-tracker inputs, and the input arrangements of window aggregates whose
+frames reach a partition's end, which carry summaries), so such a data
+directory keeps its tables and rebuilds those arrangements once at its
+first start.
 
 An upgrade that changes any of the "incompatible" rows requires starting
 from an empty data directory (and re-creating sources, which re-snapshot the

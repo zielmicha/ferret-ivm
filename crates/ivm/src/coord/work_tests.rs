@@ -324,3 +324,52 @@ fn snapshot_reads_wait_for_their_tables() {
     assert_eq!((t.e.parked.len(), t.e.deferred.len()), (0, 1));
     drop(rx);
 }
+
+/// A change to a partition recomputes the window values that can change,
+/// reading the rows their frames reach (and summaries for the parts of
+/// frames up to the partition's ends): an append or an update at the end
+/// of a 3000-row partition reads a few rows for a running sum, a sliding
+/// frame or row_number. Frames ending at the partition's end change for
+/// every row before a change, which is then read once (not once per row).
+#[test]
+fn windows_read_only_what_a_change_reaches() {
+    let mut t = T::new("work-window");
+    let n = 3000;
+    let cases = [
+        ("running", "sum(v) OVER (PARTITION BY g ORDER BY id)"),
+        ("sliding", "sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)"),
+        ("minmax", "max(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 5 PRECEDING AND CURRENT ROW)"),
+        ("numbered", "row_number() OVER (PARTITION BY g ORDER BY id)"),
+        ("ranked", "rank() OVER (PARTITION BY g ORDER BY v)"),
+        ("lagged", "lag(v) OVER (PARTITION BY g ORDER BY id)"),
+        ("suffix", "sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)"),
+    ];
+    for (name, f) in cases {
+        t.ddl(&format!("CREATE TABLE {name} (id bigint PRIMARY KEY, g bigint, v bigint)"));
+        t.upsert(name, (0..n).map(|i| vec![int(i), int(1), int(i)]).collect());
+        t.ddl(&format!("CREATE MATERIALIZED VIEW {name}_v AS SELECT id, {f} AS x FROM {name}"));
+        let last = |t: &mut T| t.rows(&format!("{name}_v")).last().unwrap()[1].clone();
+        let (update, _) = t.work(|t| t.upsert(name, vec![vec![int(n - 1), int(1), int(n)]]));
+        let (append, _) = t.work(|t| t.upsert(name, vec![vec![int(n), int(1), int(n + 1)]]));
+        let reads = update.max(append);
+        match name {
+            "suffix" => assert!(reads <= n as u64 + 50, "{name}: {reads} entries"),
+            _ => assert!(reads <= 20, "{name}: {update} and {append} entries"),
+        }
+        let want = match name {
+            "running" => int((0..n - 1).sum::<i64>() + 2 * n + 1),
+            "sliding" => int((n - 2) + n + (n + 1)),
+            "minmax" => int(n + 1),
+            "numbered" => int(n + 1),
+            "ranked" => int(n + 1),
+            "lagged" => int(n),
+            _ => int(n + 1),
+        };
+        // (a numeric sum)
+        let got = match last(&mut t) {
+            Datum::Numeric(x) => int(x.to_string().parse().unwrap()),
+            d => d,
+        };
+        assert_eq!(got, want, "{name}");
+    }
+}

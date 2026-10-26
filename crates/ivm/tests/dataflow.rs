@@ -556,6 +556,12 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 /// updates and deletes of one row or of many in one statement. After each,
 /// every view must equal its query run ad hoc.
 fn random_changes_keep_views_equal(name: &str, queries: &[&str], steps: usize, seed: u64) {
+    random_changes_keep_views_equal_from(name, queries, steps, seed, 20)
+}
+
+/// As `random_changes_keep_views_equal`, starting with `rows` rows; a view
+/// that fails must fail with the same error as its query.
+fn random_changes_keep_views_equal_from(name: &str, queries: &[&str], steps: usize, seed: u64, initial: usize) {
     let dir = tmpdir(name);
     let running = start(&dir);
     let h = running.handle.clone();
@@ -564,7 +570,7 @@ fn random_changes_keep_views_equal(name: &str, queries: &[&str], steps: usize, s
     let mut ids: Vec<i64> = Vec::new();
     let mut next_id = 1;
     let val = |rng: &mut Rng| if rng.below(10) == 0 { "NULL".to_string() } else { rng.below(8).to_string() };
-    for _ in 0..20 {
+    for _ in 0..initial {
         exec(&h, &format!("INSERT INTO t VALUES ({next_id}, {}, {})", rng.below(3), val(&mut rng)));
         ids.push(next_id);
         next_id += 1;
@@ -575,7 +581,7 @@ fn random_changes_keep_views_equal(name: &str, queries: &[&str], steps: usize, s
     for step in 0..steps {
         let pick = |rng: &mut Rng, ids: &[i64]| ids[rng.below(ids.len() as u64) as usize];
         let sql = match rng.below(9) {
-            0 | 1 if ids.len() < 60 || ids.is_empty() => {
+            0 | 1 if ids.len() < 60.max(initial + 20) || ids.is_empty() => {
                 let n = 1 + rng.below(3);
                 let mut vals = Vec::new();
                 for _ in 0..n {
@@ -604,8 +610,8 @@ fn random_changes_keep_views_equal(name: &str, queries: &[&str], steps: usize, s
         };
         exec(&h, &sql);
         for (i, q) in queries.iter().enumerate() {
-            let want = sorted(rows(&h, q));
-            let got = sorted(rows(&h, &format!("SELECT * FROM v{i}")));
+            let want = rows_of(&h, q).map(sorted);
+            let got = rows_of(&h, &format!("SELECT * FROM v{i}")).map(sorted);
             assert_eq!(got, want, "step {step} ({sql}): view {i}: {q}");
         }
     }
@@ -634,4 +640,36 @@ fn topk_follows_random_changes() {
     for seed in [1, 2, 3] {
         random_changes_keep_views_equal(&format!("topk-random-{seed}"), &queries, 150, seed * 7919);
     }
+}
+
+/// Window functions of every kind, with ROWS, RANGE (also offsets) and
+/// GROUPS frames, follow random changes, multiplicities, ties, NULLs and
+/// errors included: a change recomputes the rows whose values it can
+/// change, over the rows their frames reach.
+#[test]
+fn windows_follow_random_changes() {
+    let queries = [
+        "SELECT id, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM t",
+        "SELECT id, rank() OVER w AS r, dense_rank() OVER w AS d, percent_rank() OVER w AS pr, cume_dist() OVER w AS cd FROM t WINDOW w AS (PARTITION BY g ORDER BY v)",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, count(*) OVER (PARTITION BY g ORDER BY v) AS c FROM t",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v, id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS s, min(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS m FROM t",
+        "SELECT id, min(v) OVER w AS mn, max(v) OVER w AS mx, avg(v) OVER w AS a, count(v) OVER w AS c FROM t WINDOW w AS (PARTITION BY g ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING)",
+        "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS s, count(v) OVER (ORDER BY v DESC RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING) AS c, max(v) OVER (ORDER BY v NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS mx FROM t",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, count(*) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS c FROM t",
+        "SELECT id, lag(v) OVER (PARTITION BY g ORDER BY id) AS l1, lead(v, 2, -1) OVER (PARTITION BY g ORDER BY id) AS l2, ntile(3) OVER (PARTITION BY g ORDER BY id) AS nt FROM t",
+        "SELECT id, first_value(v) OVER w AS f, last_value(v) OVER w AS l, nth_value(v, 2) OVER w AS n2 FROM t WINDOW w AS (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING)",
+        "SELECT id, first_value(v) OVER (PARTITION BY g ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS f, last_value(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS l FROM t",
+        "SELECT id, string_agg(v::text, ',') OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS sa, array_agg(v) OVER (PARTITION BY g ORDER BY id) AS aa FROM t",
+        "SELECT g, v, count(*) OVER (PARTITION BY g ORDER BY v) AS c, sum(v) OVER (PARTITION BY g ORDER BY v ROWS UNBOUNDED PRECEDING) AS s, row_number() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
+        "SELECT id, count(*) OVER (PARTITION BY g) AS c, sum(v) OVER () AS s, max(v) OVER () AS mx FROM t",
+        "SELECT id, rank() OVER w AS r, sum(v) OVER (w ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s, max(v) OVER (w ROWS UNBOUNDED PRECEDING) AS m, sum(v) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) AS p FROM t WINDOW w AS (PARTITION BY g ORDER BY v, id)",
+        "SELECT id, dense_rank() OVER (ORDER BY v) AS d, sum(v) OVER (ORDER BY v ROWS BETWEEN 3 FOLLOWING AND UNBOUNDED FOLLOWING) AS s FROM t",
+        "SELECT id, ntile(v) OVER (PARTITION BY g ORDER BY id) AS nt FROM t",
+        "SELECT id, count(*) OVER (PARTITION BY g ORDER BY d RANGE BETWEEN interval '2 days' PRECEDING AND interval '1 day' FOLLOWING) AS c FROM (SELECT id, g, date '2026-01-01' + v AS d FROM t) s",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 40 PRECEDING AND 1 PRECEDING) AS s, lag(v, 2) OVER (PARTITION BY g ORDER BY id) AS l FROM t",
+    ];
+    for seed in [1, 2, 3] {
+        random_changes_keep_views_equal(&format!("window-random-{seed}"), &queries, 120, seed * 104_729);
+    }
+    random_changes_keep_views_equal_from("window-random-large", &queries, 60, 77, 150);
 }

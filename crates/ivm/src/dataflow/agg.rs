@@ -145,7 +145,7 @@ impl AggSpec {
     }
 
     /// Finalize an ordered aggregate from the group's rows in order.
-    pub fn finalize_ordered(&self, rows: &mut dyn Iterator<Item = (Row, i64)>) -> Result<Datum> {
+    pub fn finalize_ordered(&self, rows: &mut dyn Iterator<Item = (&Row, i64)>) -> Result<Datum> {
         use AggFunc as A;
         let arg = self.arg.unwrap_or(0);
         let passes = |r: &Row| match self.filter {
@@ -157,7 +157,7 @@ impl AggSpec {
                 let mut out: Option<Vec<u8>> = None;
                 let bytea = self.arg_type == SqlType::Bytea;
                 for (r, w) in rows {
-                    if !passes(&r) || r[arg].is_null() {
+                    if !passes(r) || r[arg].is_null() {
                         continue;
                     }
                     for _ in 0..w.max(0) {
@@ -185,7 +185,7 @@ impl AggSpec {
                 let mut elems = Vec::new();
                 let mut any = false;
                 for (r, w) in rows {
-                    if !passes(&r) {
+                    if !passes(r) {
                         continue;
                     }
                     any = true;
@@ -205,7 +205,7 @@ impl AggSpec {
             A::JsonAgg | A::JsonbAgg => {
                 let mut vals = Vec::new();
                 for (r, w) in rows {
-                    if !passes(&r) {
+                    if !passes(r) {
                         continue;
                     }
                     let j = crate::expr::builtins_datum_to_jsonb(&r[arg])?;
@@ -227,7 +227,7 @@ impl AggSpec {
                 let vcol = self.arg2.unwrap_or(arg + 1);
                 let mut pairs: Vec<(String, Jsonb)> = Vec::new();
                 for (r, w) in rows {
-                    if !passes(&r) || w <= 0 {
+                    if !passes(r) || w <= 0 {
                         continue;
                     }
                     if r[arg].is_null() {
@@ -263,7 +263,7 @@ impl AggSpec {
                 let mut best: Option<(Datum, i64)> = None;
                 let mut run: Option<(Datum, i64)> = None;
                 for (r, w) in rows {
-                    if !passes(&r) || r[arg].is_null() || w <= 0 {
+                    if !passes(r) || r[arg].is_null() || w <= 0 {
                         continue;
                     }
                     match &mut run {
@@ -288,7 +288,7 @@ impl AggSpec {
             A::PercentileCont | A::PercentileDisc => {
                 let mut vals: Vec<Datum> = Vec::new();
                 for (r, w) in rows {
-                    if !passes(&r) || r[arg].is_null() {
+                    if !passes(r) || r[arg].is_null() {
                         continue;
                     }
                     for _ in 0..w.max(0) {

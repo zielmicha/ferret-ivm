@@ -150,7 +150,7 @@ Kinds of arrangements:
 | aggregation input | group columns (+ `ORDER BY` columns of an ordered aggregate) | the aggregates' needs | `Reduce` |
 | aggregation output | group columns | — | `Reduce` |
 | full index | all columns | — | `Distinct`, `SetOp`, `Recursive` (its output, and source relations that have no arrangement), a view's read index |
-| top-k / window input | group/partition columns, then sort columns | — | `TopK`, `Window` |
+| top-k / window input | group/partition columns, then sort columns | — (window: the summaries of aggregates whose frames reach a partition's end) | `TopK`, `Window` |
 | temporal events | (time, kind) | — | `TemporalFilter` (private state) |
 | user index | `CREATE INDEX` columns | — | `CREATE INDEX` |
 
@@ -427,15 +427,47 @@ own length, the two windows are read).
 
 ### Window
 
-The input is arranged by (partition columns, `ORDER BY` columns); window
-functions with the same partitioning and order share one operator. For each
-changed partition, all window values are computed for the partition before
-and after the GSN (`compute_partition`: peer groups, frame bounds per row,
-running aggregates for frames starting at `UNBOUNDED PRECEDING`), and the old
-rows are retracted and the new ones inserted. Cost is proportional to the
-partition size — intrinsic for functions like `row_number` where one insert
-shifts every later row. An error in a partition (for example `ntile(0)`)
-becomes an error record.
+The input is arranged by (partition columns, `ORDER BY` columns), with
+summaries for the aggregates whose frames reach a partition's start or end
+(`UNBOUNDED PRECEDING`, `UNBOUNDED FOLLOWING`); window functions with the
+same partitioning and order share one operator.
+
+Values are computed over a *run* of consecutive rows of a partition
+(`compute`): frames slide over it — rows entering a frame are added to and
+rows leaving it subtracted from the invertible states (counts, sums),
+`min`/`max` are kept in monotonic deques (the leftmost of equal values
+first, as summaries keep it), and ordered aggregates read the frame's rows
+in place — so a run costs time proportional to its length, whatever the
+frames. The parts of frames up to the partition's ends that lie outside the
+run come from range summaries of the input index, and the rows at
+positions outside it (for `lag`, `lead`, `first_value`, ...) from
+`Env::nth`. A row's multiplicity is expanded into positions, but
+consecutive equal output rows are emitted once, with their count.
+
+For each changed partition, the operator determines from the functions and
+their frames which rows' values the change can change: rows whose frame
+holds a changed row (frames ending after it reach back from it, frames
+starting before it forward from it), the rows after it for `row_number` and
+`rank` when the partition's size changes (for `dense_rank` always; every row
+for `percent_rank`, `cume_dist` and `ntile`), the next row for `lag` (any
+row with an explicit offset), and so on. It reads the run those rows'
+values depend on — their frames, except the parts that summaries or row
+lookups provide; whole peer groups; from the partition's start for
+`dense_rank` — computes their values before and after the GSN, and emits
+the difference. Positions outside the changed rows are the same in both
+versions, so both are computed from one read of the run (with each entry's
+weight before and after the GSN). The work is proportional to the rows
+that change and the rows their frames reach: appending to a partition with
+a running sum reads a few rows, while a change that changes every row (an
+insert at the start with `row_number`, any change with frames reaching the
+partition's end) reads the partition once.
+
+An error in a partition (for example `ntile(0)`) becomes an error record,
+and none of its rows is output. The partitions in error are remembered
+(`WindowPlan::errors`): a change to a partition in error, or one that puts
+it in error, recomputes the whole partition before and after the GSN, as
+does any change while the state is not known (an operator whose state was
+neither restored from a checkpoint nor computed by a snapshot).
 
 ### Recursive
 
@@ -541,8 +573,10 @@ Three kinds of error state are kept:
   fingerprint (`AppState::errors.nodes`), so that views created over such a
   node after a restart see its errors too;
 - per operator, the groups currently in error of `Reduce` and `Recursive`
-  (`AppState::errors.operators`, by node fingerprint), so that a group's
-  error is retracted when it recovers, also after a restart;
+  and the partitions in error of `Window` (`AppState::errors.operators`, by
+  node fingerprint), so that a group's error is retracted when it recovers,
+  also after a restart (a `Window` operator's state is saved whenever it is
+  known, also without partitions in error);
 - per materialized view, a map from (SQLSTATE, message) to count, taken
   from its root when the view is created and updated from the root's output
   at every step (`AppState::view_errors`). Reads fail while any count is
