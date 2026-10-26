@@ -764,3 +764,53 @@ fn topk_and_windows_follow_changes_to_many_rows_of_a_group() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Window aggregates whose frames reach a partition's end take those parts
+/// from the input index's summaries, where `min`/`max` values wider than a
+/// node summary holds are kept as prefixes (resolved by descending to the
+/// entries) and float sums as exact dyadic rationals: values sharing a long
+/// prefix, and float sums whose terms cancel, give the same results as a
+/// recomputation after every change.
+#[test]
+fn window_summaries_with_wide_extremes_and_float_sums() {
+    let dir = tmpdir("window-wide");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, s text, f float8)");
+    let prefix = "p".repeat(200);
+    let mut rng = Rng(77);
+    let row = |rng: &mut Rng, id: u64| {
+        let s = if rng.below(8) == 0 { "NULL".to_string() } else { format!("'{prefix}{}'", rng.below(50)) };
+        let f = ["1e300", "-1e300", "0.1", "0.2", "3", "-0.30000000000000004", "1e-300"][rng.below(7) as usize];
+        format!("({id}, {}, {s}, {f})", rng.below(2))
+    };
+    let rows_sql: Vec<String> = (0..120).map(|i| row(&mut rng, i)).collect();
+    exec(&h, &format!("INSERT INTO t VALUES {}", rows_sql.join(", ")));
+    let queries = [
+        "SELECT id, max(s) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS mx, min(s) OVER (PARTITION BY g ORDER BY id) AS mn FROM t",
+        "SELECT id, sum(f) OVER (PARTITION BY g ORDER BY id) AS a, sum(f) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 2 FOLLOWING AND UNBOUNDED FOLLOWING) AS b FROM t",
+    ];
+    for (i, q) in queries.iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    let mut next = 1000;
+    for step in 0..60 {
+        let sql = match rng.below(4) {
+            0 => {
+                next += 1;
+                format!("INSERT INTO t VALUES {}", row(&mut rng, next))
+            }
+            1 => format!("DELETE FROM t WHERE id = {}", rng.below(120)),
+            2 => format!("UPDATE t SET s = '{prefix}{}' WHERE id % 7 = {}", rng.below(50), rng.below(7)),
+            _ => format!("UPDATE t SET f = -f WHERE id % 5 = {}", rng.below(5)),
+        };
+        exec(&h, &sql);
+        for (i, q) in queries.iter().enumerate() {
+            let want = rows_of(&h, q).map(sorted);
+            let got = rows_of(&h, &format!("SELECT * FROM v{i}")).map(sorted);
+            assert_eq!(got, want, "step {step} ({sql}): view {i}: {q}");
+        }
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
