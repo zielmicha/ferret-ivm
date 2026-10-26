@@ -99,7 +99,7 @@ pub fn start(
     name: String,
     def: SourceDef,
     tables: Vec<SourceTable>,
-    state: String,
+    state: postgres::SourceState,
     resume_lsn: u64,
     engine: EngineHandle,
 ) -> Result<SourceHandle> {

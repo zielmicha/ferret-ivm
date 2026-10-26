@@ -143,6 +143,7 @@ The first payload byte is the record tag (`LogRecord::encode` / `decode`):
 | 3 | `Progress` | `uvarint source`, `uvarint lsn`, `str state` |
 | 4 | `Schema` | `uvarint source`, `uvarint table`, `bytes columns_json`, `uvarint k`, `k × uvarint pk_column` |
 | 5 | `Tick` | `ivarint micros` |
+| 6 | `ProgressDelta` | `uvarint source`, `uvarint lsn`, `str delta` |
 
 Any other tag is a decoding error (`bad log record tag`).
 
@@ -163,11 +164,13 @@ truncation a source logs before re-copying a table.
 | 3 | `Insert` | `row` | add one instance (multiset tables) |
 | 4 | `Remove` | `row` | remove one instance (multiset tables) |
 | 5 | `Truncate` | — | remove all rows, including those the commit changed before it |
+| 6 | `UpsertIfPresent` | as `Upsert` | as `Upsert`, except that the listed columns are taken only from the key's current row (not from a row deleted just before), and without one it changes nothing. Sources log it for an update with unchanged TOASTed values of a table being copied: a key without a row there has not been copied yet, and its copy brings the whole row |
 
 Changes apply in order. Tables with a key receive `Upsert`, `Delete` and
 `Truncate` (an `Insert` or `Remove` there sets or deletes the row's key);
 multiset tables receive `Insert`, `Remove` and `Truncate` (an `Upsert` or
-`Delete` there adds or removes one instance of the row). The DBLog snapshot
+`Delete` there adds or removes one instance of the row; an
+`UpsertIfPresent` adds one, as `Upsert`). The DBLog snapshot
 of a multiset table is logged as `Truncate` followed by an `Insert` per row.
 
 `row` is a row in the [row codec](#row-codec). Example (local
@@ -228,6 +231,20 @@ table 1000, `Delete`, key row with one value, int4 4.
   parse is taken as empty (the slot counts as not created and every table
   is copied again). Progress records of a source that is no longer in the
   catalog are ignored.
+
+**ProgressDelta** — a change of a source's bookkeeping: the entries of its
+state that changed since its previous progress record, so that copying `T`
+tables logs `O(T)` bytes of progress rather than `O(T²)`.
+
+- `lsn`: as in `Progress`.
+- `delta`: JSON `StateDelta` (`source::postgres`):
+  `{"slot_created": bool, "tables": {"<table id>": SnapState}}`, where
+  `SnapState` is a table's entry as in `Progress` and `slot_created` is
+  absent unless it changed. Applying it sets `slot_created` if present and
+  replaces the listed tables' entries; the other entries stay. A delta that
+  does not parse empties the source's state, as a `Progress` state that does
+  not parse does. Records of a source that is no longer in the catalog are
+  ignored.
 
 **Schema** — an upstream table changed shape or key: the source `ObjectId`,
 the table `ObjectId`, the new columns as a JSON array of `Column` (key
@@ -522,7 +539,7 @@ with `serde_json`):
 | `catalog.instance_id` | 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted; `null` before that (and if absent) |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view with a dataflow: its error records `[[sqlstate, message], count]` |
-| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records) |
+| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records), after the `Progress` and `ProgressDelta` records up to the checkpoint |
 | `source_lsns` | per source: the end LSN of its last logged commit (resume point); `[]` if absent |
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
@@ -927,7 +944,9 @@ Consequences of code changes for an existing data directory:
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
 Data directories written by earlier versions of the engine are compatible:
-the formats have only gained fields with defaults. New functions (registered
+the formats have only gained fields with defaults, and records and change
+kinds with tags of their own (`ProgressDelta`, `UpsertIfPresent`), which
+earlier versions cannot read. New functions (registered
 among the existing ones, which renumbers the later ones) and planner fixes
 did change the fingerprints of many views' arrangements (for example joins
 on computed keys, whose keys are materialized in an `Mfp` node, semijoins

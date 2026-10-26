@@ -192,15 +192,53 @@ pub struct SourceState {
     pub tables: BTreeMap<ObjectId, SnapState>,
 }
 
-/// A source's logged `state` with the snapshot of `table` to be done again
-/// (as the source does on a schema change). A pending truncate is kept: the
-/// source logs its reset state, with the truncate a key change needs, just
-/// before the schema record, and the table's copy may start long after it.
-pub fn snapshot_again(state: &str, table: ObjectId) -> String {
-    let mut s: SourceState = serde_json::from_str(state).unwrap_or_default();
-    let truncate = s.tables.get(&table).is_some_and(|t| t.truncate);
-    s.tables.insert(table, SnapState { truncate, ..SnapState::default() });
-    serde_json::to_string(&s).unwrap()
+/// The entries of a source's state that changed, as a `ProgressDelta`
+/// record carries them (the others stay as they are).
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct StateDelta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_created: Option<bool>,
+    #[serde(default)]
+    pub tables: BTreeMap<ObjectId, SnapState>,
+}
+
+impl SourceState {
+    /// The state a `Progress` record (or a checkpoint) holds. One that does
+    /// not parse is empty: the slot counts as not created, and every table
+    /// is copied again.
+    pub fn parse(state: &str) -> SourceState {
+        serde_json::from_str(state).unwrap_or_default()
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+
+    /// Apply the change a `ProgressDelta` record carries. One that does not
+    /// parse empties the state, as a full state that does not parse would.
+    pub fn apply(&mut self, delta: &str) {
+        match serde_json::from_str::<StateDelta>(delta) {
+            Ok(d) => {
+                if let Some(created) = d.slot_created {
+                    self.slot_created = created;
+                }
+                self.tables.extend(d.tables);
+            }
+            Err(e) => {
+                log::error!("a source's progress record does not parse ({e}): its slot is created and its tables copied again");
+                *self = SourceState::default();
+            }
+        }
+    }
+
+    /// The snapshot of `table` is to be done again (as the source does on a
+    /// schema change). A pending truncate is kept: the source logs its reset
+    /// state, with the truncate a key change needs, just before the schema
+    /// record, and the table's copy may start long after it.
+    pub fn snapshot_again(&mut self, table: ObjectId) {
+        let truncate = self.tables.get(&table).is_some_and(|t| t.truncate);
+        self.tables.insert(table, SnapState { truncate, ..SnapState::default() });
+    }
 }
 
 /// Mapping of an upstream relation onto a catalog table.
@@ -1126,7 +1164,7 @@ fn reshape_changes(changes: &mut Vec<(ObjectId, TableChange)>, old: &SourceTable
             return true;
         }
         match ch {
-            TableChange::Upsert { row, unchanged } => {
+            TableChange::Upsert { row, unchanged } | TableChange::UpsertIfPresent { row, unchanged } => {
                 *row = reshape(row);
                 *unchanged = unchanged.iter().filter_map(|u| old.columns.get(*u).and_then(|c| pos(&c.name))).collect();
             }
@@ -1222,13 +1260,12 @@ pub fn run(
     name: String,
     def: SourceDef,
     tables: Vec<SourceTable>,
-    state: String,
+    state: SourceState,
     resume_lsn: u64,
     engine: EngineHandle,
     ctl: Receiver<SourceCtl>,
     status: Arc<Mutex<String>>,
 ) {
-    let state: SourceState = serde_json::from_str(&state).unwrap_or_default();
     let gauges = super::gauges(&engine.shared, id);
     let mut src = PgSource {
         id,
@@ -1569,7 +1606,7 @@ mod tests {
             for (t, ch) in changes {
                 assert_eq!(*t, 10);
                 match ch {
-                    TableChange::Upsert { row, .. } => {
+                    TableChange::Upsert { row, .. } | TableChange::UpsertIfPresent { row, .. } => {
                         keyed.insert(row[0].as_i64().unwrap(), row.clone());
                     }
                     TableChange::Delete { key } => {
@@ -1789,7 +1826,8 @@ mod tests {
         // truncate must survive it (a restart before the table's first chunk
         // used to copy it over the rows deleted by the old key)
         let LogRecord::Progress { state, .. } = &recs[0] else { unreachable!() };
-        let st: SourceState = serde_json::from_str(&snapshot_again(state, 10)).unwrap();
+        let mut st = SourceState::parse(state);
+        st.snapshot_again(10);
         assert!(!st.tables[&10].done && st.tables[&10].truncate);
     }
 

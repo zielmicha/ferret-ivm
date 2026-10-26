@@ -128,16 +128,13 @@ impl Engine {
     /// contents are no state the upstream ever had); cached per epoch.
     fn loading_tables(&mut self) -> &std::collections::HashSet<ObjectId> {
         if self.loading.0 != self.snap_epoch || self.snap_epoch == 0 {
-            let mut states: HashMap<ObjectId, crate::source::postgres::SourceState> = HashMap::new();
             let mut set = std::collections::HashSet::new();
             for o in self.catalog.objects.values() {
                 if let ObjectKind::Table(t) = &o.kind
                     && let Some(src) = t.source
                 {
-                    let st = states
-                        .entry(src)
-                        .or_insert_with(|| self.source_states.get(&src).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default());
-                    if !st.tables.get(&o.id).is_some_and(|s| s.done) {
+                    let st = self.source_states.get(&src);
+                    if !st.and_then(|st| st.tables.get(&o.id)).is_some_and(|s| s.done) {
                         set.insert(o.id);
                     }
                 }

@@ -178,8 +178,9 @@ pub struct Engine {
     pub(crate) snap_epoch_seen: u64,
     /// (epoch, replicated tables still loading their initial snapshot)
     pub(crate) loading: (u64, std::collections::HashSet<ObjectId>),
-    /// Per-source progress state (opaque JSON owned by the source).
-    pub source_states: HashMap<ObjectId, String>,
+    /// Per-source progress state (snapshot bookkeeping owned by the
+    /// source), as its `Progress` and `ProgressDelta` records leave it.
+    pub source_states: HashMap<ObjectId, crate::source::postgres::SourceState>,
     /// LSN of the last logged commit per source (resume point).
     pub source_lsns: HashMap<ObjectId, u64>,
     pub(crate) handle: Option<EngineHandle>,
@@ -464,7 +465,7 @@ impl Engine {
         } else {
             self.ticks = app.ticks.into_iter().collect();
         }
-        self.source_states = app.source_states.into_iter().collect();
+        self.source_states = app.source_states.iter().map(|(id, s)| (*id, crate::source::postgres::SourceState::parse(s))).collect();
         self.source_lsns = app.source_lsns.into_iter().collect();
         self.shared.slot_drops.lock().extend(app.slot_drops);
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
@@ -775,7 +776,14 @@ impl Engine {
             LogRecord::Progress { source, lsn: _, state } => {
                 self.processed = gsn;
                 if self.catalog.get(source).is_some() {
-                    self.source_states.insert(source, state);
+                    self.source_states.insert(source, crate::source::postgres::SourceState::parse(&state));
+                }
+                self.snap_epoch += 1;
+            }
+            LogRecord::ProgressDelta { source, lsn: _, delta } => {
+                self.processed = gsn;
+                if self.catalog.get(source).is_some() {
+                    self.source_states.entry(source).or_default().apply(&delta);
                 }
                 self.snap_epoch += 1;
             }
@@ -790,7 +798,7 @@ impl Engine {
                 // by earlier versions reset the state after the schema
                 // record).
                 if let Some(state) = self.source_states.get_mut(&source) {
-                    *state = crate::source::postgres::snapshot_again(state, table);
+                    state.snapshot_again(table);
                 }
                 self.snap_epoch += 1;
                 if let Err(e) = r {
@@ -898,7 +906,7 @@ impl Engine {
             catalog: self.catalog.clone(),
             trees: self.graph.arrangement_trees().into_iter().collect(),
             view_errors: self.rt.views.iter().map(|(id, v)| (*id, v.errors.clone().into_iter().collect())).collect(),
-            source_states: self.source_states.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            source_states: self.source_states.iter().map(|(k, v)| (*k, v.to_json())).collect(),
             source_lsns: self.source_lsns.iter().map(|(k, v)| (*k, *v)).collect(),
             next_req: self.next_req,
             clock: self.clock,
