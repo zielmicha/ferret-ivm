@@ -50,99 +50,137 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
     Ok((hi << 32) | lo)
 }
 
-/// Rows per chunk of a snapshot sent to a sink or a subscriber.
+/// Rows per chunk of a snapshot sent to a sink or a subscriber (or about
+/// `SNAPSHOT_CHUNK_BYTES` of memory, whichever comes first).
 pub(crate) const SNAPSHOT_CHUNK_ROWS: usize = 10_000;
+pub(crate) const SNAPSHOT_CHUNK_BYTES: usize = 4 << 20;
 
 /// A query result goes to the session in chunks of this many rows, or of
 /// about `RESULT_CHUNK_BYTES` (estimated), whichever comes first.
 const RESULT_CHUNK_ROWS: usize = 1024;
 const RESULT_CHUNK_BYTES: usize = 256 << 10;
 
-/// Answers a read with its rows as they are found: a result of one chunk
-/// as `ExecResult::Query` (an error before it is complete fails the
+/// A read on the engine thread keeps its rows until it is done (it may
+/// still turn out too large and run again off the engine thread, which
+/// only one that has sent nothing can): beyond this many rows, or this much
+/// memory, it fails with `READ_BUDGET`, as one that visits too many entries.
+const INLINE_RESULT_ROWS: usize = super::reader::INLINE_READ_ENTRIES as usize;
+const INLINE_RESULT_BYTES: usize = 8 << 20;
+
+/// Answers a read with its rows in chunks: a result of one chunk as
+/// `ExecResult::Query` (an error before it is complete fails the
 /// statement), a larger one as `ExecResult::Rows`, whose first chunk is in
-/// the reply and the rest follow (an error then ends the rows).
+/// the reply and the rest follow (an error then ends the rows). Chunks are
+/// counted in the memory of the outputs until the session drops them. Off
+/// the engine thread (`streaming`) a chunk is sent as soon as it is full,
+/// the reader waiting for the session to take it (`coord::stream`); on it,
+/// the chunks are kept until the read is done (`INLINE_RESULT_ROWS`).
 pub(crate) struct ChunkedReply {
     columns: Vec<ResultColumn>,
-    reply: Sender<Result<ExecResult>>,
+    reply: Option<Sender<Result<ExecResult>>>,
+    meter: Arc<crate::memory::Meter>,
     chunk: Vec<Row>,
+    /// The chunk's estimated encoded bytes, and its memory.
     bytes: usize,
-    rest: Option<Sender<Result<Vec<Row>>>>,
+    mem: usize,
+    /// The full chunks kept (on the engine thread), with their memory.
+    kept: Vec<(Vec<Row>, usize)>,
+    rows: usize,
+    kept_mem: usize,
+    /// Off the engine thread: what stops the reader while the session does
+    /// not take its rows, until the stream after the first chunk is made...
+    stop: Option<Box<dyn Fn() -> bool + Send>>,
+    /// ... and the stream.
+    rest: Option<super::stream::ChunkSender<Vec<Row>>>,
 }
 
 impl ChunkedReply {
-    pub(crate) fn new(columns: Vec<ResultColumn>, reply: Sender<Result<ExecResult>>) -> ChunkedReply {
-        ChunkedReply { columns, reply, chunk: Vec::new(), bytes: 0, rest: None }
+    /// A reply on the engine thread, which keeps the rows until the end.
+    pub(crate) fn kept(columns: Vec<ResultColumn>, reply: Sender<Result<ExecResult>>, meter: Arc<crate::memory::Meter>) -> ChunkedReply {
+        ChunkedReply { columns, reply: Some(reply), meter, chunk: Vec::new(), bytes: 0, mem: 0, kept: Vec::new(), rows: 0, kept_mem: 0, stop: None, rest: None }
     }
 
-    /// Add a row; false once nobody reads the rows any more.
-    pub(crate) fn push(&mut self, row: Row) -> bool {
+    /// A reply off the engine thread, which streams the rows; `stop` ends
+    /// the read while the session does not take them.
+    pub(crate) fn streaming(
+        columns: Vec<ResultColumn>,
+        reply: Sender<Result<ExecResult>>,
+        meter: Arc<crate::memory::Meter>,
+        stop: Box<dyn Fn() -> bool + Send>,
+    ) -> ChunkedReply {
+        ChunkedReply { stop: Some(stop), ..ChunkedReply::kept(columns, reply, meter) }
+    }
+
+    /// Add a row; false once nobody reads the rows any more. On the engine
+    /// thread, `READ_BUDGET` once it keeps too much.
+    pub(crate) fn push(&mut self, row: Row) -> Result<bool> {
         self.bytes += row.iter().map(crate::types::codec::approx_len).sum::<usize>();
+        self.mem += std::mem::size_of::<Row>() + crate::memory::row_heap(&row);
         self.chunk.push(row);
         if self.chunk.len() < RESULT_CHUNK_ROWS && self.bytes < RESULT_CHUNK_BYTES {
-            return true;
+            return Ok(true);
         }
         let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(RESULT_CHUNK_ROWS));
+        let mem = std::mem::take(&mut self.mem);
         self.bytes = 0;
+        if self.stop.is_none() && self.rest.is_none() {
+            self.rows += chunk.len();
+            self.kept_mem += mem;
+            if self.rows > INLINE_RESULT_ROWS || self.kept_mem > INLINE_RESULT_BYTES {
+                return Err(SqlError::new(crate::storage::READ_BUDGET, "the read returned more rows than its budget"));
+            }
+            self.kept.push((chunk, mem));
+            return Ok(true);
+        }
         match &self.rest {
-            Some(tx) => tx.send(Ok(chunk)).is_ok(),
+            Some(tx) => Ok(tx.send(chunk, mem)),
             None => {
-                let (tx, rx) = unbounded();
+                let (tx, rest) = super::stream::bounded(self.meter.clone(), self.stop.take().expect("a streaming reply"));
                 self.rest = Some(tx);
-                let rows = RowStream { first: Some(chunk), rx };
-                self.reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows })).is_ok()
+                let rows = RowStream { first: Some(super::stream::Chunk::new(chunk, self.meter.charge(mem))), rest };
+                let reply = self.reply.take().expect("a reply");
+                Ok(reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows })).is_ok())
             }
         }
     }
 
-    pub(crate) fn finish(self, r: Result<()>) {
-        let ChunkedReply { columns, reply, chunk, rest, .. } = self;
-        match rest {
-            None => {
-                let _ = reply.send(r.map(|()| ExecResult::Query { columns, rows: chunk }));
+    /// The reply channel back (a read on the engine thread that goes on
+    /// elsewhere; it sent nothing).
+    pub(crate) fn abandon(mut self) -> Sender<Result<ExecResult>> {
+        self.reply.take().expect("a reply that was not sent")
+    }
+
+    /// The end of the rows, or the error that ends them.
+    pub(crate) fn finish(mut self, r: Result<()>) {
+        if let Some(tx) = self.rest.take() {
+            match r {
+                Ok(()) if !self.chunk.is_empty() => {
+                    tx.send(std::mem::take(&mut self.chunk), self.mem);
+                }
+                Ok(()) => {}
+                Err(e) => tx.fail(e),
             }
-            Some(tx) => {
-                let _ = tx.send(r.map(|()| chunk));
-            }
+            return;
         }
+        let reply = self.reply.take().expect("a reply");
+        let mut kept = std::mem::take(&mut self.kept);
+        if kept.is_empty() {
+            let _ = reply.send(r.map(|()| ExecResult::Query { columns: std::mem::take(&mut self.columns), rows: std::mem::take(&mut self.chunk) }));
+            return;
+        }
+        let (first, mem) = kept.remove(0);
+        let mut end = Ok(());
+        match r {
+            Ok(()) if !self.chunk.is_empty() => kept.push((std::mem::take(&mut self.chunk), self.mem)),
+            Ok(()) => {}
+            Err(e) => end = Err(e),
+        }
+        let rows = RowStream { first: Some(super::stream::Chunk::new(first, self.meter.charge(mem))), rest: super::stream::ready(&self.meter, kept, end) };
+        let _ = reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows }));
     }
 }
 
 impl Engine {
-    /// The current contents of dataflow node `node`, handed to `f` in
-    /// chunks of at most `SNAPSHOT_CHUNK_ROWS` rows. An arranged node is
-    /// read from its arrangement chunk by chunk, so no copy of the whole
-    /// relation is built here (a node without one is computed whole).
-    pub(crate) fn snapshot_chunks(&mut self, node: NodeId, f: &mut dyn FnMut(crate::dataflow::Delta)) -> Result<()> {
-        let Some(a) = self.graph.any_arrangement(node) else {
-            let mut rows = self.graph.snapshot(&mut self.env, node)?.data.into_iter();
-            loop {
-                let chunk: Vec<_> = rows.by_ref().take(SNAPSHOT_CHUNK_ROWS).collect();
-                if chunk.is_empty() {
-                    return Ok(());
-                }
-                f(chunk);
-            }
-        };
-        let arr = self.graph.arr(a);
-        let (layout, tree) = (&arr.layout, arr.tree);
-        let mut chunk = Vec::new();
-        self.env.for_each(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
-            let w = h.weight(ReadAt::Latest);
-            if w != 0 {
-                chunk.push((layout.decode_row(k)?, w));
-                if chunk.len() >= SNAPSHOT_CHUNK_ROWS {
-                    f(std::mem::take(&mut chunk));
-                }
-            }
-            Ok(true)
-        })?;
-        if !chunk.is_empty() {
-            f(chunk);
-        }
-        Ok(())
-    }
-
     pub(crate) fn execute(
         &mut self,
         stmt: Statement,
@@ -400,28 +438,18 @@ impl Engine {
         bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
         // within a budget on the engine thread, or else off it; the rows go
         // to the session in chunks as they are found
-        let columns = result_columns(&bq);
-        let mut rows = Vec::new();
-        self.env.set_read_budget(Some(super::reader::INLINE_READ_ENTRIES));
-        let r = self.read_query(&bq, at, &mut |row| {
-            rows.push(row);
-            Ok(true)
-        });
+        let mut res = ChunkedReply::kept(result_columns(&bq), reply, self.shared.mem.outputs.clone());
+        // (without threads, no budget: there is nowhere else to go)
+        let budget = self.handle.is_some().then_some(super::reader::INLINE_READ_ENTRIES);
+        self.env.set_read_budget(budget);
+        let r = self.read_query(&bq, at, &mut |row| res.push(row));
         self.env.set_read_budget(None);
         match r {
             // (it sent nothing yet: it runs again there)
-            Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, at, vars, reply)?,
+            Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, at, vars, res.abandon())?,
             // (parked, to run again once the relation is hydrated)
             Err(e) if e.code == super::hydrate::HYDRATING => return Err(e),
-            r => {
-                let mut res = ChunkedReply::new(columns, reply);
-                for row in rows {
-                    if !res.push(row) {
-                        break;
-                    }
-                }
-                res.finish(r.map(|_| ()));
-            }
+            r => res.finish(r.map(|_| ())),
         }
         Ok(None)
     }

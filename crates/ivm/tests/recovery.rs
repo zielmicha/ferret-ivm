@@ -5,6 +5,7 @@ use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
 use ivm::types::text::format_datum;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
@@ -214,7 +215,8 @@ fn log_tail_lost_behind_a_checkpoint() {
 
 /// A commit larger than a log frame (a statement inserting 3 MB) is logged
 /// as a parts file of bounded frames and a CommitParts record, and is
-/// replayed from them after a crash.
+/// replayed from them after a crash; the checkpoint that covers it deletes
+/// the parts file with the log segments before it.
 #[test]
 fn large_commits_replay_from_their_parts() {
     let dir = tmpdir("parts");
@@ -233,6 +235,14 @@ fn large_commits_replay_from_their_parts() {
     let h = running.handle.clone();
     assert_eq!(rows(&h, "SELECT * FROM c"), ["2000|2000000"]);
     assert_eq!(rows(&h, "SELECT count(*), min(id) FROM t"), ["2000|1001"]);
+    assert_eq!(parts(), 1);
+    exec(&h, "CHECKPOINT");
+    // (the sequencer truncates after the checkpoint is committed)
+    let t0 = std::time::Instant::now();
+    while parts() != 0 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the checkpoint left the parts file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

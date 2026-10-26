@@ -256,7 +256,7 @@ background, retried until the upstream answers. Check
   history covers the requested GSN.
 - Changes queued for a subscription or a sink are bounded in memory: a
   subscription whose client does not keep up ends with `53000`, a sink that
-  does not keep up is restarted from a snapshot (see
+  does not keep up resynchronises its target from a snapshot (see
   [Operations](operations.md#memory)).
 - Upstream: PostgreSQL 14+, not `SQL_ASCII`; tables need a primary key,
   `REPLICA IDENTITY USING INDEX` or `REPLICA IDENTITY FULL`; publication row

@@ -56,7 +56,7 @@ Where the implementation differs from the design:
 | `ivm-signals` | | turns the first `SIGINT`/`SIGTERM` into a shutdown request; a second one exits the process at once (status 1) |
 | `ivm-sequencer` | the input-log writer | assigns GSNs, appends and `fsync`s records in batches, generates clock ticks, acknowledges submitters, forwards durable records to the engine |
 | `ivm-engine` (64 MiB stack) | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, begins and finishes checkpoints, builds the web UI's snapshots |
-| `ivm-reader-<n>` (four, started by the first large read; 64 MiB stack) | forks of the storage, copies of parts of the graph | run reads that exceeded their budget on the engine thread ([Planner](planner.md#batch-execution)) and answer their clients; take large snapshots for starting sinks and subscriptions |
+| `ivm-reader-<n>` (four, started by the first large read; 64 MiB stack) | forks of the storage, copies of parts of the graph | run reads that exceeded their budget on the engine thread ([Planner](planner.md#batch-execution)), streaming their rows to their sessions as these take them; read large snapshots for subscriptions and for sinks resynchronising their targets, likewise |
 | `ivm-checkpoint` (while a checkpoint is written) | a frozen version of the dirty nodes and the manifest (the append side is shared) | writes the nodes, `fsync`s and appends the manifest record with the header naming the metadata tree ([Recovery](recovery.md#checkpoints)) |
 | `ivm-session-<n>` (one per client, 16 MiB stack) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
@@ -81,8 +81,9 @@ channels of capacity 1) and a small block of shared state
 (`coord::api::Shared`). What the channels hold is bounded in bytes of
 memory instead ([Memory](#memory)): records submitted to the log and not
 yet applied by sources waiting for room, the queues to subscriptions and
-sinks by their consumers' limits. (The channels carrying a query's result
-chunks to its session are not bounded.) The web UI keeps at most 16 of its
+sinks by their consumers' limits, the rows a reader thread streams to a
+session or sink by the few chunks in flight (`coord::stream`). The web UI
+keeps at most 16 of its
 snapshot requests queued at the engine.
 
 | Shared field | Meaning |
@@ -271,10 +272,10 @@ round):
 | Message | Action |
 |---|---|
 | `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, send every sink the last applied GSN as its progress, re-check parked reads. While a hydration is in progress, a `Schema` record or a `Ddl` record replacing a view or creating a sink, and the records after it, are held until no hydration is; `Commit` and `Tick` records are forwarded to it before they are applied. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
-| `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed (their rows sent to the session in chunks as they are found) or parked; `SUBSCRIBE` is registered (its snapshot sent in chunks); `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
+| `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed within the read budget (their rows sent to the session in chunks) or handed to a reader thread, or parked; `SUBSCRIBE` is registered (its snapshot a stream of chunks, read off the engine thread when large); `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | ask for a checkpoint: answered with its GSN once one begun after the request is committed |
-| `Request(SinkSnapshot)` | a sink thread resynchronizes its target: read its relation at the last applied GSN and send it through the sink's channel in chunks of 10,000 rows (from the arrangement, chunk by chunk), after the changes sent so far ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)) |
+| `Request(SinkSnapshot)` | a sink thread resynchronises its target: send it its relation at the last applied GSN as a stream of chunks of 10,000 rows (read within the read budget, or off the engine thread as the sink writes them), after the changes sent so far, and the changes after it from then on — also to a sink that had fallen behind; a sink held for a replacement still being hydrated is answered once it follows the new version ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)) |
 | `Request(Inspect)` | build a snapshot for the web UI (`coord/inspect.rs`) between two records, so that it is consistent at one GSN, and hand it to the requester's callback |
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
 | `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress (except one that fell behind, or one held for a replacement still being hydrated, which was not sent the records since) and ask it to stop, stop the sequencer, take a final checkpoint after the one being written, if any (not after a simulated crash, which only waits for that one to be written), wait up to 5 s for sources and sinks, exit |
@@ -285,8 +286,7 @@ sends the records submitted in the round to the sequencer as one
 and `fdatasync`; `log_batches` in `Shared` counts the sequencer's batches),
 finishes the hydration in progress if it has caught up (then applies the
 records held behind it), finishes the checkpoint being written if it is
-done, gives the buffer pool its share of the memory budget, restarts sinks
-that fell behind and have written what they held ([Memory](#memory)),
+done, gives the buffer pool its share of the memory budget,
 begins a checkpoint if one is due or asked for
 ([Recovery](recovery.md#checkpoints): clock ticks alone rarely make one
 due), and removes cancelled subscriptions. The hydration thread sends
@@ -313,8 +313,12 @@ added (retracted ones do not end it); each subscription with `PROGRESS`
 gets a progress mark; each sink gets the changes of its node. Sinks learn
 of the GSNs without changes to their relation from the progress sent after
 each batch of records (and after replay), not from a message per record. A
-node's changes are moved into one shared copy (`SharedRows`) for all of its
-consumers; each queued event, progress marks included, holds a charge on
+node's changes go to all of its consumers as shared copies (`SharedRows`)
+of chunks: those the step kept in memory as one chunk (moved, not copied),
+those it spilled into temporary trees a batch at a time (`Output::spilled`,
+read and then released), so that a large output is never in memory whole
+for its consumers; a sink writes a GSN's changes once all of its chunks
+have come. Each queued event, progress marks included, holds a charge on
 its consumer's queue until the consumer drops it, and a consumer whose
 queue would exceed its limit is not sent the event ([Memory](#memory)).
 
@@ -333,8 +337,9 @@ do not depend on how wide rows are or how they serialize:
 | Part | Meter | Limit | At the limit |
 |---|---|---|---|
 | records submitted to the log and not yet applied | `MemBudget::input` | an eighth, at least 4 MiB | sources wait ([Group commit](#group-commit)) |
-| changes queued for a subscription | `Subscription::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB | the subscription ends with `53000` |
-| changes queued for a sink, until written | `SinkHandle::queue` (likewise) | a sixteenth, at least 4 MiB | the sink falls behind and is restarted |
+| changes queued for a subscription, and the chunks of its snapshot in flight | `Subscription::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB | the subscription ends with `53000` |
+| changes queued for a sink, until written, and the chunks of its snapshot in flight | `SinkHandle::queue` (likewise) | a sixteenth, at least 4 MiB | the sink falls behind and resynchronises its target |
+| query results in flight to sessions | `MemBudget::outputs` | a few chunks per read on a reader thread (it waits for its session); what a read on the engine thread returns, within its budget | the read goes on off the engine thread |
 | aggregation group caches | `Graph::group_caches` | an eighth | the group is not cached, and all caches shrink after the record ([Dataflow](dataflow.md#reduce)) |
 | transient working memory: in-memory deltas and key sets of a GSN, sort buffers of `TreeBuilder`s (the engine's and its forks') | `MemBudget::work` (`memory::Work`, which the engine gives its `Env`, `Env::set_work`, and forks share) | an eighth, set aside from the pool's share | a buffer spills to temporary trees (or applies to its index) beyond half the share (`Work::buffer`, within per-use bounds), or beyond a sixteenth of that while the buffers together exceed the share (`Work::full`) |
 | the buffer pool of a fork of the storage (a hydration, a large read or snapshot) | `MemBudget::forks` (a charge each fork holds while it lives, `Env::hold`) | a sixteenth each (at least 1 MiB) | the fork writes and evicts its own nodes; those it shares with the engine are not counted |
@@ -371,22 +376,24 @@ once written. Consumers never make the engine wait:
   client has taken what was written. Large changes are written as they are
   encoded (every 1 MiB), so a session buffers little of its own.
 - **Sinks.** When an event would take a sink's queue over its limit, the
-  sink falls behind: it is sent nothing more, not even progress marks (a
-  progress row past changes the target did not get would let a restarted
-  sink resume without resynchronising). Once its thread has written or
-  dropped everything it held (its queue's meter is back to zero, which also
-  shows that the thread is not stuck), the engine stops it and starts the
-  sink again from a snapshot of its relation at the current GSN, which
-  rewrites the target, as a sink created anew does
-  ([Sinks](../user-guide/sinks.md#start-up-and-resynchronisation)).
+  sink falls behind: it is told so (`SinkMsg::Behind`) and sent nothing
+  more, not even progress marks (a progress row past changes the target
+  did not get would let a restarted sink resume without resynchronising).
+  Its thread drops the changes it held (releasing them) and, once it can
+  write, asks for a snapshot (`Request::SinkSnapshot`), which it writes
+  over its target; the engine sends it the changes after the snapshot's
+  GSN from then on ([Sinks](../user-guide/sinks.md#delivering-changes)).
+  This one bound covers what a sink keeps while it cannot write as well.
+- **Snapshots and large results** are streams of chunks
+  (`coord::stream`): a reader thread reads them from a fork as the
+  consumer takes them, a couple of chunks ahead, and stops when the
+  consumer goes away (or the statement or subscription is cancelled while
+  it waits). A slow client holds its reader thread, not memory.
 
 Not covered: the nodes a fork still shares with the engine once the
 engine has evicted or replaced its own copies, the rows a hydration or a
-join has in flight (a few batches, sized from the working memory), what a
-hydration keeps for a `SUBSCRIBE` it hydrates (its snapshot and the changes
-until the handoff) and what the engine keeps for a snapshot taken on a
-reader thread, ad-hoc query results and the buffers of session, source and
-sink threads.
+join has in flight (a few batches, sized from the working memory), and the
+buffers of session, source and sink threads.
 
 ## The GSN clock and frontiers
 

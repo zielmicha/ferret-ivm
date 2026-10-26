@@ -2645,17 +2645,35 @@ impl Env {
             if self.trees.get(&id).is_none_or(|t| t.root.is_some()) {
                 return Err(SqlError::internal(format!("tree {id} to adopt is not an empty tree here")));
             }
-            let t = from.trees.remove(&id).ok_or_else(|| SqlError::internal(format!("no tree {id} to adopt")))?;
-            let root = match t.root {
-                None => None,
-                Some(NodePtr::Disk(loc)) => Some(NodePtr::Disk(loc)),
-                Some(NodePtr::Mem(fid)) => Some(NodePtr::Mem(self.adopt_node(from, fid, NONE, id))),
-            };
-            for (seg, live) in &t.seg_live {
-                self.seg_live.entry(*seg).or_insert((0, 0)).1 += live;
-            }
-            self.trees.insert(id, TreeState { root, ..t });
+            self.adopt_tree(from, id, id)?;
         }
+        Ok(())
+    }
+
+    /// Move temporary tree `id` from fork `from`, where it was created and
+    /// filled, into this environment, under a temporary id of its own
+    /// (returned): the fork and this environment take temporary ids
+    /// independently.
+    pub fn adopt_temp_tree(&mut self, from: &mut Env, id: TreeId) -> Result<TreeId> {
+        self.count_foreign();
+        let summarizer = from.trees.get(&id).ok_or_else(|| SqlError::internal(format!("no tree {id} to adopt")))?.summarizer.clone();
+        let into = self.create_temp_tree(summarizer);
+        self.adopt_tree(from, id, into)?;
+        Ok(into)
+    }
+
+    /// Move fork `from`'s tree `id` here as tree `into` (empty here).
+    fn adopt_tree(&mut self, from: &mut Env, id: TreeId, into: TreeId) -> Result<()> {
+        let t = from.trees.remove(&id).ok_or_else(|| SqlError::internal(format!("no tree {id} to adopt")))?;
+        let root = match t.root {
+            None => None,
+            Some(NodePtr::Disk(loc)) => Some(NodePtr::Disk(loc)),
+            Some(NodePtr::Mem(fid)) => Some(NodePtr::Mem(self.adopt_node(from, fid, NONE, into))),
+        };
+        for (seg, live) in &t.seg_live {
+            self.seg_live.entry(*seg).or_insert((0, 0)).1 += live;
+        }
+        self.trees.insert(into, TreeState { root, ..t });
         Ok(())
     }
 

@@ -530,8 +530,8 @@ fn dropping_a_view_leaves_subscriptions_to_its_twin_alone() {
     let mut acc = std::collections::BTreeMap::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            SubEvent::Data { rows, .. } => {
-                for (r, w) in rows {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                for (r, w) in ev.rows().unwrap() {
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
                 }
             }
@@ -568,9 +568,9 @@ fn replacing_a_view_with_other_columns_ends_its_subscriptions() {
     let mut error = None;
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            SubEvent::Data { rows, .. } => {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
                 assert!(error.is_none(), "rows after the error");
-                for (r, w) in rows {
+                for (r, w) in ev.rows().unwrap() {
                     assert_eq!(r.len(), 2, "a row of another shape: {r:?}");
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
                 }
@@ -603,8 +603,8 @@ fn replacing_a_view_leaves_subscriptions_to_its_twin_alone() {
     exec(&h, "INSERT INTO t VALUES (3, 3)");
     let mut acc = std::collections::BTreeMap::new();
     while let Ok(ev) = rx.try_recv() {
-        if let SubEvent::Data { rows, .. } = ev {
-            for (r, w) in rows {
+        if matches!(ev, SubEvent::Data { .. } | SubEvent::Snapshot { .. }) {
+            for (r, w) in ev.rows().unwrap() {
                 *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
             }
         }
@@ -683,8 +683,9 @@ fn limited_reads_match_sorts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A subscription's snapshot comes in chunks read from the arrangement
-/// (it used to be built whole on the engine thread and sent as one event).
+/// A subscription's snapshot comes in chunks read from the arrangement as
+/// the session takes them (it used to be built whole on the engine thread
+/// and sent as one event).
 #[test]
 fn subscription_snapshots_come_in_chunks() {
     let dir = tmpdir("sub-chunks");
@@ -697,6 +698,7 @@ fn subscription_snapshots_come_in_chunks() {
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(10)).expect("an event") {
             SubEvent::Data { rows, .. } => sizes.push(rows.len()),
+            SubEvent::Snapshot { rows, .. } => sizes.extend(rows.map(|c| c.unwrap().len())),
             SubEvent::Progress { .. } => break,
             SubEvent::Error(e) => panic!("subscription failed: {e}"),
         }

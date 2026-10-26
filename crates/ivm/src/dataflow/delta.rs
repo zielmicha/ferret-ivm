@@ -223,6 +223,14 @@ impl NodeDelta {
         }
     }
 
+    /// The rows of an in-memory delta, moved out (None if spilled).
+    pub fn take_mem(&mut self) -> Option<Delta> {
+        match &mut self.rows {
+            Rows::Mem(d) => Some(std::mem::take(d)),
+            _ => None,
+        }
+    }
+
     /// All rows, in memory.
     pub fn to_vec(&self, env: &mut Env) -> Result<Delta> {
         match &self.rows {
@@ -774,6 +782,126 @@ impl Keys {
                 r
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------ kept changes
+
+/// A node's changes at a series of GSNs, kept for consumers that get them
+/// later: a replaced view's change from its old to its new contents and the
+/// new version's outputs at the records a hydration applied after it, for
+/// the view's subscribers and sinks, which get them once the new version is
+/// live. They are kept in a temporary tree keyed by the GSN and the row (in
+/// the index by all columns, `spill_layout`), loaded through a
+/// `TreeBuilder`, so that they take bounded memory however large, and are
+/// read back in GSN order a batch at a time. Equal rows at a GSN add up.
+pub struct GsnDeltas {
+    layout: Arc<Layout>,
+    tree: TreeId,
+    builder: Option<TreeBuilder>,
+    /// Every GSN recorded, in order, with the error records at it.
+    gsns: Vec<(Gsn, ErrDelta)>,
+}
+
+impl GsnDeltas {
+    /// Changes of a node with output `schema`.
+    pub fn new(env: &mut Env, schema: &[ColumnType]) -> GsnDeltas {
+        let tree = env.create_temp_tree(Arc::new(CountSummarizer));
+        let builder = Some(TreeBuilder::new(env, tree, 1));
+        GsnDeltas { layout: Arc::new(spill_layout(schema)), tree, builder, gsns: Vec::new() }
+    }
+
+    /// Start the changes at `gsn` (after those at earlier GSNs), with
+    /// their error records.
+    pub fn begin(&mut self, gsn: Gsn, errs: ErrDelta) {
+        debug_assert!(self.gsns.last().is_none_or(|(g, _)| *g < gsn));
+        self.gsns.push((gsn, errs));
+    }
+
+    /// Add a row to the changes at the GSN begun last.
+    pub fn push(&mut self, env: &mut Env, row: &Row, w: i64) -> Result<()> {
+        let gsn = self.gsns.last().map(|(g, _)| *g).ok_or_else(|| SqlError::internal("a change kept before its GSN"))?;
+        let mut key = gsn.to_be_bytes().to_vec();
+        key.extend(self.layout.encode_row(row)?);
+        self.builder.as_mut().ok_or_else(|| SqlError::internal("a change kept after the end"))?.push(env, key, w)
+    }
+
+    /// Add a node's output at the GSN begun last (read a batch at a time
+    /// if it was spilled).
+    pub fn push_delta(&mut self, env: &mut Env, d: &NodeDelta) -> Result<()> {
+        d.for_each_batch(env, &mut |env, batch| {
+            for (row, w) in batch {
+                self.push(env, row, *w)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// No more changes: load what is buffered into the tree.
+    pub fn finish(&mut self, env: &mut Env) -> Result<()> {
+        match self.builder.take() {
+            Some(b) => b.finish(env),
+            None => Ok(()),
+        }
+    }
+
+    /// Move the changes, finished in fork `from`, into `env`.
+    pub fn adopt(mut self, env: &mut Env, from: &mut Env) -> Result<GsnDeltas> {
+        self.finish(from)?;
+        self.tree = env.adopt_temp_tree(from, self.tree)?;
+        Ok(self)
+    }
+
+    /// Visit the GSNs in order: `f` gets each one's error records and its
+    /// rows, a batch at a time (`ops::BATCH_ROWS` or about 1 MiB each; at
+    /// least one call per GSN, with an empty batch for one without rows).
+    pub fn for_each(&self, env: &mut Env, f: &mut dyn FnMut(&mut Env, Gsn, &ErrDelta, Delta) -> Result<()>) -> Result<()> {
+        let gsn_of = |k: &[u8]| -> Result<Gsn> {
+            Ok(Gsn::from_be_bytes(k.get(..8).and_then(|b| b.try_into().ok()).ok_or_else(|| SqlError::internal("a kept change without its GSN"))?))
+        };
+        let mut c = env.cursor(self.tree, Bound::Unbounded, Bound::Unbounded);
+        let mut next = env.cursor_next(&mut c)?;
+        for (gsn, errs) in &self.gsns {
+            let mut calls = 0;
+            loop {
+                let mut batch = Vec::new();
+                let mut bytes = 0;
+                let mut more = false;
+                while let Some((k, h)) = next.take() {
+                    if gsn_of(&k)? != *gsn {
+                        next = Some((k, h));
+                        break;
+                    }
+                    if batch.len() >= ops::BATCH_ROWS || bytes >= 1 << 20 {
+                        next = Some((k, h));
+                        more = true;
+                        break;
+                    }
+                    let w = h.total();
+                    if w != 0 {
+                        bytes += k.len();
+                        batch.push((self.layout.decode_row(&k[8..])?, w));
+                    }
+                    next = env.cursor_next(&mut c)?;
+                }
+                if !batch.is_empty() || calls == 0 {
+                    f(env, *gsn, errs, batch)?;
+                    calls += 1;
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the tree (and what is still buffered).
+    pub fn release(mut self, env: &mut Env) -> Result<()> {
+        if let Some(b) = self.builder.take() {
+            b.abort(env)?;
+        }
+        env.drop_tree(self.tree)
     }
 }
 

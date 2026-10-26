@@ -12,7 +12,7 @@
 
 use super::{SinkLimits, SinkMsg};
 use crate::catalog::SinkDef;
-use crate::coord::api::SharedRows;
+use crate::coord::api::{Chunks, SharedRows};
 use crate::dataflow::Delta;
 use crate::error::{Result, SqlError};
 use crate::storage::Gsn;
@@ -378,11 +378,6 @@ fn expand(delta: &Delta) -> impl Iterator<Item = &Row> {
     delta.iter().filter(|(_, w)| *w > 0).flat_map(|(r, w)| std::iter::repeat_n(r, *w as usize))
 }
 
-/// Estimated memory of a delta's rows, for the bound on pending changes.
-fn delta_bytes(delta: &Delta) -> usize {
-    delta.iter().map(|(r, _)| 32 + r.iter().map(crate::types::codec::approx_len).sum::<usize>()).sum()
-}
-
 /// Where a resynchronization of the target stands.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Resync {
@@ -390,11 +385,6 @@ enum Resync {
     Idle,
     /// The engine was asked for a snapshot.
     Asked,
-    /// The snapshot at this GSN is being written, in the transaction opened
-    /// at its first chunk.
-    Writing(Gsn),
-    /// The rest of a snapshot whose writing failed is dropped.
-    Dropping,
 }
 
 struct Sink<'a> {
@@ -407,15 +397,16 @@ struct Sink<'a> {
     /// Ask the engine for a snapshot (`SinkMsg::Snapshot`).
     ask: &'a dyn Fn(),
     writer: Option<Writer>,
-    /// Changes received and not written yet, in GSN order.
+    /// Changes received and not written yet, in GSN order (a GSN's changes
+    /// may come in several chunks). Each holds its charge on the sink's
+    /// queue, which the engine bounds: beyond it, the sink falls behind.
     pending: VecDeque<(Gsn, SharedRows)>,
     pending_rows: usize,
-    pending_bytes: usize,
     /// GSNs at or below this are already in the target.
     applied: Option<Gsn>,
     /// Every change after this GSN has been received (the engine's GSN when
     /// the sink started, then the GSN of the last resynchronization):
-    /// `pending` holds those after `applied`, unless `overflowed`.
+    /// `pending` holds those after `applied`, unless the sink fell behind.
     base: Gsn,
     /// The last GSN the engine delivered (a change, or a GSN without one): once
     /// `pending` is written, the target is the relation as of this GSN, which
@@ -423,13 +414,22 @@ struct Sink<'a> {
     /// made every restart rewrite the target: the restarted engine's snapshot
     /// is always later (clock ticks, other tables).
     seen: Gsn,
+    /// Every change at or below this GSN has been received: a GSN's changes
+    /// can come in several chunks, and it is complete once a later GSN's
+    /// changes, or progress at or after it, arrive (at the latest when the
+    /// sink stops, which comes after everything the engine sent). Only
+    /// complete GSNs are written.
+    complete: Gsn,
+    /// The GSN of the last changes received.
+    last_data: Gsn,
     /// The target has to be rewritten from a snapshot: it was behind `base`
-    /// at the first connection, or changes were dropped (`overflowed`).
+    /// at the first connection, or the sink fell behind (`SinkMsg::Behind`)
+    /// and its changes were dropped.
     resync_needed: bool,
-    /// Pending changes exceeded `limits.pending_bytes` and were dropped:
-    /// only a snapshot can bring the target up to date.
-    overflowed: bool,
     resync: Resync,
+    /// The sink was asked to stop (`SinkHandle::stop`): set before the
+    /// `Stop` message, for a snapshot being written to give up.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     backoff: Duration,
     /// The error of the last attempt to write to the target (a batch, or the
     /// progress row), with the progress that write was to commit: set until a
@@ -452,6 +452,7 @@ pub fn run(
     limits: SinkLimits,
     rx: Receiver<SinkMsg>,
     status: Arc<Mutex<String>>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     ask: &dyn Fn(),
 ) {
     let mut s = Sink {
@@ -465,13 +466,14 @@ pub fn run(
         writer: None,
         pending: VecDeque::new(),
         pending_rows: 0,
-        pending_bytes: 0,
         applied: None,
         base: start_gsn,
         seen: start_gsn,
+        complete: start_gsn,
+        last_data: start_gsn,
         resync_needed: false,
-        overflowed: false,
         resync: Resync::Idle,
+        stopping,
         backoff: RETRY_MIN,
         failure: None,
         failed: None,
@@ -498,7 +500,8 @@ impl Sink<'_> {
                 self.resync = Resync::Asked;
             }
             // a backlog is written without waiting for more
-            let wait = if self.writable() && self.pending_rows > 0 { Duration::ZERO } else { Duration::from_millis(50) };
+            let backlog = self.pending.front().is_some_and(|(g, _)| *g <= self.complete);
+            let wait = if self.writable() && backlog { Duration::ZERO } else { Duration::from_millis(50) };
             match self.rx.recv_timeout(wait) {
                 Ok(m) => self.receive(m),
                 Err(RecvTimeoutError::Disconnected) => self.stop = true,
@@ -623,116 +626,92 @@ impl Sink<'_> {
         match m {
             SinkMsg::Data(g, d) => {
                 self.seen = self.seen.max(g);
-                // (changes before a snapshot that will be written are in it)
-                let covered = self.overflowed && !matches!(self.resync, Resync::Writing(_));
-                if g > self.applied.unwrap_or(self.base) && !covered {
+                if g > self.last_data {
+                    self.complete = self.complete.max(self.last_data);
+                    self.last_data = g;
+                }
+                if g > self.applied.unwrap_or(self.base) {
                     self.pending_rows += d.len();
-                    self.pending_bytes += delta_bytes(&d);
                     self.pending.push_back((g, d));
-                    // (a single change set is kept, however large: the
-                    // engine has it in memory anyway)
-                    if self.pending_bytes > self.limits.pending_bytes && self.pending.len() > 1 {
-                        log::warn!(
-                            "sink {}: more than {} MiB of changes are waiting to be written; dropping them and resynchronizing the target from a snapshot",
-                            self.name,
-                            self.limits.pending_bytes >> 20
-                        );
-                        self.clear_pending();
-                        self.overflowed = true;
-                        self.resync_needed = true;
-                    }
                 }
             }
-            SinkMsg::Progress(g, _) => self.seen = self.seen.max(g),
-            SinkMsg::Snapshot(g, rows) => {
-                if self.start_resync(g) {
-                    let w = self.writer.as_mut().expect("writer");
-                    if let Err(e) = w.insert(expand(&rows)) {
-                        self.resync_failed(e, g);
-                    }
-                }
+            SinkMsg::Progress(g, _) => {
+                self.seen = self.seen.max(g);
+                self.complete = self.complete.max(g);
             }
-            SinkMsg::SnapshotEnd(g, error) => {
-                // (an empty relation's snapshot has no chunks)
-                if self.start_resync(g) {
-                    let w = self.writer.as_mut().expect("writer");
-                    if let Some(e) = error {
-                        w.abort();
-                        self.resync = Resync::Idle;
-                        self.failed = Some((SqlError::internal(format!("the engine could not read the snapshot: {e}")), g));
-                        return;
-                    }
-                    match w.commit(g) {
-                        Ok(()) => {
-                            self.applied = Some(g);
-                            self.base = g;
-                            self.resync_needed = false;
-                            self.overflowed = false;
-                            self.resync = Resync::Idle;
-                            self.failure = None;
-                            self.backoff = RETRY_MIN;
-                            self.last_progress = Instant::now();
-                            self.set_status(format!("running (gsn {g})"));
-                        }
-                        Err(e) => self.resync_failed(e, g),
-                    }
-                }
-                if self.resync == Resync::Dropping {
-                    self.resync = Resync::Idle;
-                }
+            SinkMsg::Behind => {
+                // (the engine sends nothing more until the snapshot)
+                log::warn!(
+                    "sink {}: its unwritten changes reached their memory limit; dropping them and resynchronizing the target from a snapshot",
+                    self.name
+                );
+                self.clear_pending();
+                self.resync_needed = true;
             }
+            SinkMsg::Snapshot(g, rows) => self.write_snapshot(g, rows),
             SinkMsg::Stop => self.stop = true,
         }
     }
 
-    /// A chunk of the snapshot at `gsn` arrived: open the resynchronizing
-    /// transaction at the first one. True if its rows are to be written.
-    fn start_resync(&mut self, gsn: Gsn) -> bool {
-        match self.resync {
-            Resync::Writing(g) => g == gsn,
-            Resync::Asked => {
-                // everything received before the snapshot is in it
-                self.clear_pending();
-                self.overflowed = false;
-                self.seen = self.seen.max(gsn);
-                if self.writer.is_none() {
-                    self.resync = Resync::Dropping;
-                    return false;
-                }
-                self.set_status(format!("resynchronizing to gsn {gsn}"));
-                match self.writer.as_mut().unwrap().begin_resync(gsn) {
-                    Ok(()) => {
-                        self.resync = Resync::Writing(gsn);
-                        true
-                    }
-                    Err(e) => {
-                        self.resync_failed(e, gsn);
-                        false
-                    }
-                }
-            }
-            Resync::Idle | Resync::Dropping => false,
+    /// Write the snapshot at `gsn` that the sink asked for over the target,
+    /// in one transaction: its chunks as they come (a reader thread reads
+    /// them as they are taken). A snapshot it did not ask for (any more) is
+    /// dropped, which stops its reader. If writing it fails, the sink asks
+    /// for a new one once it is connected again.
+    fn write_snapshot(&mut self, gsn: Gsn, rows: Chunks<Delta>) {
+        if self.resync != Resync::Asked {
+            return;
         }
-    }
-
-    /// Writing a snapshot failed: drop the rest of it; once connected
-    /// again, the sink asks for a new one.
-    fn resync_failed(&mut self, e: SqlError, gsn: Gsn) {
-        self.resync = Resync::Dropping;
-        self.failed = Some((e, gsn));
+        self.resync = Resync::Idle;
+        // everything received before the snapshot is in it
+        self.clear_pending();
+        self.seen = self.seen.max(gsn);
+        self.complete = self.complete.max(gsn);
+        let Some(w) = self.writer.as_mut() else { return };
+        *self.status.lock() = format!("resynchronizing to gsn {gsn}");
+        let stopping = self.stopping.clone();
+        let r = (|| {
+            w.begin_resync(gsn)?;
+            for chunk in rows {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        w.abort();
+                        return Err(SqlError::internal(format!("the engine could not read the snapshot: {e}")));
+                    }
+                };
+                if stopping.load(std::sync::atomic::Ordering::Acquire) {
+                    w.abort();
+                    return Err(SqlError::new(crate::error::codes::ADMIN_SHUTDOWN, "the sink is stopping"));
+                }
+                w.insert(expand(&chunk))?;
+            }
+            w.commit(gsn)
+        })();
+        match r {
+            Ok(()) => {
+                self.applied = Some(gsn);
+                self.base = gsn;
+                self.resync_needed = false;
+                self.failure = None;
+                self.backoff = RETRY_MIN;
+                self.last_progress = Instant::now();
+                self.set_status(format!("running (gsn {gsn})"));
+            }
+            Err(_) if self.stopping.load(std::sync::atomic::Ordering::Acquire) => self.stop = true,
+            Err(e) => self.failed = Some((e, gsn)),
+        }
     }
 
     fn clear_pending(&mut self) {
         self.pending.clear();
         self.pending_rows = 0;
-        self.pending_bytes = 0;
     }
 
     fn drop_pending_through(&mut self, gsn: Gsn) {
         while self.pending.front().is_some_and(|(g, _)| *g <= gsn) {
             let (_, d) = self.pending.pop_front().unwrap();
             self.pending_rows -= d.len();
-            self.pending_bytes -= delta_bytes(&d);
         }
     }
 
@@ -744,13 +723,26 @@ impl Sink<'_> {
         }
         let applied = self.applied.unwrap_or(self.base);
         let w = self.writer.as_mut().unwrap();
-        if !self.pending.is_empty() && (self.stop || self.pending_rows > 1000 || self.last_flush.elapsed() > Duration::from_millis(100)) {
+        if self.stop {
+            self.complete = self.seen;
+        }
+        let ready = self.pending.front().is_some_and(|(g, _)| *g <= self.complete);
+        if ready && (self.stop || self.pending_rows > 1000 || self.last_flush.elapsed() > Duration::from_millis(100)) {
             let batch = self.pending.make_contiguous();
-            let mut take = 0;
-            let mut rows = 0;
-            while take < batch.len() && (take == 0 || rows + batch[take].1.len() <= FLUSH_ROWS) {
-                rows += batch[take].1.len();
-                take += 1;
+            // whole GSNs (with every chunk of each), complete ones only
+            let (mut take, mut rows) = (0, 0);
+            while take < batch.len() && batch[take].0 <= self.complete {
+                let g = batch[take].0;
+                let (mut end, mut n) = (take, 0);
+                while end < batch.len() && batch[end].0 == g {
+                    n += batch[end].1.len();
+                    end += 1;
+                }
+                if take > 0 && rows + n > FLUSH_ROWS {
+                    break;
+                }
+                rows += n;
+                take = end;
             }
             let last = batch[take - 1].0;
             let progress = if take == batch.len() { self.seen } else { last };

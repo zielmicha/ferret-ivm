@@ -167,15 +167,17 @@ depend on the size of the graph:
    (`Overlay::for_each_versioned`, which also visits entries the step left
    at weight zero or removed).
 5. A node's output is freed as soon as all its consumers have run: handed
-   to the caller as `Output` (its rows only if the node is observed, its
-   error records always) and its temporary trees dropped. So only the
-   outputs of nodes with consumers still to run are alive at a time, and
-   each is in memory only while small.
+   to the caller as `Output` (its rows only if the node is observed — in
+   memory as they are, or still spilled, `Output::spilled`, for the caller
+   to read in batches and release — its error records always) and its
+   temporary trees dropped otherwise. So only the outputs of nodes with
+   consumers still to run are alive at a time, and each is in memory only
+   while small.
 
 The engine merges the error records of each view's root into the view's
 error counts and forwards the data deltas of subscribed nodes to
-subscriptions and sinks (a spilled one read into memory for that;
-[Architecture](architecture.md#the-engine-loop)).
+subscriptions and sinks, a spilled one a batch at a time
+([Architecture](architecture.md#the-engine-loop)).
 
 ## Arrangements and layouts
 
@@ -723,8 +725,8 @@ Meanwhile:
   statements are answered when that one is.
 - The statement's view or index is in the catalog from *g* on; its DDL
   reply is sent once the fragment is live (a `SUBSCRIBE` is answered then
-  too, with its snapshot as of *g* followed by the changes of the records
-  applied since, as if it had been running from *g*).
+  too: it starts at the GSN the engine is at then, with its snapshot as of
+  that GSN, streamed like any other, and the changes after it).
 - Requests that read a relation still being hydrated — reads of the view,
   DML reading it, `SUBSCRIBE` to it — are parked (`Wait::Hydration`) and run
   again once it is live (a fresh read then reads the latest state, which
@@ -743,9 +745,9 @@ Meanwhile:
   thread (also while it is still hydrating), within a record too, so that a
   commit of any size is forwarded in bounded memory.
   The thread steps its graph observing only the nodes whose outputs it
-  keeps for subscriptions and replaced views, so the outputs of the others
-  stay spilled or are freed as the step goes, as in the engine; its group
-  caches count in the engine's share.
+  keeps for replaced views, so the outputs of the others stay spilled or
+  are freed as the step goes, as in the engine; its group caches count in
+  the engine's share.
 
 What "the view exists as of *g*" means: from *g* on its name is taken, it
 is listed, and DDL can build on it; its contents at every GSN after *g* are
@@ -767,9 +769,13 @@ Replacements need more than the new contents:
   until the hydration is done. Its subscribers (same columns) and sinks are
   held — they get nothing — until then; if there are any, the thread
   computes the change from the old to the new contents as of *g* on the
-  fork, right after hydrating, and the engine then delivers it at *g*,
-  followed by the new version's outputs at the records applied since,
-  before releasing the holds and the old version (`finish_replace`).
+  fork, right after hydrating, and keeps it, with the new version's
+  outputs at the records it applies after *g*, in a temporary tree keyed
+  by GSN and row (`delta::GsnDeltas`, loaded through a `TreeBuilder`); the
+  engine adopts that tree with the fragment (`Env::adopt_temp_tree`) and
+  delivers it a chunk at a time, in GSN order, before releasing the holds
+  and the old version (`finish_replace`). A sink that asked for a snapshot
+  while it was held gets one instead.
   Subscribers and sinks get exactly what an inline replacement at *g* would
   have given them, at the same GSNs, which sinks need: they are idempotent
   by GSN. Sinks of a view whose columns changed start over then (they were
@@ -779,9 +785,9 @@ Replacements need more than the new contents:
   the new version's read arrangement is the old one (the definition planned
   to the same dataflow). Two versions whose read arrangements encode rows
   alike (the same key and columns) are merged in key order, so that only
-  the entries that differ are decoded; others are read a batch at a time
-  into a `DeltaBuf`, which consolidates them (spilling beyond the
-  threshold), so that only the change itself is held in memory.
+  the entries that differ are decoded; others are read a batch at a time,
+  the kept tree adding equal rows up. Nothing of the change is held in
+  memory beyond the builder's buffer.
 - A table rebuilt after an upstream schema change (`apply_schema_change`)
   gets a new, empty Table node at *g*, to which the table's changes are
   routed from then on; the thread first fills its primary index with the

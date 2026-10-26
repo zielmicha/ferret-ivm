@@ -4,6 +4,7 @@
 use crate::coord::api::{ExecResult, Interrupts, ResultColumn, RowStream, SessionVars, SubEvent};
 use crate::coord::{EngineHandle, EngineMsg};
 use crate::error::{codes, Result, SqlError};
+use crate::memory::Charge;
 use crate::sql::parser::{parse_statement, split_statements, AsOf, ShowKind, Statement, SubscribeTarget};
 use crate::sql::ParamSlot;
 use crate::types::text::{format_datum, parse_datum, recv_datum, send_datum};
@@ -87,8 +88,11 @@ struct Portal {
 /// The rows of a portal's result not sent yet.
 struct PortalRows {
     chunk: std::vec::IntoIter<Row>,
+    /// The chunk's memory in the budget, held while the portal holds it.
+    _charge: Charge,
     /// The chunks still to come (a streamed result).
     stream: Option<RowStream>,
+    interrupts: Arc<Interrupts>,
 }
 
 impl PortalRows {
@@ -98,14 +102,18 @@ impl PortalRows {
                 return Some(Ok(r));
             }
             match self.stream.as_mut()?.next_chunk() {
-                Some(Ok(c)) => self.chunk = c.into_iter(),
+                Some(Ok(c)) => {
+                    let (rows, charge) = c.into_parts();
+                    (self.chunk, self._charge) = (rows.into_iter(), charge);
+                }
                 Some(Err(e)) => {
                     self.stream = None;
                     return Some(Err(e));
                 }
                 None => {
                     self.stream = None;
-                    return None;
+                    // (a reader stopped by a cancel ends the rows early)
+                    return self.interrupts.cancelled().then(|| Err(crate::coord::stream::cancelled()));
                 }
             }
         }
@@ -724,10 +732,15 @@ impl Session {
                             return Ok(false);
                         }
                     };
-                    for r in chunk {
-                        self.data_row(&r, &columns, formats)?;
+                    for r in chunk.iter() {
+                        self.data_row(r, &columns, formats)?;
                         n += 1;
                     }
+                }
+                // (a reader stopped by a cancel ends the rows early)
+                if self.interrupts.cancelled() {
+                    self.error(&crate::coord::stream::cancelled());
+                    return Ok(false);
                 }
                 self.out.command_complete(&format!("SELECT {n}"));
                 Ok(true)
@@ -851,18 +864,22 @@ impl Session {
                 }
             };
             match ev {
-                SubEvent::Data { gsn, rows } => {
-                    for (r, diff) in rows.iter() {
-                        let mut vals = vec![Datum::Int8(gsn as i64)];
-                        if progress {
-                            vals.push(Datum::Bool(false));
+                SubEvent::Data { gsn, rows } => self.emit_sub_rows(gsn, &rows, progress, copy, &cols, &binary, &ended)?,
+                // read as it comes, a chunk at a time (its reader waits for
+                // them to be taken)
+                SubEvent::Snapshot { gsn, rows } => {
+                    for chunk in rows {
+                        match chunk {
+                            Ok(c) => self.emit_sub_rows(gsn, &c, progress, copy, &cols, &binary, &ended)?,
+                            Err(e) => {
+                                if copy {
+                                    self.out.copy_done();
+                                }
+                                return Err(e);
+                            }
                         }
-                        vals.push(Datum::Int8(*diff));
-                        vals.extend(r.iter().cloned());
-                        self.emit_sub_row(copy, &cols, &binary, &vals);
-                        // (a large change is written as it is encoded)
-                        if self.out.len() > 1 << 20 {
-                            self.flush_subscription(&ended, copy)?;
+                        if self.interrupts.cancelled() || cancel.load(Ordering::Acquire) {
+                            break;
                         }
                     }
                 }
@@ -882,6 +899,34 @@ impl Session {
             }
             self.flush_subscription(&ended, copy)?;
         }
+    }
+
+    /// Emit the rows of a subscription's change (or snapshot chunk) at
+    /// `gsn`; a large one is written as it is encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_sub_rows(
+        &mut self,
+        gsn: u64,
+        rows: &[(Row, i64)],
+        progress: bool,
+        copy: bool,
+        cols: &[ResultColumn],
+        binary: &[bool],
+        ended: &Mutex<Option<SqlError>>,
+    ) -> Result<()> {
+        for (r, diff) in rows {
+            let mut vals = vec![Datum::Int8(gsn as i64)];
+            if progress {
+                vals.push(Datum::Bool(false));
+            }
+            vals.push(Datum::Int8(*diff));
+            vals.extend(r.iter().cloned());
+            self.emit_sub_row(copy, cols, binary, &vals);
+            if self.out.len() > 1 << 20 {
+                self.flush_subscription(ended, copy)?;
+            }
+        }
+        Ok(())
     }
 
     /// Flush a subscription's output; fails with the error that ended the
@@ -1046,9 +1091,13 @@ impl Session {
             self.pending_copy = matches!(stmt, Statement::Subscribe { copy: true, .. });
             let res = self.run_statement(stmt, portal.params.clone())?;
             match res {
-                ExecResult::Query { columns, rows } => portal.pending = Some((columns, PortalRows { chunk: rows.into_iter(), stream: None })),
+                ExecResult::Query { columns, rows } => {
+                    let rows = PortalRows { chunk: rows.into_iter(), _charge: Charge::none(), stream: None, interrupts: self.interrupts.clone() };
+                    portal.pending = Some((columns, rows))
+                }
                 ExecResult::Rows { columns, rows } => {
-                    portal.pending = Some((columns, PortalRows { chunk: Vec::new().into_iter(), stream: Some(rows) }))
+                    let rows = PortalRows { chunk: Vec::new().into_iter(), _charge: Charge::none(), stream: Some(rows), interrupts: self.interrupts.clone() };
+                    portal.pending = Some((columns, rows))
                 }
                 other => {
                     self.send_result(other, &portal.result_formats, max_rows, false)?;

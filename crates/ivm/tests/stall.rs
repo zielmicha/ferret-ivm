@@ -152,7 +152,7 @@ fn requests_reading_a_hydrating_view_wait_for_it() {
                 let mut n = 0i64;
                 for ev in rx.iter() {
                     match ev {
-                        SubEvent::Data { rows, .. } => n += rows.iter().map(|(_, w)| w).sum::<i64>(),
+                        ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => n += ev.rows().unwrap().iter().map(|(_, w)| w).sum::<i64>(),
                         SubEvent::Progress { .. } => break,
                         SubEvent::Error(e) => panic!("{e}"),
                     }
@@ -267,9 +267,13 @@ fn replacing_a_view_does_not_hold_up_commits() {
     let mut progress = 0;
     for ev in rx.iter() {
         match ev {
-            SubEvent::Data { gsn, rows } => {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                let gsn = match &ev {
+                    SubEvent::Data { gsn, .. } | SubEvent::Snapshot { gsn, .. } => *gsn,
+                    _ => unreachable!(),
+                };
                 assert!(gsn > progress || gsn == progress && progress > 0, "data at {gsn} after progress {progress}");
-                for (r, w) in rows {
+                for (r, w) in ev.rows().unwrap() {
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_default() += w;
                 }
             }
@@ -368,8 +372,8 @@ fn replacing_a_view_by_an_existing_definition_keeps_its_subscription_complete() 
     let mut acc: std::collections::BTreeMap<String, i64> = Default::default();
     for ev in rx.iter() {
         match ev {
-            SubEvent::Data { rows, .. } => {
-                for (r, w) in rows {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                for (r, w) in ev.rows().unwrap() {
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_default() += w;
                 }
             }
@@ -463,8 +467,8 @@ fn subscriptions_to_queries_add_up_while_they_hydrate() {
     let mut progress = 0;
     for ev in rx.iter() {
         match ev {
-            SubEvent::Data { rows, .. } => {
-                for (r, w) in rows {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                for (r, w) in ev.rows().unwrap() {
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_default() += w;
                 }
             }
@@ -667,11 +671,14 @@ fn large_reads_do_not_hold_up_commits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The snapshot of a large view that a subscription starts with is taken
-/// off the engine thread: commits are applied and answered meanwhile, and
-/// the snapshot (as of the GSN the subscription started at) and the changes
-/// after it add up to the view's contents. (A sink's starting snapshot is
-/// taken the same way.)
+/// The snapshot of a large view that a subscription starts with is read
+/// off the engine thread, as the subscriber takes it: the subscription is
+/// answered at once, commits are applied and answered while the snapshot
+/// has not been read yet, what is in flight meanwhile stays a few chunks
+/// (counted in the outputs' memory), and the snapshot (as of the GSN the
+/// subscription started at) and the changes after it add up to the view's
+/// contents. (A sink's snapshot is read the same way.) It used to be built
+/// whole, on the engine thread or held by it until done.
 #[test]
 fn large_subscription_snapshots_do_not_hold_up_commits() {
     let _serial = serial();
@@ -683,31 +690,29 @@ fn large_subscription_snapshots_do_not_hold_up_commits() {
         exec(&h, &format!("INSERT INTO wide SELECT i, i % 7, repeat('x', 50) FROM generate_series({lo}, {}) i", lo + 99_999));
     }
     exec(&h, "CREATE MATERIALIZED VIEW wv AS SELECT id, g FROM wide WHERE g < 5");
-    let h2 = h.clone();
-    let sub = std::thread::spawn(move || {
-        let t0 = Instant::now();
-        let r = exec(&h2, "SUBSCRIBE wv WITH (PROGRESS)");
-        (r, t0.elapsed())
-    });
-    let (mut i, mut slowest) = (0, Duration::ZERO);
-    while !sub.is_finished() {
-        let t0 = Instant::now();
+    let ExecResult::Subscribe { rx, cancel, .. } = exec(&h, "SUBSCRIBE wv WITH (PROGRESS)") else { panic!("not a subscription") };
+    let SubEvent::Snapshot { rows: mut snapshot, .. } = rx.recv().unwrap() else { panic!("no snapshot first") };
+    let mut n: i64 = snapshot.next().unwrap().unwrap().iter().map(|(_, w)| w).sum();
+    // the rest of the snapshot waits for the subscriber; the engine does not
+    for i in 0..20 {
         exec(&h, &format!("INSERT INTO wide VALUES ({}, {}, 'y')", 1_000_000 + i, i % 7));
-        i += 1;
-        if !sub.is_finished() {
-            slowest = slowest.max(t0.elapsed());
-        }
     }
-    let (r, took) = sub.join().unwrap();
-    let ExecResult::Subscribe { rx, cancel, .. } = r else { panic!("not a subscription") };
-    assert!(i >= 3, "{i} commits answered while the snapshot was taken");
-    assert!(slowest * 3 < took, "a commit took {slowest:?} of the snapshot's {took:?}");
+    let stats = |h: &EngineHandle| match h.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
+        ivm::coord::inspect::InspectReply::Stats(s) => s,
+        other => panic!("unexpected reply {other:?}"),
+    };
+    let queued = stats(&h).output_queue_bytes;
+    // (two chunks of 10,000 rows in flight, one held by the reader, and the
+    // changes since: a few MiB, not the view's 430,000 rows)
+    assert!(queued < 8 << 20, "{queued} bytes in flight for the subscription");
+    for chunk in snapshot {
+        n += chunk.unwrap().iter().map(|(_, w)| w).sum::<i64>();
+    }
     exec(&h, "INSERT INTO wide VALUES (-1, 1, 'z')");
     let last = gsn(&h);
-    let mut n = 0i64;
     for ev in rx.iter() {
         match ev {
-            SubEvent::Data { rows, .. } => n += rows.iter().map(|(_, w)| w).sum::<i64>(),
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => n += ev.rows().unwrap().iter().map(|(_, w)| w).sum::<i64>(),
             SubEvent::Progress { gsn, .. } if gsn >= last => break,
             SubEvent::Progress { .. } => {}
             SubEvent::Error(e) => panic!("{e}"),
@@ -851,8 +856,8 @@ fn concurrent_ddl_dml_reads_and_checkpoints_stay_consistent() {
     let mut acc: std::collections::BTreeMap<String, i64> = Default::default();
     for ev in rx.iter() {
         match ev {
-            SubEvent::Data { rows, .. } => {
-                for (r, w) in rows {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                for (r, w) in ev.rows().unwrap() {
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_default() += w;
                 }
             }

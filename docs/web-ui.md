@@ -318,7 +318,8 @@ nodes (`cache_used_bytes`, of which `dirty_bytes` are dirty) against the
 pool's current share of the memory budget (`cache_capacity_bytes`, which
 moves as the other parts grow and shrink), the aggregation group caches,
 the records waiting to be applied, the changes queued for subscriptions
-and sinks, the dataflow's transient working memory in use (between two
+and sinks with the snapshots and query results in flight to consumers,
+the dataflow's transient working memory in use (between two
 records, a hydration's), the buffer pools of forks of the storage (a
 hydration, large reads) and the changes forwarded to a hydration not
 applied there yet; `config.memory_bytes` is the budget (`--memory-mb`, see

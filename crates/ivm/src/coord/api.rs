@@ -1,5 +1,7 @@
 //! Requests from sessions (and sources) to the engine thread.
 
+pub use super::stream::{Chunk, Chunks};
+use crate::dataflow::Delta;
 use crate::error::{Result, SqlError};
 use crate::log::LogRecord;
 use crate::memory::Charge;
@@ -25,10 +27,32 @@ pub struct ResultColumn {
 pub enum SubEvent {
     /// Changes at a GSN (row, diff).
     Data { gsn: Gsn, rows: SharedRows },
+    /// The rows of the relation as of `gsn` (row, multiplicity), the
+    /// subscription's snapshot, read in chunks from `rows` as they come
+    /// (before the events after this one).
+    Snapshot { gsn: Gsn, rows: Chunks<Delta> },
     /// All changes up to and including `gsn` have been delivered. `charge`
     /// holds the event's bytes in the subscription's queue.
     Progress { gsn: Gsn, charge: Charge },
     Error(SqlError),
+}
+
+impl SubEvent {
+    /// The rows of a `Data` event or of a whole `Snapshot` (read to its
+    /// end), for a consumer that collects them; none for the others.
+    pub fn rows(self) -> Result<Vec<(Row, i64)>> {
+        match self {
+            SubEvent::Data { rows, .. } => Ok(rows.to_vec()),
+            SubEvent::Snapshot { rows, .. } => {
+                let mut all = Vec::new();
+                for c in rows {
+                    all.extend(c?.into_parts().0);
+                }
+                Ok(all)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
 }
 
 /// The changes of one node at one GSN as delivered to a subscription or a
@@ -78,20 +102,20 @@ pub enum ExecResult {
     Subscribe { columns: Vec<ResultColumn>, rx: Receiver<SubEvent>, cancel: Arc<AtomicBool>, progress: bool },
 }
 
-/// Rows of a query result in chunks, sent by the engine as it finds them;
-/// an error ends them. Dropping the stream ends the read in the engine at
-/// its next chunk.
+/// Rows of a query result in chunks, sent as they are found (by a reader
+/// thread, which waits for the session to take them; see `coord::stream`);
+/// an error ends them. Dropping the stream ends the read at its next chunk.
 pub struct RowStream {
-    pub(crate) first: Option<Vec<Row>>,
-    pub(crate) rx: Receiver<Result<Vec<Row>>>,
+    pub(crate) first: Option<Chunk<Vec<Row>>>,
+    pub(crate) rest: Chunks<Vec<Row>>,
 }
 
 impl RowStream {
     /// The next chunk; None after the last.
-    pub fn next_chunk(&mut self) -> Option<Result<Vec<Row>>> {
+    pub fn next_chunk(&mut self) -> Option<Result<Chunk<Vec<Row>>>> {
         match self.first.take() {
             Some(c) => Some(Ok(c)),
-            None => self.rx.recv().ok(),
+            None => self.rest.next(),
         }
     }
 
@@ -99,7 +123,7 @@ impl RowStream {
     pub fn collect(mut self) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         while let Some(c) = self.next_chunk() {
-            rows.extend(c?);
+            rows.extend(c?.into_parts().0);
         }
         Ok(rows)
     }

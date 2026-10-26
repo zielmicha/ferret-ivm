@@ -122,7 +122,9 @@ fn events_until(rx: &Receiver<ivm::coord::api::SubEvent>, until: impl Fn(&str) -
     let mut out = Vec::new();
     while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
         let evs = match ev {
-            SubEvent::Data { rows, .. } => rows
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => ev
+                .rows()
+                .unwrap()
                 .iter()
                 .map(|(r, w)| format!("{w}:{}", r.iter().map(ivm::types::text::format_datum).collect::<Vec<_>>().join("|")))
                 .collect(),
@@ -278,9 +280,9 @@ fn a_subscription_that_is_not_read_ends_at_its_memory_limit() {
     let (mut rows, mut error) = (0, None);
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            SubEvent::Data { rows: r, .. } => {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
                 assert!(error.is_none(), "changes after the error");
-                rows += r.len();
+                rows += ev.rows().unwrap().len();
             }
             SubEvent::Progress { .. } => {}
             SubEvent::Error(e) => error = Some((e.code, e.message)),
@@ -297,16 +299,29 @@ fn a_subscription_that_is_not_read_ends_at_its_memory_limit() {
 
 /// A sink whose target is unreachable stops receiving changes once its
 /// unwritten changes reach their limit, instead of keeping them all in
-/// memory (it is restarted from a new snapshot once it has written what it
-/// holds); dropping it releases them.
+/// memory: it falls behind, drops them, and is to resynchronise its target
+/// from a new snapshot once it can write; dropping it releases what it
+/// holds.
 #[test]
 fn a_sink_that_cannot_write_stops_receiving_changes_at_its_memory_limit() {
     let e = Engine::start_with("slow-sink", |c| c.memory_bytes = 16 << 20);
     e.exec("CREATE TABLE t (id int PRIMARY KEY, s text)");
     e.exec("CREATE SINK s FROM t INTO POSTGRES CONNECTION 'host=127.0.0.1 port=1 connect_timeout=1' TABLE 'target'");
-    insert_kb_rows(&e, 0, 12_000);
-    let queued = e.stats().output_queue_bytes;
-    assert!((1 << 20..5 << 20).contains(&queued), "{queued} bytes queued for the sink with a 4 MiB limit");
+    let mut peak = 0;
+    for i in 0..12 {
+        insert_kb_rows(&e, i * 1000, 1000);
+        peak = peak.max(e.stats().output_queue_bytes);
+    }
+    assert!(peak < 5 << 20, "{peak} bytes queued for the sink with a 4 MiB limit");
+    let ExecResult::Query { rows, .. } = e.exec("SHOW SINKS") else { panic!("SHOW SINKS") };
+    let status = ivm::types::text::format_datum(&rows[0][3]);
+    assert!(status.starts_with("behind"), "{status}");
+    // (the sink thread drops what it holds once it learns it is behind)
+    let t0 = std::time::Instant::now();
+    while e.stats().output_queue_bytes > 1 << 20 {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the sink keeps the changes it fell behind with");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     e.exec("DROP SINK s");
     let t0 = std::time::Instant::now();
     while e.stats().output_queue_bytes != 0 {

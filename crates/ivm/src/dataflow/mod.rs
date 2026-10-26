@@ -40,16 +40,58 @@ pub type Delta = Vec<(Row, i64)>;
 /// Error records: (sqlstate, message) with weights.
 pub type ErrDelta = Vec<((String, String), i64)>;
 
-#[derive(Default, Debug, Clone)]
+/// A node's output at a step as `step` hands it on, or its contents
+/// (`snapshot`): rows and error records. The rows of a large output stay
+/// spilled in temporary trees (`spilled`, with `data` empty), to be read a
+/// batch at a time (`delta::NodeDelta::for_each_batch`) and then released
+/// by the receiver.
+#[derive(Default)]
 pub struct Output {
     pub data: Delta,
     pub errs: ErrDelta,
+    pub spilled: Option<delta::NodeDelta>,
 }
 
 impl Output {
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty() && self.errs.is_empty()
+        self.data.is_empty() && self.errs.is_empty() && self.spilled.as_ref().is_none_or(|d| d.rows.is_empty())
     }
+
+    /// Has it rows?
+    pub fn has_rows(&self) -> bool {
+        !self.data.is_empty() || self.spilled.as_ref().is_some_and(|d| !d.rows.is_empty())
+    }
+
+    /// Hand the rows to `f` as chunks: those in memory at once (moved out),
+    /// spilled ones a batch at a time.
+    pub fn for_each_chunk(&mut self, env: &mut Env, f: &mut dyn FnMut(&mut Env, Delta) -> Result<()>) -> Result<()> {
+        if !self.data.is_empty() {
+            f(env, std::mem::take(&mut self.data))?;
+        }
+        if let Some(d) = &self.spilled {
+            d.for_each_batch(env, &mut |env, batch| f(env, batch.to_vec()))?;
+        }
+        Ok(())
+    }
+
+    /// Drop the spilled rows' temporary trees.
+    pub fn release(&mut self, env: &mut Env) -> Result<()> {
+        match self.spilled.take() {
+            Some(d) => d.release(env),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Release the spilled rows of `outputs`.
+pub fn release_outputs(env: &mut Env, outputs: &mut FxHashMap<NodeId, Output>) -> Result<()> {
+    let mut r = Ok(());
+    for o in outputs.values_mut() {
+        if let Err(e) = o.release(env) {
+            r = Err(e);
+        }
+    }
+    r
 }
 
 /// A change to a base table carried by the input log.
@@ -802,16 +844,16 @@ impl Graph {
         }
     }
 
-    /// The change from the contents of arrangement `old` to those of `new`
-    /// (consolidated), computed in bounded memory: arrangements that encode
-    /// rows alike (same key and columns) are merged in key order, so that
-    /// only the entries that differ are decoded; others are read a batch at
-    /// a time into a `DeltaBuf`, which consolidates them (in a temporary
-    /// tree once they exceed the spill threshold). Only the difference is
-    /// returned, in memory.
-    pub fn diff_arrangements(&self, env: &mut Env, old: ArrId, new: ArrId, gsn: Gsn) -> Result<Delta> {
+    /// The change from the contents of arrangement `old` to those of `new`,
+    /// handed to `out` row by row in bounded memory: arrangements that
+    /// encode rows alike (same key and columns) are merged in key order, so
+    /// that only the entries that differ are decoded, each once
+    /// (consolidated); others are read a batch at a time, the rows of `new`
+    /// and then, negated, those of `old` (equal rows to be added up by the
+    /// receiver, as `GsnDeltas` does).
+    pub fn diff_arrangements(&self, env: &mut Env, old: ArrId, new: ArrId, out: &mut dyn FnMut(&mut Env, Row, i64) -> Result<()>) -> Result<()> {
         if old == new {
-            return Ok(vec![]);
+            return Ok(());
         }
         let (a, b) = (self.arr(old), self.arr(new));
         let (la, lb) = (&a.layout, &b.layout);
@@ -827,24 +869,12 @@ impl Graph {
             && la.payload == lb.payload
             && la.row_len == lb.row_len
             && fps(la) == fps(lb);
-        let layout = Arc::new(delta::spill_layout(&self.node(b.node).schema));
-        let mut buf = delta::DeltaBuf::new(gsn, vec![delta::Target { arr: None, layout, apply_to: None }]);
-        let r = if alike { self.merge_diff(env, a.tree, b.tree, lb, &mut buf) } else { self.scan_diff(env, old, new, &mut buf) };
-        let d = match r {
-            Ok(()) => buf.into_delta(env)?,
-            Err(e) => {
-                buf.abort(env)?;
-                return Err(e);
-            }
-        };
-        let rows = d.to_vec(env);
-        d.release(env)?;
-        rows
+        if alike { self.merge_diff(env, a.tree, b.tree, lb, out) } else { self.scan_diff(env, old, new, out) }
     }
 
     /// The entries of trees `a` and `b`, encoded alike by `layout`, merged
     /// in key order: the rows of those that differ, with the difference.
-    fn merge_diff(&self, env: &mut Env, a: TreeId, b: TreeId, layout: &Layout, out: &mut delta::DeltaBuf) -> Result<()> {
+    fn merge_diff(&self, env: &mut Env, a: TreeId, b: TreeId, layout: &Layout, out: &mut dyn FnMut(&mut Env, Row, i64) -> Result<()>) -> Result<()> {
         let (u, v) = (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
         let mut ca = env.cursor(a, u, v);
         let mut cb = env.cursor(b, u, v);
@@ -875,18 +905,18 @@ impl Graph {
             };
             visited(1);
             if w != 0 {
-                out.push(env, layout.decode_row(&key)?, w)?;
+                out(env, layout.decode_row(&key)?, w)?;
             }
         }
     }
 
     /// The rows of arrangement `new` and, negated, those of `old`, a batch
     /// at a time.
-    fn scan_diff(&self, env: &mut Env, old: ArrId, new: ArrId, out: &mut delta::DeltaBuf) -> Result<()> {
+    fn scan_diff(&self, env: &mut Env, old: ArrId, new: ArrId, out: &mut dyn FnMut(&mut Env, Row, i64) -> Result<()>) -> Result<()> {
         for (arr, sign) in [(new, 1), (old, -1)] {
             self.scan_stream(env, arr, ReadAt::Latest, &mut |env, batch| {
                 for (r, w) in batch {
-                    out.push(env, r, sign * w)?;
+                    out(env, r, sign * w)?;
                 }
                 Ok(())
             })?;
@@ -918,7 +948,7 @@ impl Graph {
             Ok(())
         })?;
         consolidate(&mut data);
-        Ok(Output { data, errs })
+        Ok(Output { data, errs, spilled: None })
     }
 
     /// The node's first hydrated arrangement, if any.
@@ -1097,7 +1127,8 @@ impl Graph {
     // ------------------------------------------------------------------ ticks
 
     /// Process one GSN. `changes` holds base table changes keyed by table node.
-    /// Returns the output of every node that produced something.
+    /// Returns the output of every node that produced something (spilled
+    /// rows among them are the caller's to release).
     pub fn step(&mut self, env: &mut Env, gsn: Gsn, changes: FxHashMap<NodeId, Vec<TableChange>>) -> Result<FxHashMap<NodeId, Output>> {
         let all = self.live_nodes().map(|n| n.id).collect();
         self.step_observed(env, gsn, changes, all)
@@ -1215,6 +1246,7 @@ impl Graph {
             for (_, d) in deltas.drain() {
                 d.release(env)?;
             }
+            release_outputs(env, &mut outputs)?;
             return Err(e);
         }
         Ok(outputs)
@@ -1643,15 +1675,20 @@ impl FedTable {
     }
 }
 
-/// Hand a node's output over to the caller of `step` if it is observed or
-/// has error records, and free its rows.
+/// Hand a node's output over to the caller of `step` if it is observed (its
+/// rows as they are: in memory, or spilled for the caller to read in
+/// batches) or has error records, and free its rows otherwise.
 fn retire(env: &mut Env, id: NodeId, mut d: delta::NodeDelta, outputs: &mut FxHashMap<NodeId, Output>, observed: &FxHashSet<NodeId>) -> Result<()> {
     let errs = std::mem::take(&mut d.errs);
     if observed.contains(&id) {
-        let data = d.to_vec(env)?;
-        outputs.insert(id, Output { data, errs });
+        let out = match d.take_mem() {
+            Some(data) => Output { data, errs, spilled: None },
+            None => Output { data: Vec::new(), errs, spilled: Some(d) },
+        };
+        outputs.insert(id, out);
+        return Ok(());
     } else if !errs.is_empty() {
-        outputs.insert(id, Output { data: Vec::new(), errs });
+        outputs.insert(id, Output { data: Vec::new(), errs, spilled: None });
     }
     d.release(env)
 }

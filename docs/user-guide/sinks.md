@@ -81,23 +81,28 @@ started (its status says why).
      of the sink's last resynchronisation), delivery resumes after it;
    - otherwise — no row yet, or the target is behind the changes the sink
      has — the target is **resynchronised**. This happens only at the
-     thread's first synchronisation (and after dropped changes, see
+     thread's first synchronisation (and after the sink fell behind, see
      [Delivering changes](#delivering-changes)); if on a later reconnect the
      row is missing or behind, the sink reports
      `error: sink progress row went backwards` and keeps retrying.
 
 To resynchronise, the sink thread asks the engine for a snapshot. The
-engine reads the relation at its last applied GSN (the *snapshot GSN*),
-between two records, and sends it to the thread in chunks of 10,000 rows,
-after the changes it sent before (the snapshot includes them; the thread
-drops them). The thread writes it in one transaction, opened at the first
-chunk: `DELETE FROM <target>`, `INSERT`s of the snapshot rows (each row
-repeated by its multiplicity, up to 500 rows per statement), and the
-progress row set to the snapshot GSN. `SHOW SINKS` shows
-`resynchronizing to gsn <n>` meanwhile. If the transaction fails, it is
-rolled back, the rest of the snapshot is dropped, and once the thread is
-connected again it asks for a new snapshot. The snapshot is not kept after
-it is written.
+engine puts the relation at its last applied GSN (the *snapshot GSN*)
+into the sink's queue after the changes it sent before (the snapshot
+includes them; the thread drops them), as a stream of chunks of 10,000
+rows: a relation that the engine thread reads within its read budget (up
+to 50,000 index entries) at once, a larger one from a fork of the storage
+on a reader thread, which reads ahead of the sink by at most two chunks,
+as the sink writes them. The changes after the snapshot GSN follow in the
+queue. The thread writes the snapshot in one transaction:
+`DELETE FROM <target>`, `INSERT`s of the snapshot rows (each row repeated
+by its multiplicity, up to 500 rows per statement), and the progress row
+set to the snapshot GSN. `SHOW SINKS` shows `resynchronizing to gsn <n>`
+meanwhile. If the transaction fails, it is rolled back, the rest of the
+snapshot is dropped (which stops its reader), and once the thread is
+connected again it asks for a new snapshot. Nothing of the snapshot is
+kept after it is written. (A sink held for a view replacement being
+hydrated gets its snapshot once it follows the new version.)
 
 Every transaction a sink writes is sent in as many messages as it needs,
 each at most 8 MiB of SQL text (a single statement can be longer; an
@@ -109,11 +114,13 @@ in one message used to exceed.
 
 For every GSN at which the relation changes, the engine hands the
 consolidated change (rows with positive and negative multiplicities) to the
-sink thread. The thread batches changes and flushes when more than 1000 rows
-are pending or 100 ms have passed since the last flush. A flush is one
-transaction of whole GSNs, about 50,000 rows (at least one GSN): a backlog
-is written in several transactions, each of which leaves the target as of
-a GSN, without waiting in between:
+sink thread, in chunks of at most 1,024 rows when the change is large. The
+thread batches changes and flushes when more than 1000 rows are pending or
+100 ms have passed since the last flush. A flush is one transaction of
+whole GSNs (every chunk of a GSN: one is complete once a later GSN's
+changes or a progress mark at or after it have come), about 50,000 rows
+(at least one GSN): a backlog is written in several transactions, each of
+which leaves the target as of a GSN, without waiting in between:
 
 ```sql
 BEGIN;
@@ -127,14 +134,21 @@ INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('<name>', <last gsn delivered>
 COMMIT;
 ```
 
-The changes a sink has received but not written are bounded: when they
-exceed 256 MiB (estimated from their values) and more than one GSN — the
-target is unreachable for long, or keeps rejecting a batch — they are
-dropped (logged as `more than 256 MiB of changes are waiting to be written;
-dropping them and resynchronizing the target from a snapshot`), further
-changes are ignored, and once the thread is connected again the target is
-resynchronised from a fresh snapshot. (A single GSN's change is kept
-whatever its size.)
+The changes queued for a sink and not written yet — in its channel and
+held by its thread — are bounded by one limit, a sixteenth of the memory
+budget (`--memory-mb`, at least 4 MiB), measured in bytes of memory as the
+other parts of the budget are ([Operations](operations.md#memory)). When a
+change would take them over it — the target is unreachable for long,
+keeps rejecting a batch, or does not keep up — the sink *falls behind*:
+the engine sends it nothing more (not even progress, so its progress row
+stays behind) but a notice, upon which the thread drops what it holds
+(logged as `sink <id> fell behind ...` and `sink <name>: its unwritten
+changes reached their memory limit; dropping them and resynchronizing the
+target from a snapshot`); once it is connected, it resynchronises the
+target from a fresh snapshot (above), after which it is sent the changes
+again. `SHOW SINKS` says `behind (...)` until it asks for the snapshot. A
+resynchronisation rewrites the whole target, which is expensive for a
+large relation.
 
 Every write — a flush, a progress update, a resynchronisation — first locks
 the sink's progress row, so that the writers of one sink take turns, and
@@ -264,8 +278,8 @@ shown until a write succeeds: reconnecting alone does not clear the error of
 a batch the target rejects), `error: broken: <reason>` (the relation is a
 broken materialized view; the sink is not started), `behind (<status>)`
 (its unwritten changes reached their memory limit: it is sent nothing more
-and is restarted once it has written them, see
-[Known problems](#known-problems)), or `stopped`.
+until it asks for a snapshot to resynchronise its target, see
+[Delivering changes](#delivering-changes)), or `stopped`.
 
 ```sql
 DROP SINK [ IF EXISTS ] name
@@ -290,15 +304,11 @@ engine waits up to 5 s for its sinks to stop.
 
 See also [Troubleshooting](troubleshooting.md#known-problems).
 
-- While a sink cannot write (its target is down, or a batch keeps failing),
-  the changes it has not written accumulate in memory, up to a sixteenth of
-  the memory budget (`--memory-mb`, at least 4 MiB). Beyond that the engine
-  sends it nothing more — not even progress, so its progress row stays
-  behind — and once it has written (or dropped) what it holds, it is
-  restarted, and the new sink thread resynchronises the whole target from a
-  snapshot ([resynchronisation](#start-up-and-resynchronisation)), which is
-  expensive for a large relation. The log says `sink <id> fell behind ...`
-  and `restarting sink <name> ...`.
-- A snapshot for a resynchronisation is read on the engine thread in one
-  go, and its chunks wait in the sink's queue until the sink has written
-  them.
+- A sink that cannot write for long (its target is down, or a batch keeps
+  failing), or does not keep up, falls behind once its unwritten changes
+  reach their memory limit, and then rewrites the whole target from a
+  snapshot ([Delivering changes](#delivering-changes)), which is expensive
+  for a large relation; if changes keep coming faster than such a snapshot
+  is written, it can fall behind again right after it.
+- While a large snapshot is written, its reader thread (one of four shared
+  with large reads) waits for the sink.

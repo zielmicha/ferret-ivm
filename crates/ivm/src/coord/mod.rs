@@ -11,6 +11,7 @@ pub mod meta;
 mod read;
 mod reader;
 pub mod seq;
+pub mod stream;
 
 use crate::catalog::{Catalog, ObjectKind};
 use crate::dataflow::{ArrId, ErrDelta, Graph, NodeId, Output, TableChange};
@@ -194,8 +195,6 @@ pub struct Engine {
     /// Threads running large reads on forks (`reader.rs`), started when
     /// first needed.
     readers: Option<Sender<reader::ReadJob>>,
-    /// Snapshots being taken on reader threads for subscriptions and sinks.
-    pub(crate) snapshotting: Vec<reader::Snapshotting>,
     /// Command tags of DML waiting to be applied.
     pub(crate) dml_counts: HashMap<u64, String>,
     /// Requests to run after the current message.
@@ -241,6 +240,9 @@ pub struct Engine {
     /// Sinks whose changes are held back: their view is being replaced and
     /// they get the change to its new version once it is hydrated.
     pub(crate) held_sinks: rustc_hash::FxHashSet<ObjectId>,
+    /// Held sinks that asked for a snapshot meanwhile (answered once they
+    /// follow the new version).
+    pub(crate) snapshot_asked: rustc_hash::FxHashSet<ObjectId>,
     /// Durable records not applied yet: one that must wait for the
     /// hydration in progress (or for snapshots being taken) and those after
     /// it.
@@ -553,7 +555,6 @@ impl Engine {
             dml_reads: None,
             outbox: Vec::new(),
             readers: None,
-            snapshotting: Vec::new(),
             dml_counts: HashMap::new(),
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),
@@ -577,6 +578,7 @@ impl Engine {
             hydrations_done: 0,
             record_then: Vec::new(),
             held_sinks: Default::default(),
+            snapshot_asked: Default::default(),
             held: VecDeque::new(),
             checkpointing: None,
             checkpoint_waiters: Vec::new(),
@@ -747,14 +749,9 @@ impl Engine {
                 }
             }
             self.flush_outbox();
-            if !self.snapshotting.is_empty() {
-                self.poll_snapshots()?;
-                self.apply_durable(&handle)?;
-            }
             self.poll_hydration(&handle)?;
             self.poll_checkpoint(false)?;
             self.rebalance_memory();
-            self.restart_lagging_sinks();
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
@@ -799,11 +796,7 @@ impl Engine {
     fn apply_durable(&mut self, handle: &EngineHandle) -> Result<()> {
         let mut applied = false;
         while let Some((_, rec)) = self.held.front() {
-            // (and DDL while snapshots are taken for the subscriptions and
-            // sinks it could end or replace)
-            if (self.hydration.is_some() && self.must_wait_for_hydration(rec))
-                || (!self.snapshotting.is_empty() && matches!(rec, LogRecord::Ddl { .. } | LogRecord::Schema { .. }))
-            {
+            if self.hydration.is_some() && self.must_wait_for_hydration(rec) {
                 break;
             }
             let (gsn, rec) = self.held.pop_front().unwrap();
@@ -1049,7 +1042,7 @@ impl Engine {
                 self.processed = gsn;
                 // (outputs hold the rows of observed nodes only)
                 changed = self.graph.step_totals.out_rows != rows_before || !outputs.is_empty();
-                self.deliver(gsn, outputs);
+                self.deliver(gsn, outputs)?;
             }
         }
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
@@ -1102,7 +1095,7 @@ impl Engine {
         self.forward_step(gsn);
         let outputs = self.graph.step_finish(&mut self.env, input)?;
         self.processed = gsn;
-        self.deliver(gsn, outputs);
+        self.deliver(gsn, outputs)?;
         if source == 0 {
             // local DML: lsn carries the request id
             let n = self.dml_counts.remove(&lsn).unwrap_or_default();
@@ -1135,28 +1128,23 @@ impl Engine {
         if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
     }
 
-    /// Nodes whose rows `deliver` hands on (subscriptions and sinks, and
-    /// those whose snapshots are being taken for them, whose outputs are
-    /// kept meanwhile); of the other nodes it only needs the error records.
+    /// Nodes whose rows `deliver` hands on (subscriptions and sinks); of the
+    /// other nodes it only needs the error records.
     fn delivered_nodes(&self) -> rustc_hash::FxHashSet<NodeId> {
-        self.subs
-            .iter()
-            .map(|s| s.node)
-            .chain(self.sink_handles.values().map(|s| s.node))
-            .chain(self.snapshotting.iter().map(|s| s.node))
-            .collect()
+        self.subs.iter().map(|s| s.node).chain(self.sink_handles.values().map(|s| s.node)).collect()
     }
 
     /// Route outputs to views (errors), subscriptions and sinks. Only the
     /// consumers of nodes that produced something are visited (and the
     /// subscriptions that want progress marks; sinks learn of the GSNs
     /// without changes from `sink_progress`). Each node's changes are
-    /// delivered as one copy shared by all its consumers, and each
-    /// consumer's queue is bounded in bytes: a subscription whose client
-    /// does not keep up ends with an error, a sink that does not keep up is
-    /// restarted from a new snapshot once it has caught up with what it
-    /// holds.
-    fn deliver(&mut self, gsn: Gsn, mut outputs: FxHashMap<NodeId, Output>) {
+    /// delivered as one copy shared by all its consumers, in chunks: those
+    /// of a large output, which the step left spilled, are read a batch at
+    /// a time, so that no consumer ever gets more at once than its queue's
+    /// limit (a subscription whose client does not keep up ends with an
+    /// error, a sink that does not keep up falls behind and resynchronises
+    /// its target from a new snapshot). Spilled outputs are released.
+    fn deliver(&mut self, gsn: Gsn, mut outputs: FxHashMap<NodeId, Output>) -> Result<()> {
         // (error records are rare: views are only visited for them)
         if outputs.values().any(|o| !o.errs.is_empty()) {
             for v in self.rt.views.values_mut() {
@@ -1165,11 +1153,13 @@ impl Engine {
                 }
             }
         }
-        if !self.snapshotting.is_empty() {
-            self.keep_for_snapshots(gsn, &outputs);
-        }
         let limit = self.shared.mem.consumer_limit();
-        let mut shared = FxHashMap::default();
+        // the consumers of each node that produced something: subscriptions
+        // (held: their view is being replaced, and they get the change to its
+        // new version once that is hydrated; a cancelled one may refer to a
+        // node freed since, whose id was reused) and sinks
+        let mut consumers: FxHashMap<NodeId, (Vec<usize>, Vec<ObjectId>)> = FxHashMap::default();
+        let mut progress = Vec::new();
         if !self.subs.is_empty() {
             let index = self.sub_index.get_or_insert_with(|| SubIndex::of(&self.subs));
             #[cfg(debug_assertions)]
@@ -1180,38 +1170,59 @@ impl Engine {
             } else {
                 outputs.keys().filter_map(|n| index.by_node.get(n)).flatten().copied().collect()
             };
-            // (held: their view is being replaced, and they get the change
-            // to its new version once that is hydrated; a cancelled one may
-            // refer to a node freed since, whose id was reused)
             for i in changed {
                 let s = &self.subs[i];
-                if s.held || s.cancel.load(Ordering::Acquire) {
-                    continue;
+                if !s.held && !s.cancel.load(Ordering::Acquire) {
+                    consumers.entry(s.node).or_default().0.push(i);
                 }
-                let errs = outputs.get(&s.node).map(|o| o.errs.clone()).unwrap_or_default();
-                deliver_to(s, gsn, &errs, shared_rows(&mut shared, &mut outputs, s.node), limit);
             }
             // the progress marks of the others
-            for &i in &index.progress {
-                let s = &self.subs[i];
-                if !s.held && !outputs.contains_key(&s.node) {
-                    deliver_to(s, gsn, &[], None, limit);
+            progress.extend(index.progress.iter().copied().filter(|&i| !self.subs[i].held && !outputs.contains_key(&self.subs[i].node)));
+        }
+        for (id, sink) in &self.sink_handles {
+            if !sink.behind() && !self.held_sinks.contains(id) && outputs.get(&sink.node).is_some_and(|o| o.has_rows()) {
+                consumers.entry(sink.node).or_default().1.push(*id);
+            }
+        }
+        let mut r = Ok(());
+        for (node, (subs, sinks)) in consumers {
+            let Some(out) = outputs.get_mut(&node) else { continue };
+            // a new error record ends a subscription, as it fails reads
+            for &i in &subs {
+                deliver_errors(&self.subs[i], &out.errs);
+            }
+            let (all_subs, all_sinks) = (&self.subs, &mut self.sink_handles);
+            r = out.for_each_chunk(&mut self.env, &mut |_, rows| {
+                let rows = Arc::new(rows);
+                let bytes = crate::memory::delta_bytes(&rows);
+                for &i in &subs {
+                    let s = &all_subs[i];
+                    if !s.cancel.load(Ordering::Acquire) {
+                        send_rows(s, gsn, &rows, bytes, limit);
+                    }
                 }
+                for id in &sinks {
+                    if let Some(sink) = all_sinks.get_mut(id)
+                        && !sink.behind()
+                        && !sink.send(gsn, &rows, bytes, limit)
+                    {
+                        log::warn!("sink {id} fell behind: its unwritten changes reached {} MiB; it resynchronises its target from a snapshot", limit >> 20);
+                    }
+                }
+                Ok(())
+            });
+            if r.is_err() {
+                break;
+            }
+            for &i in &subs {
+                send_progress(&self.subs[i], gsn, limit);
             }
         }
-        for (id, sink) in self.sink_handles.iter_mut() {
-            if sink.behind() || self.held_sinks.contains(id) {
-                continue;
-            }
-            if let Some((rows, bytes)) = shared_rows(&mut shared, &mut outputs, sink.node)
-                && !sink.send(gsn, &rows, bytes, limit)
-            {
-                log::warn!(
-                    "sink {id} fell behind: its unwritten changes reached {} MiB; it is restarted from a new snapshot once it has written them",
-                    limit >> 20
-                );
-            }
+        for i in progress {
+            send_progress(&self.subs[i], gsn, limit);
         }
+        crate::dataflow::release_outputs(&mut self.env, &mut outputs)?;
+        r
     }
 
     /// Tell the sinks that everything up to the last applied record is
@@ -1222,26 +1233,6 @@ impl Engine {
         for (id, sink) in &self.sink_handles {
             if !self.held_sinks.contains(id) {
                 sink.progress(self.processed);
-            }
-        }
-    }
-
-    /// Restart the sinks that fell behind and have written (or dropped)
-    /// what they held: from a new snapshot, which they write over their
-    /// targets (they were sent nothing since they fell behind, so their
-    /// targets' progress is older).
-    fn restart_lagging_sinks(&mut self) {
-        let Some(handle) = self.handle.clone() else { return };
-        let idle: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.behind_and_idle()).map(|(id, _)| *id).collect();
-        for id in idle {
-            let Some(h) = self.sink_handles.remove(&id) else { continue };
-            // (it has nothing left to write: no need to wait for it)
-            let _ = h.stop();
-            if let Some(obj) = self.catalog.get(id).cloned()
-                && let ObjectKind::Sink(def) = &obj.kind
-            {
-                log::info!("restarting sink {} from a snapshot at gsn {}", obj.name, self.processed);
-                self.start_sink_or_mark_broken(id, &obj.name, def, &handle);
             }
         }
     }
@@ -1394,19 +1385,36 @@ impl Engine {
         }
     }
 
-    /// Send sink `id`'s thread `token` (not that of a sink it replaced) its
-    /// relation's current contents, through its channel after the changes
-    /// sent to it so far: it resynchronizes its target from them.
+    /// Sink `id`'s thread `token` (not that of a sink it replaced) asks for
+    /// its relation's contents, to resynchronise its target: send them
+    /// (`resync_sink`) — unless the sink is held for a replacement still
+    /// being hydrated, which answers once it is done (`finish_replace`).
     pub(crate) fn send_sink_snapshot(&mut self, id: ObjectId, token: u64) {
-        let Some(h) = self.sink_handles.get(&id).filter(|h| h.token == token) else { return };
-        let (node, tx, gsn) = (h.node, h.sender(), self.processed);
-        let r = self.snapshot_chunks(node, &mut |rows| {
-            let _ = tx.send(crate::sink::SinkMsg::Snapshot(gsn, SharedRows::new(rows)));
-        });
-        if let Err(e) = &r {
-            log::error!("cannot read the snapshot of sink {id}: {e}");
+        if !self.sink_handles.get(&id).is_some_and(|h| h.token == token) {
+            return;
         }
-        let _ = tx.send(crate::sink::SinkMsg::SnapshotEnd(gsn, r.err().map(|e| e.message)));
+        if self.held_sinks.contains(&id) {
+            self.snapshot_asked.insert(id);
+            return;
+        }
+        self.resync_sink(id);
+    }
+
+    /// Send sink `id` its relation's contents now, through its queue after
+    /// the changes sent so far, as a stream of chunks read as the sink
+    /// writes them (from a fork, on a reader thread, unless small); it is
+    /// sent the changes after them, also if it had fallen behind.
+    pub(crate) fn resync_sink(&mut self, id: ObjectId) {
+        let Some(h) = self.sink_handles.get(&id) else { return };
+        let (node, queue, gsn) = (h.node, h.queue().clone(), self.processed);
+        // (the sink drops the stream when it stops, which ends the read)
+        let rows = self.snapshot_stream(node, &queue, Box::new(|| false)).unwrap_or_else(|e| {
+            log::error!("cannot read the snapshot of sink {id}: {e}");
+            stream::failed(e)
+        });
+        if let Some(h) = self.sink_handles.get_mut(&id) {
+            h.resync(gsn, rows);
+        }
     }
 
     /// The error of using broken object `id`, if it is broken.
@@ -1461,61 +1469,28 @@ impl Engine {
 /// Bytes of a subscription event without rows in its queue.
 const SUB_EVENT_BYTES: usize = std::mem::size_of::<SubEvent>() + 8;
 
-/// The changes of `node` in `outputs`, moved into one shared copy (made at
-/// the first consumer that asks) with its bytes in memory; None if empty.
-fn shared_rows(
-    shared: &mut FxHashMap<NodeId, (Arc<crate::dataflow::Delta>, usize)>,
-    outputs: &mut FxHashMap<NodeId, Output>,
-    node: NodeId,
-) -> Option<(Arc<crate::dataflow::Delta>, usize)> {
-    if let Some((rows, bytes)) = shared.get(&node) {
-        return Some((rows.clone(), *bytes));
-    }
-    let o = outputs.get_mut(&node).filter(|o| !o.data.is_empty())?;
-    let rows = Arc::new(std::mem::take(&mut o.data));
-    let bytes = crate::memory::delta_bytes(&rows);
-    shared.insert(node, (rows.clone(), bytes));
-    Some((rows, bytes))
-}
-
-/// An output's rows as a copy of their own, with their bytes (for one
-/// consumer); None if empty.
-pub(crate) fn own_rows(rows: &crate::dataflow::Delta) -> Option<(Arc<crate::dataflow::Delta>, usize)> {
-    (!rows.is_empty()).then(|| {
-        let rows = Arc::new(rows.clone());
-        let bytes = crate::memory::delta_bytes(&rows);
-        (rows, bytes)
-    })
-}
-
-/// Deliver to subscription `s` its node's output at `gsn`: error records
-/// `errs` and the rows (shared, with their bytes), then a progress mark if
-/// it asked for them. Every event counts in its queue's memory: one whose
-/// client does not read as fast ends with 53000 instead.
-pub(crate) fn deliver_to(s: &Subscription, gsn: Gsn, errs: &[((String, String), i64)], rows: Option<(Arc<crate::dataflow::Delta>, usize)>, limit: usize) {
-    if s.cancel.load(Ordering::Acquire) {
+/// A new error record among `errs` ends subscription `s`, as it fails
+/// reads (a retracted one does not).
+pub(crate) fn deliver_errors(s: &Subscription, errs: &[((String, String), i64)]) {
+    if errs.is_empty() || s.cancel.load(Ordering::Acquire) {
         return;
     }
-    // a new error record ends the subscription, as it fails reads (a
-    // retracted one does not)
-    if !errs.is_empty() {
-        let mut errs = errs.to_vec();
-        crate::dataflow::consolidate_errs(&mut errs);
-        if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
-            let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
-        }
+    let mut errs = errs.to_vec();
+    crate::dataflow::consolidate_errs(&mut errs);
+    if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
+        let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
     }
-    if let Some((rows, bytes)) = rows
-        && !send_rows(s, gsn, &rows, bytes, limit)
-    {
+}
+
+/// A progress mark at `gsn`, if subscription `s` asked for them.
+pub(crate) fn send_progress(s: &Subscription, gsn: Gsn, limit: usize) {
+    if !s.progress || s.cancel.load(Ordering::Acquire) {
         return;
     }
-    if s.progress {
-        if s.queue.used() + SUB_EVENT_BYTES > limit {
-            return end_slow_subscription(s, SUB_EVENT_BYTES, limit);
-        }
-        let _ = s.tx.send(SubEvent::Progress { gsn, charge: s.queue.charge(SUB_EVENT_BYTES) });
+    if s.queue.used() + SUB_EVENT_BYTES > limit {
+        return end_slow_subscription(s, SUB_EVENT_BYTES, limit);
     }
+    let _ = s.tx.send(SubEvent::Progress { gsn, charge: s.queue.charge(SUB_EVENT_BYTES) });
 }
 
 /// Send rows to subscription `s`, counted in its queue's memory; false if

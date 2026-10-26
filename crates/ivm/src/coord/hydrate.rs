@@ -23,7 +23,7 @@
 //! for it. Replay and recovery hydrate inline: the result is the same.
 
 use super::*;
-use crate::dataflow::Delta;
+use crate::dataflow::delta::GsnDeltas;
 use crate::storage::TreeId;
 use rustc_hash::FxHashSet;
 use std::sync::atomic::AtomicBool;
@@ -238,13 +238,10 @@ enum ToFork {
 struct Hydrated {
     env: Env,
     graph: Graph,
-    /// Snapshots of subscribed nodes as of the hydration's GSN.
-    snapshots: FxHashMap<NodeId, Output>,
     /// Per replaced view, the change from its old to its new contents as of
-    /// the hydration's GSN.
-    diffs: FxHashMap<ObjectId, Delta>,
-    /// Outputs of subscribed nodes at every record applied after it.
-    steps: Vec<(Gsn, FxHashMap<NodeId, Output>)>,
+    /// the hydration's GSN and the new version's outputs at every record
+    /// applied after it (in temporary trees of `env`).
+    changes: Vec<(ObjectId, GsnDeltas)>,
 }
 
 /// What a hydration thread does besides hydrating.
@@ -253,12 +250,27 @@ struct ForkWork {
     /// on stepping.
     roots: Vec<NodeId>,
     arrs: Vec<ArrId>,
-    /// Nodes whose outputs at every record are kept (and whose snapshot).
-    watch: Vec<(NodeId, bool)>,
-    /// Replaced views: (view, old read arrangement, new read arrangement).
-    diffs: Vec<(ObjectId, ArrId, ArrId)>,
+    /// Replaced views whose changes are kept for their subscribers and
+    /// sinks: (view, old read arrangement, new read arrangement, new node).
+    replaced: Vec<(ObjectId, ArrId, ArrId, NodeId)>,
     /// Rebuilt tables, filled before hydrating.
     conversions: Vec<Conversion>,
+}
+
+/// The change from a replaced view's old read arrangement to its new one
+/// as of `gsn`, the first of the changes kept for its consumers.
+fn replacement_diff(graph: &Graph, env: &mut Env, old: ArrId, new: ArrId, gsn: Gsn) -> Result<GsnDeltas> {
+    let schema = graph.node(graph.arr(new).node).schema.clone();
+    let mut changes = GsnDeltas::new(env, &schema);
+    changes.begin(gsn, Vec::new());
+    let r = graph.diff_arrangements(env, old, new, &mut |env, row, w| changes.push(env, &row, w));
+    match r {
+        Ok(()) => Ok(changes),
+        Err(e) => {
+            changes.release(env)?;
+            Err(e)
+        }
+    }
 }
 
 /// Hydrate the fork's pending fragment as of `gsn`, then apply forwarded
@@ -274,20 +286,14 @@ fn run(
     applied: Arc<Applied>,
     wake: Sender<EngineMsg>,
 ) -> Result<Hydrated> {
-    let ForkWork { roots, arrs, watch, diffs: to_diff, conversions } = work;
+    let ForkWork { roots, arrs, replaced, conversions } = work;
     for c in &conversions {
         fill_rebuilt(&mut graph, &mut env, c, gsn)?;
     }
     graph.hydrate(&mut env, gsn)?;
-    let mut snapshots = FxHashMap::default();
-    for (n, snap) in &watch {
-        if *snap {
-            snapshots.insert(*n, graph.snapshot(&mut env, *n)?);
-        }
-    }
-    let mut diffs = FxHashMap::default();
-    for (view, old, new) in to_diff {
-        diffs.insert(view, graph.diff_arrangements(&mut env, old, new, gsn)?);
+    let mut changes: Vec<(ObjectId, NodeId, GsnDeltas)> = Vec::new();
+    for (view, old, new, node) in replaced {
+        changes.push((view, node, replacement_diff(&graph, &mut env, old, new, gsn)?));
     }
     // (the old versions of replaced views are not stepped here)
     graph.retain_closure(&roots);
@@ -295,8 +301,7 @@ fn run(
     applied.set(gsn);
     hydrated.store(true, Ordering::Release);
     let _ = wake.send(EngineMsg::Wake);
-    let mut steps = Vec::new();
-    let watched: rustc_hash::FxHashSet<NodeId> = watch.iter().map(|(n, _)| *n).collect();
+    let watched: rustc_hash::FxHashSet<NodeId> = changes.iter().map(|(_, n, _)| *n).collect();
     // (the record being fed)
     let mut input: Option<crate::dataflow::StepInput> = None;
     loop {
@@ -319,18 +324,36 @@ fn run(
             Ok(ToFork::Step { gsn, now }) => {
                 graph.now = now;
                 let inp = input.take().unwrap_or_else(|| graph.step_begin(gsn, watched.clone()));
-                let out = graph.step_finish(&mut env, inp)?;
+                let mut out = graph.step_finish(&mut env, inp)?;
                 crate::dataflow::reduce::trim_caches(&graph);
-                if !watch.is_empty() {
-                    steps.push((gsn, watch.iter().filter_map(|(n, _)| out.get(n).map(|o| (*n, o.clone()))).collect()));
+                // the replaced views' new outputs are kept in their trees
+                for (_, node, kept) in changes.iter_mut() {
+                    let o = out.get_mut(node);
+                    kept.begin(gsn, o.as_ref().map(|o| o.errs.clone()).unwrap_or_default());
+                    if let Some(o) = o {
+                        o.for_each_chunk(&mut env, &mut |env, rows| {
+                            for (row, w) in rows {
+                                kept.push(env, &row, w)?;
+                            }
+                            Ok(())
+                        })?;
+                    }
                 }
+                crate::dataflow::release_outputs(&mut env, &mut out)?;
                 applied.set(gsn);
                 if rx.is_empty() {
                     // caught up with the engine, which may be waiting for that
                     let _ = wake.send(EngineMsg::Wake);
                 }
             }
-            Ok(ToFork::Finish) => return Ok(Hydrated { env, graph, snapshots, diffs, steps }),
+            Ok(ToFork::Finish) => {
+                let mut kept = Vec::with_capacity(changes.len());
+                for (view, _, mut c) in changes {
+                    c.finish(&mut env)?;
+                    kept.push((view, c));
+                }
+                return Ok(Hydrated { env, graph, changes: kept });
+            }
             Err(_) => return Err(SqlError::new(codes::ADMIN_SHUTDOWN, "hydration abandoned")),
         }
     }
@@ -377,29 +400,27 @@ impl Engine {
         };
         let mut roots = nodes.clone();
         roots.extend(arrs.iter().map(|a| self.graph.arr(*a).node));
-        let mut watch: Vec<(NodeId, bool)> = Vec::new();
-        let mut diffs = Vec::new();
+        let mut replaced = Vec::new();
         let mut fork_roots = roots.clone();
         for t in &then {
             match t {
-                Then::Subscribe(p) => watch.push((p.node, p.snapshot)),
                 Then::Rebuilt(r) => fork_roots.push(r.old_node),
                 // (the old version too, for the change to the new one: only
                 // for the subscribers and sinks that follow the new version)
                 Then::Replaced(r) if r.consumers => {
                     fork_roots.push(r.old.node);
                     if let Some(v) = self.rt.views.get(&r.id) {
-                        diffs.push((r.id, r.old.arr, v.arr));
-                        watch.push((v.node, false));
+                        replaced.push((r.id, r.old.arr, v.arr, v.node));
                     }
                 }
                 _ => {}
             }
         }
-        // (a watched node may be no part of the fragment: a replacement by a
-        // version that exists already; it is stepped there too)
-        roots.extend(watch.iter().map(|(n, _)| *n));
-        fork_roots.extend(watch.iter().map(|(n, _)| *n));
+        // (a replaced view's new node may be no part of the fragment: a
+        // replacement by a version that exists already; it is stepped there
+        // too, for its outputs)
+        roots.extend(replaced.iter().map(|r| r.3));
+        fork_roots.extend(replaced.iter().map(|r| r.3));
         let env = self.fork_env()?;
         let graph = self.graph.fork_of(&fork_roots);
         let tables = graph.live_nodes().filter(|n| matches!(n.kind, crate::dataflow::NodeKind::Table { .. })).map(|n| n.id).collect();
@@ -408,7 +429,7 @@ impl Engine {
         let hydrated = Arc::new(AtomicBool::new(false));
         let applied = Arc::new(Applied::default());
         let (h2, a2) = (hydrated.clone(), applied.clone());
-        let work = ForkWork { roots, arrs: arrs.clone(), watch, diffs, conversions };
+        let work = ForkWork { roots, arrs: arrs.clone(), replaced, conversions };
         // (the engine thread's stack: the same operators run here)
         std::thread::Builder::new().name("ivm-hydrate".into()).stack_size(64 << 20).spawn(move || {
             let r = run(env, graph, gsn, work, rx, h2, a2, wake);
@@ -425,19 +446,17 @@ impl Engine {
         match then {
             Then::Reply { req, res } => self.reply_pending(req, res),
             Then::ViewErrors(id) => self.take_root_errors(id),
-            Then::Subscribe(p) if p.snapshot => {
-                // (a large one is taken off the engine thread)
-                if let Some((snapshot, then)) = self.snapshot_or_defer(p.node, super::reader::AfterSnapshot::Subscription(p))? {
-                    self.after_snapshot(then, self.processed, snapshot, Vec::new())?;
-                }
-            }
-            Then::Subscribe(p) => self.start_subscription(p, self.processed, None, &[]),
+            Then::Subscribe(p) => self.start_subscription(p),
             Then::Replaced(r) => {
-                let diff = match self.rt.views.get(&r.id).map(|v| v.arr) {
-                    Some(new) if r.consumers => self.graph.diff_arrangements(&mut self.env, r.old.arr, new, self.processed)?,
-                    _ => Vec::new(),
+                let changes = match self.rt.views.get(&r.id).map(|v| v.arr) {
+                    Some(new) if r.consumers => {
+                        let mut c = replacement_diff(&self.graph, &mut self.env, r.old.arr, new, self.processed)?;
+                        c.finish(&mut self.env)?;
+                        Some(c)
+                    }
+                    _ => None,
                 };
-                self.finish_replace(*r, self.processed, diff, &[])?;
+                self.finish_replace(*r, changes)?;
             }
             Then::Repaired(id) => self.finish_repair(id),
             Then::Rebuilt(r) => self.finish_rebuild(*r)?,
@@ -461,64 +480,97 @@ impl Engine {
 
     /// The rest of a view replacement (`replace_view`) once the new version
     /// is hydrated: the view takes its new root's error records; held
-    /// subscribers and sinks follow the new version, getting the change
-    /// `diff` from the old to the new contents as of `gsn` and the new
-    /// version's outputs at the records applied since (`steps`), as they
-    /// would have had it been hydrated inline (sinks of a view whose columns
-    /// changed start over); the old version is released.
-    pub(crate) fn finish_replace(&mut self, r: Replaced, gsn: Gsn, diff: Delta, steps: &[(Gsn, FxHashMap<NodeId, Output>)]) -> Result<()> {
+    /// subscribers and sinks follow the new version, getting the kept
+    /// `changes` — the change from the old to the new contents as of the
+    /// replacement's GSN and the new version's outputs at the records
+    /// applied since — a chunk at a time, as they would have had it been
+    /// hydrated inline (a sink that asked for a snapshot meanwhile gets one
+    /// instead; sinks of a view whose columns changed start over); the old
+    /// version is released.
+    pub(crate) fn finish_replace(&mut self, r: Replaced, changes: Option<GsnDeltas>) -> Result<()> {
+        let mut res = Ok(());
         if let Some(new_node) = self.rt.views.get(&r.id).map(|v| v.node) {
             self.take_root_errors(r.id);
             let limit = self.shared.mem.consumer_limit();
-            let diff = own_rows(&diff);
-            for s in self.subs.iter_mut().filter(|s| s.view == Some(r.id) && s.held) {
-                s.node = new_node;
-                s.held = false;
-                if let Some((rows, bytes)) = &diff {
-                    send_rows(s, gsn, rows, *bytes, limit);
-                }
-                for (g, outs) in steps {
-                    let o = outs.get(&new_node);
-                    deliver_to(s, *g, o.map(|o| &o.errs[..]).unwrap_or_default(), o.and_then(|o| own_rows(&o.data)), limit);
-                }
+            let subs: Vec<usize> = (0..self.subs.len()).filter(|&i| self.subs[i].view == Some(r.id) && self.subs[i].held).collect();
+            for &i in &subs {
+                self.subs[i].node = new_node;
+                self.subs[i].held = false;
             }
             self.subs_changed();
             for sid in &r.sinks {
                 self.held_sinks.remove(sid);
             }
-            if r.same {
-                for sid in &r.sinks {
-                    if let Some(sink) = self.sink_handles.get_mut(sid) {
-                        sink.node = new_node;
-                        // (one that falls behind is restarted after the next record)
-                        match &diff {
-                            Some((rows, bytes)) => sink.send(gsn, rows, *bytes, limit),
-                            None => {
-                                sink.progress(gsn);
-                                true
+            let sinks: Vec<ObjectId> = if r.same { r.sinks.iter().filter(|s| self.sink_handles.contains_key(s)).copied().collect() } else { Vec::new() };
+            for sid in &sinks {
+                self.sink_handles.get_mut(sid).unwrap().node = new_node;
+            }
+            // (one that asked for a snapshot while it was held gets it now)
+            let asked: Vec<ObjectId> = sinks.iter().filter(|s| self.snapshot_asked.remove(s)).copied().collect();
+            if let Some(c) = &changes {
+                let (all_subs, all_sinks) = (&self.subs, &mut self.sink_handles);
+                let mut last: Option<Gsn> = None;
+                res = c.for_each(&mut self.env, &mut |_, gsn, errs, rows| {
+                    if last != Some(gsn) {
+                        if let Some(g) = last {
+                            for &i in &subs {
+                                send_progress(&all_subs[i], g, limit);
                             }
-                        };
-                        for (g, outs) in steps {
-                            match outs.get(&new_node).and_then(|o| own_rows(&o.data)) {
-                                Some((rows, bytes)) => sink.send(*g, &rows, bytes, limit),
-                                None => {
-                                    sink.progress(*g);
-                                    true
-                                }
-                            };
+                        }
+                        for &i in &subs {
+                            deliver_errors(&all_subs[i], errs);
+                        }
+                        last = Some(gsn);
+                    }
+                    if rows.is_empty() {
+                        return Ok(());
+                    }
+                    let rows = Arc::new(rows);
+                    let bytes = crate::memory::delta_bytes(&rows);
+                    for &i in &subs {
+                        let s = &all_subs[i];
+                        if !s.cancel.load(Ordering::Acquire) {
+                            send_rows(s, gsn, &rows, bytes, limit);
+                        }
+                    }
+                    for sid in sinks.iter().filter(|s| !asked.contains(s)) {
+                        if let Some(sink) = all_sinks.get_mut(sid)
+                            && !sink.behind()
+                            && !sink.send(gsn, &rows, bytes, limit)
+                        {
+                            log::warn!("sink {sid} fell behind: its unwritten changes reached {} MiB; it resynchronises its target from a snapshot", limit >> 20);
+                        }
+                    }
+                    Ok(())
+                });
+                if let Some(g) = last {
+                    for &i in &subs {
+                        send_progress(&self.subs[i], g, limit);
+                    }
+                    for sid in sinks.iter().filter(|s| !asked.contains(s)) {
+                        if let Some(sink) = self.sink_handles.get(sid) {
+                            sink.progress(g);
                         }
                     }
                 }
-            } else {
+            }
+            for sid in asked {
+                self.resync_sink(sid);
+            }
+            if !r.same {
                 // (re-planned after an upstream change) new rows, new columns
                 self.restart_sinks(r.sinks)?;
             }
+        }
+        if let Some(c) = changes {
+            c.release(&mut self.env)?;
         }
         for a in r.old_index_arrs {
             self.graph.release_arr(&mut self.env, a)?;
         }
         self.graph.release_arr(&mut self.env, r.old.arr)?;
-        self.graph.release_node(&mut self.env, r.old.node)
+        self.graph.release_node(&mut self.env, r.old.node)?;
+        res
     }
 
     /// A broken view built again (`repair_view`) is hydrated: it takes its
@@ -705,47 +757,52 @@ impl Engine {
         self.env.adopt_trees(&mut res.env, &trees)?;
         self.graph.adopt_hydrated(&res.graph, &h.nodes, &h.arrs);
         log::debug!("hydration as of gsn {} is live at gsn {}", h.gsn, self.processed);
-        let Hydrated { env, graph, mut snapshots, mut diffs, steps } = res;
+        let Hydrated { mut env, graph, changes } = res;
+        // (the replaced views' kept changes, moved here)
+        let mut kept = FxHashMap::default();
+        for (view, c) in changes {
+            kept.insert(view, c.adopt(&mut self.env, &mut env)?);
+        }
         drop((env, graph));
         for t in h.then {
             match t {
                 Then::Reply { req, res } => self.reply_pending(req, res),
                 Then::ViewErrors(id) => self.take_root_errors(id),
-                Then::Subscribe(p) => {
-                    let snapshot = snapshots.remove(&p.node);
-                    self.start_subscription(p, h.gsn, snapshot, &steps);
-                }
+                // (as of now: it is live)
+                Then::Subscribe(p) => self.start_subscription(p),
                 Then::Replaced(r) => {
-                    let diff = diffs.remove(&r.id).unwrap_or_default();
-                    self.finish_replace(*r, h.gsn, diff, &steps)?;
+                    let c = kept.remove(&r.id);
+                    self.finish_replace(*r, c)?;
                 }
                 Then::Repaired(id) => self.finish_repair(id),
                 Then::Rebuilt(r) => self.finish_rebuild(*r)?,
             }
         }
+        for (_, c) in kept {
+            c.release(&mut self.env)?;
+        }
         Ok(())
     }
 
-    /// Start a subscription as of `gsn`, with its node's snapshot then and
-    /// its outputs at the records applied since (`steps`), as `deliver`
-    /// would have delivered them.
-    pub(crate) fn start_subscription(&mut self, p: PendingSub, gsn: Gsn, snapshot: Option<Output>, steps: &[(Gsn, FxHashMap<NodeId, Output>)]) {
+    /// Start a subscription at the last applied GSN: with its node's
+    /// snapshot then, if it asked for one, streamed to its session in chunks
+    /// (`snapshot_stream`, off the engine thread when large), and the changes
+    /// after it.
+    pub(crate) fn start_subscription(&mut self, p: PendingSub) {
         let (tx, rx) = unbounded();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Some(s) = snapshot {
-            // (in chunks, which the session writes out one at a time)
-            let mut rows = s.data.into_iter();
-            loop {
-                let chunk: Delta = rows.by_ref().take(super::read::SNAPSHOT_CHUNK_ROWS).collect();
-                if chunk.is_empty() {
-                    break;
-                }
-                let _ = tx.send(SubEvent::Data { gsn, rows: SharedRows::new(chunk) });
-            }
+        // (changes queued after the snapshot are bounded by its share of the
+        // memory budget; the snapshot's chunks in flight count too)
+        let queue = crate::memory::Meter::child(&self.shared.mem.outputs);
+        let gsn = self.processed;
+        if p.snapshot {
+            let c = cancel.clone();
+            let rows = self
+                .snapshot_stream(p.node, &queue, Box::new(move || c.load(Ordering::Acquire)))
+                .unwrap_or_else(super::stream::failed);
+            let _ = tx.send(SubEvent::Snapshot { gsn, rows });
         }
         let _ = tx.send(SubEvent::Progress { gsn, charge: crate::memory::Charge::none() });
-        // (changes queued after the snapshot are bounded by its share of the memory budget)
-        let queue = crate::memory::Meter::child(&self.shared.mem.outputs);
         let sub = Subscription {
             node: p.node,
             tx,
@@ -757,11 +814,6 @@ impl Engine {
             view: p.view,
             reads: p.reads,
         };
-        let limit = self.shared.mem.consumer_limit();
-        for (g, outs) in steps {
-            let o = outs.get(&sub.node);
-            deliver_to(&sub, *g, o.map(|o| &o.errs[..]).unwrap_or_default(), o.and_then(|o| own_rows(&o.data)), limit);
-        }
         self.subs.push(sub);
         self.subs_changed();
         // (a client that is gone no longer reads it: it ends)

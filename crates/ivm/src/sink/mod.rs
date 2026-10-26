@@ -3,7 +3,7 @@
 pub mod postgres;
 
 use crate::catalog::SinkDef;
-use crate::coord::api::SharedRows;
+use crate::coord::api::{Chunks, SharedRows};
 use crate::coord::EngineHandle;
 use crate::dataflow::{Delta, NodeId};
 use crate::error::Result;
@@ -13,6 +13,7 @@ use crate::storage::Gsn;
 use crate::types::Column;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Messages to a sink thread. Changes and progress marks hold a charge on
@@ -21,35 +22,34 @@ use std::sync::Arc;
 pub enum SinkMsg {
     Data(Gsn, SharedRows),
     Progress(Gsn, Charge),
-    /// Rows of the relation as of the GSN, which the sink asked for to
-    /// resynchronize its target (`Request::SinkSnapshot`): one chunk of
-    /// them. The changes sent before the first chunk are at or before the
-    /// GSN, those after the last one after it.
-    Snapshot(Gsn, SharedRows),
-    /// The end of a snapshot; an error if it could not be read whole.
-    SnapshotEnd(Gsn, Option<String>),
+    /// The relation's rows as of the GSN, which the sink asked for to
+    /// resynchronize its target (`Request::SinkSnapshot`), read in chunks
+    /// from the stream as the sink writes them (each chunk counted in the
+    /// sink's queue until written). The changes sent before it are at or
+    /// before the GSN, those after it after it.
+    Snapshot(Gsn, Chunks<Delta>),
+    /// The sink's queue reached its limit: the changes after those sent so
+    /// far are not sent, and only a snapshot (which the sink asks for)
+    /// brings its target up to date again.
+    Behind,
     Stop,
 }
 
 /// Bytes of a message in the sink's channel.
 const MSG_BYTES: usize = std::mem::size_of::<SinkMsg>() + 8;
 
-/// Bounds of a sink's writes and memory.
+/// Bounds of a sink's writes.
 #[derive(Clone, Copy, Debug)]
 pub struct SinkLimits {
     /// Most SQL text sent to the target in one message (a single statement
     /// can be larger): a transaction is written in as many messages as it
     /// needs (PostgreSQL rejects messages over 1 GB).
     pub message_bytes: usize,
-    /// Most changes (estimated encoded bytes) a sink keeps while it cannot
-    /// write them; beyond it they are dropped and the target is
-    /// resynchronized from a fresh snapshot once it can be written again.
-    pub pending_bytes: usize,
 }
 
 impl Default for SinkLimits {
     fn default() -> Self {
-        SinkLimits { message_bytes: 8 << 20, pending_bytes: 256 << 20 }
+        SinkLimits { message_bytes: 8 << 20 }
     }
 }
 
@@ -61,22 +61,29 @@ pub struct SinkHandle {
     tx: Sender<SinkMsg>,
     status: Arc<Mutex<String>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Memory of the changes queued for the sink and not written yet.
+    /// Set when the sink is asked to stop (a snapshot being written stops).
+    stopping: Arc<AtomicBool>,
+    /// Memory of the changes (and snapshot chunks) queued for the sink and
+    /// not written yet: the one bound on what a sink holds.
     queue: Arc<Meter>,
-    /// The queue would have exceeded its limit: the sink is sent nothing
-    /// more (not even progress, which would claim that the target holds
-    /// the changes it missed) and is restarted from a new snapshot once it
-    /// has written what it holds (`Engine::deliver`).
+    /// The queue would have exceeded its limit: the sink was told
+    /// (`SinkMsg::Behind`) and is sent nothing more (not even progress,
+    /// which would claim that the target holds the changes it missed) until
+    /// it asks for a snapshot (`resync`).
     behind: bool,
 }
 
 impl SinkHandle {
-    /// Queue the changes of a GSN (`bytes` in memory), unless the queue
-    /// would exceed `limit` bytes: then the sink falls behind and false is
-    /// returned.
+    /// Queue the changes of a GSN (`bytes` in memory; a GSN's changes may
+    /// come in several chunks), unless the queue would exceed `limit`
+    /// bytes: then the sink falls behind and false is returned.
     pub fn send(&mut self, gsn: Gsn, rows: &Arc<Delta>, bytes: usize, limit: usize) -> bool {
-        if self.behind || self.queue.used() + bytes + MSG_BYTES > limit {
+        if self.behind {
+            return false;
+        }
+        if self.queue.used() + bytes + MSG_BYTES > limit {
             self.behind = true;
+            let _ = self.tx.send(SinkMsg::Behind);
             return false;
         }
         let _ = self.tx.send(SinkMsg::Data(gsn, SharedRows::shared(rows, self.queue.charge(bytes + MSG_BYTES))));
@@ -88,17 +95,19 @@ impl SinkHandle {
             let _ = self.tx.send(SinkMsg::Progress(gsn, self.queue.charge(MSG_BYTES)));
         }
     }
-    /// Is the sink behind, and has it written (or dropped) everything it
-    /// was sent, so that it can be restarted?
-    pub fn behind_and_idle(&self) -> bool {
-        self.behind && self.queue.used() == 0
-    }
     pub fn behind(&self) -> bool {
         self.behind
     }
-    /// The sink's channel (to send it a snapshot).
-    pub fn sender(&self) -> Sender<SinkMsg> {
-        self.tx.clone()
+    /// The memory of what is queued for the sink (snapshot chunks are
+    /// charged to it).
+    pub fn queue(&self) -> &Arc<Meter> {
+        &self.queue
+    }
+    /// Send the sink the snapshot it asked for, as of `gsn`: it is current
+    /// from there on, and is sent the changes after it.
+    pub fn resync(&mut self, gsn: Gsn, rows: Chunks<Delta>) {
+        self.behind = false;
+        let _ = self.tx.send(SinkMsg::Snapshot(gsn, rows));
     }
     pub fn status(&self) -> String {
         let st = self.status.lock().clone();
@@ -111,6 +120,7 @@ impl SinkHandle {
     /// writers take turns on the progress row, which only moves forward, and
     /// one whose progress is outdated cannot write; see `postgres::Writer`.)
     pub fn stop(mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.stopping.store(true, Ordering::Release);
         let _ = self.tx.send(SinkMsg::Stop);
         self.thread.take()
     }
@@ -130,16 +140,17 @@ pub fn start(
     limits: SinkLimits,
     engine: EngineHandle,
 ) -> Result<SinkHandle> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static TOKENS: AtomicU64 = AtomicU64::new(1);
     let token = TOKENS.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = crossbeam_channel::unbounded();
     let queue = Meter::child(&engine.shared.mem.outputs);
     let status = Arc::new(Mutex::new("starting".to_string()));
-    let st = status.clone();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let (st, sp) = (status.clone(), stopping.clone());
     let thread = std::thread::Builder::new().name(format!("ivm-sink-{name}")).spawn(move || {
         let ask = move || engine.request_sink_snapshot(id, token);
-        postgres::run(name, def, columns, gsn, limits, rx, st, &ask);
+        postgres::run(name, def, columns, gsn, limits, rx, st, sp, &ask);
     })?;
-    Ok(SinkHandle { node, token, tx, status, thread: Some(thread), queue, behind: false })
+    Ok(SinkHandle { node, token, tx, status, thread: Some(thread), stopping, queue, behind: false })
 }

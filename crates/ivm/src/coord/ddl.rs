@@ -1125,6 +1125,7 @@ impl Engine {
                 if let Some(h) = self.sink_handles.remove(&id) {
                     let _ = h.stop();
                 }
+                self.snapshot_asked.remove(&id);
             }
             ObjectKind::View(_) => {}
         }
@@ -1186,6 +1187,7 @@ impl Engine {
             if let Some(h) = self.sink_handles.remove(&id) {
                 let _ = h.stop();
             }
+            self.snapshot_asked.remove(&id);
             if let (Some(o), Some(handle)) = (self.catalog.get(id).cloned(), self.handle.clone())
                 && let ObjectKind::Sink(sd) = &o.kind
             {

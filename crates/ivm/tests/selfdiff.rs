@@ -155,7 +155,14 @@ impl Sub {
     fn drain(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
-                SubEvent::Data { rows, .. } => {
+                ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                    let rows = match ev.rows() {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            self.failed = Some(e.message);
+                            continue;
+                        }
+                    };
                     for (r, w) in rows {
                         let k: Vec<String> = r.iter().zip(&self.columns).map(|(d, c)| datum_text(d, &c.ty, false)).collect();
                         let e = self.rows.entry(k.clone()).or_default();

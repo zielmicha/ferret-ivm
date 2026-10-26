@@ -1,19 +1,27 @@
 //! Large reads off the engine thread. A read runs on the engine thread with
-//! a budget of entries it may visit; one that exceeds it is run again on a
-//! reader thread, against a fork of the storage taken at once (every tree
-//! as of the last applied GSN, `Env::fork`) and a copy of the part of the
-//! graph it reads: the same read point and plan, hence the same result,
-//! while the engine goes on. The budget bounds what a read costs the engine
-//! thread; small reads (point lookups, short ranges) cost no fork.
+//! a budget of entries it may visit (and of rows it may return); one that
+//! exceeds it is run again on a reader thread, against a fork of the
+//! storage taken at once (every tree as of the last applied GSN,
+//! `Env::fork`) and a copy of the part of the graph it reads: the same read
+//! point and plan, hence the same result, while the engine goes on. The
+//! budget bounds what a read costs the engine thread; small reads (point
+//! lookups, short ranges) cost no fork.
 //!
-//! The snapshots that a subscription `WITH SNAPSHOT` to a relation and a
-//! sink start from are taken the same way: within the budget on the engine
-//! thread, else on a reader thread as of the GSN the subscription or sink
-//! starts at, while the outputs of the relation's node at the records
-//! applied meanwhile are kept, to be delivered after the snapshot.
+//! The snapshots that a subscription `WITH SNAPSHOT` starts with and that a
+//! sink resynchronises its target from are taken the same way: within the
+//! budget on the engine thread, else on a reader thread from a fork as of
+//! the GSN the subscription or the snapshot starts at. Either way the
+//! consumer gets the snapshot as a stream of chunks (`coord::stream`) in
+//! its queue at that GSN, before the changes after it: a reader thread
+//! sends the chunks as the consumer takes them, a few at a time, so that a
+//! snapshot of any size reaches a slow consumer in bounded memory, and the
+//! engine keeps nothing for it.
 
+use super::stream::{ChunkSender, Chunks};
 use super::*;
+use crate::dataflow::Delta;
 use crate::exec::ExecCtx;
+use crate::memory::Meter;
 use crate::storage::ReadAt;
 
 /// Entries a read may visit on the engine thread.
@@ -35,49 +43,72 @@ pub(crate) enum ReadJob {
         settings: Arc<BTreeMap<String, String>>,
         interrupts: Option<Arc<Interrupts>>,
         reply: Sender<Result<ExecResult>>,
+        meter: Arc<Meter>,
     },
-    /// A node's snapshot, handed back to the engine (which it wakes).
-    Snapshot { env: Env, graph: Graph, node: NodeId, done: Sender<Result<Output>>, wake: Sender<EngineMsg> },
+    /// A node's snapshot, streamed to its consumer.
+    Snapshot { env: Env, graph: Graph, node: NodeId, tx: ChunkSender<Delta> },
 }
 
 fn run(job: ReadJob) {
     match job {
-        ReadJob::Query { mut env, graph, objects, bq, at, settings, interrupts, reply } => {
+        ReadJob::Query { mut env, graph, objects, bq, at, settings, interrupts, reply, meter } => {
             let objects = |oid: u64| objects.iter().find(|(o, _)| *o == oid).map(|(_, n)| *n);
             let mut ctx = ExecCtx { g: &graph, env: &mut env, at, objects: &objects, rec: Default::default(), visited: 0 };
             // the rows go to the session in chunks as they are found; a
             // session that stops reading them (or a cancel) ends the read
-            let mut res = super::read::ChunkedReply::new(super::read::result_columns(&bq), reply);
+            let stop = interrupts.clone();
+            let stop = Box::new(move || stop.as_ref().is_some_and(|i| i.cancelled() || i.gone()));
+            let mut res = super::read::ChunkedReply::streaming(super::read::result_columns(&bq), reply, meter, stop);
             let r = crate::expr::with_session_settings(settings, || {
                 ctx.run_query(&bq, &mut |row| {
                     if interrupts.as_ref().is_some_and(|i| i.cancelled()) {
-                        return Err(SqlError::new(codes::QUERY_CANCELED, "canceling statement due to user request"));
+                        return Err(super::stream::cancelled());
                     }
-                    Ok(res.push(row))
+                    res.push(row)
                 })
             });
+            // (stopped by a cancel while the session did not take its rows)
+            let r = match r {
+                Ok(()) if interrupts.as_ref().is_some_and(|i| i.cancelled()) => Err(super::stream::cancelled()),
+                r => r,
+            };
             res.finish(r);
         }
-        ReadJob::Snapshot { mut env, graph, node, done, wake } => {
-            let _ = done.send(graph.snapshot(&mut env, node));
-            let _ = wake.send(EngineMsg::Wake);
+        ReadJob::Snapshot { mut env, graph, node, tx } => {
+            if let Err(e) = snapshot_chunks(&graph, &mut env, node, &mut |rows, mem| tx.send(rows, mem)) {
+                tx.fail(e);
+            }
         }
     }
 }
 
-/// A snapshot being taken on a reader thread for a subscription or a sink
-/// that starts at `gsn`, and the outputs of its node at the records applied
-/// since (None: it did not change), delivered after it.
-pub(crate) struct Snapshotting {
-    gsn: Gsn,
-    pub(crate) node: NodeId,
-    done: Receiver<Result<Output>>,
-    outputs: Vec<(Gsn, Option<Output>)>,
-    then: AfterSnapshot,
-}
-
-pub(crate) enum AfterSnapshot {
-    Subscription(super::hydrate::PendingSub),
+/// The rows of `node` now, handed to `f` in chunks of `SNAPSHOT_CHUNK_ROWS`
+/// rows or about `SNAPSHOT_CHUNK_BYTES` of memory, with their memory, until
+/// `f` returns false.
+fn snapshot_chunks(graph: &Graph, env: &mut Env, node: NodeId, f: &mut dyn FnMut(Delta, usize) -> bool) -> Result<()> {
+    use super::read::{SNAPSHOT_CHUNK_BYTES, SNAPSHOT_CHUNK_ROWS};
+    let (mut chunk, mut mem, mut stopped) = (Vec::new(), 0, false);
+    let r = crate::dataflow::ops::snapshot_stream(graph, env, node, &mut |_, batch| {
+        for (row, w) in batch {
+            mem += crate::dataflow::delta::row_mem(&row);
+            chunk.push((row, w));
+            if (chunk.len() >= SNAPSHOT_CHUNK_ROWS || mem >= SNAPSHOT_CHUNK_BYTES) && !f(std::mem::take(&mut chunk), std::mem::take(&mut mem)) {
+                stopped = true;
+                return Err(super::stream::cancelled());
+            }
+        }
+        Ok(())
+    });
+    match r {
+        Err(_) if stopped => Ok(()),
+        Err(e) => Err(e),
+        Ok(_) => {
+            if !chunk.is_empty() {
+                f(chunk, mem);
+            }
+            Ok(())
+        }
+    }
 }
 
 impl Engine {
@@ -100,7 +131,9 @@ impl Engine {
             .collect();
         let graph = self.graph.fork_of(&objects.iter().map(|(_, n)| *n).collect::<Vec<_>>());
         let env = self.fork_env()?;
-        self.send_to_reader(ReadJob::Query { env, graph, objects, bq: Box::new(bq), at, settings: vars.settings, interrupts: vars.interrupts, reply })
+        let meter = self.shared.mem.outputs.clone();
+        let job = ReadJob::Query { env, graph, objects, bq: Box::new(bq), at, settings: vars.settings, interrupts: vars.interrupts, reply, meter };
+        self.send_to_reader(job)
     }
 
     fn send_to_reader(&mut self, job: ReadJob) -> Result<()> {
@@ -124,66 +157,33 @@ impl Engine {
         tx.send(job).map_err(|_| SqlError::internal("reader threads stopped"))
     }
 
-    /// The snapshot of `node` now, if it is taken within the read budget
-    /// (always when replaying or without threads); else it is taken on a
-    /// reader thread, as of the last applied GSN, and `then` follows it
-    /// (`poll_snapshots`).
-    pub(crate) fn snapshot_or_defer(&mut self, node: NodeId, then: AfterSnapshot) -> Result<Option<(Output, AfterSnapshot)>> {
-        let Some(wake) = self.handle.as_ref().filter(|_| !self.replaying).map(|h| h.tx.clone()) else {
-            return Ok(Some((self.graph.snapshot(&mut self.env, node)?, then)));
-        };
-        self.env.set_read_budget(Some(INLINE_READ_ENTRIES));
-        let r = self.graph.snapshot(&mut self.env, node);
+    /// The snapshot of `node` at the last applied GSN, as a stream of
+    /// chunks charged to `meter`: read on the engine thread if that takes
+    /// no more than the read budget (always when replaying or without
+    /// threads), else on a reader thread from a fork, which sends the chunks
+    /// as the consumer takes them and gives up when `stop` returns true
+    /// while it waits.
+    pub(crate) fn snapshot_stream(&mut self, node: NodeId, meter: &Arc<Meter>, stop: Box<dyn Fn() -> bool + Send>) -> Result<Chunks<Delta>> {
+        let inline = self.handle.is_none() || self.replaying;
+        let mut chunks = Vec::new();
+        if !inline {
+            self.env.set_read_budget(Some(INLINE_READ_ENTRIES));
+        }
+        let r = snapshot_chunks(&self.graph, &mut self.env, node, &mut |rows, mem| {
+            chunks.push((rows, mem));
+            true
+        });
         self.env.set_read_budget(None);
         match r {
             Err(e) if e.code == crate::storage::READ_BUDGET => {}
-            r => return Ok(Some((r?, then))),
+            Err(e) => return Err(e),
+            Ok(()) => return Ok(super::stream::ready(meter, chunks, Ok(()))),
         }
+        drop(chunks);
         let graph = self.graph.fork_of(&[node]);
         let env = self.fork_env()?;
-        let (tx, done) = bounded(1);
-        self.send_to_reader(ReadJob::Snapshot { env, graph, node, done: tx, wake })?;
-        self.snapshotting.push(Snapshotting { gsn: self.processed, node, done, outputs: Vec::new(), then });
-        Ok(None)
-    }
-
-    /// Keep a record's outputs for the snapshots being taken.
-    pub(crate) fn keep_for_snapshots(&mut self, gsn: Gsn, outputs: &FxHashMap<NodeId, Output>) {
-        for s in self.snapshotting.iter_mut() {
-            s.outputs.push((gsn, outputs.get(&s.node).cloned()));
-        }
-    }
-
-    /// Start the subscriptions and sinks whose snapshots have been taken,
-    /// with the outputs kept since.
-    pub(crate) fn poll_snapshots(&mut self) -> Result<()> {
-        let mut i = 0;
-        while i < self.snapshotting.len() {
-            let r = match self.snapshotting[i].done.try_recv() {
-                Ok(r) => r,
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    i += 1;
-                    continue;
-                }
-                Err(_) => Err(SqlError::internal("reader thread vanished")),
-            };
-            let s = self.snapshotting.remove(i);
-            let snapshot = r?;
-            self.after_snapshot(s.then, s.gsn, snapshot, s.outputs)?;
-        }
-        Ok(())
-    }
-
-    /// Start a subscription or a sink from its snapshot as of `gsn` and the
-    /// outputs of its node at the records applied since.
-    pub(crate) fn after_snapshot(&mut self, then: AfterSnapshot, gsn: Gsn, snapshot: Output, outputs: Vec<(Gsn, Option<Output>)>) -> Result<()> {
-        match then {
-            AfterSnapshot::Subscription(p) => {
-                let steps: Vec<(Gsn, FxHashMap<NodeId, Output>)> =
-                    outputs.into_iter().map(|(g, o)| (g, o.map(|o| (p.node, o)).into_iter().collect())).collect();
-                self.start_subscription(p, gsn, Some(snapshot), &steps);
-            }
-        }
-        Ok(())
+        let (tx, rx) = super::stream::bounded(meter.clone(), stop);
+        self.send_to_reader(ReadJob::Snapshot { env, graph, node, tx })?;
+        Ok(rx)
     }
 }

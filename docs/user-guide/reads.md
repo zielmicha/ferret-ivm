@@ -191,9 +191,14 @@ Rows tied in the `ORDER BY` can come in any order, and which of them a
 `LIMIT` keeps depends on the index read. An error in the middle of a large
 result (a division by zero in row 20,000, say) ends it after the rows
 already sent, as in PostgreSQL; a result of one chunk fails before any row.
-A client that stops reading (it disconnects) ends the read at its next
-chunk. The engine thread does not wait for the client: chunks it produced
-faster than the client reads them wait in memory.
+A client that disconnects ends the read at its next chunk, and a cancel
+ends it while it waits for the client. A small read (one that visits up to
+50,000 index entries and returns up to 50,000 rows) runs on the engine
+thread and hands its rows over at once; a larger one runs on one of four
+reader threads ([Planner](../internals/planner.md#batch-execution)), which
+reads ahead of the client by at most two chunks: a client that reads
+slowly does not make the server's memory grow, but holds a reader thread
+(four large reads whose clients do not read make other large reads wait).
 
 ## Transactions
 
@@ -307,8 +312,11 @@ The stream consists of:
 
 1. with `SNAPSHOT` (default): the current contents, as rows with
    `gsn` = the last applied GSN and positive `diff` (the multiplicity),
-   read from the relation's index and sent in chunks of 10,000 rows (the
-   session writes them out every 1 MiB);
+   read from the relation's index in chunks of 10,000 rows as the session
+   writes them out (every 1 MiB) — a large snapshot on a reader thread,
+   which reads ahead of the client by two chunks, so that a snapshot of any
+   size takes bounded memory; the changes after it are queued meanwhile,
+   within the subscription's limit;
 2. a progress row at that GSN (only with `PROGRESS`);
 3. for every later GSN at which the relation changes: its changes,
    consolidated — no row appears with both signs within a GSN, so an update

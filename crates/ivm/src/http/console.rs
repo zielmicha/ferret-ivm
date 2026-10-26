@@ -161,7 +161,7 @@ fn render(res: ExecResult, limit: usize) -> Result<QueryResponse, ApiError> {
             let mut out = header(&columns);
             let mut bytes = 0usize;
             while let Some(chunk) = rows.next_chunk() {
-                for r in &chunk.map_err(statement_error)? {
+                for r in chunk.map_err(statement_error)?.iter() {
                     add_row(&mut out, r, limit, &mut bytes);
                 }
             }

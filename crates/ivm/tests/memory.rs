@@ -13,7 +13,7 @@
 //! key's heap block, so 128 MiB of accounted cache took over 500 MiB; and a
 //! full scan loaded the whole tree before evicting anything.
 
-use ivm::coord::api::{ExecResult, SessionVars};
+use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
 use ivm::storage::{AggKind, CountSummarizer, Env, EnvOptions, Summarizer, Summary};
 use ivm::types::text::format_datum;
@@ -347,7 +347,9 @@ fn memory_stays_within_the_cache() {
     let running = coord::start(cfg.clone()).expect("engine starts");
     let h = running.handle.clone();
     hydration(&h, cache);
-    large_commit(&h, cache);
+    let alone = large_commit(&h, cache);
+    large_commit_delivered(&h, cache, alone);
+    large_replacement_delivered(&h, cache);
     let running = large_commit_replayed(running, cfg, cache);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -361,7 +363,7 @@ fn memory_stays_within_the_cache() {
 fn large_commit_replayed(running: coord::Running, cfg: coord::Config, cache: usize) -> coord::Running {
     let h = running.handle.clone();
     exec(&h, "CHECKPOINT");
-    exec(&h, "INSERT INTO q SELECT g, g % 1000, repeat('r', 300) || g FROM generate_series(150001, 300000) g");
+    exec(&h, "INSERT INTO q SELECT g, g % 1000, repeat('r', 300) || g FROM generate_series(300001, 450000) g");
     let parts = std::fs::read_dir(cfg.data_dir.join("log")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("parts-")).count();
     assert_eq!(parts, 1, "the commit is logged as parts");
     running.crash();
@@ -373,9 +375,9 @@ fn large_commit_replayed(running: coord::Running, cfg: coord::Config, cache: usi
     // (the rows alone take about 70 MiB in memory)
     assert!(used < cache + 40 * MB, "replaying the commit used {} MiB", used / MB);
     let h = running.handle.clone();
-    assert_eq!(rows(&h, "SELECT count(*) FROM q"), ["300000"]);
+    assert_eq!(rows(&h, "SELECT count(*) FROM q"), ["450000"]);
     assert_eq!(rows(&h, "SELECT count(*), sum(k) FROM qf"), rows(&h, "SELECT count(*), sum(k) FROM q"));
-    assert_eq!(rows(&h, "SELECT count(*), sum(c) FROM qa"), ["1000|300000"]);
+    assert_eq!(rows(&h, "SELECT count(*), sum(c) FROM qa"), ["1000|450000"]);
     running
 }
 
@@ -420,7 +422,7 @@ fn hydration(h: &EngineHandle, cache: usize) {
 /// (the statement and the log record themselves, outside the dataflow).
 /// The deltas used to be held in memory, all of them until the end of the
 /// GSN.
-fn large_commit(h: &EngineHandle, cache: usize) {
+fn large_commit(h: &EngineHandle, cache: usize) -> usize {
     exec(h, "CREATE TABLE plain (id bigint PRIMARY KEY, k bigint, s text)");
     exec(h, "CREATE TABLE q (id bigint PRIMARY KEY, k bigint, s text)");
     exec(h, "CREATE TABLE d (k bigint PRIMARY KEY, name text)");
@@ -447,4 +449,74 @@ fn large_commit(h: &EngineHandle, cache: usize) {
     assert_eq!(rows(h, "SELECT count(*), sum(k) FROM qf"), rows(h, "SELECT count(*), sum(k) FROM q"));
     assert_eq!(rows(h, "SELECT count(*) FROM qj"), ["150000"]);
     assert_eq!(rows(h, "SELECT count(*), sum(c) FROM qa"), ["1000|150000"]);
+    alone
+}
+
+/// A subscription's event (`subscriptions`), with a timeout.
+fn next_event(rx: &crossbeam_channel::Receiver<SubEvent>) -> SubEvent {
+    rx.recv_timeout(std::time::Duration::from_secs(30)).expect("an event")
+}
+
+/// The changes of such a commit reach a subscriber in chunks read from the
+/// trees the step spilled them to: the commit costs no more with a
+/// subscriber than with views alone, and a subscriber that does not read
+/// them is ended at its queue's limit. (A spilled output was read back
+/// whole for its consumers, and copied once more.)
+fn large_commit_delivered(h: &EngineHandle, cache: usize, alone: usize) {
+    let ExecResult::Subscribe { rx, .. } = try_exec(h, "SUBSCRIBE TO qf WITH (SNAPSHOT = false)").unwrap() else { panic!("not a subscription") };
+    assert!(matches!(next_event(&rx), SubEvent::Progress { .. }));
+    let (before, _) = heap();
+    exec(h, "INSERT INTO q SELECT g, g % 1000, repeat('s', 300) || g FROM generate_series(150001, 300000) g");
+    let (_, peak) = heap();
+    let used = peak.saturating_sub(before);
+    println!("a commit of 150,000 wide rows with a subscriber to their view: peak {} MiB", used / MB);
+    assert!(used < alone + cache + 40 * MB, "the commit used {} MiB with a subscriber", used / MB);
+    let (mut chunks, mut error) = (0, None);
+    while error.is_none() {
+        match next_event(&rx) {
+            SubEvent::Data { rows, .. } => {
+                assert!(rows.len() <= 1024, "a chunk of {} rows", rows.len());
+                chunks += 1;
+            }
+            SubEvent::Error(e) => error = Some(e.code),
+            _ => {}
+        }
+    }
+    assert!(chunks >= 2, "{chunks} chunks");
+    assert_eq!(error.as_deref(), Some("53000"));
+}
+
+/// Replacing a view with subscribers computes the change from the old to
+/// the new contents into a temporary tree and delivers it in chunks: the
+/// replacement stays within the pool and a constant, and the subscriber
+/// gets the change a chunk at a time (ended at its queue's limit here).
+/// (The change was computed and delivered as one vector in memory.)
+fn large_replacement_delivered(h: &EngineHandle, cache: usize) {
+    exec(h, "CREATE MATERIALIZED VIEW rv AS SELECT id, s FROM q WHERE k < 100");
+    let ExecResult::Subscribe { rx, .. } = try_exec(h, "SUBSCRIBE TO rv WITH (SNAPSHOT = false)").unwrap() else { panic!("not a subscription") };
+    assert!(matches!(next_event(&rx), SubEvent::Progress { .. }));
+    let (before, _) = heap();
+    // (about 120,000 rows more: some 50 MiB in memory)
+    exec(h, "CREATE OR REPLACE MATERIALIZED VIEW rv AS SELECT id, s FROM q WHERE k < 500");
+    let (_, peak) = heap();
+    let used = peak.saturating_sub(before);
+    println!("replacing a view with a subscriber by one 120,000 wide rows larger: peak {} MiB", used / MB);
+    // (the change alone takes about 50 MiB in memory; it used to take 27
+    // MiB, held as one vector, where it now takes 5)
+    assert!(used < cache + 12 * MB, "the replacement used {} MiB", used / MB);
+    let (mut chunks, mut error) = (0, None);
+    while error.is_none() {
+        match next_event(&rx) {
+            SubEvent::Data { rows, .. } => {
+                assert!(rows.len() <= 1024, "a chunk of {} rows", rows.len());
+                assert!(rows.iter().all(|(_, w)| *w == 1));
+                chunks += 1;
+            }
+            SubEvent::Error(e) => error = Some(e.code),
+            _ => {}
+        }
+    }
+    assert!(chunks >= 2, "{chunks} chunks");
+    assert_eq!(error.as_deref(), Some("53000"));
+    assert_eq!(rows(h, "SELECT count(*) FROM rv"), ["150000"]);
 }

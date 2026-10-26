@@ -388,10 +388,11 @@ arrangements at a given `ReadAt`:
   rows without `LIMIT`). A plan with `Negate` is consolidated before its
   rows are read. Multiplicities are expanded, `OFFSET`/`LIMIT`/`WITH TIES`
   applied and the hidden sort columns truncated as the rows go out
-  (`Emitter`). The engine sends them to the session in chunks of 1,024 rows
-  or about 256 KB (`coord/read.rs`: a result of one chunk as
+  (`Emitter`). They go to the session in chunks of 1,024 rows or about
+  256 KB (`coord/read.rs`, `ChunkedReply`: a result of one chunk as
   `ExecResult::Query`, a larger one as `ExecResult::Rows`, whose later
-  chunks follow on a channel; a closed channel ends the read).
+  chunks follow on a stream, `coord::stream`; a closed stream ends the
+  read).
 
 Before a read runs, `now()` and its relatives are bound to the logical clock
 as of the read's GSN, and the read fails if it touches a broken view
@@ -399,21 +400,32 @@ as of the read's GSN, and the read fails if it touches a broken view
 the query, as in PostgreSQL (after the chunks already sent, if any).
 
 A read runs on the engine thread with a budget of 50,000 entries that its
-scans may visit (`Env::set_read_budget`; DML is evaluated without one). A
-read that exceeds it is abandoned there and run again on a reader thread
+scans may visit (`Env::set_read_budget`; DML is evaluated without one), and
+of 50,000 rows or 8 MiB that it may return: it keeps its rows until it is
+done (it sends nothing before, so that it can still go elsewhere), and
+then hands them to the session at once, counted in the outputs' memory. A
+read that exceeds either is abandoned there and run again on a reader thread
 (`coord/reader.rs`, four of them, started when first needed) against a fork
 of the storage taken at once — every tree as it is after the last applied
 record ([Storage](storage.md#forks)) — and a copy of the part of the graph
 it reads (`Graph::fork_of`): the same read point and plan, hence the same
 result, while the engine goes on applying records and answering other
-statements. The reader thread answers the client. A small read costs no
-fork; a large one costs the engine thread its budget and the fork (one
-reference-count increment per loaded node). The snapshots that a sink and
-a `SUBSCRIBE ... WITH SNAPSHOT` to a relation start from are taken the same
-way (`Engine::snapshot_or_defer`): one taken off the engine thread is as of
-the GSN the sink or subscription starts at, and the engine keeps the
-relation's outputs at the records it applies meanwhile, delivered after the
-snapshot; DDL records wait until no such snapshot is being taken.
+statements. The reader thread streams the rows to the session as they are
+found, waiting for it to take them: at most two chunks are in flight
+(`coord::stream`), so a large result reaches a slow client in bounded
+memory; the reader stops when the session drops the stream (the client
+went away, or a portal was closed) or the statement is cancelled while it
+waits (the session then reports `57014`). A small read costs no fork; a
+large one costs the engine thread its budget and the fork (one
+reference-count increment per loaded node), and holds a reader thread
+while its client reads. The snapshots that a `SUBSCRIBE ... WITH SNAPSHOT`
+starts with and that a sink resynchronises its target from are read the
+same way (`Engine::snapshot_stream`): within the budget on the engine
+thread, else on a reader thread from a fork as of the GSN the subscription
+or snapshot starts at, as the consumer takes them. The consumer gets the
+snapshot as one event in its queue at that GSN (`SubEvent::Snapshot`,
+`SinkMsg::Snapshot`), before the changes after it, which the engine
+delivers as usual meanwhile: it keeps nothing for the snapshot.
 
 Because the executor and the dataflow share the aggregate, window and
 expression code, a maintained view and the same query run ad hoc compute

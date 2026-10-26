@@ -84,7 +84,8 @@ pub struct EngineStats {
     pub cache_capacity_bytes: usize,
     pub dirty_bytes: usize,
     /// The other parts of the memory budget: group caches, records waiting
-    /// to be applied, changes queued for subscriptions and sinks, the
+    /// to be applied, changes queued for subscriptions and sinks (with the
+    /// snapshots and query results in flight to consumers), the
     /// dataflow's transient working memory in use, the buffer pools of forks
     /// of the storage, changes forwarded to a hydration.
     pub group_cache_bytes: usize,

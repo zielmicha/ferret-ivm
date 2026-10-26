@@ -912,11 +912,11 @@ fn sink_delivers_exactly_once_across_restarts() {
 
 /// A sink whose writes block (here on a lock held on its target) stops
 /// receiving changes once its unwritten ones reach their memory limit, and
-/// once it has written them it is restarted from a snapshot, rewriting the
-/// target: memory stays bounded and the target ends up equal to the
-/// relation. (Its queue used to grow with every change.)
+/// once it can write again it drops them and resynchronises the target
+/// from a snapshot: memory stays bounded and the target ends up equal to
+/// the relation. (Its queue used to grow with every change.)
 #[test]
-fn a_sink_that_falls_behind_is_restarted_from_a_snapshot() {
+fn a_sink_that_falls_behind_resynchronises_from_a_snapshot() {
     let mut up = Upstream::start();
     let dir = tmpdir("sink-behind");
     let mut ivm = Ivm::start_with(&dir, |c| c.memory_bytes = 16 << 20);
@@ -935,11 +935,11 @@ fn a_sink_that_falls_behind_is_restarted_from_a_snapshot() {
     let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
     eventually("the sink to fall behind", || status(&mut ivm).starts_with("behind"));
     locker.simple_query("ROLLBACK").unwrap();
-    eventually("the restarted sink to catch up", || count(&mut up).as_deref() == Some("12001") && status(&mut ivm).starts_with("running"));
-    // the restart rewrote the target
+    eventually("the sink to catch up", || count(&mut up).as_deref() == Some("12001") && status(&mut ivm).starts_with("running"));
+    // the resynchronisation rewrote the target
     assert_ne!(up.rows("SELECT xmin FROM t_copy WHERE id = 0"), first_xmin);
     ivm.exec("UPDATE t SET s = 'changed' WHERE id = 0");
-    eventually("a change after the restart", || up.rows("SELECT s FROM t_copy WHERE id = 0") == ["changed"]);
+    eventually("a change after the resynchronisation", || up.rows("SELECT s FROM t_copy WHERE id = 0") == ["changed"]);
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1114,18 +1114,23 @@ fn sink_keeps_changes_while_its_target_is_unreachable() {
 /// A sink writes a transaction in messages of bounded size (a
 /// resynchronization used to be one SQL string, which PostgreSQL rejects
 /// beyond 1 GB, so a large relation never finished its first sync), and
-/// bounds the changes it keeps while it cannot write: beyond the bound it
-/// drops them and resynchronizes the target from a fresh snapshot instead
-/// (they used to grow without limit, and the catch-up write with them).
-/// Each resynchronization is one transaction.
+/// the changes it keeps while it cannot write are bounded by its queue's
+/// limit (a sixteenth of the memory budget, at least 4 MiB): beyond it,
+/// the engine stops sending, the sink drops them and resynchronizes the
+/// target from a fresh snapshot instead (they used to grow without limit,
+/// and the catch-up write with them). Each resynchronization is one
+/// transaction.
 #[test]
 fn sinks_write_in_bounded_messages_and_resynchronize_a_large_backlog() {
     let mut up = Upstream::start();
-    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int)");
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int, s text)");
     let dir = tmpdir("sink-bounded");
-    let mut ivm = Ivm::start_with(&dir, |c| c.sink_limits = ivm::sink::SinkLimits { message_bytes: 4096, pending_bytes: 16 << 10 });
-    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
-    ivm.exec("INSERT INTO t SELECT g, g FROM generate_series(1, 3000) g");
+    let mut ivm = Ivm::start_with(&dir, |c| {
+        c.sink_limits = ivm::sink::SinkLimits { message_bytes: 4096 };
+        c.memory_bytes = 16 << 20;
+    });
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int, s text)");
+    ivm.exec("INSERT INTO t SELECT g, g, repeat('s', 1000) FROM generate_series(1, 3000) g");
     ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
     let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
     let same = |ivm: &mut Ivm, up: &mut Upstream| {
@@ -1137,9 +1142,10 @@ fn sinks_write_in_bounded_messages_and_resynchronize_a_large_backlog() {
     let xmins = |up: &mut Upstream| up.rows("SELECT count(DISTINCT xmin::text) FROM target");
     assert_eq!(xmins(&mut up), ["1"], "the first sync is one transaction");
     eventually("the sink to run", || status(&mut ivm).starts_with("running"));
-    ivm.exec("INSERT INTO t VALUES (5000, 5000)");
+    ivm.exec("INSERT INTO t VALUES (5000, 5000, 'x')");
     eventually("a change", || same(&mut ivm, &mut up));
-    // the target rejects every change while about 100 KB of changes come
+    // the target rejects every change while about 6 MiB of changes (in
+    // memory) come, more than the 4 MiB the sink may keep
     up.exec("ALTER TABLE target ADD CONSTRAINT small CHECK (v < 10000)");
     for i in 0..40 {
         ivm.exec(&format!("UPDATE t SET v = v + 10000 WHERE id % 40 = {i}"));
@@ -1561,13 +1567,14 @@ mod api {
     }
 }
 
-/// A sink over a relation too large to snapshot within the engine thread's
-/// read budget starts from a snapshot taken on a reader thread, as of the
-/// GSN it was created at, and then gets the changes applied meanwhile:
-/// the target ends up equal to the relation, and commits made while the
-/// snapshot was taken are not lost or doubled.
+/// A new sink over a relation too large to snapshot within the engine
+/// thread's read budget synchronises its target from a snapshot read on a
+/// reader thread as the sink writes it, as of the GSN it asked at, and then
+/// gets the changes applied meanwhile: the target ends up equal to the
+/// relation, and commits made while the snapshot was read and written are
+/// not lost or doubled.
 #[test]
-fn sinks_over_large_relations_start_from_a_snapshot_taken_off_the_engine_thread() {
+fn sinks_over_large_relations_synchronise_from_a_snapshot_read_off_the_engine_thread() {
     let up = Upstream::start();
     let dir = tmpdir("sink-large");
     let mut ivm = Ivm::start(&dir);
