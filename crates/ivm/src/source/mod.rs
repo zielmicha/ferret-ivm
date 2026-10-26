@@ -76,8 +76,10 @@ pub struct SourceHandle {
 
 impl SourceHandle {
     /// Ask the source thread to stop, without waiting for it: it may be in
-    /// a connection attempt or a snapshot query, which the engine thread
-    /// must not wait for. Returns the thread, to join where waiting is fine.
+    /// a connection attempt, which the engine thread must not wait for.
+    /// Returns the thread, to join where waiting is fine. (Its copy thread,
+    /// which may be in a snapshot query, ends once the source thread is
+    /// gone and the query returns.)
     /// (Its replication slot, if the source was dropped, is dropped by
     /// retrying until the thread's session has let go of it.)
     pub fn stop(mut self) -> Option<std::thread::JoinHandle<()>> {
@@ -99,7 +101,7 @@ pub fn start(
     name: String,
     def: SourceDef,
     tables: Vec<SourceTable>,
-    state: String,
+    state: postgres::SourceState,
     resume_lsn: u64,
     engine: EngineHandle,
 ) -> Result<SourceHandle> {

@@ -344,7 +344,7 @@ fn snapshot_reads_wait_for_their_tables() {
         s.tables.insert(st, crate::source::postgres::SnapState { done, ..Default::default() });
         serde_json::to_string(&s).unwrap()
     };
-    t.e.source_states.insert(src, state(false));
+    t.e.source_states.insert(src, crate::source::postgres::SourceState::parse(&state(false)));
     t.e.snap_epoch += 1;
     let rx = read(&mut t, &h, "SELECT count(*) FROM st", crate::sql::parser::AsOf::Fresh);
     assert_eq!(t.e.parked.len(), 1);

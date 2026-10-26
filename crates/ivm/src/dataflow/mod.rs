@@ -100,6 +100,11 @@ pub enum TableChange {
     /// Upsert by primary key; `unchanged` lists columns to keep from the
     /// stored row (unchanged TOAST values).
     Upsert { row: Row, unchanged: Vec<usize> },
+    /// An `Upsert` whose `unchanged` values are taken only from the row the
+    /// key has: without one it changes nothing. Sources log it for tables
+    /// being copied, where a key without a row has not been copied yet and
+    /// its copy brings the whole row.
+    UpsertIfPresent { row: Row, unchanged: Vec<usize> },
     /// Delete by primary key values (in key order).
     Delete { key: Row },
     /// Multiset insert (tables without primary key).
@@ -1205,7 +1210,7 @@ impl Graph {
                 && let Some(ch) = changes.next()
             {
                 bytes += match &ch {
-                    TableChange::Upsert { row, .. } | TableChange::Insert { row } | TableChange::Remove { row } => row_bytes(row),
+                    TableChange::Upsert { row, .. } | TableChange::UpsertIfPresent { row, .. } | TableChange::Insert { row } | TableChange::Remove { row } => row_bytes(row),
                     TableChange::Delete { key } => row_bytes(key),
                     TableChange::Truncate => 0,
                 };

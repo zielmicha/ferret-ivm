@@ -59,7 +59,8 @@ Where the implementation differs from the design:
 | `ivm-reader-<n>` (four, started by the first large read; 64 MiB stack) | forks of the storage, copies of parts of the graph | run reads that exceeded their budget on the engine thread ([Planner](planner.md#batch-execution)), streaming their rows to their sessions as these take them; read large snapshots for subscriptions and for sinks resynchronising their targets, likewise |
 | `ivm-checkpoint` (while a checkpoint is written) | a frozen version of the dirty nodes and the manifest (the append side is shared) | writes the nodes, `fsync`s and appends the manifest record with the header naming the metadata tree ([Recovery](recovery.md#checkpoints)) |
 | `ivm-session-<n>` (one per client, 16 MiB stack) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
-| `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
+| `ivm-source-<name>` (one per source) | the replication connection | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot; never blocks on a snapshot query or on the log |
+| `ivm-copy-<source id>` (one per source, from its first snapshot chunk on) | the snapshot connection | reads snapshot chunks and writes their watermarks for the source thread ([Recovery](recovery.md#the-dblog-snapshot-algorithm)) |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
 | `ivm-hydrate` (while a view, index or subscription is hydrated; 64 MiB stack) | a fork of the storage and of part of the graph | hydrates the new dataflow fragment as of its statement's GSN, then applies the records the engine forwards until it has caught up ([Dataflow](dataflow.md#hydration-off-the-engine-thread)) |
 | `ivm-stop-file` | | polls for `.ivm-stop` every 500 ms; when it appears, removes it and requests a shutdown |
@@ -157,8 +158,11 @@ snapshot requests queued at the engine.
    in bounded chunks; the GSN is then propagated (`Graph::step_finish`). A
    commit is never held in memory whole, however large.
 
-Source progress (snapshot bookkeeping) and schema records are logged with
-the blocking `EngineHandle::log`, which returns once the record is durable.
+Source progress (snapshot bookkeeping, as `ProgressDelta` records) and
+schema records are sent the same way and count as in flight, at the LSN of
+the commit before them, until durable. A source with 10,000 records in
+flight stops reading the stream until some are durable, but goes on sending
+status updates, so its session stays up.
 
 ### Local DML
 
@@ -300,7 +304,8 @@ checkpoint.
 |---|---|
 | `Commit`, `CommitParts` | feed the changes to the dataflow by table (`Graph::step_feed`; changes to tables that no longer exist are skipped; a `CommitParts` record's are read from its parts file and fed one part at a time), then step the GSN (`Graph::step_finish`) and deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); write the catalog's changes into the metadata tree at the record's GSN (`persist_meta`); reply |
-| `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
+| `Progress` | store the source's state (snapshot progress), if the source still exists |
+| `ProgressDelta` | apply the change to the source's stored state (the listed tables' entries replace theirs), if the source still exists |
 | `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 

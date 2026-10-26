@@ -358,7 +358,7 @@ pub fn table_step(
         let mut out: Delta = Vec::new();
         for ch in changes {
             match ch {
-                TableChange::Insert { row } | TableChange::Upsert { row, .. } => out.push((row, 1)),
+                TableChange::Insert { row } | TableChange::Upsert { row, .. } | TableChange::UpsertIfPresent { row, .. } => out.push((row, 1)),
                 TableChange::Remove { row } => out.push((row, -1)),
                 TableChange::Delete { key } => out.push((key, -1)),
                 TableChange::Truncate => {
@@ -398,8 +398,9 @@ pub fn table_step(
     let mut deleted: Option<Row> = carry.deleted.take();
     for ch in changes {
         let just_deleted = std::mem::take(&mut deleted);
+        let if_present = matches!(ch, TableChange::UpsertIfPresent { .. });
         match ch {
-            TableChange::Upsert { mut row, unchanged } => {
+            TableChange::Upsert { mut row, unchanged } | TableChange::UpsertIfPresent { mut row, unchanged } => {
                 let i = touch(env, &mut index, &mut touched, layout.encode_prefix_of(&row, pk))?;
                 if !unchanged.is_empty() {
                     let (stored, after) = &touched[i];
@@ -408,10 +409,15 @@ pub fn table_step(
                         After::Row(r) => Some(r),
                         After::Absent => None,
                     };
-                    if let Some(o) = old.or(just_deleted.as_ref()) {
+                    // (a conditional upsert takes nothing from a deleted row:
+                    // the delete before it need not be of its old key)
+                    if let Some(o) = old.or(just_deleted.as_ref().filter(|_| !if_present)) {
                         for c in &unchanged {
                             row[*c] = o[*c].clone();
                         }
+                    } else if if_present {
+                        // (not copied yet: its copy brings the whole row)
+                        continue;
                     } else {
                         log::warn!("unchanged TOAST value for a row not present in the replica; using NULL");
                         for c in &unchanged {

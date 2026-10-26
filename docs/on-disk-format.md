@@ -184,6 +184,7 @@ The first payload byte is the record tag (`LogRecord::encode` / `decode`):
 | 4 | `Schema` | `uvarint source`, `uvarint table`, `bytes columns_json`, `uvarint k`, `k × uvarint pk_column` |
 | 5 | `Tick` | `ivarint micros` |
 | 6 | `CommitParts` | `uvarint source`, `uvarint lsn`, `uvarint parts`, `uvarint changes` |
+| 7 | `ProgressDelta` | `uvarint source`, `uvarint lsn`, `str delta` |
 
 Any other tag is a decoding error (`bad log record tag`).
 
@@ -204,12 +205,16 @@ truncation a source logs before re-copying a table.
 | 3 | `Insert` | `row` | add one instance (multiset tables) |
 | 4 | `Remove` | `row` | remove one instance (multiset tables) |
 | 5 | `Truncate` | — | remove all rows, including those the commit changed before it |
+| 6 | `UpsertIfPresent` | as `Upsert` | as `Upsert`, except that the listed columns are taken only from the key's current row (not from a row deleted just before), and without one it changes nothing. Sources log it for an update with unchanged TOASTed values of a table being copied: a key without a row there has not been copied yet, and its copy brings the whole row |
 
 Changes apply in order. Tables with a key receive `Upsert`, `Delete` and
 `Truncate` (an `Insert` or `Remove` there sets or deletes the row's key);
 multiset tables receive `Insert`, `Remove` and `Truncate` (an `Upsert` or
-`Delete` there adds or removes one instance of the row). The DBLog snapshot
-of a multiset table is logged as `Truncate` followed by an `Insert` per row.
+`Delete` there adds or removes one instance of the row; an
+`UpsertIfPresent` adds one, as `Upsert`). The DBLog snapshot of a multiset
+table is logged as a commit holding a `Truncate`, followed by commits of up
+to 10,000 `Insert`s each (one per row; earlier versions logged the
+`Truncate` and all the `Insert`s in one commit).
 
 `row` is a row in the [row codec](#row-codec). Example (local
 `INSERT INTO customers VALUES (1, 'eu'), (2, 'us')`, table id 1001):
@@ -263,27 +268,56 @@ single `Commit` frames of any size, which are still read.
   by versions without instance ids) means a default name without it,
   `ivm_<name>_<id>`.
 
-**Progress** — a source's bookkeeping without data.
+**Progress** — a source's bookkeeping without data (written by earlier
+versions; the current code writes `ProgressDelta` records instead, and still
+reads these).
 
 - `lsn`: the end LSN of the commit after which it was logged (informational;
   not used on replay).
 - `state`: JSON `SourceState` (`source::postgres`):
-  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...], "truncate": bool}}}`
+  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...], "truncate": bool, "index_order": bool, "scanned": bool, "reread": [[str, ...], ...]}}}`
   where `boundary` holds the text values of the last key copied by the
   table's snapshot, and `truncate` (absent: `false`) says that the table's
   next snapshot chunk starts by logging a commit that truncates it (set for
   tables with a key after a key change upstream or a lost replication
-  slot). The whole state replaces the previous one; a state that does not
-  parse is taken as empty (the slot counts as not created and every table
-  is copied again). Progress records of a source that is no longer in the
-  catalog are ignored.
+  slot). `index_order` (absent: `false`; written only when `true`) says that
+  `boundary` is in the order of the upstream key index, in which the
+  current code reads chunks. Boundaries without it were logged by earlier
+  versions, which read chunks in the engine's key order (string key columns
+  compared as `col::text COLLATE "C"`): when the source starts, it keeps
+  such a boundary if no key column is of a string type (the two orders are
+  the same then), and otherwise drops it, so that the table's copy starts
+  again from its first key. `scanned` (absent: `false`; written only when
+  `true`) says that every key range has been copied, and `reread` (absent:
+  empty; written only when not) lists keys, as text values, whose rows are
+  to be read again before the table is done: keys the stream moved a row to
+  leaving TOASTed values unchanged that the source could not supply. Both
+  are absent in states of earlier versions (a table not done has its ranges
+  still to copy then). The whole state replaces the previous one; a
+  state that does not parse is taken as empty (the slot counts as not
+  created and every table is copied again). Progress records of a source
+  that is no longer in the catalog are ignored.
+
+**ProgressDelta** — a change of a source's bookkeeping: the entries of its
+state that changed since its previous progress record, so that copying `T`
+tables logs `O(T)` bytes of progress rather than `O(T²)`.
+
+- `lsn`: as in `Progress`.
+- `delta`: JSON `StateDelta` (`source::postgres`):
+  `{"slot_created": bool, "tables": {"<table id>": SnapState}}`, where
+  `SnapState` is a table's entry as in `Progress` and `slot_created` is
+  absent unless it changed. Applying it sets `slot_created` if present and
+  replaces the listed tables' entries; the other entries stay. A delta that
+  does not parse empties the source's state, as a `Progress` state that does
+  not parse does. Records of a source that is no longer in the catalog are
+  ignored.
 
 **Schema** — an upstream table changed shape or key: the source `ObjectId`,
 the table `ObjectId`, the new columns as a JSON array of `Column` (key
 columns `NOT NULL`), and the new key as column indexes (the replica
 identity's columns, as for `pk` above). Applying it also resets the table's
 entry in the source's stored state to `{"done": false, "boundary": null}`,
-keeping its `truncate` flag (which the source's `Progress` record logged just
+keeping its `truncate` flag (which the source's progress record logged just
 before sets after a key change), so that the table is copied again, from an
 empty table after a key change, even if the engine restarts before the
 copy starts.
@@ -827,7 +861,7 @@ it.
 | `catalog.instance_id` | 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted; `null` before that (and if absent) |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view with a dataflow: its error records `[[sqlstate, message], count]` |
-| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records) |
+| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records), after the `Progress` and `ProgressDelta` records up to the checkpoint |
 | `source_lsns` | per source: the end LSN of its last logged commit (resume point); `[]` if absent |
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
@@ -1282,10 +1316,10 @@ Consequences of code changes for an existing data directory:
 
 | Change | Consequence |
 |---|---|
-| frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag fails to replay a log holding it (versions before `CommitParts` truncated the newest log segment at the first such record, losing it and everything after it: a log with `CommitParts` records, tag 6, cannot be opened by them) |
-| `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
+| frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag fails to replay a log holding it (versions before `CommitParts` truncated the newest log segment at the first such record, losing it and everything after it: a log with `CommitParts` records, tag 6, `ProgressDelta` records, tag 7, or `UpsertIfPresent` changes, kind 6, cannot be opened by them) |
+| `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType`, `SourceState` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`, `SourceState` also in `Progress` records: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
 | metadata record layouts (tags 1–11), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tag 11 was added within format 2 (a directory without it recomputes its window operators' partitions in error once, at the first start) |
-| format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
+| format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate`, `index_order`, `scanned` and `reread` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tags 8–10 (float sums as normalized dyadic rationals, `min`/`max` prefixes) are written instead of format 1's tag 5 and wide values under tags 6 and 7, which are still read (as described [above](#summary)) |
 | internal node kind 3, the checkpoint record's tree space section | format 1's kind-2 nodes and records without the section are read (see [Internal node](#internal-node) and [Checkpoint record](#checkpoint-record)): the first start reads every tree's internal nodes once, and maintenance passes then visit every subtree once |
@@ -1300,17 +1334,20 @@ Data directories written by earlier versions of the engine are compatible:
 format 1 only gained fields with defaults (and a node kind and summary
 state encodings that are written instead of older ones still read: float
 sums, wide `min`/`max` values; [Summary](#summary)), and is migrated to
-format 2 at the first start; the log gained a record tag (`CommitParts`)
-next to the single-frame `Commit`, which is still read. New functions
-(registered among the existing ones, which renumbers the later ones) and
-planner fixes did change the fingerprints of many views' arrangements (for
-example joins on computed keys, whose keys are materialized in an `Mfp`
-node, semijoins whose presence inputs match exactly, the summaries of
-`var*`/`stddev*` over `bigint`, joins whose input filters or maps can fail,
-which have error-tracker inputs, and the input arrangements of window
-aggregates whose frames reach a partition's end, which carry summaries), so
-such a data directory keeps its tables and rebuilds those arrangements once
-at its first start.
+format 2 at the first start; the log gained record tags and a change kind
+(`CommitParts`, `ProgressDelta`, `UpsertIfPresent`) next to the ones it
+still reads. A table whose snapshot an upgrade interrupts is copied again
+from its first key if its key has a string column (see `index_order`
+under [Progress](#logrecord)). New functions (registered among the
+existing ones, which renumbers the later ones) and planner fixes did
+change the fingerprints of many views' arrangements (for example joins on
+computed keys, whose keys are materialized in an `Mfp` node, semijoins
+whose presence inputs match exactly, the summaries of `var*`/`stddev*`
+over `bigint`, joins whose input filters or maps can fail, which have
+error-tracker inputs, and the input arrangements of window aggregates
+whose frames reach a partition's end, which carry summaries), so such a
+data directory keeps its tables and rebuilds those arrangements once at
+its first start.
 `crates/ivm/tests/data/format1` is a format-1 directory that the restart
 tests migrate.
 

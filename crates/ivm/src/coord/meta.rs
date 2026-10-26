@@ -254,7 +254,7 @@ impl Engine {
             let k = u64_key(tag, id);
             (k.clone(), entry(k, value))
         };
-        let states = self.source_states.iter().map(|(id, s)| keyed(T_SOURCE_STATE, *id, &|e| e.extend_from_slice(s.as_bytes()))).collect();
+        let states = self.source_states.iter().map(|(id, s)| keyed(T_SOURCE_STATE, *id, &|e| e.extend_from_slice(s.to_json().as_bytes()))).collect();
         self.meta.sync_keyed(T_SOURCE_STATE, states, &mut ups);
         let lsns = self.source_lsns.iter().map(|(id, l)| keyed(T_SOURCE_LSN, *id, &|e| put_uvarint(e, *l))).collect();
         self.meta.sync_keyed(T_SOURCE_LSN, lsns, &mut ups);

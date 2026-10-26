@@ -825,8 +825,7 @@ impl Engine {
         let ObjectKind::Source(def) = &o.kind else { return None };
         // drop gauges of sources that no longer exist
         self.shared.source_gauges.lock().retain(|k, _| self.catalog.objects.contains_key(k));
-        let state: crate::source::postgres::SourceState =
-            self.source_states.get(&id).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+        let state = self.source_states.get(&id).cloned().unwrap_or_default();
         let frontier = self.shared.source_lsn.lock().get(&id).copied().unwrap_or(0);
         let last_commit = self.source_lsns.get(&id).copied().unwrap_or(0);
         let gauges = self.shared.source_gauges.lock().get(&id).cloned();

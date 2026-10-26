@@ -34,6 +34,9 @@ pub enum LogRecord {
     Ddl { req: u64, sql: String, extra: String },
     /// Source progress without data (LSN frontier, snapshot bookkeeping).
     Progress { source: ObjectId, lsn: u64, state: String },
+    /// A change of a source's progress state: the entries that changed
+    /// (`source::postgres::StateDelta` as JSON).
+    ProgressDelta { source: ObjectId, lsn: u64, delta: String },
     /// Upstream schema change for a source table.
     Schema { source: ObjectId, table: ObjectId, columns: Vec<Column>, pk: Vec<usize> },
     /// Wall clock reading (microseconds since the Unix epoch): the logical
@@ -44,8 +47,8 @@ pub enum LogRecord {
 fn encode_change(out: &mut Vec<u8>, t: ObjectId, c: &TableChange) {
     put_uvarint(out, t);
     match c {
-        TableChange::Upsert { row, unchanged } => {
-            out.push(1);
+        TableChange::Upsert { row, unchanged } | TableChange::UpsertIfPresent { row, unchanged } => {
+            out.push(if matches!(c, TableChange::Upsert { .. }) { 1 } else { 6 });
             codec::encode_row(row, out);
             put_uvarint(out, unchanged.len() as u64);
             for u in unchanged {
@@ -71,14 +74,14 @@ fn encode_change(out: &mut Vec<u8>, t: ObjectId, c: &TableChange) {
 fn decode_change(b: &mut &[u8]) -> Result<(ObjectId, TableChange)> {
     let t = get_uvarint(b)?;
     let c = match get_u8(b)? {
-        1 => {
+        kind @ (1 | 6) => {
             let row = codec::decode_row(b)?;
             let k = get_uvarint(b)? as usize;
             let mut unchanged = Vec::with_capacity(k.min(4096));
             for _ in 0..k {
                 unchanged.push(get_uvarint(b)? as usize);
             }
-            TableChange::Upsert { row, unchanged }
+            if kind == 1 { TableChange::Upsert { row, unchanged } } else { TableChange::UpsertIfPresent { row, unchanged } }
         }
         2 => TableChange::Delete { key: codec::decode_row(b)? },
         3 => TableChange::Insert { row: codec::decode_row(b)? },
@@ -105,6 +108,7 @@ impl LogRecord {
             LogRecord::Commit { .. } | LogRecord::CommitParts { .. } => "commit",
             LogRecord::Ddl { .. } => "ddl",
             LogRecord::Progress { .. } => "progress",
+            LogRecord::ProgressDelta { .. } => "progress delta",
             LogRecord::Schema { .. } => "schema",
             LogRecord::Tick { .. } => "tick",
         }
@@ -132,6 +136,12 @@ impl LogRecord {
                 put_uvarint(out, *source);
                 put_uvarint(out, *lsn);
                 put_str(out, state);
+            }
+            LogRecord::ProgressDelta { source, lsn, delta } => {
+                out.push(7);
+                put_uvarint(out, *source);
+                put_uvarint(out, *lsn);
+                put_str(out, delta);
             }
             LogRecord::Schema { source, table, columns, pk } => {
                 out.push(4);
@@ -182,6 +192,7 @@ impl LogRecord {
             }
             5 => LogRecord::Tick { micros: get_ivarint(b)? },
             6 => LogRecord::CommitParts { source: get_uvarint(b)?, lsn: get_uvarint(b)?, parts: get_uvarint(b)?, changes: get_uvarint(b)? },
+            7 => LogRecord::ProgressDelta { source: get_uvarint(b)?, lsn: get_uvarint(b)?, delta: get_str(b)?.to_string() },
             t => return Err(SqlError::corrupt(format!("bad log record tag {t}"))),
         })
     }
@@ -204,7 +215,7 @@ const WRITE_BYTES: usize = 8 << 20;
 pub fn change_len(c: &TableChange) -> usize {
     let row = |r: &[crate::types::Datum]| 2 + r.iter().map(codec::approx_len).sum::<usize>();
     2 + match c {
-        TableChange::Upsert { row: r, unchanged } => row(r) + 1 + unchanged.len(),
+        TableChange::Upsert { row: r, unchanged } | TableChange::UpsertIfPresent { row: r, unchanged } => row(r) + 1 + unchanged.len(),
         TableChange::Delete { key: r } | TableChange::Insert { row: r } | TableChange::Remove { row: r } => row(r),
         TableChange::Truncate => 0,
     }
@@ -1017,6 +1028,39 @@ mod tests {
         assert!(all(&dir, 3).is_err());
         assert_eq!(all(&dir, 7).unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Progress deltas and conditional upserts keep their own tags, beside
+    /// the full progress records and plain upserts they extend.
+    #[test]
+    fn progress_deltas_and_conditional_upserts_round_trip() {
+        let row = vec![Datum::Int4(1), Datum::Null];
+        let recs = [
+            LogRecord::Progress { source: 3, lsn: 7, state: "{}".into() },
+            LogRecord::ProgressDelta { source: 3, lsn: 8, delta: r#"{"tables":{}}"#.into() },
+            LogRecord::Commit {
+                source: 3,
+                lsn: 9,
+                changes: vec![
+                    (5, TableChange::Upsert { row: row.clone(), unchanged: vec![1] }),
+                    (5, TableChange::UpsertIfPresent { row: row.clone(), unchanged: vec![1] }),
+                ],
+            },
+        ];
+        for r in recs {
+            let mut b = Vec::new();
+            r.encode(&mut b);
+            let back = LogRecord::decode(&b).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{r:?}"));
+        }
+        // (tag 6 is CommitParts')
+        let mut b = Vec::new();
+        LogRecord::ProgressDelta { source: 3, lsn: 8, delta: String::new() }.encode(&mut b);
+        assert_eq!(b[0], 7);
+        let mut b = Vec::new();
+        LogRecord::CommitParts { source: 3, lsn: 9, parts: 2, changes: 5 }.encode(&mut b);
+        assert_eq!(b[0], 6);
+        assert!(matches!(LogRecord::decode(&b).unwrap(), LogRecord::CommitParts { parts: 2, changes: 5, .. }));
     }
 
     #[test]

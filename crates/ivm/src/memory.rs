@@ -87,7 +87,9 @@ pub fn delta_bytes(d: &Delta) -> usize {
 /// Heap bytes owned by a table change.
 pub fn change_heap(c: &TableChange) -> usize {
     match c {
-        TableChange::Upsert { row, unchanged } => row_heap(row) + heap_block(unchanged.capacity() * size_of::<usize>()),
+        TableChange::Upsert { row, unchanged } | TableChange::UpsertIfPresent { row, unchanged } => {
+            row_heap(row) + heap_block(unchanged.capacity() * size_of::<usize>())
+        }
         TableChange::Delete { key: row } | TableChange::Insert { row } | TableChange::Remove { row } => row_heap(row),
         TableChange::Truncate => 0,
     }
@@ -101,7 +103,7 @@ pub fn record_bytes(rec: &LogRecord) -> usize {
             heap_block(changes.capacity() * size_of::<(u64, TableChange)>()) + changes.iter().map(|(_, c)| change_heap(c)).sum::<usize>()
         }
         LogRecord::Ddl { sql, extra, .. } => heap_block(sql.capacity()) + heap_block(extra.capacity()),
-        LogRecord::Progress { state, .. } => heap_block(state.capacity()),
+        LogRecord::Progress { state, .. } | LogRecord::ProgressDelta { delta: state, .. } => heap_block(state.capacity()),
         LogRecord::Schema { columns, pk, .. } => {
             heap_block(columns.capacity() * size_of::<crate::types::Column>())
                 + columns.iter().map(|c| heap_block(c.name.capacity())).sum::<usize>()

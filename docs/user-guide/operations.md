@@ -32,8 +32,8 @@ Fixed internal parameters (not configurable):
 | buffer pool of a fork of the storage (a hydration, a large read), each while it lives | a sixteenth of `--memory-mb` (at least 1 MiB) |
 | changes forwarded to a hydration that it has not applied yet | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
 | buffer pool | what the above leave of `--memory-mb`, at least a quarter of it |
-| unacknowledged commits per source | 10,000 |
-| initial-snapshot chunk | 10,000 rows |
+| records a source has in flight to the input log before it stops reading the stream until they are durable | 10,000 |
+| initial-snapshot chunk (and piece of a table without a key) | 10,000 rows |
 | maintenance pass budget (compaction, and relocation, each) | 8 MiB plus the bytes checkpoints wrote for updates since the previous pass |
 | sort buffer when building or updating an index in bulk (hydration, large changes) | half the working memory, within 1 MiB and 64 MiB |
 | change (delta) of a view or operator kept in memory per GSN, and changes of a table applied at once | half the working memory, within 1 MiB and 256 MiB (larger ones go to temporary trees) |

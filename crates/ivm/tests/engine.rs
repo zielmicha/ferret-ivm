@@ -43,6 +43,32 @@ fn tick(h: &EngineHandle, secs: i64) {
     h.log(LogRecord::Tick { micros: base + secs * 1_000_000 }).unwrap();
 }
 
+/// A conditional upsert (what a source logs for an update leaving TOASTed
+/// values unchanged while the table is being copied) fills the unchanged
+/// values from the key's row, and changes nothing without one: the key has
+/// not been copied yet, and its copy brings the whole row. Unlike a plain
+/// upsert, it takes nothing from a row deleted just before (the delete need
+/// not be of its old key).
+#[test]
+fn conditional_upserts_need_a_row() {
+    use ivm::dataflow::TableChange::{Delete, UpsertIfPresent};
+    use ivm::types::Datum;
+    let dir = tmpdir("upsert-if-present");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int, b text)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 'kept')");
+    let upsert = |id: i32, a: i32| UpsertIfPresent { row: vec![Datum::Int4(id), Datum::Int4(a), Datum::Null], unchanged: vec![2] };
+    // (table t is object 1000; the source, which need not exist, is 4242)
+    let commit = |changes| LogRecord::Commit { source: 4242, lsn: 1, changes };
+    h.log(commit(vec![(1000, upsert(1, 2)), (1000, upsert(2, 2))])).unwrap();
+    assert_eq!(rows(&h, "SELECT * FROM t ORDER BY id"), ["1|2|kept"]);
+    h.log(commit(vec![(1000, Delete { key: vec![Datum::Int4(1)] }), (1000, upsert(5, 5))])).unwrap();
+    assert!(rows(&h, "SELECT * FROM t ORDER BY id").is_empty());
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn temporal_filters_follow_the_logged_clock() {
     let dir = tmpdir("temporal");
