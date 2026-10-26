@@ -175,3 +175,18 @@ fn topk_reads_only_where_the_window_changes() {
     assert!(entries <= 6, "{entries} entries for a row leaving the window");
     assert_eq!(window(&mut t), (2000..2011).filter(|i| *i != 2003).map(int).collect::<Vec<_>>());
 }
+
+/// Percentiles read the values at their ranks (no scan of the group), with
+/// the group cache on.
+#[test]
+fn percentiles_do_not_scan_their_group() {
+    let mut t = T::new("work-percentile");
+    t.ddl("CREATE TABLE p (id bigint PRIMARY KEY, g bigint, v bigint)");
+    t.upsert("p", (0..5000).map(|i| vec![int(i), int(i % 2), int(i)]).collect());
+    t.ddl("CREATE MATERIALIZED VIEW pv AS SELECT g, percentile_disc(0.5) WITHIN GROUP (ORDER BY v) AS m, count(*) AS n FROM p GROUP BY g");
+    for i in 0..3 {
+        let (entries, _) = t.work(|t| t.upsert("p", vec![vec![int(i), int(i % 2), int(-1)]]));
+        assert_eq!(entries, 0);
+    }
+    assert_eq!(t.rows("pv"), vec![vec![int(0), int(2498), int(2500)], vec![int(1), int(2499), int(2500)]]);
+}

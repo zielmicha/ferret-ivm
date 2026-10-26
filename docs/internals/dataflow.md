@@ -318,7 +318,7 @@ every subtree:
 | `bool_and(x)` | count of false, non-null count |
 | `bool_or(x)` | count of true, non-null count |
 | `stddev*`, `var*` | sum, sum of squares, non-null count (for `bigint`, `numeric` sums of the argument cast to `numeric`: squares of `bigint` values would overflow `i128` sums) |
-| `percentile_cont/disc` | non-null count (values located by rank); with `FILTER`, none (the group is scanned) |
+| `percentile_cont/disc` | non-null count (values read at their ranks with `Env::nth`); with `FILTER`, none (the group is scanned) |
 | `string_agg`, `array_agg`, `json(b)_agg`, `json(b)_object_agg`, `mode` | none (the group is scanned) |
 
 `FILTER (WHERE f)` is folded into the argument (`CASE WHEN f THEN x END`).
@@ -330,19 +330,24 @@ group: the old output row comes from the output index (or the group cache);
 the new one from one **range summary** over the group's key range in the
 input index — O(log n) whatever the group size — with the group's key
 values taken from its first live entry (so the representation is that of the
-first entry in index order). Ordered aggregates additionally scan the group.
-Percentiles read the values at the required ranks with `Env::nth`; when the
-`ORDER BY` column sorts NULLs first (`DESC`, `NULLS FIRST`), they skip the
-group's NULL entries first. If old and new rows differ (by exact
-comparison), `−old, +new` is emitted.
+first entry in index order). Percentiles (without `FILTER`) read the values
+at the required ranks with `Env::nth` — O(log n) each, whatever the group
+size; when the `ORDER BY` column sorts NULLs first (`DESC`, `NULLS FIRST`),
+they skip the group's NULL entries first. The other ordered aggregates
+(`string_agg`, `array_agg`, `json(b)_agg`, the object aggregates, `mode`,
+and percentiles with `FILTER`) additionally scan the group. If old and new
+rows differ (by exact comparison), `−old, +new` is emitted.
 
 - **Group cache**: the summaries of up to 2^18 recently touched groups per
   `Reduce` are kept in memory. A small change to a large group is folded into
   the cached summary instead of summarising the range again. When folding is
   not exact — a `min`/`max` loses its extreme, or the group key has types with
   several representations and a row is retracted or arrives in another
-  representation — the group is summarised from the index. Disabled for
-  ordered aggregates and with `IVM_NO_GROUP_CACHE`.
+  representation — the group is summarised from the index. A group with a
+  percentile takes its previous output row from the output index (the
+  values at the ranks before the step are no longer in the input index)
+  and reads the new values at their ranks. Disabled for aggregates that
+  scan the group and with `IVM_NO_GROUP_CACHE`.
 - **Errors**: if finalising a group fails (for example `sum(float8)`
   overflows, or a `numeric` sum leaves numeric's range), the group's row is
   retracted and an error record emitted; the group's error is remembered in
