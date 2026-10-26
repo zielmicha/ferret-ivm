@@ -1165,6 +1165,7 @@ impl Env {
     /// when it does not need to split, its children's parent links and the
     /// loaded count are already right (maintained by load, allocation and
     /// free).
+    #[allow(clippy::too_many_arguments)]
     fn finish_internal_sized(
         &mut self,
         id: u32,
