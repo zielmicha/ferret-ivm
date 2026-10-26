@@ -5,6 +5,7 @@ mechanism: *read the state as of GSN g, replay the log from g + 1*. This
 chapter describes the recovery protocol, how checkpointed indexes are found
 again, how sources resume, and the DBLog snapshot algorithm as implemented.
 Code: `crates/ivm/src/coord/mod.rs` (`start`, `recover`, `checkpoint`),
+`crates/ivm/src/coord/meta.rs` (the metadata tree, `FORMAT`),
 `crates/ivm/src/storage/mod.rs` (`Env::open`, `Env::checkpoint`),
 `crates/ivm/src/log.rs`, `crates/ivm/src/source/postgres.rs`.
 
@@ -13,13 +14,24 @@ Code: `crates/ivm/src/coord/mod.rs` (`start`, `recover`, `checkpoint`),
 | Store | Written | Contents |
 |---|---|---|
 | input log (`log/`) | by the sequencer, before anything is applied or acknowledged | every input with its GSN |
-| checkpoint (`store/`) | by the engine every few seconds | all index trees as of the checkpoint GSN, plus the catalog and engine state (`AppState`) |
+| checkpoint (`store/`) | by the engine, every few seconds while something changes | all index trees as of the checkpoint GSN, among them the *metadata tree*, which holds the catalog with its DDL history and the engine state |
 
 The input log is the source of truth. A checkpoint is an optimisation: it
-bounds replay. Checkpoints are *atomic*: all trees and the engine state are
-committed by one manifest append at one GSN (the design in
+bounds replay. Checkpoints are *atomic*: all trees, the metadata tree
+included, are committed by one manifest append at one GSN (the design in
 [doc.md](../../doc.md) describes per-arrangement durable frontiers; the
 implementation checkpoints everything together).
+
+The catalog and the engine state are stored like the indexes, as a weighted
+multiset of entries with GSN-stamped histories in a tree of their own
+([On-disk format](../on-disk-format.md#the-metadata-tree)): a change
+retracts the old entry and adds the new one, so a checkpoint writes only
+the nodes that changed, and its manifest record names the trees and carries
+a small header. The engine keeps the same state in memory (the catalog,
+source states, the graph's error records, ...) and writes what changed
+since the last time after every DDL or schema record, at its GSN (so the
+tree holds the catalog as of every GSN of the retention window), and at
+every checkpoint.
 
 ## The recovery protocol
 
@@ -29,7 +41,10 @@ with status 1 at once) and accepts connections only once recovery is done.
 
 1. **Lock** `LOCK` (exclusive `flock`, retried for up to 2 s: a process
    forked while the lock was held keeps a copy of it until it execs); fail
-   (`55006`) if another process holds it.
+   (`55006`) if another process holds it. Then read the **format version**
+   (`FORMAT`, before anything else is opened): a newer format than the code
+   reads is refused (`0A000`), a new directory gets `FORMAT` at once, and a
+   directory with data but without `FORMAT` (format 1) is migrated in step 9.
 2. **Open the log** (`LogWriter::open`): read the newest segment, parse frames
    until the first one that is incomplete, fails its CRC or does not decode,
    truncate the file there (`fsync`), and take the last GSN (from the
@@ -42,11 +57,13 @@ with status 1 at once) and accepts connections only once recovery is done.
    while segment files hold data, stops the start before anything is
    modified: the checkpoint may have existed, and the log may already be
    truncated after it.
-4. **Restore the engine state** (`Engine::recover`) from the record's
-   application state (JSON `AppState`): catalog, the map from arrangement
-   fingerprint to tree id and to the GSN its history starts at
-   (`arr_since`), source states and resume LSNs, the request counter, the
-   logical clock and its recent ticks, and the pending slot drops.
+4. **Restore the engine state** (`Engine::recover`): the record's
+   application state is a header naming the metadata tree (`meta::load`
+   attaches it and reads all of it), or, for format 1, the JSON `AppState`:
+   catalog with its DDL history, the map from arrangement fingerprint to
+   tree id and to the GSN its history starts at (`arr_since`), the error
+   state, source states and resume LSNs, the request counter, the logical
+   clock and its recent ticks, and the pending slot drops.
 5. **Rebuild the dataflow** from the catalog: tables (`table_rt`), then
    materialized views (planned and lowered again from their SQL text, as
    stored definitions) and indexes, each after the views it reads
@@ -59,13 +76,15 @@ with status 1 at once) and accepts connections only once recovery is done.
    recorded in `Runtime::broken` with the reason instead of stopping the
    start (I/O errors still stop it); it stays in the catalog without a
    dataflow, and its recovered trees are dropped with the other unattached
-   ones. Then the views' error counts and, by node fingerprint, the error
-   records of arranged nodes and the per-group error state of operators are
-   restored ([Dataflow](dataflow.md#errors)).
+   ones. Then, by node fingerprint, the error records of arranged nodes and
+   the per-group error state of operators are restored
+   ([Dataflow](dataflow.md#errors)); records of nodes that no longer exist
+   are retracted from the metadata tree.
 6. **Hydrate** everything that was not matched, from the recovered state at
    the checkpoint GSN (`Graph::hydrate`; the rebuilt arrangements' history
-   starts there), then **drop** recovered trees that nothing attached
-   (arrangements that no longer exist) and set the retention frontier.
+   starts there), give each materialized view the error records of its root
+   node, then **drop** recovered trees that nothing attached (arrangements
+   that no longer exist) and set the retention frontier.
 7. **Start the sinks** from the recovered state (each takes a snapshot at
    the checkpoint GSN; a target at least that far resumes, one behind it is
    resynchronised, see
@@ -84,10 +103,15 @@ with status 1 at once) and accepts connections only once recovery is done.
    error.
 9. If the log ends before the checkpoint's GSN (an unsynced tail lost with
    `--no-sync`), GSN numbering continues after the checkpoint
-   (`LogWriter::skip_to`). **Start** the sources (with their logged state
-   and resume LSN), the pending slot drops, the sequencer (whose next GSN is
-   the log's last GSN + 1), and the engine thread; then the server starts
-   accepting connections.
+   (`LogWriter::skip_to`). A format-1 directory is **migrated** here: a
+   checkpoint writes the whole state into a new metadata tree, and only then
+   is `FORMAT` written; a crash in between finds a format-1 record (before
+   the checkpoint's commit) or a current one (after it) at the next start,
+   and migrates again or only writes `FORMAT`
+   ([Compatibility](../on-disk-format.md#migrating-format-1)). **Start** the
+   sources (with their logged state and resume LSN), the pending slot drops,
+   the sequencer (whose next GSN is the log's last GSN + 1), and the engine
+   thread; then the server starts accepting connections.
 
 A data directory without a checkpoint replays the whole log from GSN 1 (the
 log is only truncated after checkpoints).
@@ -95,7 +119,7 @@ log is only truncated after checkpoints).
 ### Matching checkpointed indexes
 
 A checkpoint records, for every hydrated arrangement, its **structural
-fingerprint** and its tree id (`AppState::trees`). Because fingerprints are
+fingerprint** and its tree id (in the metadata tree). Because fingerprints are
 computed from the operator structure — the operator kind, its parameters, the
 fingerprints of its inputs and of the arrangements it reads, and the
 arrangement's key and summaries — and never from node ids or creation order,
@@ -132,25 +156,41 @@ fingerprint mismatch only costs a rebuild.
 
 ## Checkpoints
 
-`Engine::checkpoint` (every `--checkpoint-secs` if anything changed, when
-dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
+A checkpoint is taken on `CHECKPOINT`, on shutdown, and when one is due
+(`Engine::maybe_checkpoint`, after every message the engine handles): every
+`--checkpoint-secs`, or as soon as dirty nodes exceed half the cache, once
+something durable changed since the last one — a record was applied other
+than a clock tick that changed nothing but the clock (a tick that releases
+temporal-filter events counts), or garbage collection relocated nodes that
+the next checkpoint must write. Ticks alone only add replay work (and 25
+bytes of log each): they make a checkpoint due after 3,600 of them (an hour
+at the default `--tick-ms`), which bounds the replay of an idle engine. An
+engine that is idle takes no checkpoints otherwise.
 
-1. build `AppState`: the catalog (with its DDL history), the fingerprint →
-   tree id and fingerprint → `since` maps of all hydrated arrangements, each
-   materialized view's error counts, the error records of arranged nodes and
-   the per-group error state of operators, each source's opaque state (JSON)
-   and last logged LSN, the request counter, the logical clock and its ticks
-   in the retention window (at most the last 100,000), and the pending slot
-   drops; serialise it as JSON
-   ([On-disk format](../on-disk-format.md#checkpoint-application-state-appstate));
-2. `Env::checkpoint(processed_gsn, json)`: write dirty nodes, `fsync`, append
-   the manifest record (the commit point), delete dead segments
+`Engine::checkpoint`:
+
+1. `persist_meta(processed GSN)`: write what changed since the last time
+   into the metadata tree — catalog objects changed by DDL since (normally
+   none: DDL records write them when applied), new and trimmed history
+   entries, new ticks and ticks behind the retention frontier, changed
+   source states and resume LSNs, arrangements hydrated or dropped, pending
+   slot drops, and the changes of the error state
+   ([On-disk format](../on-disk-format.md#the-metadata-tree));
+2. `Env::checkpoint(processed_gsn, header)`: write dirty nodes (of the
+   metadata tree too), `fsync`, append the manifest record — the trees, the
+   segments and the header naming the metadata tree, tens of bytes per tree —
+   (the commit point), delete dead segments
    ([Storage](storage.md#segments-and-checkpoints));
 3. `Env::gc(1000)`: relocate live nodes of the oldest sparse segment;
-4. send `Truncate(processed − retention)` to the sequencer, which deletes
-   log segments whose records all lie at or before that GSN.
+4. send `Truncate(processed)` to the sequencer, which deletes log segments
+   whose records all lie at or before the checkpoint: recovery replays the
+   log after the checkpoint, and nothing else reads the log (`AS OF` reads
+   use the histories in the trees).
 
-The engine thread does nothing else while a checkpoint runs.
+The engine thread does nothing else while a checkpoint runs. Its cost is
+that of the nodes that changed since the previous one; it does not depend
+on the size of what did not change (the catalog, its history of up to
+11,000 statements, the error records).
 
 ## Source resumption
 

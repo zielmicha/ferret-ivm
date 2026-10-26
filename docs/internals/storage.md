@@ -19,7 +19,10 @@ A tree (`TreeId`, a `u64` from a persistent counter) is an ordered map from
 arrangement; an entry is the encoding of one row (key part, fidelity suffix,
 payload — see [Dataflow](dataflow.md#arrangements-and-layouts)), so the tree
 is keyed by (key, value) and distinct rows with the same key are distinct
-entries. Each tree has a *summarizer* that defines its per-node summaries.
+entries. One more tree, the *metadata tree*, holds the catalog and the
+engine's state as entries of the same kind
+([On-disk format](../on-disk-format.md#the-metadata-tree)). Each tree has a
+*summarizer* that defines its per-node summaries.
 
 Each tree's state: its root pointer, the summary of the whole tree, the
 oldest segment holding any of its nodes (`min_seg`), its summarizer, and
@@ -236,8 +239,8 @@ id once it reaches 256 MiB. A checkpoint (`Env::checkpoint(gsn, app)`):
 3. appends a checkpoint record — sequence number, GSN, every tree's root
    location, summary and `min_seg`, every segment's (total bytes, live
    bytes), the active segment and its length, the next tree id, and the
-   application state — to `store/MANIFEST` and `fsync`s it. This append is
-   the commit point;
+   application state (a header of a few bytes naming the metadata tree) —
+   to `store/MANIFEST` and `fsync`s it. This append is the commit point;
 4. deletes sealed segments without live bytes.
 
 On open, the last valid manifest record defines the state: the active

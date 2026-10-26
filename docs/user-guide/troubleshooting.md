@@ -124,11 +124,11 @@ view or index that can no longer be built does not stop the start: it is
 marked broken ([Recovery](operations.md#recovery)). What still keeps a data
 directory from starting: a missing or damaged manifest or segment file, a
 damaged or deleted input-log segment holding records after the last
-checkpoint, a checkpoint written by an incompatible version
-([Compatibility](../on-disk-format.md#compatibility)), and a log record
-other than DDL that fails to apply again during replay (a bug: such a
-record was skipped while the engine ran, and fails again on replay unless
-a checkpoint was taken after it).
+checkpoint, a data directory or checkpoint written by an incompatible (or
+newer) version ([Compatibility](../on-disk-format.md#compatibility)), and a
+log record other than DDL that fails to apply again during replay (a bug:
+such a record was skipped while the engine ran, and fails again on replay
+unless a checkpoint was taken after it).
 
 Either restore a copy of the data directory taken before the problem, or
 start over with an empty data directory (and drop the old replication slots
@@ -194,8 +194,11 @@ stream until it catches up (`SHOW FRONTIERS`: `durable_gsn` −
 
 ### Disk usage grows
 
-- The input log keeps segments back to `checkpoint GSN − --retention-gsns`
-  (and always the current 64 MiB segment).
+- The input log keeps the segments holding records after the last checkpoint
+  (and always the current 64 MiB segment). An engine that applies nothing
+  but clock ticks checkpoints only every 3,600 ticks, so its log segment
+  fills slowly (25 bytes per tick) and is deleted once it is sealed and
+  covered by a checkpoint.
 - Dead index nodes are reclaimed only in sealed segments that are less than
   half live, one segment at a time after each checkpoint (at most 1000 nodes
   relocated per pass); up to half of any other sealed segment can stay

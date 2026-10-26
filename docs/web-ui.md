@@ -315,8 +315,10 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
 `catalog_version` is the length of the catalog history, so it changes with
 every applied DDL statement (the history is trimmed back to 10,000 entries
 once it exceeds 11,000); `last_checkpoint_ms` is the engine start until the
-first checkpoint; `clock_ms` is null before the first clock tick and
-`config.tick_ms` null with `--tick-ms 0`. The `process` fields come from
+first checkpoint; `records_since_checkpoint` counts every applied record,
+clock ticks included (ticks alone make a checkpoint due only after 3,600 of
+them, so on an idle engine it climbs to 3,600); `clock_ms` is null before
+the first clock tick and `config.tick_ms` null with `--tick-ms 0`. The `process` fields come from
 `/proc` and are null where it is not available (`cpu_percent` assumes 100
 clock ticks per second, the Linux norm).
 

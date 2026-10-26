@@ -175,6 +175,11 @@ pub struct Graph {
     /// output errors). Authoritative for nodes with a hydrated arrangement:
     /// their snapshots read the arrangement, which holds rows only.
     node_errors: FxHashMap<NodeId, BTreeMap<(String, String), i64>>,
+    /// Nodes whose error records are in the durable mirror of the error
+    /// state (`take_error_changes`): the arranged ones it has seen.
+    errs_mirrored: rustc_hash::FxHashSet<NodeId>,
+    /// Changes to the mirrored error state not yet taken.
+    err_changes: BTreeMap<ErrorKey, i64>,
 }
 
 /// Error state that must survive restarts, by node fingerprint: the error
@@ -189,8 +194,86 @@ pub struct ErrorState {
     pub operators: Vec<(Vec<u8>, Vec<(Vec<u8>, (String, String))>)>,
 }
 
+/// One record of the error state, by node fingerprint (see `ErrorState`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ErrorKey {
+    /// An error record in an arranged node's contents (weighted by its count).
+    Node(Vec<u8>, (String, String)),
+    /// The error of an operator's group, by group key (weight 1).
+    Group(Vec<u8>, Vec<u8>, (String, String)),
+}
+
+fn add_weight<K: Ord>(m: &mut BTreeMap<K, i64>, k: K, w: i64) {
+    match m.entry(k) {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            *e.get_mut() += w;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+        std::collections::btree_map::Entry::Vacant(e) => {
+            if w != 0 {
+                e.insert(w);
+            }
+        }
+    }
+}
+
 /// Groups of an operator currently in error, by group key prefix.
-pub type OpErrors = Arc<parking_lot::Mutex<BTreeMap<Vec<u8>, (String, String)>>>;
+pub type OpErrors = Arc<parking_lot::Mutex<GroupErrors>>;
+
+/// The error records of an operator's groups in error (one per group, by
+/// group key prefix), and, once the graph mirrors them durably
+/// (`Graph::take_error_changes`), their changes since it last took them.
+#[derive(Default, Debug)]
+pub struct GroupErrors {
+    groups: BTreeMap<Vec<u8>, (String, String)>,
+    /// Weight changes by (group, error); None while not mirrored.
+    changes: Option<GroupErrorChanges>,
+}
+
+type GroupErrorChanges = BTreeMap<(Vec<u8>, (String, String)), i64>;
+
+impl GroupErrors {
+    /// Set a group's error, returning the previous one.
+    pub fn insert(&mut self, group: Vec<u8>, err: (String, String)) -> Option<(String, String)> {
+        let Some(ch) = &mut self.changes else { return self.groups.insert(group, err) };
+        let prev = self.groups.insert(group.clone(), err.clone());
+        if prev.as_ref() != Some(&err) {
+            if let Some(p) = &prev {
+                add_weight(ch, (group.clone(), p.clone()), -1);
+            }
+            add_weight(ch, (group, err), 1);
+        }
+        prev
+    }
+
+    /// Clear a group's error, returning it.
+    pub fn remove(&mut self, group: &[u8]) -> Option<(String, String)> {
+        let prev = self.groups.remove(group);
+        if let (Some(ch), Some(p)) = (&mut self.changes, &prev) {
+            add_weight(ch, (group.to_vec(), p.clone()), -1);
+        }
+        prev
+    }
+
+    pub fn clear(&mut self) {
+        let groups = std::mem::take(&mut self.groups);
+        if let Some(ch) = &mut self.changes {
+            for (g, e) in groups {
+                add_weight(ch, (g, e), -1);
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &(String, String))> {
+        self.groups.iter()
+    }
+}
 
 /// The per-group error state of an operator, if it keeps one.
 fn operator_errors(kind: &NodeKind) -> Option<&OpErrors> {
@@ -536,7 +619,8 @@ impl Graph {
         }
         let node = self.nodes[id].take().unwrap();
         self.node_by_fp.remove(&node.fp);
-        self.node_errors.remove(&id);
+        let errs = self.node_errors.remove(&id);
+        self.forget_mirrored_errors(id, &node, errs);
         self.counters.remove(&id);
         self.topo_dirty = true;
         // arrangements used by this operator
@@ -614,6 +698,12 @@ impl Graph {
         if errs.is_empty() {
             return;
         }
+        if self.errs_mirrored.contains(&node) {
+            let fp = &self.nodes[node].as_ref().expect("dangling node").fp;
+            for (e, w) in errs {
+                add_weight(&mut self.err_changes, ErrorKey::Node(fp.clone(), e.clone()), *w);
+            }
+        }
         let m = self.node_errors.entry(node).or_default();
         for (e, w) in errs {
             let v = m.entry(e.clone()).or_default();
@@ -628,43 +718,124 @@ impl Graph {
     }
 
     fn set_errors(&mut self, node: NodeId, errs: &ErrDelta) {
-        self.node_errors.remove(&node);
+        if let Some(old) = self.node_errors.remove(&node)
+            && self.errs_mirrored.contains(&node)
+        {
+            let fp = &self.nodes[node].as_ref().expect("dangling node").fp;
+            for (e, w) in old {
+                add_weight(&mut self.err_changes, ErrorKey::Node(fp.clone(), e), -w);
+            }
+        }
         self.add_errors(node, errs);
     }
 
-    /// Error state for a checkpoint.
-    pub fn error_state(&self) -> ErrorState {
-        let mut st = ErrorState::default();
-        for n in self.live_nodes() {
-            if let Some(m) = self.node_errors.get(&n.id)
-                && self.any_arrangement(n.id).is_some()
-            {
-                st.nodes.push((n.fp.clone(), m.iter().map(|(e, w)| (e.clone(), *w)).collect()));
+    /// A node leaves the graph: retract its mirrored error state.
+    fn forget_mirrored_errors(&mut self, id: NodeId, node: &Node, errs: Option<BTreeMap<(String, String), i64>>) {
+        if self.errs_mirrored.remove(&id) {
+            for (e, w) in errs.into_iter().flatten() {
+                add_weight(&mut self.err_changes, ErrorKey::Node(node.fp.clone(), e), -w);
             }
-            if let Some(errs) = operator_errors(&n.kind) {
-                let errs = errs.lock();
-                if !errs.is_empty() {
-                    st.operators.push((n.fp.clone(), errs.iter().map(|(k, e)| (k.clone(), e.clone())).collect()));
+        }
+        if let Some(op) = operator_errors(&node.kind) {
+            let mut op = op.lock();
+            if let Some(ch) = op.changes.take() {
+                for ((g, e), w) in ch {
+                    add_weight(&mut self.err_changes, ErrorKey::Group(node.fp.clone(), g, e), w);
+                }
+                for (g, e) in &op.groups {
+                    add_weight(&mut self.err_changes, ErrorKey::Group(node.fp.clone(), g.clone(), e.clone()), -1);
                 }
             }
         }
-        st
     }
 
-    /// Restore checkpointed error state into a graph rebuilt for recovery
-    /// (before hydrating whatever could not be recovered).
-    pub fn restore_error_state(&mut self, st: ErrorState) {
+    /// Changes to the durable error state since the last call, as weighted
+    /// records (`ErrorKey`): summed over all calls, they are the error
+    /// records of every arranged node (views created later over a node
+    /// must see them) and the groups in error of every operator that keeps
+    /// them. A node's whole state is returned the first time it is seen
+    /// arranged (an operator's, the first time it is seen), and retracted
+    /// when it loses its last arrangement or leaves the graph.
+    pub fn take_error_changes(&mut self) -> Vec<(ErrorKey, i64)> {
+        let mut out = std::mem::take(&mut self.err_changes);
+        for n in self.nodes.iter().flatten() {
+            let arranged = n.arrangements.iter().any(|a| self.arr(*a).hydrated);
+            if arranged != self.errs_mirrored.contains(&n.id) {
+                let sign = if arranged { 1 } else { -1 };
+                for (e, w) in self.node_errors.get(&n.id).into_iter().flatten() {
+                    add_weight(&mut out, ErrorKey::Node(n.fp.clone(), e.clone()), sign * w);
+                }
+                if arranged {
+                    self.errs_mirrored.insert(n.id);
+                } else {
+                    self.errs_mirrored.remove(&n.id);
+                }
+            }
+            if let Some(op) = operator_errors(&n.kind) {
+                let mut op = op.lock();
+                match op.changes.replace(BTreeMap::new()) {
+                    Some(ch) => {
+                        for ((g, e), w) in ch {
+                            add_weight(&mut out, ErrorKey::Group(n.fp.clone(), g, e), w);
+                        }
+                    }
+                    None => {
+                        for (g, e) in &op.groups {
+                            add_weight(&mut out, ErrorKey::Group(n.fp.clone(), g.clone(), e.clone()), 1);
+                        }
+                    }
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Restore error state into a graph rebuilt for recovery (before
+    /// hydrating whatever could not be recovered). `mirrored`: the state
+    /// was read from the durable mirror that `take_error_changes` keeps, so
+    /// it is not returned again, and the records of nodes that no longer
+    /// exist are retracted from it; otherwise (a checkpoint of the earlier
+    /// format) the next `take_error_changes` returns all of it.
+    pub fn restore_error_state(&mut self, st: ErrorState, mirrored: bool) {
         for (fp, errs) in st.nodes {
-            if let Some(&id) = self.node_by_fp.get(&fp) {
-                self.set_errors(id, &errs);
+            match self.node_by_fp.get(&fp) {
+                Some(&id) => {
+                    self.set_errors(id, &errs);
+                    if mirrored {
+                        self.errs_mirrored.insert(id);
+                    }
+                }
+                None if mirrored => {
+                    for (e, w) in errs {
+                        add_weight(&mut self.err_changes, ErrorKey::Node(fp.clone(), e), -w);
+                    }
+                }
+                None => {}
             }
         }
         for (fp, groups) in st.operators {
-            if let Some(&id) = self.node_by_fp.get(&fp)
-                && let Some(errs) = operator_errors(&self.node(id).kind)
-            {
-                *errs.lock() = groups.into_iter().collect();
+            match self.node_by_fp.get(&fp).and_then(|&id| operator_errors(&self.node(id).kind)) {
+                Some(errs) => {
+                    let mut errs = errs.lock();
+                    errs.groups = groups.into_iter().collect();
+                    errs.changes = mirrored.then(BTreeMap::new);
+                }
+                None if mirrored => {
+                    for (g, e) in groups {
+                        add_weight(&mut self.err_changes, ErrorKey::Group(fp.clone(), g, e), -1);
+                    }
+                }
+                None => {}
             }
+        }
+    }
+
+    /// Give a node the error records a checkpoint of an earlier format
+    /// kept only with the materialized view it is the root of, if it has
+    /// none of its own.
+    pub fn restore_view_errors(&mut self, node: NodeId, errs: &ErrDelta) {
+        if !self.node_errors.contains_key(&node) {
+            self.set_errors(node, errs);
         }
     }
 

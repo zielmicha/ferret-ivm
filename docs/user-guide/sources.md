@@ -491,10 +491,11 @@ exists counts as dropped). Failed attempts — the upstream is unreachable,
 the slot still in use, also by the stopping source's own session — are
 retried with a delay doubling from 250 ms up to 10 s, with a warning in the
 log at attempts 1, 2, 4, 8, ..., until the drop succeeds.
-Pending drops are saved in checkpoints (and re-derived from a `DROP SOURCE`
-replayed from the log), so a drop that has not succeeded when the engine
-stops is retried after the next start. Creating a source whose slot has the
-name of a slot still to be dropped (an explicit `SLOT`) cancels that drop.
+Pending drops are part of the checkpointed state (and re-derived from a
+`DROP SOURCE` replayed from the log), so a drop that has not succeeded when
+the engine stops is retried after the next start. Creating a source whose
+slot has the name of a slot still to be dropped (an explicit `SLOT`)
+cancels that drop.
 
 ## Monitoring
 

@@ -1,17 +1,19 @@
 # On-disk format
 
 > **Scope.** This document describes the formats the current code writes and
-> reads. The engine has no format version number (see
-> [Compatibility](#compatibility)), so a change to any of these files changes
-> a format described here and must be reflected in this document (paths
-> relative to `crates/ivm/src/` unless noted): `log.rs`, `storage/`,
-> `types/codec.rs`, `types/encoding.rs`, `dataflow/layout.rs`,
-> `dataflow/mod.rs` and the operators' `fingerprint` methods (structural
-> fingerprints), `expr/mod.rs` (expression fingerprints), the function
-> registry order (`expr/ops.rs`, `expr/builtins.rs`), `catalog.rs`,
-> `coord/mod.rs` (`AppState`), `coord/ddl.rs` (`DiscoveredTable`, the
-> `CREATE SOURCE` record's `extra`), `source/` (`SourceState`, `SlotDrop`),
-> `crates/pgnumeric/src/encoding.rs` and `crates/pgfuncs/src/json/keyenc.rs`.
+> reads: format version 2, and format 1 as far as it is read to migrate it
+> (see [Compatibility](#compatibility) for what changes the version). A
+> change to any of these files changes a format described here and must be
+> reflected in this document (paths relative to `crates/ivm/src/` unless
+> noted): `log.rs`, `storage/`, `types/codec.rs`, `types/encoding.rs`,
+> `dataflow/layout.rs`, `dataflow/mod.rs` and the operators' `fingerprint`
+> methods (structural fingerprints), `expr/mod.rs` (expression
+> fingerprints), the function registry order (`expr/ops.rs`,
+> `expr/builtins.rs`), `catalog.rs`, `coord/meta.rs` (the metadata tree, the
+> checkpoint header, `FORMAT`, format 1's `AppState`), `coord/ddl.rs`
+> (`DiscoveredTable`, the `CREATE SOURCE` record's `extra`), `source/`
+> (`SourceState`, `SlotDrop`), `crates/pgnumeric/src/encoding.rs` and
+> `crates/pgfuncs/src/json/keyenc.rs`.
 
 Every statement below was checked against the code and, where indicated, by
 decoding files written by a running engine.
@@ -21,14 +23,16 @@ decoding files written by a running engine.
 1. [Conventions](#conventions)
 2. [Data directory layout](#data-directory-layout)
 3. [The LOCK file](#the-lock-file)
-4. [Input log](#input-log)
-5. [Storage segments and nodes](#storage-segments-and-nodes)
-6. [Manifest and checkpoints](#manifest-and-checkpoints)
-7. [Checkpoint application state](#checkpoint-application-state-appstate)
-8. [Data encodings](#data-encodings)
-9. [Structural fingerprints](#structural-fingerprints)
-10. [Garbage collection and retention](#garbage-collection-and-retention)
-11. [Compatibility](#compatibility)
+4. [The FORMAT file](#the-format-file)
+5. [Input log](#input-log)
+6. [Storage segments and nodes](#storage-segments-and-nodes)
+7. [Manifest and checkpoints](#manifest-and-checkpoints)
+8. [The metadata tree](#the-metadata-tree)
+9. [Format 1 application state (AppState)](#format-1-application-state-appstate)
+10. [Data encodings](#data-encodings)
+11. [Structural fingerprints](#structural-fingerprints)
+12. [Garbage collection and retention](#garbage-collection-and-retention)
+13. [Compatibility](#compatibility)
 
 ## Conventions
 
@@ -48,6 +52,8 @@ decoding files written by a running engine.
 
 ```
 <data-dir>/
+├── FORMAT
+├── FORMAT.new                  (transient)
 ├── LOCK
 ├── log/
 │   └── log-<first GSN, %020u>.ivl ...
@@ -59,6 +65,8 @@ decoding files written by a running engine.
 
 | Path | Written by | Contents |
 |---|---|---|
+| `FORMAT` | `coord::start` | the format version, ASCII decimal and a newline |
+| `FORMAT.new` | `coord::start` | the new `FORMAT`, until renamed |
 | `LOCK` | `coord::start` | empty; exclusive lock |
 | `log/log-NNNNNNNNNNNNNNNNNNNN.ivl` | sequencer (`log::LogWriter`) | input-log segment; the number is the GSN of its first record, zero-padded to 20 digits |
 | `store/MANIFEST` | checkpoints (`storage::manifest`) | sequence of checkpoint records |
@@ -69,9 +77,10 @@ Directories are created on demand; creating `store/` (and `log/`, unless
 `--no-sync`) is followed by an `fsync` of the data directory, so that their
 entries survive a crash. Files in `log/` and `store/` whose names do not
 match these patterns are ignored. Example of a fresh directory after one
-second: `LOCK` (0 bytes), `log/log-00000000000000000001.ivl` (one tick frame
-per second, 25 bytes each), `store/MANIFEST` (0 bytes until the first
-checkpoint), `store/seg-00000001.dat` (0 bytes).
+second: `FORMAT` (2 bytes, `2\n`), `LOCK` (0 bytes),
+`log/log-00000000000000000001.ivl` (one tick frame per second, 25 bytes
+each), `store/MANIFEST` (0 bytes until the first checkpoint),
+`store/seg-00000001.dat` (0 bytes).
 
 ## The LOCK file
 
@@ -84,6 +93,27 @@ lock was held keeps a copy of it until it execs); if it is still taken,
 start-up fails with SQLSTATE `55006`
 (`data directory <dir> is in use by another ivm process`). The file is never
 deleted and its contents are never read.
+
+## The FORMAT file
+
+Code: `coord::meta` (`read_format`, `write_format`), `coord::start`.
+
+`FORMAT` holds the data directory's format version: the version in ASCII
+decimal followed by a newline (`2\n`). It is read right after the lock is
+taken, before anything else is opened (opening the log truncates a torn
+tail, opening the store deletes unreferenced segment files):
+
+| `FORMAT` | Meaning | Start-up |
+|---|---|---|
+| missing, `log/` and `store/` empty or absent | a new directory | `FORMAT` is written first |
+| missing, `log/` or `store/` holds a file | format 1, written before versions were recorded | recovered, then migrated: see [Compatibility](#compatibility) |
+| `2` | the current format | normal |
+| a larger number | written by a newer engine | refused with SQLSTATE `0A000` (`the data directory has format <n>, which this version of ivm cannot read (it reads formats up to 2)`), nothing is modified |
+| anything else | damaged | refused with `XX001` (`.../FORMAT does not hold a format version: ...`) |
+
+`FORMAT` is written atomically: to `FORMAT.new`, which is `fsync`ed and
+renamed over `FORMAT`, followed by an `fsync` of the data directory. A
+leftover `FORMAT.new` is never read.
 
 ## Input log
 
@@ -201,7 +231,7 @@ table 1000, `Delete`, key row with one value, int4 4.
 - `extra`: empty, except for the statements that discover upstream tables.
   A discovered table is
   `{"schema": str, "name": str, "columns": [Column], "pk": [column index, ...], "replica_identity_full": bool}`
-  (`coord::ddl::DiscoveredTable`; `Column` as in [AppState](#checkpoint-application-state-appstate);
+  (`coord::ddl::DiscoveredTable`; `Column` as in [catalog objects](#catalog-objects);
   `pk` is the key: the columns of the replica identity index under
   `REPLICA IDENTITY USING INDEX`, else the primary key's, in key order).
   `ALTER SOURCE ... REFRESH` logs a JSON array of all discovered tables (the
@@ -266,9 +296,11 @@ The engine converts it to the PostgreSQL epoch (subtracting
   (`input log is missing records: expected gsn <g>, found <h> in <path>`),
   rather than replaying around the damage.
 - **Truncation** (`truncate_before(g)`, after every checkpoint with
-  `g = checkpoint GSN − retention`): every segment except the current one
-  whose successor starts at or before `g + 1` (so all its records are ≤ `g`)
-  is deleted.
+  `g` = the checkpoint's GSN): every segment except the current one whose
+  successor starts at or before `g + 1` (so all its records are ≤ `g`) is
+  deleted. Recovery replays the log after the checkpoint, and nothing else
+  reads the log, so the records a checkpoint covers are not kept (`AS OF`
+  reads use the histories in the trees, not the log).
 - The engine ignores records whose GSN is at or below the last GSN it has
   applied.
 
@@ -423,26 +455,44 @@ ns × (uvarint id, uvarint total_bytes, uvarint live_bytes)
 uvarint  active_seg              id of the active segment
 uvarint  active_len              length of the active segment belonging to this checkpoint
 uvarint  next_tree_id            next tree id to allocate
-bytes    app                     application state (JSON, see below)
+bytes    app                     application state: the header below (format 1: JSON, see AppState below)
 ```
 
-Every record is complete: it lists every tree, every segment and the whole
-application state, so only the last record matters. The very first record of
-a new data directory (after about ten seconds of ticks):
+The application state of the current format is a header naming the
+[metadata tree](#the-metadata-tree), which holds the catalog and the rest of
+the engine's state:
 
 ```
-e6 01 00 00  34 b1 84 4e     len 486, crc
+uvarint  format                  2 (format 1's JSON starts with '{', 0x7B)
+uvarint  meta_tree               id of the metadata tree (one of the trees above)
+uvarint  next_req                request counter
+```
+
+Every record is complete: it lists every tree (the metadata tree included)
+and every segment, so only the last record matters. The first record of a
+new data directory, ten seconds after `CREATE TABLE customers (id int
+PRIMARY KEY, region text)`, `INSERT INTO customers VALUES (1, 'eu'), (2,
+'us'), (3, 'x')` and `CREATE MATERIALIZED VIEW c AS SELECT id, region::int
+AS r FROM customers` (three error records, no rows):
+
+```
+24 00 00 00  b0 1c a3 a4     len 36, crc
 01                           seq 1
-0b                           gsn 11
-00                           no trees
-01  01 00 00                 one segment: id 1, 0 bytes written, 0 live
+0d                           gsn 13
+03                           three trees
+01  01  01 00 2b  06 00  01  tree 1 (customers): root at segment 1, offset 0, 43 bytes; count 3, no aggregates; min_seg 1
+02  01  01 2b a7 09  28 00  01
+                             tree 2 (the metadata tree): root at offset 43, 1191 bytes; 20 entries
+03  00                       tree 3 (c): empty
+01  01 d2 09 d2 09           one segment: id 1, 1234 bytes written, 1234 live
 01                           active segment 1
-00                           active length 0
-01                           next tree id 1
-da 03  7b 22 63 61 ...       app: 474 bytes of JSON {"catalog":{"objects":{},"next_id":1000,...
+d2 09                        active length 1234
+04                           next tree id 4
+03  02 02 04                 app: format 2, metadata tree 2, next request 4
 ```
 
-(Almost half of the 474 bytes are the eleven clock ticks in `ticks`.)
+A checkpoint after changes to some rows of one tree has the same size; the
+record grows only with the number of trees and segments.
 
 ### Reading and updating
 
@@ -460,10 +510,14 @@ da 03  7b 22 63 61 ...       app: 474 bytes of JSON {"catalog":{"objects":{},"ne
 - **Rewrite**: if the append would grow the file beyond 8 MiB
   (8,388,608 bytes), the new frame is written alone to `MANIFEST.new`, which
   is `fsync`ed and renamed over `MANIFEST`; then the directory is `fsync`ed.
-  Readers either see the old file or the new one.
+  Readers either see the old file or the new one. (With records of tens of
+  bytes per tree this takes many thousands of checkpoints; format 1's
+  records carried the whole engine state and could reach it every few.)
 
 ### Checkpoint procedure
 
+0. The engine writes the metadata changed since the previous checkpoint into
+   the [metadata tree](#the-metadata-tree) (`Engine::persist_meta`).
 1. Every tree with a dirty root is written depth-first, children before their
    parent, so that each internal node records the final locations of its
    children; each written frame adds its length to its segment's
@@ -477,10 +531,124 @@ Creating a segment file (the first one, and each new active segment) is
 followed by an `fsync` of the store directory, so that a checkpoint never
 refers to a file whose directory entry a crash could lose.
 
-## Checkpoint application state (AppState)
+## The metadata tree
 
-The record's `app` field is a JSON object (`coord::AppState`, serialized
-with `serde_json`):
+Code: `crates/ivm/src/coord/meta.rs`.
+
+The catalog, its DDL history and the engine's state live in one storage
+tree, the *metadata tree*, named by the [checkpoint header](#checkpoint-record).
+It is stored like an arrangement's tree (the same nodes; its summaries hold
+the count only), and each record is one entry: a byte string whose first
+byte is the record's tag, with a (GSN, weight) history. A record kept by
+key — every record but the error records — has weight 1; changing it
+retracts the old entry (weight −1) and adds the new one (+1) at the GSN of
+the change, so the tree holds the metadata as of every GSN of the retention
+window, as an arrangement holds its rows (versions at or before the
+retention frontier are merged when a leaf is rewritten). An error record's
+weight is its count.
+
+| Tag | Record | Entry after the tag | Weight |
+|---|---|---|---|
+| 1 | catalog object | `u64 BE id`, then the [`CatalogObject`](#catalog-objects) as JSON (to the end of the entry) | 1 |
+| 2 | catalog scalar | `u8 field`, then its value: field 1, the next object id (`uvarint`); field 2, the instance id (`str`; no record while there is none) | 1 |
+| 3 | DDL history | `u64 BE gsn`, then the statement (UTF-8, to the end of the entry) | 1 |
+| 4 | source state | `u64 BE source`, then its `SourceState` JSON (to the end of the entry), as in [`Progress` records](#logrecord) | 1 |
+| 5 | source resume LSN | `u64 BE source`, `uvarint lsn` | 1 |
+| 6 | arrangement | `bytes fingerprint`, `uvarint tree`, `uvarint since` | 1 |
+| 7 | node error record | `bytes node fingerprint`, `str sqlstate`, `str message` | its count |
+| 8 | group error | `bytes node fingerprint`, `bytes group key`, `str sqlstate`, `str message` | 1 |
+| 9 | clock tick | `u64 BE gsn`, `ivarint clock` | 1 |
+| 10 | pending slot drop | `str conninfo`, `str slot` | 1 |
+
+The *key* of a record kept by key is its entry up to its value: tag and
+id for tags 1, 3, 4, 5 and 9, tag and field for 2, tag and fingerprint for
+6, the whole entry for 10. Fixed-width big-endian ids and length-prefixed
+fields make keys prefix-free, so the entries of one key are found by a
+prefix scan.
+
+| Record | Contents |
+|---|---|
+| catalog objects | every object of the catalog, by id |
+| DDL history | `ivm.catalog_history`: the successfully applied DDL statements, by GSN, the most recent 10,000; when a statement makes the history longer than 11,000, the oldest are retracted down to 10,000. Trimming happens when a statement is applied, so replay trims identically |
+| catalog scalars | the next object id; the instance id: 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted |
+| source states, resume LSNs | per source: its `SourceState`; the end LSN of its last logged commit, from which it resumes streaming |
+| arrangements | every hydrated arrangement (also private state arrangements, such as a temporal filter's events): its [structural fingerprint](#structural-fingerprints), its tree, and the GSN from which its history is complete (when it was hydrated, or created with its table): `AS OF` reads of earlier GSNs do not use it |
+| node error records | the error records in the contents of every arranged node, by node fingerprint, so that views created later over the node start with them (an arrangement holds rows only); a materialized view's error records are those of its root node |
+| group errors | for every `Reduce` and `Recursive` node, the groups in error with their error record, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers |
+| clock ticks | `(gsn, clock)` of the clock ticks of the retention window, for `now()` in reads as of earlier GSNs: the last tick at or before the retention frontier and every later one. `clock` is microseconds since the PostgreSQL epoch; the logical clock is the last tick's (0 without ticks) |
+| pending slot drops | replication slots of dropped sources not dropped upstream yet, retried after the start |
+
+**Writing** (`Engine::persist_meta`): after every applied DDL or `Schema`
+record, at its GSN (catalog objects and history entries are thus stamped
+with the GSN of their change), and at every checkpoint, at the checkpoint's
+GSN, before its nodes are written. Each time only what changed since the
+previous time is written: the catalog objects inserted, replaced or removed
+(the stored entries of each are retracted, whatever their bytes); history
+entries and ticks after the last ones written, and those trimmed or behind
+the frontier (retracted by a range scan); the records kept by key whose
+entry differs from the one the tree holds; and the changes to the error
+state (`Graph::take_error_changes`: a node's error records are added when
+it is first seen with an arrangement and retracted when it loses its last
+one or leaves the graph; an operator's group errors when it is first seen
+and when it leaves).
+
+**Reading** (recovery, `meta::load`): every entry with a non-zero weight.
+An entry with an unknown tag or trailing bytes, a record kept by key whose
+weight is not 1 or whose key appears twice, a catalog object whose key is
+not its `id`, and a tree without the next object id are refused
+(`bad metadata entry (...)` with the entry's bytes, SQLSTATE `XX001`).
+
+Entries of the data directory of the [example record](#checkpoint-record),
+decoded:
+
+```
+01 00 00 00 00 00 00 03 e8  7b 22 69 64 22 3a 31 30 30 30 ...
+                                   catalog object 1000: {"id":1000,"name":"customers","kind":{"Table":...
+02 01  ea 07                       next object id 1002 (history [(5, +1)]; the entry 02 01 e9 07,
+                                   1001, has [(3, +1), (5, −1)] until the frontier passes GSN 5)
+03 00 00 00 00 00 00 00 03  43 52 45 41 54 45 ...
+                                   history: GSN 3, CREATE TABLE customers (id INT PRIMARY KEY, region TEXT)
+06 10 b7 47 23 59 ... 1f 56  01  03
+                                   arrangement b7472359...ae511f56 (customers' primary index): tree 1, since GSN 3
+07 10 c3 bf 44 d5 ... 2d ef 75  05 32 32 50 30 32  2a 69 6e 76 61 6c 69 64 ...
+                                   node c3bf44d5...2def75: 22P02, invalid input syntax for type integer: "x"; weight 1
+09 00 00 00 00 00 00 00 0e  94 d9 f7 d4 ad ec 80 03
+                                   tick at GSN 14: 846286484862538 (2026-10-25 23:34:44.862538 UTC)
+```
+
+### Catalog objects
+
+`CatalogObject`: `id`, `name`, `kind`, `created_gsn`, `create_sql` (the
+logged statement; for replicated tables the text
+`-- table <schema>.<table> replicated by source <id>`). `kind` is one of:
+
+| Variant | Fields |
+|---|---|
+| `Table` | `columns: [Column]`, `pk: [column index]` (the key in key order: for a replicated table the replica identity index's columns, else the primary key's; empty: multiset), `source: id or null`, `upstream: [schema, table] or null`, `version: u32` (incremented by upstream schema changes) |
+| `MaterializedView`, `View` | `sql` (the query text), `columns: [Column]` |
+| `Index` | `on: id`, `columns: [column index]` |
+| `Source` | `conninfo`, `publication`, `slot`, `tables: [name] or null` |
+| `Sink` | `from: id`, `conninfo`, `table`, `key: [name] or null` |
+
+`Column` is `{"name": str, "ty": {"ty": SqlType, "typmod": i32, "nullable": bool}}`.
+`SqlType` is serialized by variant name: `"Bool"`, `"Int2"`, `"Int4"`,
+`"Int8"`, `"Float4"`, `"Float8"`, `"Numeric"`, `"Text"`, `"Varchar"`,
+`"Bpchar"`, `"Name"`, `"Bytea"`, `"Date"`, `"Time"`, `"Timestamp"`,
+`"TimestampTz"`, `"Interval"`, `"Uuid"`, `"Json"`, `"Jsonb"`, `"JsonPath"`,
+`"Oid"`, `"Unknown"`, and `{"Array": SqlType}`. Type modifiers follow
+PostgreSQL (`numeric(p,s)`: `((p << 16) | s) + 4`; `varchar(n)`, `char(n)`:
+`n + 4`; `time(p)`, `timestamp(p)`, `timestamptz(p)`: `p`; `interval`:
+`(field range << 16) | precision`, with range `0x7FFF` for all fields and
+precision `0xFFFF` for none; `-1`: none). An array column carries its
+element type's modifier.
+
+## Format 1 application state (AppState)
+
+Data directories of format 1 (written before `FORMAT` existed) carry the
+whole engine state in every checkpoint record's `app` field, as a JSON
+object (`coord::meta::AppState`, `serde_json`). The current code reads it
+to migrate the directory ([Compatibility](#compatibility)); it never writes
+it.
 
 ```json
 {
@@ -518,7 +686,7 @@ with `serde_json`):
 |---|---|
 | `catalog.objects` | map from object id (as a JSON string key) to `CatalogObject` |
 | `catalog.next_id` | next object id |
-| `catalog.history` | `[gsn, statement]` of the successfully applied DDL statements (`ivm.catalog_history`), oldest first: the most recent 10,000; when a statement makes it longer than 11,000, the oldest entries are dropped down to 10,000. Trimming happens when a statement is applied, so replay trims identically |
+| `catalog.history` | `[gsn, statement]` of the DDL history, oldest first (as in the metadata tree) |
 | `catalog.instance_id` | 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted; `null` before that (and if absent) |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view with a dataflow: its error records `[[sqlstate, message], count]` |
@@ -531,32 +699,9 @@ with `serde_json`):
 | `ticks` | `[gsn, clock]` of recent clock ticks, for `now()` in reads as of earlier GSNs: the last tick at or before the retention frontier and every later one, at most the last 100,000; `[]` if absent (recovery then starts from `[[checkpoint gsn, clock]]`) |
 | `slot_drops` | replication slots of dropped sources not dropped upstream yet (`conninfo`, `slot`), retried after the start; `[]` if absent |
 
-`CatalogObject`: `id`, `name`, `kind`, `created_gsn`, `create_sql` (the
-logged statement; for replicated tables the text
-`-- table <schema>.<table> replicated by source <id>`). `kind` is one of:
-
-| Variant | Fields |
-|---|---|
-| `Table` | `columns: [Column]`, `pk: [column index]` (the key in key order: for a replicated table the replica identity index's columns, else the primary key's; empty: multiset), `source: id or null`, `upstream: [schema, table] or null`, `version: u32` (incremented by upstream schema changes) |
-| `MaterializedView`, `View` | `sql` (the query text), `columns: [Column]` |
-| `Index` | `on: id`, `columns: [column index]` |
-| `Source` | `conninfo`, `publication`, `slot`, `tables: [name] or null` |
-| `Sink` | `from: id`, `conninfo`, `table`, `key: [name] or null` |
-
-`Column` is `{"name": str, "ty": {"ty": SqlType, "typmod": i32, "nullable": bool}}`.
-`SqlType` is serialized by variant name: `"Bool"`, `"Int2"`, `"Int4"`,
-`"Int8"`, `"Float4"`, `"Float8"`, `"Numeric"`, `"Text"`, `"Varchar"`,
-`"Bpchar"`, `"Name"`, `"Bytea"`, `"Date"`, `"Time"`, `"Timestamp"`,
-`"TimestampTz"`, `"Interval"`, `"Uuid"`, `"Json"`, `"Jsonb"`, `"JsonPath"`,
-`"Oid"`, `"Unknown"`, and `{"Array": SqlType}`. Type modifiers follow
-PostgreSQL (`numeric(p,s)`: `((p << 16) | s) + 4`; `varchar(n)`, `char(n)`:
-`n + 4`; `time(p)`, `timestamp(p)`, `timestamptz(p)`: `p`; `interval`:
-`(field range << 16) | precision`, with range `0x7FFF` for all fields and
-precision `0xFFFF` for none; `-1`: none). An array column carries its
-element type's modifier.
-
-The application state is the only place where the catalog is stored besides
-the log; dataflow plans are re-derived from it on every start.
+`view_errors` duplicates the error records of each view's root node in
+`errors.nodes`; recovery gives a root node without records of its own
+(checkpoints from before `errors` existed) its view's.
 
 ## Data encodings
 
@@ -789,16 +934,17 @@ Arrangements used by the engine:
 
 ### Catalog serialisation
 
-The catalog is serialised only as part of the [application state](#checkpoint-application-state-appstate)
-(JSON); DDL statements are additionally logged as text in `Ddl` records.
+The catalog is stored in the [metadata tree](#the-metadata-tree): each object
+as JSON, the history as statement text by GSN; DDL statements are
+additionally logged as text in `Ddl` records.
 
 ## Structural fingerprints
 
 Code: `crates/ivm/src/dataflow/mod.rs` (`hash128`, `node_fp`,
 `add_arrangement`), the operators' `fingerprint` methods, `Mfp::fingerprint`,
 `Expr::fingerprint`. Checkpoints identify arrangement trees by fingerprint
-(`AppState.trees`); recovery finds them again by re-planning the catalog and
-computing the same fingerprints.
+(the metadata tree's arrangement records); recovery finds them again by
+re-planning the catalog and computing the same fingerprints.
 
 **Hash**: 128-bit FNV-1a — state initialised to
 `0x6c62272e07bb014262b821756295c58d`; for each byte, `state ^= byte;
@@ -896,19 +1042,73 @@ checkpoint of a running engine).
   are kept as broken) are dropped during start-up, after hydration.
 - **Retention**: history elements at or before the retention frontier
   (`processed GSN − --retention-gsns`) are merged when a leaf is next
-  modified; input-log segments whose records all lie at or before
-  `checkpoint GSN − retention` are deleted after the checkpoint.
+  modified (in the metadata tree too, which merges away replaced records).
+  Input-log segments whose records all lie at or before the checkpoint's
+  GSN are deleted after the checkpoint, whatever the retention.
 
 ## Compatibility
 
-The engine writes no format version. It notices incompatible data only
-through these checks:
+### Format versions
+
+A data directory records the format it is written in, in
+[`FORMAT`](#the-format-file). Format 1 is everything written before the
+version was recorded (no `FORMAT` file): the catalog and the engine state
+as JSON in every checkpoint record. Format 2 keeps them in the
+[metadata tree](#the-metadata-tree), with a header in the checkpoint record.
+
+- **The version changes when existing data would not be read as it is**:
+  something already written changes its meaning or layout (an existing tag
+  or field reinterpreted, a structure replaced by another). Such a change
+  raises `coord::meta::FORMAT_VERSION`, keeps reading the previous format,
+  and migrates a directory of that format at its first start, as format 1
+  is migrated (below).
+- **Additive changes keep the version**: a new log record tag, change kind,
+  datum tag, node kind, summary state tag or metadata record tag, a new
+  JSON field with a default, data that existing code never reads. Code with
+  the change reads everything written before it unchanged, because no
+  existing tag or field changes its meaning. Data written after it may
+  contain the new encodings, which code without the change does not know:
+  it stops with a decoding error when it meets one (`bad log record tag`,
+  `bad metadata entry (tag)`, `bad agg state tag`, ...), never misreading
+  it — except that in the newest log segment a record it cannot decode is
+  taken for a torn write and truncated with everything after it (see
+  [Opening, replay and truncation](#opening-replay-and-truncation)). So an
+  engine of a format version reads every directory of that version and of
+  every earlier one, but running an older engine on a directory a newer one
+  has written is not supported, within a format version as across.
+- A directory of a newer format than the engine reads is refused before
+  anything in it is opened.
+
+### Migrating format 1
+
+A data directory without `FORMAT` whose `log/` or `store/` holds a file is
+of format 1. The engine starts it as usual — it recovers the last
+checkpoint from its JSON state, rebuilds the dataflow and replays the log
+after the checkpoint — then takes a checkpoint, which writes every record of
+a new metadata tree, and then writes `FORMAT`. Until that checkpoint's
+manifest append commits it, the format-1 record is the last valid one, so a
+crash before it migrates again at the next start (the nodes it wrote are
+beyond the recorded length of the active segment, and truncated); after it,
+the next start finds a record of the current format — the application
+state tells the formats apart: JSON starts with `{` (0x7B), the header with
+its format number — and only writes `FORMAT`. The migration keeps
+everything format 1 kept: the catalog and its history, the trees with
+their history starts, the error records of nodes and the groups in error,
+source states and resume LSNs, the request counter, the clock ticks and the
+pending slot drops (a view's error records, which format 1 also kept with
+the view, are its root node's).
+
+### Checks
+
+The engine notices incompatible data through these checks:
 
 | Check | Error | Effect |
 |---|---|---|
+| `FORMAT` | `the data directory has format <n>, which this version of ivm cannot read ...`, `... does not hold a format version` | refused at start-up before anything is opened |
 | frame CRC and length (log, segments, manifest) | `node checksum mismatch`, `input log segment ... is corrupt at byte <n>`, torn-tail truncation | log: in the newest segment, a bad frame and everything after it are truncated at start-up as a torn write; anywhere else, and for a gap in the GSNs after the checkpoint (`input log is missing records ...`), start-up fails; segments: fatal on access; manifest: a torn tail after the last valid record is dropped, and a manifest with contents but no valid record (or a missing one while segment files hold data) stops the start, modifying nothing |
 | record decoding | `bad log record tag`, `bad change tag`, `bad datum tag`, `bad agg state tag`, ... | fatal; except that in the newest log segment a frame that does not decode counts as a torn write and is truncated with everything after it |
-| `AppState` JSON decoding | `cannot decode checkpoint state: ...` | fatal at start-up |
+| checkpoint header and metadata tree | `the data directory has format <n> ...` (header), `bad metadata entry (...)`, `the metadata tree has no next object id` | fatal at start-up |
+| format 1 `AppState` JSON decoding | `cannot decode checkpoint state: ...` | fatal at start-up |
 | every table's primary index found by fingerprint | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | fatal at start-up |
 
 Consequences of code changes for an existing data directory:
@@ -916,7 +1116,9 @@ Consequences of code changes for an existing data directory:
 | Change | Consequence |
 |---|---|
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag truncates the newest log segment at the first such record (see above), losing it and everything after it |
-| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#checkpoint-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array.) |
+| `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
+| metadata record layouts (tags 1–10), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`) |
+| format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
@@ -927,14 +1129,17 @@ Consequences of code changes for an existing data directory:
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
 Data directories written by earlier versions of the engine are compatible:
-the formats have only gained fields with defaults. New functions (registered
-among the existing ones, which renumbers the later ones) and planner fixes
-did change the fingerprints of many views' arrangements (for example joins
-on computed keys, whose keys are materialized in an `Mfp` node, semijoins
-whose presence inputs match exactly, and the summaries of `var*`/`stddev*`
-over `bigint`), so such a data directory keeps its tables and rebuilds those
-arrangements once at its first start.
+format 1 only gained fields with defaults, and is migrated to format 2 at
+the first start. New functions (registered among the existing ones, which
+renumbers the later ones) and planner fixes did change the fingerprints of
+many views' arrangements (for example joins on computed keys, whose keys
+are materialized in an `Mfp` node, semijoins whose presence inputs match
+exactly, and the summaries of `var*`/`stddev*` over `bigint`), so such a
+data directory keeps its tables and rebuilds those arrangements once at its
+first start. `crates/ivm/tests/data/format1` is a format-1 directory that
+the restart tests migrate.
 
-An upgrade that changes any of the "incompatible" rows requires starting
+A change in any of the "incompatible" rows needs a new format version whose
+migration the engine runs at the first start (as for format 1), or starting
 from an empty data directory (and re-creating sources, which re-snapshot the
-upstream tables) or a migration tool, which does not exist.
+upstream tables).

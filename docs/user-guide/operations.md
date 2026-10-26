@@ -12,8 +12,8 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 | Knob | Default | Trade-off |
 |---|---|---|
 | `--cache-mb` | 1024 | Target size of the node cache. Clean index nodes beyond it are evicted (CLOCK) and re-read from segment files on demand; dirty nodes stay until the next checkpoint, and a checkpoint is forced when dirty nodes exceed half of it. Working sets that fit run from memory; larger ones degrade gradually. |
-| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
-| `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes, more input-log segments on disk, and more clock ticks in each checkpoint. `0` keeps no history beyond the previous GSN. |
+| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
+| `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes and more clock ticks. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
 | `--no-sync` | off | Skips `fsync` of the input log. Only for tests and benchmarks; see [Durability](#durability-and---no-sync). |
 
@@ -32,7 +32,8 @@ Fixed internal parameters (not configurable):
 | nodes relocated per garbage-collection pass | 1000 |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
-| clock ticks saved in a checkpoint | the retention window, at most 100,000 |
+| clock ticks kept | those of the retention window |
+| clock ticks that make a checkpoint due without other changes | 3,600 |
 | source reconnect delay | 200 ms, doubling up to 10 s |
 | retry of a table that cannot be copied | 1 s, doubling up to 60 s |
 | sink reconnect delay | 100 ms, doubling up to 10 s |
@@ -59,6 +60,7 @@ Things to keep in mind when sizing:
 
 ```
 <data-dir>/
+├── FORMAT                            the data directory's format version
 ├── LOCK                              exclusive lock while a process uses the directory
 ├── log/
 │   └── log-<first GSN, 20 digits>.ivl   input-log segments
@@ -73,9 +75,13 @@ Things to keep in mind when sizing:
   checksum. It is the source of truth: everything else can be recomputed
   from it plus the last checkpoint.
 - **Store** (`store/`): the persistent indexes (copy-on-write B+trees) in
-  append-only segment files, and the manifest, whose last valid record names
-  the tree roots of the last checkpoint together with the catalog and the
-  engine's state.
+  append-only segment files, among them the metadata tree, which holds the
+  catalog with its DDL history and the engine's state, and the manifest,
+  whose last valid record names the tree roots of the last checkpoint.
+- **Format** (`FORMAT`): the version of the on-disk formats the directory is
+  written in ([Compatibility](../on-disk-format.md#compatibility)). A
+  directory written by an older version is migrated at its first start; one
+  written in a newer format is refused untouched.
 
 The stop file `.ivm-stop` lives in the process's working directory, not in
 the data directory ([Stopping](getting-started.md#stopping-the-server)).
@@ -97,7 +103,8 @@ file, lock it, and run on the same directory concurrently.
 Every start is a recovery (the listen address is bound before it, so
 clients that connect meanwhile wait):
 
-1. Lock the data directory.
+1. Lock the data directory and read its format version (`FORMAT`): a
+   directory of a newer format is refused before anything in it is opened.
 2. Open the input log: scan the last segment, truncate a torn tail (a frame
    whose length or checksum does not match), and determine the last GSN.
 3. Open the store: read the manifest, take its last valid record as the
@@ -105,7 +112,8 @@ clients that connect meanwhile wait):
    delete segment files the checkpoint does not reference (written after
    it). A store whose manifest is missing (while segment files hold data)
    or has no valid record stops the start, untouched.
-4. Restore the catalog and engine state from the checkpoint, rebuild the
+4. Restore the catalog and engine state from the checkpoint (its metadata
+   tree), rebuild the
    dataflow from the catalog (tables first, then materialized views and
    indexes, each after what it reads), and attach every index whose
    structure matches one in the checkpoint. A table whose primary index is
@@ -125,7 +133,11 @@ clients that connect meanwhile wait):
    checkpoint's GSN (a lost unsynced tail, see
    [Durability](#durability-and---no-sync)), numbering continues after the
    checkpoint.
-6. Restart sources (from their logged progress) and the retries of pending
+6. A directory of format 1 (written before formats were recorded) is
+   migrated: a checkpoint writes its state into a metadata tree, then
+   `FORMAT` is written (a crash in between migrates again at the next
+   start; see [Compatibility](../on-disk-format.md#migrating-format-1)).
+   Restart sources (from their logged progress) and the retries of pending
    slot drops, start the sequencer and engine threads, and accept
    connections.
 
@@ -138,7 +150,8 @@ Startup failures and what they mean:
 | Message | Cause |
 |---|---|
 | `data directory ... is in use by another ivm process` | another process holds `LOCK` |
-| `cannot decode checkpoint state: ...` | the checkpoint was written by an incompatible version ([Compatibility](../on-disk-format.md#compatibility)) |
+| `the data directory has format <n>, which this version of ivm cannot read ...` | the directory was written by a newer version ([Compatibility](../on-disk-format.md#compatibility)); nothing was modified |
+| `cannot decode checkpoint state: ...`, `bad metadata entry (...)` | the checkpoint was written by an incompatible version ([Compatibility](../on-disk-format.md#compatibility)) or is damaged |
 | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | the table's primary index cannot be found by its structural fingerprint — usually an incompatible version |
 | `node checksum mismatch at ...`, `cannot open segment ...` | damaged or missing store files |
 | `input log segment ... is corrupt at byte ...`, `input log is missing records: expected gsn ..., found ...` | a damaged or deleted input-log segment holding records after the checkpoint; those records exist nowhere else. Restore the data directory from a backup |
@@ -162,24 +175,36 @@ view).
 
 ## Checkpoints and garbage collection
 
-A checkpoint is taken every `--checkpoint-secs` seconds if anything was
-applied since the last one, when dirty index nodes exceed half of
-`--cache-mb` (also only if something was applied), on the `CHECKPOINT`
-statement, and as the final step of a requested shutdown. It:
+A checkpoint is taken every `--checkpoint-secs` seconds, or as soon as
+dirty index nodes exceed half of `--cache-mb`, if something durable changed
+since the last one: anything applied but clock ticks that changed nothing
+but the clock (a tick that changes a view through a temporal filter
+counts), or nodes the last garbage-collection pass relocated. Clock ticks
+alone make one due only after 3,600 of them (an hour at the default
+`--tick-ms`), so an idle engine writes nothing but its ticks to the log, and
+a restart replays at most that many. A checkpoint is also taken on the
+`CHECKPOINT` statement and as the final step of a requested shutdown. It:
 
-1. serialises the engine state (the catalog and its DDL history, index
-   fingerprints → tree ids and the GSN each index's history starts at,
-   view error counts and the error records of operators, source states and
-   LSNs, the logical clock and the recent clock ticks, pending slot drops)
-   as JSON;
-2. writes all dirty index nodes bottom-up to the active segment and `fsync`s
-   the segment files;
-3. appends a checkpoint record (tree roots, segment usage, the JSON state) to
-   the manifest and `fsync`s it — this is the atomic commit point;
+1. writes what changed in the catalog and the engine state since the last
+   one (DDL history entries, source states and LSNs, index fingerprints →
+   tree ids and the GSN each index's history starts at, error records,
+   clock ticks, pending slot drops) into the metadata tree, a tree like the
+   indexes (DDL statements write their catalog changes into it right
+   away);
+2. writes all dirty nodes bottom-up to the active segment and `fsync`s the
+   segment files;
+3. appends a checkpoint record (tree roots, segment usage, a small header
+   naming the metadata tree) to the manifest and `fsync`s it — this is the
+   atomic commit point;
 4. deletes sealed segment files with no live nodes;
 5. runs one garbage-collection pass;
 6. asks the sequencer to delete input-log segments whose records all lie at
-   or before `checkpoint GSN − retention`.
+   or before the checkpoint's GSN (only recovery reads the log, and it
+   starts after the checkpoint).
+
+What a checkpoint writes is what changed since the previous one: its cost
+does not grow with the catalog, its DDL history or the error records that
+stay the same.
 
 Space reclamation: a node rewritten after a checkpoint makes its old copy
 dead. Garbage collection picks the oldest sealed segment that is less than
@@ -195,8 +220,9 @@ checkpoint. The active segment is never collected, so up to one segment
 Each index entry keeps a history of (GSN, weight) changes. Changes at or
 before the *retention frontier* (`last applied GSN − --retention-gsns`) are
 merged into one when an index leaf is next rewritten, and `AS OF` reads
-before the frontier are refused. The same bound decides which input-log
-segments a checkpoint may delete. See [Reads](reads.md#time-travel-as-of-gsn).
+before the frontier are refused. Retention does not keep input-log
+segments: `AS OF` reads use the histories in the indexes. See
+[Reads](reads.md#time-travel-as-of-gsn).
 
 ## Durability and --no-sync
 
@@ -237,6 +263,8 @@ While it is stopped:
 | File | Safe to delete? |
 |---|---|
 | `LOCK` | yes (it is re-created) |
+| `FORMAT.new` | yes — a leftover of an interrupted write of `FORMAT`; it is never read |
+| `FORMAT` | do not: the next start takes the directory for one of format 1 and goes through the migration again (harmlessly: it reads the current checkpoint, takes a checkpoint and writes `FORMAT`) |
 | `store/MANIFEST.new` | yes — a leftover of an interrupted manifest rewrite; it is never read |
 | `store/seg-*.dat` not referenced by the last checkpoint | they are deleted automatically on the next start |
 | other `store/` files | **no** — the checkpoint refers to them |
@@ -265,7 +293,9 @@ slot; a slot whose engine is gone retains WAL indefinitely.
 ## Monitoring checklist
 
 - `SHOW FRONTIERS`: `durable_gsn` − `processed_gsn` is the apply backlog;
-  `checkpoint_gsn` should advance every `--checkpoint-secs`.
+  `checkpoint_gsn` should advance every `--checkpoint-secs` while anything
+  but clock ticks is applied (an idle engine checkpoints once per 3,600
+  ticks).
 - `SHOW SOURCES`: `status` (`streaming`, `snapshotting ...`, `error: ...`,
   `error: cannot copy table ...`) and `lsn`; upstream,
   `pg_replication_slots.confirmed_flush_lsn` should track

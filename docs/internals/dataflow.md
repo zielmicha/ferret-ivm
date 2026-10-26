@@ -153,8 +153,8 @@ An arrangement's history is complete only from the GSN it was hydrated at
 earlier GSNs were never stored. `Arrangement::covers(at)` tells whether a
 read can use it — `since <= g` for `AS OF g` — and reads in the past only use
 arrangements that cover them ([Planner](planner.md#batch-execution)). The
-value is saved in checkpoints with the tree (`AppState::arr_since`), so a
-recovered arrangement keeps its history; one rebuilt by hydration starts a
+value is saved with the tree in the metadata tree's arrangement records, so
+a recovered arrangement keeps its history; one rebuilt by hydration starts a
 new one.
 
 ## Operators
@@ -469,20 +469,37 @@ Three kinds of error state are kept:
 - per node, the error records in its contents (`Graph::node_errors`): the
   sum of its output error deltas, set from its snapshot when it is
   hydrated. For arranged nodes this is authoritative — their snapshots read
-  the arrangement, which holds rows only — and checkpoints save it by node
-  fingerprint (`AppState::errors.nodes`), so that views created over such a
-  node after a restart see its errors too;
+  the arrangement, which holds rows only — and it is kept durably by node
+  fingerprint, so that views created over such a node after a restart see
+  its errors too;
 - per operator, the groups currently in error of `Reduce` and `Recursive`
-  (`AppState::errors.operators`, by node fingerprint), so that a group's
+  (`GroupErrors`, kept durably by node fingerprint), so that a group's
   error is retracted when it recovers, also after a restart;
 - per materialized view, a map from (SQLSTATE, message) to count, taken
   from its root when the view is created and updated from the root's output
-  at every step (`AppState::view_errors`). Reads fail while any count is
-  positive
+  at every step: always equal to its root node's records. Reads fail while
+  any count is positive
   ([Errors as data](../user-guide/temporal-filters-and-errors.md#errors-as-data)).
 
+The durable copy lives in the metadata tree
+([On-disk format](../on-disk-format.md#the-metadata-tree)), as one entry per
+error record weighted by its count (and one per group in error), and is
+kept by changes: `Graph::take_error_changes` returns what changed since its
+last call — the error deltas of arranged nodes and the groups' changes as
+they happen, a node's whole records when it is first seen arranged (an
+operator's when it is first seen), and their retraction when it loses its
+last arrangement or leaves the graph — and the engine applies them to the
+tree at checkpoints and after DDL. So a checkpoint's cost is that of the
+error records that changed, not of all of them. Records stay keyed by
+(SQLSTATE, message), the message including the offending value: that is
+what reads report and what makes a record retract with exactly the rows
+that raised it; a view over dirty data has one record per distinct
+message, but writes only the records that change.
+
 Recovery restores the per-node and per-operator state by fingerprint after
-rebuilding the dataflow and before hydrating what it could not match.
+rebuilding the dataflow and before hydrating what it could not match (and
+retracts from the tree the records of nodes that no longer exist); each
+view then takes its root's records.
 
 Arrangement keys are plain columns (a computed join key is materialized as
 a column of its input, see [DeltaJoin](#deltajoin)), and summaries cannot

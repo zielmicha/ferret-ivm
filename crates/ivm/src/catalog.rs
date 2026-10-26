@@ -2,14 +2,15 @@
 //!
 //! Definitions are data (SQL text, column lists); dataflow plans are
 //! re-derived from them, so the catalog plus the input log determines all
-//! state. The catalog is persisted with every checkpoint.
+//! state. The catalog is kept in the metadata tree of the storage
+//! environment (`coord::meta`), which is updated with each change.
 
 use crate::sql::plan::ObjectId;
 use crate::sql::{Catalog as BindCatalog, CatalogRelation};
 use crate::storage::Gsn;
 use crate::types::Column;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TableDef {
@@ -88,6 +89,8 @@ pub struct CatalogObject {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
+    /// Change it with `insert` and `remove`, which record the change for
+    /// the metadata tree.
     pub objects: BTreeMap<ObjectId, CatalogObject>,
     pub next_id: ObjectId,
     /// DDL history: (gsn, statement) — "what was the catalog at g" is a query.
@@ -97,11 +100,14 @@ pub struct Catalog {
     /// chosen at the first CREATE SOURCE and logged with each.
     #[serde(default)]
     pub instance_id: Option<String>,
+    /// Objects inserted or removed since the last `take_changed`.
+    #[serde(skip)]
+    changed: BTreeSet<ObjectId>,
 }
 
 impl Catalog {
     pub fn new() -> Catalog {
-        Catalog { objects: BTreeMap::new(), next_id: 1000, history: Vec::new(), instance_id: None }
+        Catalog { objects: BTreeMap::new(), next_id: 1000, history: Vec::new(), instance_id: None, changed: BTreeSet::new() }
     }
 
     pub fn alloc_id(&mut self) -> ObjectId {
@@ -119,11 +125,18 @@ impl Catalog {
     }
 
     pub fn insert(&mut self, obj: CatalogObject) {
+        self.changed.insert(obj.id);
         self.objects.insert(obj.id, obj);
     }
 
     pub fn remove(&mut self, id: ObjectId) -> Option<CatalogObject> {
+        self.changed.insert(id);
         self.objects.remove(&id)
+    }
+
+    /// Ids of the objects inserted, replaced or removed since the last call.
+    pub(crate) fn take_changed(&mut self) -> BTreeSet<ObjectId> {
+        std::mem::take(&mut self.changed)
     }
 
     /// Relations a query reads as the binder resolves their names, including

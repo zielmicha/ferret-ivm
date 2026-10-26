@@ -5,6 +5,7 @@ pub mod api;
 pub mod ddl;
 mod dml;
 pub mod inspect;
+pub mod meta;
 mod read;
 pub mod seq;
 
@@ -113,42 +114,14 @@ pub(crate) enum Wait {
     Snapshot,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-pub(crate) struct AppState {
-    pub catalog: Catalog,
-    pub trees: Vec<(Vec<u8>, TreeId)>,
-    pub view_errors: Vec<(ObjectId, Vec<((String, String), i64)>)>,
-    pub source_states: Vec<(ObjectId, String)>,
-    #[serde(default)]
-    pub source_lsns: Vec<(ObjectId, u64)>,
-    pub next_req: u64,
-    /// Logical clock (timestamptz microseconds) at the checkpoint.
-    #[serde(default)]
-    pub clock: i64,
-    /// Error records of arranged dataflow nodes (absent in older checkpoints).
-    #[serde(default)]
-    pub errors: crate::dataflow::ErrorState,
-    /// GSN from which each tree's history is complete (by fingerprint).
-    #[serde(default)]
-    pub arr_since: Vec<(Vec<u8>, Gsn)>,
-    /// Recent (gsn, clock) ticks (`Engine::ticks`, the last MAX_SAVED_TICKS
-    /// of the retention window), for now() in reads as of earlier GSNs
-    /// (absent in older checkpoints).
-    #[serde(default)]
-    pub ticks: Vec<(Gsn, i64)>,
-    /// Replication slots of dropped sources still to be dropped.
-    #[serde(default)]
-    pub slot_drops: Vec<crate::source::SlotDrop>,
-}
-
 /// DDL statements kept in the catalog history (`ivm.catalog_history`), the
-/// most recent ones: the history is part of every checkpoint.
+/// most recent ones (kept in memory and in the metadata tree).
 pub const MAX_HISTORY: usize = 10_000;
 
-/// Most clock ticks kept in a checkpoint: a day of ticks at the default
-/// interval. now() in a read as of an older GSN (within a larger retention
-/// window) after a restart is the oldest kept tick's clock.
-const MAX_SAVED_TICKS: usize = 100_000;
+/// Clock ticks that change nothing but the clock only cost replay time: they
+/// make a checkpoint due once this many records were applied since the last
+/// one (an hour of ticks at the default interval).
+const MAX_TICKS_WITHOUT_CHECKPOINT: u64 = 3600;
 
 pub struct Engine {
     pub cfg: Config,
@@ -171,6 +144,11 @@ pub struct Engine {
     deferred: Vec<Request>,
     last_checkpoint: Instant,
     records_since_checkpoint: u64,
+    /// Records since the last checkpoint other than clock ticks that changed
+    /// nothing but the clock (and nodes relocated by garbage collection).
+    changes_since_checkpoint: u64,
+    /// What the metadata tree holds.
+    pub(crate) meta: meta::Meta,
     pub(crate) replaying: bool,
     /// Bumped by source progress and DDL: parked reads waiting for initial
     /// snapshots are re-run when it moves.
@@ -352,6 +330,17 @@ pub fn start(cfg: Config) -> Result<Running> {
             format!("data directory {} is in use by another ivm process", cfg.data_dir.display()),
         ));
     }
+    // before anything is opened (and a torn log tail truncated): a newer
+    // format is refused untouched; a directory without a format version is
+    // new, or of format 1, migrated below
+    let migrate = match meta::read_format(&cfg.data_dir)? {
+        Some(v) => v < meta::FORMAT_VERSION,
+        None if meta::holds_data(&cfg.data_dir)? => true,
+        None => {
+            meta::write_format(&cfg.data_dir)?;
+            false
+        }
+    };
     let shared = Arc::new(Shared::default());
     let (etx, erx) = unbounded::<EngineMsg>();
     let (stx, srx) = unbounded::<SeqMsg>();
@@ -386,6 +375,13 @@ pub fn start(cfg: Config) -> Result<Running> {
     shared.durable_gsn.store(writer.last_gsn(), Ordering::Release);
     engine.replaying = false;
     engine.shared.processed_gsn.store(engine.processed, Ordering::Release);
+    if migrate {
+        // the recovered state in the current format; until FORMAT records
+        // it, a restart migrates again (from whichever record is last)
+        engine.checkpoint()?;
+        meta::write_format(&cfg.data_dir)?;
+        log::info!("migrated the data directory to format {}", meta::FORMAT_VERSION);
+    }
     engine.start_sources(&handle)?;
     // slot drops left from before the restart (or replayed DROP SOURCEs)
     crate::source::resume_slot_drops(&shared);
@@ -433,6 +429,8 @@ impl Engine {
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),
             records_since_checkpoint: 0,
+            changes_since_checkpoint: 0,
+            meta: meta::Meta::default(),
             replaying: true,
             snap_epoch: 0,
             snap_epoch_seen: 0,
@@ -449,8 +447,10 @@ impl Engine {
 
     fn recover(&mut self, recovered: Option<crate::storage::Recovered>) -> Result<()> {
         let Some(rec) = recovered else { return Ok(()) };
-        let app: AppState = serde_json::from_slice(&rec.app)
-            .map_err(|e| SqlError::corrupt(format!("cannot decode checkpoint state: {e}")))?;
+        let (app, meta) = meta::load(&mut self.env, &rec.app)?;
+        // (format 1 kept the state in the record: the tree holds nothing yet)
+        let mirrored = meta.tree.is_some();
+        self.meta = meta;
         log::info!("recovering checkpoint at gsn {}", rec.gsn);
         self.catalog = app.catalog;
         self.next_req = app.next_req;
@@ -491,15 +491,19 @@ impl Engine {
                 self.rt.broken.insert(obj.id, e.message);
             }
         }
+        self.graph.restore_error_state(app.errors, mirrored);
         for (id, errs) in app.view_errors {
-            if let Some(v) = self.rt.views.get_mut(&id) {
-                v.errors = errs.into_iter().collect();
+            if let Some(v) = self.rt.views.get(&id) {
+                self.graph.restore_view_errors(v.node, &errs);
             }
         }
-        self.graph.restore_error_state(app.errors);
         // anything that could not be matched to a recovered tree is rebuilt
         // from the recovered state
         self.graph.hydrate(&mut self.env, self.processed)?;
+        // a view's error records are those of its root
+        for v in self.rt.views.values_mut() {
+            v.errors = self.graph.errors_of(v.node).into_iter().collect();
+        }
         for t in self.env.unattached_trees() {
             self.env.drop_tree(t)?;
         }
@@ -721,6 +725,8 @@ impl Engine {
         if gsn <= self.processed {
             return Ok(());
         }
+        // (false for a tick that changed nothing but the clock)
+        let mut changed = true;
         match rec {
             LogRecord::Commit { source, lsn, changes } => {
                 // local DML is planned when it arrives, but DDL logged before
@@ -758,12 +764,14 @@ impl Engine {
                 self.snap_epoch += 1;
                 if res.is_ok() {
                     self.catalog.history.push((gsn, sql.clone()));
-                    // (every checkpoint saves it; trimmed in steps)
+                    // (trimmed in steps)
                     if self.catalog.history.len() > MAX_HISTORY + MAX_HISTORY / 10 {
                         let excess = self.catalog.history.len() - MAX_HISTORY;
                         self.catalog.history.drain(..excess);
                     }
                 }
+                // the catalog in the metadata tree as of this GSN
+                self.persist_meta(gsn)?;
                 if let Err(e) = &res
                     && self.replaying
                 {
@@ -796,6 +804,7 @@ impl Engine {
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }
+                self.persist_meta(gsn)?;
             }
             LogRecord::Tick { micros } => {
                 // monotonic even if the wall clock steps back
@@ -810,10 +819,12 @@ impl Engine {
                 let outputs = self.graph.step(&mut self.env, gsn, FxHashMap::default())?;
                 self.processed = gsn;
                 self.deliver(gsn, &outputs);
+                changed = !outputs.is_empty();
             }
         }
         self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
         self.records_since_checkpoint += 1;
+        self.changes_since_checkpoint += changed as u64;
         Ok(())
     }
 
@@ -882,8 +893,13 @@ impl Engine {
         }
     }
 
+    /// A checkpoint is due every `checkpoint_interval` (or as soon as dirty
+    /// nodes exceed half the cache) once something durable changed: records
+    /// other than clock ticks that changed nothing but the clock, or nodes
+    /// relocated by garbage collection. Ticks alone only add replay work:
+    /// they make one due after MAX_TICKS_WITHOUT_CHECKPOINT of them.
     fn maybe_checkpoint(&mut self) -> Result<()> {
-        if self.records_since_checkpoint == 0 {
+        if self.changes_since_checkpoint == 0 && self.records_since_checkpoint < MAX_TICKS_WITHOUT_CHECKPOINT {
             return Ok(());
         }
         let dirty = self.env.dirty_bytes();
@@ -894,26 +910,19 @@ impl Engine {
     }
 
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
-        let app = AppState {
-            catalog: self.catalog.clone(),
-            trees: self.graph.arrangement_trees().into_iter().collect(),
-            view_errors: self.rt.views.iter().map(|(id, v)| (*id, v.errors.clone().into_iter().collect())).collect(),
-            source_states: self.source_states.iter().map(|(k, v)| (*k, v.clone())).collect(),
-            source_lsns: self.source_lsns.iter().map(|(k, v)| (*k, *v)).collect(),
-            next_req: self.next_req,
-            clock: self.clock,
-            errors: self.graph.error_state(),
-            arr_since: self.graph.arrangement_since().into_iter().collect(),
-            ticks: self.ticks.iter().skip(self.ticks.len().saturating_sub(MAX_SAVED_TICKS)).copied().collect(),
-            slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
-        self.env.checkpoint(self.processed, &bytes)?;
-        self.env.gc(1000)?;
-        let keep_from = self.processed.saturating_sub(self.cfg.retention_gsns);
-        let _ = self.seq.send(SeqMsg::Truncate(keep_from));
+        // what changed since the last one goes into the metadata tree; the
+        // manifest record names that tree in a small header
+        self.persist_meta(self.processed)?;
+        let header = meta::encode_header(&self.meta, self.next_req);
+        self.env.checkpoint(self.processed, &header)?;
+        let relocated = self.env.gc(1000)?;
+        // recovery replays the log after the checkpoint, and nothing else
+        // reads the log
+        let _ = self.seq.send(SeqMsg::Truncate(self.processed));
         self.last_checkpoint = Instant::now();
         self.records_since_checkpoint = 0;
+        // (the next checkpoint writes the relocated nodes)
+        self.changes_since_checkpoint = (relocated > 0) as u64;
         Ok(())
     }
 
@@ -1049,5 +1058,66 @@ mod tests {
         assert!(err.message.contains("has no dataflow"), "{}", err.message);
         assert_eq!((e.graph.live_nodes().count(), e.graph.live_arrangements().count()), (nodes, arrs));
         assert!(e.subs.is_empty());
+    }
+
+    /// Clock ticks that change nothing but the clock do not make a
+    /// checkpoint due: an idle engine took one every interval, rewriting its
+    /// whole state each time. A tick that changes a view does, and so does
+    /// a long run of ticks (which bounds the replay of an idle engine).
+    #[test]
+    fn ticks_alone_do_not_make_a_checkpoint_due() {
+        use crate::types::Datum;
+        let tmp = crate::testkit::TempDir::new("coord-idle-ticks");
+        let mut e = engine(tmp.path());
+        e.cfg.checkpoint_interval = Duration::ZERO;
+        // 2026-01-01T00:00:00Z in Unix and in PostgreSQL-epoch microseconds
+        let (unix, pg) = (1_767_225_600_000_000i64, 1_767_225_600_000_000i64 - 946_684_800_000_000);
+        let mut gsn = 0;
+        let mut apply = |e: &mut Engine, rec: LogRecord| {
+            gsn += 1;
+            e.apply_record(gsn, rec).unwrap();
+            e.maybe_checkpoint().unwrap();
+            gsn
+        };
+        let ddl = |sql: &str| LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() };
+        let tick = |secs: i64| LogRecord::Tick { micros: unix + secs * 1_000_000 };
+        apply(&mut e, ddl("CREATE TABLE t (id int PRIMARY KEY, until timestamptz)"));
+        apply(&mut e, ddl("CREATE MATERIALIZED VIEW live AS SELECT id FROM t WHERE until > now()"));
+        let t = e.catalog.by_name("t").unwrap().id;
+        let row = vec![Datum::Int4(1), Datum::TimestampTz(pg + 10_000_000)];
+        let g = apply(&mut e, LogRecord::Commit { source: 0, lsn: 0, changes: vec![(t, TableChange::Upsert { row, unchanged: vec![] })] });
+        assert_eq!(e.env.checkpoint_gsn(), g);
+        for s in 1..=5 {
+            apply(&mut e, tick(s));
+        }
+        assert_eq!(e.env.checkpoint_gsn(), g, "ticks that change nothing else");
+        // the row expires: the view changes
+        let g = apply(&mut e, tick(11));
+        assert_eq!(e.env.checkpoint_gsn(), g, "a tick that changes a view");
+        for s in 12..12 + MAX_TICKS_WITHOUT_CHECKPOINT as i64 - 1 {
+            apply(&mut e, tick(s));
+        }
+        assert_eq!(e.env.checkpoint_gsn(), g);
+        let g = apply(&mut e, tick(100_000));
+        assert_eq!(e.env.checkpoint_gsn(), g, "a long run of ticks");
+    }
+
+    /// A checkpoint lets the sequencer delete the input log up to its own
+    /// GSN, whatever the retention: only recovery reads the log, from the
+    /// checkpoint on (the log used to be kept for the retention window too).
+    #[test]
+    fn checkpoints_truncate_the_log_to_their_gsn() {
+        let tmp = crate::testkit::TempDir::new("coord-truncate");
+        let (env, _) = Env::open(&tmp.path().join("store"), EnvOptions::default()).unwrap();
+        let (seq, rx) = unbounded();
+        let cfg = Config { data_dir: tmp.path().to_path_buf(), retention_gsns: 1000, ..Default::default() };
+        let mut e = Engine::new(cfg, env, seq, Arc::new(Shared::default()));
+        e.replaying = false;
+        for gsn in 1..=5 {
+            e.apply_record(gsn, LogRecord::Ddl { req: 0, sql: format!("CREATE TABLE t{gsn} (id int)"), extra: String::new() }).unwrap();
+        }
+        e.checkpoint().unwrap();
+        let truncated: Vec<Gsn> = rx.try_iter().filter_map(|m| if let SeqMsg::Truncate(g) = m { Some(g) } else { None }).collect();
+        assert_eq!(truncated, [5]);
     }
 }

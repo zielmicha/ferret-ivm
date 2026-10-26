@@ -6,6 +6,7 @@ use ivm::coord::inspect::{InspectQuery, InspectReply};
 use ivm::coord::{self, EngineHandle};
 use ivm::error::SqlError;
 use ivm::types::text::format_datum;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -62,24 +63,15 @@ impl Engine {
     }
 }
 
-/// Rewrite the application state (catalog and engine state, JSON) of the
-/// last checkpoint of a stopped engine's data directory.
-fn rewrite_checkpoint(dir: &Path, f: impl FnOnce(&mut serde_json::Value)) {
-    let (mut env, rec) = ivm::storage::Env::open(&dir.join("store"), Default::default()).unwrap();
-    let rec = rec.expect("a checkpoint");
-    let mut app: serde_json::Value = serde_json::from_slice(&rec.app).unwrap();
-    f(&mut app);
-    env.checkpoint(rec.gsn, &serde_json::to_vec(&app).unwrap()).unwrap();
-}
-
 /// Give materialized view `name` of a checkpointed catalog a definition
 /// that no longer plans (as stricter code or catalog drift would).
 fn break_view(dir: &Path, name: &str, sql: &str) {
-    rewrite_checkpoint(dir, |app| {
-        let objects = app["catalog"]["objects"].as_object_mut().unwrap();
-        let v = objects.values_mut().find(|o| o["name"] == name).expect("the view");
-        v["kind"]["MaterializedView"]["sql"] = serde_json::Value::String(sql.into());
-    });
+    ivm::coord::meta::edit_stored_catalog(dir, |objects| {
+        let v = objects.values_mut().find(|o| o.name == name).expect("the view");
+        let ivm::catalog::ObjectKind::MaterializedView(def) = &mut v.kind else { panic!("not a materialized view") };
+        def.sql = sql.into();
+    })
+    .unwrap();
 }
 
 /// A materialized view whose stored definition no longer plans used to
@@ -341,5 +333,222 @@ fn replacements_check_only_the_views_reading_the_replaced_one() {
     e.exec("INSERT INTO t VALUES (2, 20)");
     assert_eq!(e.rows("SELECT a, p > 0 FROM old ORDER BY a"), ["1|t", "2|t"]);
     e.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A data directory written by the last version of format 1, which kept
+/// the catalog and the engine state as JSON in every checkpoint record
+/// (and had no `FORMAT` file): `ivm --retention-gsns 1000000 --tick-ms 1000
+/// --checkpoint-secs 1`, replicating from a PostgreSQL server, ran
+///
+/// ```sql
+/// CREATE TABLE t (id int PRIMARY KEY, v text);
+/// INSERT INTO t VALUES (1, '10'), (2, '20'), (3, 'x'), (4, 'y');
+/// CREATE MATERIALIZED VIEW m AS SELECT id, v::int AS n FROM t;  -- two error records
+/// CREATE TABLE r (k int PRIMARY KEY, g int, x real);
+/// INSERT INTO r VALUES (1, 1, 3e38), (2, 1, 3e38), (3, 2, 1);
+/// CREATE MATERIALIZED VIEW s AS SELECT g, sum(x) AS total FROM r GROUP BY g;  -- group 1 in error
+/// CREATE INDEX ti ON t (v);
+/// CREATE VIEW pv AS SELECT id FROM t WHERE id > 1;
+/// CREATE SOURCE src FROM POSTGRES CONNECTION '...' PUBLICATION 'pub';  -- table up: (1, 'a'), (2, 'b')
+/// CREATE SOURCE src2 FROM POSTGRES CONNECTION '...' PUBLICATION 'pub2' SLOT 'fixture_src2';
+/// -- upstream: INSERT INTO up VALUES (3, 'c'); now at GSN 21
+/// UPDATE t SET v = '30' WHERE id = 2;
+/// CREATE MATERIALIZED VIEW late AS SELECT id, v FROM t;
+/// CREATE TABLE tmp (a int);
+/// DROP TABLE tmp;
+/// -- the upstream server stopped
+/// DROP SOURCE src2;  -- its slot drop is pending
+/// ```
+///
+/// and stopped on SIGTERM (final checkpoint at GSN 31).
+const FORMAT1: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/format1");
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &to.join(e.file_name()));
+        } else {
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+/// The application state (JSON) of the format-1 directory's checkpoint
+/// (read from a copy named `name`: opening a store may modify it).
+fn format1_state(name: &str) -> serde_json::Value {
+    let dir = tmpdir(name);
+    copy_dir(Path::new(FORMAT1), &dir);
+    let (_env, rec) = ivm::storage::Env::open(&dir.join("store"), Default::default()).unwrap();
+    let app = serde_json::from_slice(&rec.expect("a checkpoint").app).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    app
+}
+
+/// Everything the format-1 directory holds, as the engine shows it,
+/// against its checkpointed state `app`.
+fn check_format1(e: &Engine, app: &serde_json::Value) {
+    let s = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+    // the catalog and its history
+    let history: Vec<String> = app["catalog"]["history"].as_array().unwrap().iter().map(|h| format!("{}|{}", h[0], s(&h[1]))).collect();
+    assert_eq!(history.len(), 12);
+    assert_eq!(e.rows("SELECT gsn, statement FROM ivm.catalog_history ORDER BY gsn"), history);
+    let objects: Vec<String> =
+        app["catalog"]["objects"].as_object().unwrap().values().map(|o| format!("{}|{}|{}", o["id"], s(&o["name"]), o["created_gsn"])).collect();
+    assert_eq!(e.rows("SELECT oid::int8 - 16384, name, created_gsn FROM ivm.objects ORDER BY oid"), objects);
+    // error records
+    let name = |id: &serde_json::Value| app["catalog"]["objects"][id.to_string()]["name"].as_str().unwrap().to_string();
+    let mut want: Vec<String> = Vec::new();
+    for v in app["view_errors"].as_array().unwrap() {
+        for r in v[1].as_array().unwrap() {
+            want.push(format!("{}|{}|{}|{}", name(&v[0]), s(&r[0][0]), s(&r[0][1]), r[1]));
+        }
+    }
+    want.sort();
+    assert_eq!(want.len(), 3);
+    match e.h.inspect_wait(InspectQuery::Errors, Duration::from_secs(10)).unwrap() {
+        InspectReply::Errors(d) => {
+            let mut got: Vec<String> = d.views.iter().map(|v| format!("{}|{}|{}|{}", v.name, v.code, v.message, v.count)).collect();
+            got.sort();
+            assert_eq!(got, want);
+        }
+        other => panic!("unexpected reply {other:?}"),
+    }
+    assert_eq!(e.err("SELECT * FROM m").message, "invalid input syntax for type integer: \"x\"");
+    assert_eq!(e.err("SELECT * FROM s").message, "value out of range: overflow");
+    assert_eq!(e.rows("SHOW VIEWS"), ["m|materialized|2|2|ok", "s|materialized|1|1|ok", "pv|virtual|||", "late|materialized|4|0|ok"]);
+    // the source's resume point and state, the pending slot drop
+    match e.h.inspect_wait(InspectQuery::Sources, Duration::from_secs(10)).unwrap() {
+        InspectReply::Sources(d) => {
+            let src = &d.sources[0];
+            assert_eq!((d.sources.len(), src.name.as_str()), (1, "src"));
+            assert_eq!(src.last_commit_lsn, app["source_lsns"][0][1].as_u64().unwrap());
+            assert!(src.slot_created);
+            assert_eq!((src.tables.len(), src.tables_done), (1, 1));
+        }
+        other => panic!("unexpected reply {other:?}"),
+    }
+    let drops: Vec<(String, String)> = e.h.shared.slot_drops.lock().iter().map(|d| (d.conninfo.clone(), d.slot.clone())).collect();
+    assert_eq!(drops, [(s(&app["slot_drops"][0]["conninfo"]), "fixture_src2".to_string())]);
+    assert_eq!(e.rows("SELECT * FROM up ORDER BY id"), ["1|a", "2|b", "3|c"]);
+    // the clock as of earlier GSNs (as the format-1 engine answered), and
+    // histories: ti's starts at its creation (GSN 9), so the read as of
+    // GSN 8 does not use it
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t AS OF 21"), ["2026-10-25 23:18:50.490978+00|4"]);
+    assert_eq!(e.rows("SELECT now()"), ["2026-10-25 23:18:55.673051+00"]);
+    assert_eq!(e.rows("SELECT v FROM t WHERE id = 2 AS OF 21"), ["20"]);
+    assert_eq!(e.rows("SELECT id FROM t WHERE v = '20' AS OF 8"), ["2"]);
+    assert_eq!(e.rows("SELECT id FROM t WHERE v = '30'"), ["2"]);
+}
+
+/// The last checkpoint record's application state.
+fn checkpoint_state(dir: &Path) -> Vec<u8> {
+    ivm::storage::Env::open(&dir.join("store"), Default::default()).unwrap().1.expect("a checkpoint").app
+}
+
+/// A data directory of format 1 opens, and is migrated at its first start:
+/// everything it held is kept (catalog, DDL history, error records of views
+/// and aggregation groups, source states and resume LSNs, pending slot
+/// drops, clock ticks, the histories of indexes), and from then on its
+/// checkpoints carry a small header naming the metadata tree.
+#[test]
+fn format1_data_directories_are_migrated() {
+    let app = format1_state("format1-state");
+    let dir = tmpdir("format1");
+    copy_dir(Path::new(FORMAT1), &dir);
+    assert!(!dir.join("FORMAT").exists());
+    let e = Engine::start(&dir);
+    check_format1(&e, &app);
+    assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
+    e.shutdown();
+    let header = checkpoint_state(&dir);
+    assert!(header[0] == 2 && header.len() < 16, "{header:?}");
+
+    let e = Engine::start(&dir);
+    check_format1(&e, &app);
+    // the error state is complete: a view created over m's dataflow starts
+    // with its error records, and the errors retract with their rows
+    e.exec("CREATE MATERIALIZED VIEW m2 AS SELECT n FROM m");
+    assert_eq!(e.err("SELECT * FROM m2").message, "invalid input syntax for type integer: \"x\"");
+    e.exec("DELETE FROM t WHERE id > 2");
+    assert_eq!(e.rows("SELECT * FROM m ORDER BY id"), ["1|10", "2|30"]);
+    assert_eq!(e.rows("SELECT * FROM m2 ORDER BY n"), ["10", "30"]);
+    e.exec("DELETE FROM r WHERE k = 2");
+    assert_eq!(e.rows("SELECT * FROM s ORDER BY g"), ["1|3e+38", "2|1"]);
+    e.shutdown();
+    let e = Engine::start(&dir);
+    assert_eq!(e.rows("SELECT * FROM m2 ORDER BY n"), ["10", "30"]);
+    assert_eq!(e.rows("SELECT * FROM s ORDER BY g"), ["1|3e+38", "2|1"]);
+    assert_eq!(e.rows("SELECT count(*) FROM ivm.catalog_history"), ["13"]);
+    e.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crash during the migration loses nothing: until the migration's
+/// checkpoint is committed the next start finds the format-1 record and
+/// migrates again; after it, but before `FORMAT` records the migration, it
+/// finds a record of the current format and only records the format.
+#[test]
+fn a_crash_during_migration_migrates_again() {
+    let app = format1_state("format1-crash-state");
+    let dir = tmpdir("format1-crash");
+    copy_dir(Path::new(FORMAT1), &dir);
+    let manifest = std::fs::read(dir.join("store/MANIFEST")).unwrap();
+    Engine::start(&dir).shutdown();
+    // before the commit: the format-1 manifest, with the migration's
+    // record torn
+    let mut torn = manifest.clone();
+    torn.extend_from_slice(&[0x40, 0, 0, 0, 1, 2, 3, 4, 5]);
+    std::fs::write(dir.join("store/MANIFEST"), &torn).unwrap();
+    std::fs::remove_file(dir.join("FORMAT")).unwrap();
+    let e = Engine::start(&dir);
+    check_format1(&e, &app);
+    e.shutdown();
+    assert_eq!(checkpoint_state(&dir)[0], 2);
+    // after the commit
+    std::fs::remove_file(dir.join("FORMAT")).unwrap();
+    let e = Engine::start(&dir);
+    check_format1(&e, &app);
+    e.shutdown();
+    assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Names and sizes of the files under a directory.
+fn all_files(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_dir() {
+            v.extend(all_files(&e.path()));
+        } else {
+            v.push((e.path(), e.metadata().unwrap().len()));
+        }
+    }
+    v.sort();
+    v
+}
+
+/// A new data directory records its format first; one of a newer format
+/// than this code reads is refused before anything in it is touched (a
+/// torn log tail is not truncated, for one).
+#[test]
+fn newer_formats_are_refused_untouched() {
+    let dir = tmpdir("format-newer");
+    let e = Engine::start(&dir);
+    assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
+    e.exec("CREATE TABLE t (id int PRIMARY KEY)");
+    e.shutdown();
+    std::fs::write(dir.join("FORMAT"), "3\n").unwrap();
+    let seg = std::fs::read_dir(dir.join("log")).unwrap().next().unwrap().unwrap().path();
+    std::fs::OpenOptions::new().append(true).open(&seg).unwrap().write_all(&[1, 2, 3]).unwrap();
+    let before = all_files(&dir);
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    let err = coord::start(cfg).err().expect("refused");
+    assert_eq!(err.code, "0A000", "{err}");
+    assert!(err.message.contains("format 3"), "{err}");
+    assert_eq!(all_files(&dir), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
