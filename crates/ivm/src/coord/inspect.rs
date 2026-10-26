@@ -1676,7 +1676,7 @@ impl Engine {
                     Wait::Gsn(g) => ("gsn", Some(g)),
                     Wait::Lsn => ("lsn", None),
                     Wait::Snapshot => ("snapshot", None),
-                    Wait::Hydration => ("hydration", None),
+                    Wait::Hydration(_) => ("hydration", None),
                 };
                 let sql = match &p.req {
                     Request::Execute { stmt, .. } => match &**stmt {

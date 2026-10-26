@@ -398,7 +398,7 @@ impl Engine {
                 // re-run: it parks again if a snapshot is still loading
                 Wait::Snapshot => snapshots_changed,
                 Wait::Gsn(g) => self.processed >= g,
-                Wait::Hydration => self.hydration.is_none(),
+                Wait::Hydration(done) => self.hydrations_done > done,
             };
             if ready {
                 self.deferred.push(p.req);

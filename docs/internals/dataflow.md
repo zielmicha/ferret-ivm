@@ -488,9 +488,16 @@ forwarded changes, not from the log.
 Meanwhile:
 
 - The engine applies records, maintaining the existing views, and answers
-  requests. It stops at the next `Ddl` or `Schema` record (and holds the
-  records after it) until the hydration is done: DDL is applied against a
-  graph without a hydration in progress.
+  requests. DDL records are applied as they come, except those that would
+  hydrate inline or read a relation's contents at once — replacing an
+  existing view (`CREATE OR REPLACE`, with the re-planning of the views
+  reading it) and `CREATE SINK` — and `Schema` records: such a record, and
+  the records after it, wait until no hydration is in progress
+  (`must_wait_for_hydration`). The nodes and arrangements of a view or index
+  created meanwhile (its statement's DDL record applied, possibly on top of
+  the fragment being hydrated) are hydrated by the next hydration, which
+  begins when this one is done, with everything pending then; their
+  statements are answered when that one is.
 - The statement's view or index is in the catalog from *g* on; its DDL
   reply is sent once the fragment is live (a `SUBSCRIBE` is answered then
   too, with its snapshot as of *g* followed by the changes of the records

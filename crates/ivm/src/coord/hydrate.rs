@@ -166,10 +166,15 @@ impl Engine {
     /// Hydrate the pending nodes and arrangements as of `gsn` (the record
     /// being applied, or the last one), then do `then`: inline when
     /// replaying or without threads, else on a thread of its own while the
-    /// engine goes on (see the module docs). A hydration must not be in
-    /// progress.
+    /// engine goes on (see the module docs). While a hydration is in
+    /// progress, the pending nodes and arrangements it does not include are
+    /// hydrated by the next one, which begins when it is done.
     pub(crate) fn hydrate(&mut self, gsn: Gsn, then: Vec<Then>) -> Result<()> {
-        debug_assert!(self.hydration.is_none(), "hydration started while one is in progress");
+        if self.hydration.is_some() {
+            self.hydration_next.extend(then);
+            self.reply_deferred = true;
+            return Ok(());
+        }
         let (nodes, arrs) = self.graph.pending();
         let wake = match &self.handle {
             Some(h) if !self.replaying && !(nodes.is_empty() && arrs.is_empty()) => h.tx.clone(),
@@ -202,6 +207,7 @@ impl Engine {
             let _ = dtx.send(r);
         })?;
         log::debug!("hydrating {} nodes and {} arrangements as of gsn {gsn} in the background", nodes.len(), arrs.len());
+        self.reply_deferred = true;
         self.hydration = Some(Hydration { gsn, nodes, arrs, tables, tx, done, hydrated, applied, forwarded: gsn, allowed: u64::MAX, then });
         Ok(())
     }
@@ -292,8 +298,39 @@ impl Engine {
         let _ = h.tx.send(ToFork::Finish);
         let res = h.done.recv().map_err(|_| SqlError::internal("hydration thread vanished"))??;
         self.finish_hydration(h, res)?;
+        self.hydrations_done += 1;
+        // what was created meanwhile
+        let next = std::mem::take(&mut self.hydration_next);
+        let (nodes, arrs) = self.graph.pending();
+        if !next.is_empty() || !nodes.is_empty() || !arrs.is_empty() {
+            self.hydrate(self.processed, next)?;
+        }
         self.wake_parked(handle);
         self.apply_durable(handle)
+    }
+
+    /// Must durable record `rec` wait until no hydration is in progress?
+    /// DDL that hydrates inline (replacing a view, and the re-planning it
+    /// entails) or reads a relation's contents at once (a sink's start), and
+    /// schema changes; other DDL is applied (a new view or index joins the
+    /// next hydration).
+    pub(crate) fn must_wait_for_hydration(&self, rec: &LogRecord) -> bool {
+        use crate::sql::parser::Statement;
+        match rec {
+            LogRecord::Schema { .. } => true,
+            LogRecord::Ddl { sql, .. } => match crate::sql::parser::parse_statement(sql) {
+                Ok(Statement::CreateSink { .. }) => true,
+                Ok(Statement::Sql(s)) => match &*s {
+                    sqlparser::ast::Statement::CreateView(cv) => {
+                        cv.or_replace
+                            && crate::sql::binder::object_name(&cv.name).is_ok_and(|(_, n)| self.catalog.by_name(&n).is_some())
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// Make a caught-up hydration's fragment live: adopt its trees and its

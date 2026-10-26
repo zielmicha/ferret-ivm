@@ -24,8 +24,10 @@
   other statement waits. (New views, indexes and subscriptions are hydrated,
   checkpoints written and large reads run on threads of their own.)
 - **A view is being hydrated.** Statements that read a view that is still
-  being hydrated wait until it is maintained; DDL logged while a view is
-  being hydrated waits for it, and so do the changes logged after that DDL.
+  being hydrated wait until it is maintained; a new view or index created
+  meanwhile is hydrated after it; `CREATE OR REPLACE` of an existing view or
+  `CREATE SINK` logged meanwhile waits for it, and so do the changes logged
+  after it.
 - **DML** that reads rows a statement logged before it writes (the same
   primary key, or any row of a table it scans) waits for that statement to
   be applied.

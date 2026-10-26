@@ -114,8 +114,9 @@ pub(crate) enum Wait {
     Lsn,
     /// The initial snapshots of the tables it reads (rechecked on wake).
     Snapshot,
-    /// The hydration of a relation it reads (re-run when it is done).
-    Hydration,
+    /// The hydration of a relation it reads (re-run when a hydration
+    /// finished after this many had).
+    Hydration(u64),
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -209,8 +210,15 @@ pub struct Engine {
     pub ticks: VecDeque<(Gsn, i64)>,
     /// The hydration in progress off the engine thread (`hydrate.rs`).
     pub(crate) hydration: Option<hydrate::Hydration>,
+    /// What waits for the hydration to begin after it (statements applied
+    /// while it was in progress whose dataflow is still pending).
+    pub(crate) hydration_next: Vec<hydrate::Then>,
+    /// Hydrations finished so far.
+    pub(crate) hydrations_done: u64,
+    /// The DDL record being applied left its reply to a hydration.
+    pub(crate) reply_deferred: bool,
     /// Durable records not applied yet: those from a DDL or schema record
-    /// on wait while a hydration is in progress.
+    /// that must not be applied while a hydration is in progress on.
     held: VecDeque<(Gsn, LogRecord)>,
     /// The checkpoint being written in the background (`checkpoint.rs`).
     checkpointing: Option<checkpoint::InFlight>,
@@ -475,6 +483,9 @@ impl Engine {
             clock: 0,
             ticks: VecDeque::new(),
             hydration: None,
+            hydration_next: Vec::new(),
+            hydrations_done: 0,
+            reply_deferred: false,
             held: VecDeque::new(),
             checkpointing: None,
             checkpoint_waiters: Vec::new(),
@@ -683,13 +694,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply the durable records received, in GSN order, up to a DDL or
-    /// schema record while a hydration is in progress (it is applied once
-    /// the hydration is done).
+    /// Apply the durable records received, in GSN order, up to one that
+    /// must wait for the hydration in progress (`must_wait_for_hydration`;
+    /// it is applied once no hydration is).
     fn apply_durable(&mut self, handle: &EngineHandle) -> Result<()> {
         let mut applied = false;
         while let Some((_, rec)) = self.held.front() {
-            if self.hydration.is_some() && matches!(rec, LogRecord::Ddl { .. } | LogRecord::Schema { .. }) {
+            if self.hydration.is_some() && self.must_wait_for_hydration(rec) {
                 break;
             }
             let (gsn, rec) = self.held.pop_front().unwrap();
@@ -799,7 +810,8 @@ impl Engine {
                     Ok(None) => {} // deferred (submitted or parked)
                     Err(e) if e.code == hydrate::HYDRATING && retry.is_some() => {
                         let (stmt, params, vars, extra) = retry.unwrap();
-                        self.parked.push(Parked { wait: Wait::Hydration, req: Request::Execute { stmt, params, vars, extra, reply } });
+                        let wait = Wait::Hydration(self.hydrations_done);
+                        self.parked.push(Parked { wait, req: Request::Execute { stmt, params, vars, extra, reply } });
                     }
                     // (it read rows pending DML writes: evaluated again after it,
                     // first among the DML waiting)
@@ -859,6 +871,7 @@ impl Engine {
                 }
             }
             LogRecord::Ddl { req, sql, extra } => {
+                self.reply_deferred = false;
                 let res = self.apply_ddl(gsn, &sql, &extra);
                 self.processed = gsn;
                 self.snap_epoch += 1;
@@ -875,11 +888,14 @@ impl Engine {
                 {
                     log::warn!("DDL at gsn {gsn} failed on replay: {e}");
                 }
+                // its dataflow is being hydrated (or will be, after the
+                // hydration in progress): the reply waits for it
                 match self.hydration.as_mut().filter(|h| h.gsn == gsn) {
-                    // its dataflow is being hydrated: the reply waits for it
-                    Some(h) => h.then.push(hydrate::Then::Reply { req, res }),
-                    None => self.reply_pending(req, res),
+                    Some(h) if self.reply_deferred => h.then.push(hydrate::Then::Reply { req, res }),
+                    _ if self.reply_deferred => self.hydration_next.push(hydrate::Then::Reply { req, res }),
+                    _ => self.reply_pending(req, res),
                 }
+                self.reply_deferred = false;
                 self.drain_dml_queue();
             }
             LogRecord::Progress { source, lsn: _, state } => {

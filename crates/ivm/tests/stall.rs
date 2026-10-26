@@ -182,6 +182,44 @@ fn requests_reading_a_hydrating_view_wait_for_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// DDL logged while a view is being hydrated does not hold up the records
+/// after it: new tables and views are created, and commits after them are
+/// applied, before the hydration is done; a view created meanwhile over
+/// the one being hydrated is hydrated next. Only DDL that replaces a view
+/// (or reads a relation's contents at once, as a sink's start) waits.
+#[test]
+fn ddl_during_a_hydration_does_not_hold_up_commits() {
+    let _serial = serial();
+    let dir = tmpdir("hydrate-ddl");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    load_big(&h);
+    let create = start_ddl(&h, &format!("CREATE MATERIALIZED VIEW slow AS {SLOW_VIEW}"), "slow");
+    exec(&h, "CREATE TABLE t2 (id int PRIMARY KEY, v int)");
+    // (new views are hydrated after the one in progress: their statements
+    // return then)
+    let t2_sum = start_ddl(&h, "CREATE MATERIALIZED VIEW t2_sum AS SELECT sum(v) AS s FROM t2", "t2_sum");
+    let over = start_ddl(&h, "CREATE MATERIALIZED VIEW over_slow AS SELECT sum(n) AS total FROM slow", "over_slow");
+    for i in 0..10 {
+        exec(&h, &format!("INSERT INTO t2 VALUES ({i}, {i})"));
+    }
+    assert_eq!(rows(&h, "SELECT sum(v) FROM t2"), vec!["45"]);
+    assert!(!create.is_finished(), "the view was done before the commits after DDL logged meanwhile were applied");
+    create.join().unwrap().unwrap();
+    t2_sum.join().unwrap().unwrap();
+    over.join().unwrap().unwrap();
+    assert_eq!(rows(&h, "SELECT s FROM t2_sum"), vec!["45"]);
+    assert_eq!(rows(&h, "SELECT total FROM over_slow"), vec![BIG.to_string()]);
+    // a replacement waits for the hydration in progress
+    let create = start_ddl(&h, "CREATE MATERIALIZED VIEW slow2 AS SELECT a.g, count(*) AS n FROM big a JOIN big b ON a.x = b.id GROUP BY a.g", "slow2");
+    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW t2_sum AS SELECT sum(v) + 1 AS s FROM t2");
+    assert_eq!(rows(&h, "SELECT s FROM t2_sum"), vec!["46"]);
+    create.join().unwrap().unwrap();
+    assert_eq!(rows(&h, "SELECT count(*) FROM slow2"), vec!["97"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A crash while a view is being hydrated (after its DDL record, with
 /// commits to its tables and a checkpoint meanwhile) recovers to the state
 /// an uninterrupted run reaches: recovery replays the DDL record and

@@ -184,9 +184,11 @@ indexes as of that GSN, and then catches up with the changes applied since;
 meanwhile the engine goes on maintaining the other views, applying changes
 and answering other statements. The statement returns once the view is
 maintained like the others, so a large view takes about as long as one scan
-of its inputs. Until then the view is listed (with no rows), statements
-reading it wait for it, and DDL logged after it waits too (the changes
-logged after that DDL with it). `CREATE INDEX` works the same way.
+of its inputs. Until then the view is listed (with no rows) and statements
+reading it wait for it. Views and indexes created meanwhile are hydrated
+after it (their statements return then); `CREATE OR REPLACE` of an
+existing view and `CREATE SINK` logged meanwhile wait for it, and so do the
+changes logged after them. `CREATE INDEX` works the same way.
 
 Errors found while binding and planning the query (unknown columns,
 unsupported constructs, non-deterministic functions, a column list that is
