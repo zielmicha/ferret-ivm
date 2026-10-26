@@ -283,7 +283,9 @@ pool's target to what the other parts leave over (`rebalance_memory`,
 taken from the pool, the one part that can always give memory back; it
 also shrinks the group caches when one of them could not take a group. A
 checkpoint is forced when dirty nodes, which cannot be evicted, exceed
-half of the pool's target.
+half of the pool's target, and the maintenance pass before a checkpoint
+rewrites no more nodes than the pool has room for besides the dirty ones
+([Storage](storage.md#space-reclamation)).
 
 Queued changes release their memory wherever they are dropped: a charge
 (`memory::Charge`) travels with each event and gives its bytes back when the
