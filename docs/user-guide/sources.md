@@ -269,9 +269,10 @@ engine is stopped, after it fails to start, or while the source cannot
 stream (it keeps reconnecting with `error: ...`), the slot holds back WAL
 removal indefinitely. (A table the source cannot copy does not stop the
 stream, see [below](#tables-added-to-or-removed-from-the-publication).)
-When the engine falls 10,000 logged records behind in applying them, the
-input log stops taking records until it catches up: sources then stop
-reading the replication stream, and the upstream keeps the WAL meanwhile.
+When the records waiting to be applied fill their part of the memory budget
+(an eighth of `--memory-mb`, in bytes of memory), a source waits before
+logging more until the engine catches up: it then stops reading the
+replication stream, and the upstream keeps the WAL meanwhile.
 
 ## Initial snapshot
 

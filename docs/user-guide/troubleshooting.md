@@ -187,10 +187,11 @@ Grouped `count`, `sum`, `avg`, `min`, `max`, `bool_and/or`, `stddev` and
 same query also has an ordered aggregate: then all of its aggregates are
 computed by one operator that rescans each changed group.
 
-When the engine cannot keep up, the backlog stays bounded: once 10,000
-logged records wait to be applied, sources stop reading the replication
-stream until it catches up (`SHOW FRONTIERS`: `durable_gsn` −
-`processed_gsn`).
+When the engine cannot keep up, the backlog stays bounded: once the records
+waiting to be applied take an eighth of `--memory-mb` (in bytes of memory),
+sources stop reading the replication stream until it catches up (`SHOW
+FRONTIERS`: `durable_gsn` − `processed_gsn`; `/api/overview`'s
+`input_queue_bytes`, see [Memory](operations.md#memory)).
 
 ### Disk usage grows
 
