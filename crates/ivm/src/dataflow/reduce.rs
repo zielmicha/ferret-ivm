@@ -3,9 +3,10 @@
 //! The input is arranged by the group key (then ORDER BY columns of ordered
 //! aggregates); its tree nodes carry the summaries every aggregate needs, so
 //! a group's aggregates are a range summary (O(log n)) regardless of whether
-//! the aggregate is invertible. Ordered aggregates (string_agg, array_agg,
-//! json_agg) rescan the group. The output is arranged by the group key and
-//! supplies the previous value of each affected group.
+//! the aggregate is invertible. Percentiles read the values at their ranks
+//! (O(log n) each); other ordered aggregates (string_agg, array_agg,
+//! json_agg, mode) rescan the group. The output is arranged by the group key
+//! and supplies the previous value of each affected group.
 //!
 //! Recently touched groups keep their summary in memory, so a small change
 //! to a large group folds the changed rows into the cached summary instead
@@ -184,9 +185,22 @@ impl ReducePlan {
         fp.extend_from_slice(cx.arr(self.input_arr));
     }
 
-    fn ordered(&self) -> bool {
-        self.aggs.iter().any(|a| a.func.is_ordered())
+    /// Does some aggregate read the group's rows (an ordered aggregate other
+    /// than a percentile without FILTER)?
+    fn scans(&self) -> bool {
+        self.aggs.iter().any(|a| a.func.is_ordered() && !by_rank(a))
     }
+
+    /// Does some aggregate read the values at given ranks (a percentile)?
+    fn ranked(&self) -> bool {
+        self.aggs.iter().any(by_rank)
+    }
+}
+
+/// A percentile without FILTER reads the values at its ranks (`Env::nth`
+/// over the count summaries) instead of scanning the group.
+fn by_rank(a: &AggSpec) -> bool {
+    matches!(a.func, crate::sql::plan::AggFunc::PercentileCont | crate::sql::plan::AggFunc::PercentileDisc) && a.filter.is_none()
 }
 
 fn group_range(prefix: &[u8]) -> (Bound<&[u8]>, Option<Vec<u8>>) {
@@ -251,9 +265,10 @@ fn compute_group(
     }
     // ordered aggregates scan the group once
     let mut scanned: Option<Vec<(Row, i64)>> = None;
-    if p.ordered() {
+    if p.scans() {
         let mut rows = Vec::new();
         env.for_each(tree, lo, hib, &mut |k, h| {
+            visited(1);
             let w = h.total();
             if w > 0 {
                 rows.push((layout.decode_row(k)?, w));
@@ -262,43 +277,56 @@ fn compute_group(
         })?;
         scanned = Some(rows);
     }
-    let mut row: Row = kv.clone();
+    let row = group_row(g, env, p, prefix, &summary, &kv, scanned.as_deref())?;
+    Ok((row, Some((summary, kv))))
+}
+
+/// The output row of a group from its summary (and the group's rows, for
+/// aggregates that scan it): percentiles read the values at their ranks in
+/// the input index, which must hold the group as summarized.
+fn group_row(g: &Graph, env: &mut Env, p: &ReducePlan, prefix: &[u8], summary: &Summary, kv: &[Datum], scanned: Option<&[(Row, i64)]>) -> Result<GroupResult> {
+    let ng = p.group_key.len();
+    if ng > 0 && summary.count == 0 {
+        return Ok(Ok(None));
+    }
+    let mut row: Row = kv.to_vec();
     for (i, agg) in p.aggs.iter().enumerate() {
-        let v = if agg.func.is_ordered() {
-            if matches!(agg.func, crate::sql::plan::AggFunc::PercentileCont | crate::sql::plan::AggFunc::PercentileDisc)
-                && agg.filter.is_none()
-            {
-                // order statistics through count summaries
-                let st = &summary.aggs[p.slots[i][0]];
-                let n = match st {
-                    crate::storage::AggState::Count(c) => *c,
-                    _ => 0,
-                };
-                let col = agg.arg.unwrap();
-                // the n non-null values follow the group's NULLs when the
-                // ORDER BY column sorts NULLs first (DESC, NULLS FIRST)
-                let skip = if layout.specs.get(ng).is_some_and(|s| s.nulls_first) { summary.count - n } else { 0 };
-                let mut get = |k: i64| -> Result<Datum> {
-                    match env.nth(tree, lo, hib, skip + k)? {
-                        Some((key, _, _)) => Ok(layout.decode_row(&key)?[col].clone()),
-                        None => Ok(Datum::Null),
-                    }
-                };
-                super::agg::percentile(agg.func, agg.fraction.unwrap_or(0.5), n, &mut get)
-            } else {
-                let rows = scanned.as_ref().unwrap();
-                agg.finalize_ordered(&mut rows.iter().cloned())
-            }
+        let v = if by_rank(agg) {
+            // order statistics through count summaries
+            let a = g.arr(p.input_arr);
+            let (layout, tree) = (a.layout.clone(), a.tree);
+            let (lo, hi) = group_range(prefix);
+            let hib = match &hi {
+                Some(h) => Bound::Excluded(h.as_slice()),
+                None => Bound::Unbounded,
+            };
+            let n = match &summary.aggs[p.slots[i][0]] {
+                crate::storage::AggState::Count(c) => *c,
+                _ => 0,
+            };
+            let col = agg.arg.unwrap();
+            // the n non-null values follow the group's NULLs when the
+            // ORDER BY column sorts NULLs first (DESC, NULLS FIRST)
+            let skip = if layout.specs.get(ng).is_some_and(|s| s.nulls_first) { summary.count - n } else { 0 };
+            let mut get = |k: i64| -> Result<Datum> {
+                match env.nth(tree, lo, hib, skip + k)? {
+                    Some((key, _, _)) => Ok(layout.decode_row(&key)?[col].clone()),
+                    None => Ok(Datum::Null),
+                }
+            };
+            super::agg::percentile(agg.func, agg.fraction.unwrap_or(0.5), n, &mut get)
+        } else if agg.func.is_ordered() {
+            agg.finalize_ordered(&mut scanned.expect("scanned group").iter().map(|(r, w)| (r, *w)))
         } else {
-            agg.finalize(&summary, &p.slots[i])
+            agg.finalize(summary, &p.slots[i])
         };
         match v {
             Ok(d) => row.push(d),
-            Err(e) if is_data_error(&e) => return Ok((Err(e), Some((summary, kv)))),
+            Err(e) if is_data_error(&e) => return Ok(Err(e)),
             Err(e) => return Err(e),
         }
     }
-    Ok((Ok(Some(row)), Some((summary, kv))))
+    Ok(Ok(Some(row)))
 }
 
 /// Fold a group's changed rows into its cached summary. False when that is
@@ -324,22 +352,6 @@ fn fold_rows(p: &ReducePlan, layout: &Layout, s: &mut Summary, kv: &[Datum], row
         }
     }
     Ok(true)
-}
-
-/// Output row of a group from its summary (non-ordered aggregates only).
-fn finish_group(p: &ReducePlan, s: &Summary, kv: &[Datum]) -> Result<GroupResult> {
-    if !p.group_key.is_empty() && s.count == 0 {
-        return Ok(Ok(None));
-    }
-    let mut row: Row = kv.to_vec();
-    for (i, agg) in p.aggs.iter().enumerate() {
-        match agg.finalize(s, &p.slots[i]) {
-            Ok(d) => row.push(d),
-            Err(e) if is_data_error(&e) => return Ok(Err(e)),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(Ok(Some(row)))
 }
 
 fn same_row(a: &Option<Row>, b: &Option<Row>) -> bool {
@@ -375,7 +387,8 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn:
     static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let cx = GroupCx {
         layout: &layout,
-        cacheable: !p.ordered() && !*NO_CACHE.get_or_init(|| std::env::var("IVM_NO_GROUP_CACHE").is_ok()),
+        cacheable: !p.scans() && !*NO_CACHE.get_or_init(|| std::env::var("IVM_NO_GROUP_CACHE").is_ok()),
+        ranked: p.ranked(),
         fidelity_key: layout.key_types[..ng].iter().any(crate::types::encoding::has_fidelity),
     };
     let Rows::Mem(rows) = &delta.rows else {
@@ -409,6 +422,10 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn:
 struct GroupCx<'a> {
     layout: &'a Layout,
     cacheable: bool,
+    /// Some aggregate is a percentile: the values at its ranks before the
+    /// step are no longer in the input index, so a group's previous output
+    /// is read from the output index.
+    ranked: bool,
     fidelity_key: bool,
 }
 
@@ -435,13 +452,15 @@ fn step_group(
     let mut result = None;
     if cacheable && let Some((mut s, ckv)) = cache.remove(&prefix) {
         // the cached summary also gives the group's current output
-        if let Ok(o) = finish_group(p, &s, &ckv)? {
+        if !cx.ranked
+            && let Ok(o) = group_row(g, env, p, &prefix, &s, &ckv, None)?
+        {
             old = Some(o);
         }
         if let Some(rows) = rows
             && fold_rows(p, cx.layout, &mut s, &ckv, rows, fidelity_key)?
         {
-            result = Some(finish_group(p, &s, &ckv)?);
+            result = Some(group_row(g, env, p, &prefix, &s, &ckv, None)?);
             if s.count != 0 || ng == 0 {
                 cache.insert(prefix.clone(), (s, ckv));
             }

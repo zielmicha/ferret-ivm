@@ -440,6 +440,7 @@ impl Engine {
                     deliver_to(s, *g, o.map(|o| &o.errs[..]).unwrap_or_default(), o.and_then(|o| own_rows(&o.data)), limit);
                 }
             }
+            self.subs_changed();
             for sid in &r.sinks {
                 self.held_sinks.remove(sid);
             }
@@ -693,6 +694,7 @@ impl Engine {
             deliver_to(&sub, *g, o.map(|o| &o.errs[..]).unwrap_or_default(), o.and_then(|o| own_rows(&o.data)), limit);
         }
         self.subs.push(sub);
+        self.subs_changed();
         // (a client that is gone no longer reads it: it ends)
         if p.reply.send(Ok(ExecResult::Subscribe { columns: p.columns, rx, cancel: cancel.clone(), progress: p.progress })).is_err() {
             cancel.store(true, Ordering::Release);

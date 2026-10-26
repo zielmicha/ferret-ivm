@@ -108,6 +108,27 @@ pub(crate) struct Subscription {
     pub reads: Vec<ObjectId>,
 }
 
+/// Subscriptions by the node they receive the changes of, and those that
+/// want a progress mark after every record (indexes into `Engine::subs`).
+#[derive(Default, PartialEq, Debug)]
+struct SubIndex {
+    by_node: FxHashMap<NodeId, Vec<usize>>,
+    progress: Vec<usize>,
+}
+
+impl SubIndex {
+    fn of(subs: &[Subscription]) -> SubIndex {
+        let mut ix = SubIndex::default();
+        for (i, s) in subs.iter().enumerate() {
+            ix.by_node.entry(s.node).or_default().push(i);
+            if s.progress {
+                ix.progress.push(i);
+            }
+        }
+        ix
+    }
+}
+
 /// A read waiting for the engine to reach a GSN.
 pub(crate) struct Parked {
     pub wait: Wait,
@@ -115,14 +136,16 @@ pub(crate) struct Parked {
 }
 
 /// What a parked read waits for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Wait {
     /// The engine to process this GSN.
     Gsn(Gsn),
-    /// Every source frontier to pass the read's LSN.
-    Lsn,
-    /// The initial snapshots of the tables it reads (rechecked on wake).
-    Snapshot,
+    /// Every source frontier to pass this LSN.
+    Lsn(u64),
+    /// The initial snapshots of these tables (those it reads that were
+    /// loading), or a catalog change after `catalog` (`Engine::catalog_epoch`),
+    /// which may change what it reads.
+    Snapshot { tables: Vec<ObjectId>, catalog: u64 },
     /// The hydration of a relation it reads (re-run when a hydration
     /// finished after this many had).
     Hydration(u64),
@@ -153,6 +176,9 @@ pub struct Engine {
     pending: HashMap<u64, Sender<Result<ExecResult>>>,
     pub(crate) parked: Vec<Parked>,
     pub(crate) subs: Vec<Subscription>,
+    /// `subs` by node, for delivery; None after `subs` changed (see
+    /// `subs_changed`).
+    sub_index: Option<SubIndex>,
     pub(crate) next_req: u64,
     /// DML logged but not applied yet, with the rows it writes (`dml.rs`).
     dml_pending: Vec<(u64, dml::Touched)>,
@@ -180,9 +206,12 @@ pub struct Engine {
     pub(crate) meta: meta::Meta,
     pub(crate) replaying: bool,
     /// Bumped by source progress and DDL: parked reads waiting for initial
-    /// snapshots are re-run when it moves.
+    /// snapshots are re-checked when it moves.
     pub(crate) snap_epoch: u64,
     pub(crate) snap_epoch_seen: u64,
+    /// Bumped by catalog changes (DDL, upstream schema changes): reads
+    /// waiting for initial snapshots are re-run (re-planned) when it moves.
+    pub(crate) catalog_epoch: u64,
     /// (epoch, replicated tables still loading their initial snapshot)
     pub(crate) loading: (u64, std::collections::HashSet<ObjectId>),
     /// Per-source progress state (opaque JSON owned by the source).
@@ -228,15 +257,19 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Record a source's LSN frontier; wakes reads waiting for it.
+    /// Record a source's LSN frontier; wakes reads waiting for it, when it
+    /// passes the smallest LSN one waits for.
     pub fn advance_frontier(&self, source: u64, lsn: u64) {
         let mut m = self.shared.source_lsn.lock();
-        let e = m.entry(source).or_insert(0);
-        if lsn > *e {
-            *e = lsn;
+        let before = m.get(&source).copied();
+        if before.is_none_or(|b| lsn > b) {
+            m.insert(source, lsn);
             drop(m);
             if self.shared.lsn_waiters.load(Ordering::Acquire) {
-                let _ = self.tx.send(EngineMsg::Wake);
+                let wanted = self.shared.lsn_wanted.load(Ordering::Acquire);
+                if lsn >= wanted && before.is_none_or(|b| b < wanted) {
+                    let _ = self.tx.send(EngineMsg::Wake);
+                }
             }
         }
     }
@@ -424,6 +457,7 @@ pub fn start(cfg: Config) -> Result<Running> {
     for (gsn, rec) in records {
         engine.apply_record(gsn, rec)?;
     }
+    engine.sink_progress();
     // The checkpoint can be ahead of the log if the log lost records it
     // covers (an unsynced tail with --no-sync): GSNs must continue after
     // it, or new records would be taken for already applied ones.
@@ -485,6 +519,7 @@ impl Engine {
             pending: HashMap::new(),
             parked: Vec::new(),
             subs: Vec::new(),
+            sub_index: None,
             next_req: 1,
             dml_pending: Vec::new(),
             dml_queue: VecDeque::new(),
@@ -501,6 +536,7 @@ impl Engine {
             replaying: true,
             snap_epoch: 0,
             snap_epoch_seen: 0,
+            catalog_epoch: 0,
             loading: (0, std::collections::HashSet::new()),
             source_states: HashMap::new(),
             source_lsns: HashMap::new(),
@@ -533,7 +569,7 @@ impl Engine {
         self.graph.recovery = app.trees.into_iter().collect();
         self.graph.recovery_since = app.arr_since.into_iter().collect();
         self.clock = app.clock;
-        self.graph.now = app.clock;
+        self.graph.restore_clock(app.clock);
         if app.ticks.is_empty() {
             self.ticks.push_back((rec.gsn, app.clock));
         } else {
@@ -774,6 +810,7 @@ impl Engine {
         }
         if applied {
             self.shared.processed_gsn.store(self.processed, Ordering::Release);
+            self.sink_progress();
             self.wake_parked(handle);
         }
         Ok(())
@@ -939,6 +976,7 @@ impl Engine {
                 let res = self.apply_ddl(gsn, &sql, &extra);
                 self.processed = gsn;
                 self.snap_epoch += 1;
+                self.catalog_epoch += 1;
                 if res.is_ok() {
                     self.catalog.history.push((gsn, sql.clone()));
                     // (trimmed in steps)
@@ -988,6 +1026,7 @@ impl Engine {
                     *state = crate::source::postgres::snapshot_again(state, table);
                 }
                 self.snap_epoch += 1;
+                self.catalog_epoch += 1;
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }
@@ -1046,16 +1085,22 @@ impl Engine {
             .collect()
     }
 
-    /// Route outputs to views (errors), subscriptions and sinks. Each node's
-    /// changes are delivered as one copy shared by all its consumers, and
-    /// each consumer's queue is bounded in bytes: a subscription whose
-    /// client does not keep up ends with an error, a sink that does not
-    /// keep up is restarted from a new snapshot once it has caught up with
-    /// what it holds.
+    /// Route outputs to views (errors), subscriptions and sinks. Only the
+    /// consumers of nodes that produced something are visited (and the
+    /// subscriptions that want progress marks; sinks learn of the GSNs
+    /// without changes from `sink_progress`). Each node's changes are
+    /// delivered as one copy shared by all its consumers, and each
+    /// consumer's queue is bounded in bytes: a subscription whose client
+    /// does not keep up ends with an error, a sink that does not keep up is
+    /// restarted from a new snapshot once it has caught up with what it
+    /// holds.
     fn deliver(&mut self, gsn: Gsn, mut outputs: FxHashMap<NodeId, Output>) {
-        for v in self.rt.views.values_mut() {
-            if let Some(o) = outputs.get(&v.node) {
-                merge_errors(&mut v.errors, &o.errs);
+        // (error records are rare: views are only visited for them)
+        if outputs.values().any(|o| !o.errs.is_empty()) {
+            for v in self.rt.views.values_mut() {
+                if let Some(o) = outputs.get(&v.node) {
+                    merge_errors(&mut v.errors, &o.errs);
+                }
             }
         }
         if !self.snapshotting.is_empty() {
@@ -1063,28 +1108,58 @@ impl Engine {
         }
         let limit = self.shared.mem.consumer_limit();
         let mut shared = FxHashMap::default();
-        // (held: their view is being replaced, and they get the change to
-        // its new version once that is hydrated)
-        for s in self.subs.iter().filter(|s| !s.held) {
-            let errs = outputs.get(&s.node).map(|o| o.errs.clone()).unwrap_or_default();
-            deliver_to(s, gsn, &errs, shared_rows(&mut shared, &mut outputs, s.node), limit);
+        if !self.subs.is_empty() {
+            let index = self.sub_index.get_or_insert_with(|| SubIndex::of(&self.subs));
+            #[cfg(debug_assertions)]
+            assert_eq!(*index, SubIndex::of(&self.subs), "stale subscription index");
+            // smaller of the two: the subscribed nodes, or the nodes that changed
+            let changed: Vec<usize> = if index.by_node.len() <= outputs.len() {
+                index.by_node.iter().filter(|(n, _)| outputs.contains_key(n)).flat_map(|(_, subs)| subs.iter().copied()).collect()
+            } else {
+                outputs.keys().filter_map(|n| index.by_node.get(n)).flatten().copied().collect()
+            };
+            // (held: their view is being replaced, and they get the change
+            // to its new version once that is hydrated; a cancelled one may
+            // refer to a node freed since, whose id was reused)
+            for i in changed {
+                let s = &self.subs[i];
+                if s.held || s.cancel.load(Ordering::Acquire) {
+                    continue;
+                }
+                let errs = outputs.get(&s.node).map(|o| o.errs.clone()).unwrap_or_default();
+                deliver_to(s, gsn, &errs, shared_rows(&mut shared, &mut outputs, s.node), limit);
+            }
+            // the progress marks of the others
+            for &i in &index.progress {
+                let s = &self.subs[i];
+                if !s.held && !outputs.contains_key(&s.node) {
+                    deliver_to(s, gsn, &[], None, limit);
+                }
+            }
         }
         for (id, sink) in self.sink_handles.iter_mut() {
             if sink.behind() || self.held_sinks.contains(id) {
                 continue;
             }
-            let sent = match shared_rows(&mut shared, &mut outputs, sink.node) {
-                Some((rows, bytes)) => sink.send(gsn, &rows, bytes, limit),
-                None => {
-                    sink.progress(gsn);
-                    true
-                }
-            };
-            if !sent {
+            if let Some((rows, bytes)) = shared_rows(&mut shared, &mut outputs, sink.node)
+                && !sink.send(gsn, &rows, bytes, limit)
+            {
                 log::warn!(
                     "sink {id} fell behind: its unwritten changes reached {} MiB; it is restarted from a new snapshot once it has written them",
                     limit >> 20
                 );
+            }
+        }
+    }
+
+    /// Tell the sinks that everything up to the last applied record is
+    /// delivered: after a batch of records, not after each (sinks only
+    /// record the GSN they are current as of). Not those held for a
+    /// replacement still being hydrated, which were sent nothing since.
+    fn sink_progress(&self) {
+        for (id, sink) in &self.sink_handles {
+            if !self.held_sinks.contains(id) {
+                sink.progress(self.processed);
             }
         }
     }
@@ -1109,11 +1184,18 @@ impl Engine {
         }
     }
 
+    /// `subs` changed (added, removed, or moved to another node): the
+    /// delivery index is rebuilt.
+    pub(crate) fn subs_changed(&mut self) {
+        self.sub_index = None;
+    }
+
     fn prune_subscriptions(&mut self) {
         let mut i = 0;
         while i < self.subs.len() {
             if self.subs[i].cancel.load(Ordering::Acquire) {
                 let s = self.subs.swap_remove(i);
+                self.sub_index = None;
                 if let Some(n) = s.pinned {
                     let _ = self.graph.release_node(&mut self.env, n);
                 }
@@ -1397,6 +1479,9 @@ pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &Err
         }
     }
 }
+
+#[cfg(test)]
+mod work_tests;
 
 #[cfg(test)]
 mod tests {

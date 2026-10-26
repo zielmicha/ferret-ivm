@@ -195,11 +195,12 @@ impl Engine {
         &self.loading.1
     }
 
-    /// A table the plan reads (directly or through views) whose initial
+    /// The tables the plan reads (directly or through views) whose initial
     /// snapshot is still loading.
-    fn snapshotting_table(&mut self, rel: &Rel) -> Option<ObjectId> {
+    fn snapshotting_tables(&mut self, rel: &Rel) -> Vec<ObjectId> {
+        let mut loading = Vec::new();
         if self.loading_tables().is_empty() {
-            return None;
+            return loading;
         }
         fn gets(r: &Rel, out: &mut Vec<u64>) {
             if let Rel::Get { id, .. } = r {
@@ -220,7 +221,7 @@ impl Engine {
             match self.catalog.get(id).map(|o| &o.kind) {
                 Some(ObjectKind::Table(_)) => {
                     if self.loading.1.contains(&id) {
-                        return Some(id);
+                        loading.push(id);
                     }
                 }
                 Some(ObjectKind::View(v)) | Some(ObjectKind::MaterializedView(v)) => {
@@ -233,7 +234,7 @@ impl Engine {
                 _ => {}
             }
         }
-        None
+        loading
     }
 
     fn select(
@@ -252,9 +253,10 @@ impl Engine {
         };
         if fresh && !self.loading_tables().is_empty() {
             let bq = crate::sql::plan_query(&self.catalog, &query, params.clone())?;
-            if self.snapshotting_table(&bq.rel).is_some() {
+            let tables = self.snapshotting_tables(&bq.rel);
+            if !tables.is_empty() {
                 self.parked.push(Parked {
-                    wait: Wait::Snapshot,
+                    wait: Wait::Snapshot { tables, catalog: self.catalog_epoch },
                     req: Request::Execute {
                         stmt: Box::new(Statement::Select { query, as_of, text: String::new() }),
                         params,
@@ -274,10 +276,14 @@ impl Engine {
             AsOf::AtLeastLsn(l) => {
                 let lsn = parse_lsn(l)?;
                 if !self.lsn_reached(l, lsn)? {
-                    self.shared.lsn_waiters.store(true, Ordering::Release);
+                    // (wake_parked keeps these up to date while reads wait)
+                    if !self.shared.lsn_waiters.swap(true, Ordering::AcqRel) {
+                        self.shared.lsn_wanted.store(u64::MAX, Ordering::Release);
+                    }
+                    self.shared.lsn_wanted.fetch_min(lsn, Ordering::AcqRel);
                     self.shared.want_keepalive.store(true, Ordering::Release);
                     self.parked.push(Parked {
-                        wait: Wait::Lsn,
+                        wait: Wait::Lsn(lsn),
                         req: Request::Execute {
                             stmt: Box::new(Statement::Select { query, as_of: as_of.clone(), text: String::new() }),
                             params,
@@ -341,17 +347,32 @@ impl Engine {
     /// it, and reading at once could not show the commit the client waits
     /// for (read-your-writes).
     pub(crate) fn lsn_reached(&self, text: &str, lsn: u64) -> Result<bool> {
-        let sources: Vec<ObjectId> =
-            self.catalog.objects.values().filter(|o| matches!(o.kind, ObjectKind::Source(_))).map(|o| o.id).collect();
-        if sources.is_empty() {
-            return Err(SqlError::new(
+        match self.lsn_floor() {
+            None => Err(SqlError::new(
                 codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 format!("AS OF AT LEAST LSN '{text}' cannot be satisfied: there is no source"),
             )
-            .with_hint("The LSN is a position in the WAL of a source's upstream server; create the source first."));
+            .with_hint("The LSN is a position in the WAL of a source's upstream server; create the source first.")),
+            Some(floor) => Ok(floor.is_some_and(|f| f >= lsn)),
         }
+    }
+
+    /// The LSN frontier every source of the catalog has reached: None
+    /// without any source, Some(None) while one has reported none.
+    fn lsn_floor(&self) -> Option<Option<u64>> {
         let frontiers = self.shared.source_lsn.lock();
-        Ok(sources.iter().all(|s| frontiers.get(s).is_some_and(|f| *f >= lsn)))
+        let mut floor: Option<Option<u64>> = None;
+        for o in self.catalog.objects.values() {
+            if matches!(o.kind, ObjectKind::Source(_)) {
+                let f = frontiers.get(&o.id).copied();
+                floor = Some(match (floor, f) {
+                    (None, f) => f,
+                    (Some(Some(a)), Some(b)) => Some(a.min(b)),
+                    _ => None,
+                });
+            }
+        }
+        floor
     }
 
     /// Re-run parked reads whose GSN (or LSN) condition is now satisfied;
@@ -375,6 +396,12 @@ impl Engine {
         // snapshot progress or catalog changes since reads were parked
         let snapshots_changed = self.snap_epoch != self.snap_epoch_seen;
         self.snap_epoch_seen = self.snap_epoch;
+        let lsn_waiting = self.parked.iter().any(|p| matches!(p.wait, Wait::Lsn(_)));
+        // (the sources' common frontier, once for all reads)
+        let mut floor = if lsn_waiting { self.lsn_floor() } else { None };
+        if snapshots_changed && self.parked.iter().any(|p| matches!(p.wait, Wait::Snapshot { .. })) {
+            self.loading_tables();
+        }
         let mut still = Vec::new();
         for p in std::mem::take(&mut self.parked) {
             if let Some(e) = interruption(&p.req, true) {
@@ -383,22 +410,18 @@ impl Engine {
                 }
                 continue;
             }
-            let ready = match p.wait {
-                // (re-run on an error: it fails then, e.g. when the last
-                // source was dropped)
-                Wait::Lsn => match &p.req {
-                    Request::Execute { stmt, .. } => match &**stmt {
-                        Statement::Select { as_of: AsOf::AtLeastLsn(l), .. } => {
-                            parse_lsn(l).and_then(|lsn| self.lsn_reached(l, lsn)).unwrap_or(true)
-                        }
-                        _ => true,
-                    },
-                    _ => true,
-                },
-                // re-run: it parks again if a snapshot is still loading
-                Wait::Snapshot => snapshots_changed,
-                Wait::Gsn(g) => self.processed >= g,
-                Wait::Hydration(done) => self.hydrations_done > done,
+            let ready = match &p.wait {
+                // (re-run without any source: it fails then, e.g. when the
+                // last source was dropped)
+                Wait::Lsn(lsn) => floor.is_none_or(|f| f.is_some_and(|f| f >= *lsn)),
+                // re-run (re-planned) after a catalog change, or once the
+                // tables it waited for are loaded: it parks again if a table
+                // it reads is still loading
+                Wait::Snapshot { tables, catalog } => {
+                    snapshots_changed && (*catalog != self.catalog_epoch || !tables.iter().any(|t| self.loading.1.contains(t)))
+                }
+                Wait::Gsn(g) => self.processed >= *g,
+                Wait::Hydration(done) => self.hydrations_done > *done,
             };
             if ready {
                 self.deferred.push(p.req);
@@ -406,11 +429,25 @@ impl Engine {
                 still.push(p);
             }
         }
-        let lsn_waiting = still.iter().any(|p| p.wait == Wait::Lsn);
-        self.shared.lsn_waiters.store(lsn_waiting, Ordering::Release);
-        if lsn_waiting {
+        // Sources wake the engine when their frontier passes the smallest
+        // LSN still waited for. One that passed it while it was being set
+        // has not: the frontiers are read again after setting it.
+        loop {
+            let wanted = still.iter().filter_map(|p| if let Wait::Lsn(l) = p.wait { Some(l) } else { None }).min();
+            self.shared.lsn_wanted.store(wanted.unwrap_or(u64::MAX), Ordering::Release);
+            self.shared.lsn_waiters.store(wanted.is_some(), Ordering::Release);
+            let Some(wanted) = wanted else { break };
             // keep asking until the frontier passes
             self.shared.want_keepalive.store(true, Ordering::Release);
+            let now = self.lsn_floor();
+            if now == floor || !now.is_none_or(|f| f.is_some_and(|f| f >= wanted)) {
+                break;
+            }
+            floor = now;
+            let (ready, rest): (Vec<Parked>, Vec<Parked>) =
+                still.into_iter().partition(|p| matches!(p.wait, Wait::Lsn(l) if floor.is_none_or(|f| f.is_some_and(|f| f >= l))));
+            self.deferred.extend(ready.into_iter().map(|p| p.req));
+            still = rest;
         }
         self.parked = still;
     }

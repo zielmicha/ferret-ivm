@@ -156,6 +156,9 @@ pub struct Shared {
     pub want_keepalive: AtomicBool,
     /// Reads are parked until a source frontier passes some LSN.
     pub lsn_waiters: AtomicBool,
+    /// While `lsn_waiters`: the smallest LSN they wait for. A source whose
+    /// frontier passes it wakes the engine (not on every advance).
+    pub lsn_wanted: AtomicU64,
     /// Upstream position and ingest counters per source (web UI).
     pub source_gauges: Mutex<HashMap<u64, Arc<crate::source::SourceGauges>>>,
     /// Replication slots of dropped sources still to be dropped (saved in

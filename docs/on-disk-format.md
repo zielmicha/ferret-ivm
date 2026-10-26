@@ -1048,7 +1048,7 @@ operator name (ASCII: Table, Constant, Mfp, Union, Negate, FlatMap, DeltaJoin,
 | `Union` | one byte per input: 1 if negated |
 | `Negate` | — |
 | `FlatMap` | per function: `Debug` text `"<TableFunc>/<arity>"`, its argument expressions, `0xFD`; then the ordinality flag byte |
-| `DeltaJoin` | per input: node fingerprint, MFP fingerprint, then for a presence input its arrangement fingerprint followed by `0xE0` if it matches exactly (by representation), otherwise `0x00`; per delta path: `0xA0`, source input `u32 LE`, source filter expressions; per step: `0xA1`, input `u32 LE`, arrangement fingerprint, key expressions, null-safe flag bytes, filter expressions, and `0xE1` if the lookup matches keys exactly |
+| `DeltaJoin` | (the node's inputs are the join inputs' nodes followed by the error trackers' `Mfp` nodes, see [Dataflow](internals/dataflow.md#deltajoin)) per input: node fingerprint, MFP fingerprint, then for a presence input its arrangement fingerprint followed by `0xE0` if it matches exactly (by representation), otherwise `0x00`; per delta path: `0xA0`, source input `u32 LE`, source filter expressions; per step: `0xA1`, input `u32 LE`, arrangement fingerprint, key expressions, null-safe flag bytes, filter expressions, and `0xE1` if the lookup matches keys exactly |
 | `Reduce` | `Debug` of the group-key column list; per aggregate `Debug` of (function, argument, second argument, filter, argument type, fraction) concatenated; input arrangement fingerprint |
 | `Distinct` | arrangement fingerprint |
 | `SetOp` | `Debug` text `"<op><all>"` (e.g. `Exceptfalse`), left and right arrangement fingerprints |
@@ -1246,10 +1246,13 @@ format 2 at the first start. New functions (registered among the existing
 ones, which renumbers the later ones) and planner fixes did change the
 fingerprints of many views' arrangements (for example joins on computed
 keys, whose keys are materialized in an `Mfp` node, semijoins whose presence
-inputs match exactly, and the summaries of `var*`/`stddev*` over `bigint`),
-so such a data directory keeps its tables and rebuilds those arrangements
-once at its first start. `crates/ivm/tests/data/format1` is a format-1
-directory that the restart tests migrate.
+inputs match exactly, the summaries of `var*`/`stddev*` over `bigint`, joins
+whose input filters or maps can fail, which have error-tracker inputs, and
+the input arrangements of window aggregates whose frames reach a partition's
+end, which carry summaries), so such a data directory keeps its tables and
+rebuilds those arrangements once at its first start.
+`crates/ivm/tests/data/format1` is a format-1 directory that the restart
+tests migrate.
 
 A change in any of the "incompatible" rows needs a new format version whose
 migration the engine runs at the first start (as for format 1), or starting

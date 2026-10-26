@@ -90,6 +90,7 @@ snapshot requests queued at the engine.
 | `processed_gsn` | last GSN applied by the engine |
 | `source_lsn` | per-source LSN frontier (mutex-protected map) |
 | `lsn_waiters` | some read is waiting for an LSN frontier |
+| `lsn_wanted` | the smallest LSN such a read waits for: a source wakes the engine when its frontier passes it |
 | `want_keepalive` | ask sources to request a keepalive (to move their frontier) |
 | `source_gauges` | per-source upstream position and ingest counters (web UI) |
 | `slot_drops` | replication slots of dropped sources still to be dropped (checkpointed) |
@@ -251,7 +252,7 @@ round):
 
 | Message | Action |
 |---|---|
-| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. While a hydration is in progress, a `Schema` record or a `Ddl` record replacing a view or creating a sink, and the records after it, are held until no hydration is; `Commit` and `Tick` records are forwarded to it before they are applied. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
+| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, send every sink the last applied GSN as its progress, re-check parked reads. While a hydration is in progress, a `Schema` record or a `Ddl` record replacing a view or creating a sink, and the records after it, are held until no hydration is; `Commit` and `Tick` records are forwarded to it before they are applied. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | ask for a checkpoint: answered with its GSN once one begun after the request is committed |
@@ -284,15 +285,19 @@ checkpoint.
 | `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
-Delivering outputs (`deliver`): the error records of each materialized
-view's root are merged into the view's error counts; each subscription gets
-the data changes of its node, ends at the first error record that is added
-(retracted ones do not end it), and gets a progress mark; each sink gets the
-changes of its node, or the GSN alone as progress when its relation did not
-change. A node's changes are moved into one shared copy (`SharedRows`) for
-all of its consumers; each queued event holds a charge on its consumer's
-queue until the consumer drops it, and a consumer whose queue would exceed
-its limit is not sent the event ([Memory](#memory)).
+Delivering outputs (`deliver`) visits only the consumers of the nodes that
+produced something (subscriptions are indexed by node): the error records
+of each materialized view's root are merged into the view's error counts
+(views are only visited for records with errors); each subscription gets
+the data changes of its node and ends at the first error record that is
+added (retracted ones do not end it); each subscription with `PROGRESS`
+gets a progress mark; each sink gets the changes of its node. Sinks learn
+of the GSNs without changes to their relation from the progress sent after
+each batch of records (and after replay), not from a message per record. A
+node's changes are moved into one shared copy (`SharedRows`) for all of its
+consumers; each queued event, progress marks included, holds a charge on
+its consumer's queue until the consumer drops it, and a consumer whose
+queue would exceed its limit is not sent the event ([Memory](#memory)).
 
 Records at or below the last applied GSN are ignored, which makes replay
 idempotent. After each record the retention frontier is moved to
@@ -406,8 +411,8 @@ and a wait condition:
 | Condition | Woken when |
 |---|---|
 | `Gsn(g)` | the engine has applied `g` (checked after every batch) |
-| `Lsn` | every source of the catalog has a frontier ≥ the read's LSN (`lsn_reached`; checked on `Wake` messages, which sources send when a frontier moves while `lsn_waiters` is set, after every batch and on the 200 ms timeout). When the last source is dropped, the read is re-run and fails |
-| `Snapshot` | something changed that could finish a snapshot (source progress, a schema change or DDL); the read is re-run and parks again if a table it reads, directly or through views, is still loading |
+| `Lsn(l)` | every source of the catalog has a frontier ≥ `l` (the frontier all sources have reached is computed once per check, for every waiting read); checked on `Wake` messages, which a source sends when its frontier passes `lsn_wanted` (not at every advance), after every batch and on the 200 ms timeout. When the last source is dropped, the read is re-run and fails |
+| `Snapshot` | the tables it reads, directly or through views, whose initial snapshot was loading have all finished it, or the catalog changed (DDL or an upstream schema change: what the read reads may have changed); the read is re-run (planned again) and parks again if a table it reads is still loading. Source progress that finishes none of its tables does not re-run it |
 | `Hydration` | the hydration in progress is done; a statement (read, DML or `SUBSCRIBE`) that read a view still being hydrated is re-run |
 
 While an LSN read waits, `want_keepalive` makes the sources request a

@@ -951,11 +951,11 @@ pub fn aggregate(rows: Rows, group: &[usize], aggs: &[crate::sql::plan::AggCall]
                     .map(|(r, _)| (r.clone(), 1))
                     .collect();
                 sort_rows(&mut rs, &aggs[i].order);
-                s.finalize_ordered(&mut rs.into_iter())?
+                s.finalize_ordered(&mut rs.iter().map(|(r, w)| (r, *w)))?
             } else if s.func.is_ordered() {
                 let mut rs = std::mem::take(&mut g.rows);
                 sort_rows(&mut rs, &aggs[i].order);
-                let v = s.finalize_ordered(&mut rs.iter().cloned())?;
+                let v = s.finalize_ordered(&mut rs.iter().map(|(r, w)| (r, *w)))?;
                 g.rows = rs;
                 v
             } else {
@@ -1006,9 +1006,7 @@ fn window(rows: Rows, funcs: &[crate::sql::plan::WindowCall], schema: &[crate::t
         for k in keys {
             let mut g = groups.remove(&k).unwrap();
             sort_rows(&mut g, order);
-            for r in compute_partition(&g, order, &specs)? {
-                next.push((r, 1));
-            }
+            next.extend(compute_partition(&g, order, &specs)?);
         }
         cur_schema.extend(funcs[i..j].iter().map(|f| f.ret.clone()));
         cur = next;

@@ -529,3 +529,198 @@ fn numeric_aggregates_beyond_the_numeric_range() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A small deterministic random generator (xorshift64*).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// Random changes to `t (id int PRIMARY KEY, g int, v int)` with few
+/// distinct values (ties, duplicate rows in projections, NULLs): inserts,
+/// updates and deletes of one row or of many in one statement. After each,
+/// every view must equal its query run ad hoc.
+fn random_changes_keep_views_equal(name: &str, queries: &[&str], steps: usize, seed: u64) {
+    random_changes_keep_views_equal_from(name, queries, steps, seed, 20)
+}
+
+/// As `random_changes_keep_views_equal`, starting with `rows` rows; a view
+/// that fails must fail with the same error as its query.
+fn random_changes_keep_views_equal_from(name: &str, queries: &[&str], steps: usize, seed: u64, initial: usize) {
+    let dir = tmpdir(name);
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+    let mut rng = Rng(seed);
+    let mut ids: Vec<i64> = Vec::new();
+    let mut next_id = 1;
+    let val = |rng: &mut Rng| if rng.below(10) == 0 { "NULL".to_string() } else { rng.below(8).to_string() };
+    for _ in 0..initial {
+        exec(&h, &format!("INSERT INTO t VALUES ({next_id}, {}, {})", rng.below(3), val(&mut rng)));
+        ids.push(next_id);
+        next_id += 1;
+    }
+    for (i, q) in queries.iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    for step in 0..steps {
+        let pick = |rng: &mut Rng, ids: &[i64]| ids[rng.below(ids.len() as u64) as usize];
+        let sql = match rng.below(9) {
+            0 | 1 if ids.len() < 60.max(initial + 20) || ids.is_empty() => {
+                let n = 1 + rng.below(3);
+                let mut vals = Vec::new();
+                for _ in 0..n {
+                    vals.push(format!("({next_id}, {}, {})", rng.below(3), val(&mut rng)));
+                    ids.push(next_id);
+                    next_id += 1;
+                }
+                format!("INSERT INTO t VALUES {}", vals.join(", "))
+            }
+            _ if ids.is_empty() => continue,
+            0..=2 => format!("UPDATE t SET v = {} WHERE id = {}", val(&mut rng), pick(&mut rng, &ids)),
+            3 => format!("UPDATE t SET g = {} WHERE id = {}", rng.below(3), pick(&mut rng, &ids)),
+            4 => format!("UPDATE t SET v = v + 1 WHERE id % {} = {}", 2 + rng.below(4), rng.below(2)),
+            5 => format!("UPDATE t SET v = v - 1, g = (g + 1) % 3 WHERE v > {}", rng.below(8)),
+            6 | 7 => {
+                let id = pick(&mut rng, &ids);
+                ids.retain(|x| *x != id);
+                format!("DELETE FROM t WHERE id = {id}")
+            }
+            _ => {
+                let g = rng.below(3);
+                let gone = rows(&h, &format!("SELECT id FROM t WHERE g = {g}"));
+                ids.retain(|x| !gone.contains(&x.to_string()));
+                format!("DELETE FROM t WHERE g = {g}")
+            }
+        };
+        exec(&h, &sql);
+        for (i, q) in queries.iter().enumerate() {
+            let want = rows_of(&h, q).map(sorted);
+            let got = rows_of(&h, &format!("SELECT * FROM v{i}")).map(sorted);
+            assert_eq!(got, want, "step {step} ({sql}): view {i}: {q}");
+        }
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Top-k windows (LIMIT, OFFSET, WITH TIES, per group) follow random
+/// changes, multiplicities and ties included: a change is applied where the
+/// window before and after it can differ, found through the count
+/// summaries.
+#[test]
+fn topk_follows_random_changes() {
+    let queries = [
+        "SELECT id, v FROM t ORDER BY v, id LIMIT 3 OFFSET 2",
+        "SELECT g, v FROM t ORDER BY v DESC NULLS LAST OFFSET 4 FETCH FIRST 3 ROWS WITH TIES",
+        "SELECT v FROM t ORDER BY v LIMIT 5 OFFSET 3",
+        "SELECT v FROM t ORDER BY v NULLS FIRST OFFSET 6",
+        "SELECT g, v FROM t ORDER BY v FETCH FIRST 1 ROWS WITH TIES",
+        "SELECT DISTINCT ON (g) g, v FROM t ORDER BY g, v DESC",
+        "SELECT v FROM t ORDER BY v LIMIT 0",
+        "SELECT g FROM t ORDER BY g LIMIT 7 OFFSET 7",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v LIMIT 2 OFFSET 1) x",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v DESC FETCH FIRST 2 ROWS WITH TIES) x",
+    ];
+    for seed in [1, 2] {
+        random_changes_keep_views_equal(&format!("topk-random-{seed}"), &queries, 100, seed * 7919);
+    }
+    // windows of more than 32 rows are located through the count summaries,
+    // smaller ones read from the start of their group
+    let large = [
+        "SELECT id, v FROM t ORDER BY v, id LIMIT 20 OFFSET 30",
+        "SELECT g, v FROM t ORDER BY v DESC NULLS LAST OFFSET 25 FETCH FIRST 10 ROWS WITH TIES",
+        "SELECT v FROM t ORDER BY v LIMIT 40 OFFSET 7",
+        "SELECT v FROM t ORDER BY v NULLS FIRST OFFSET 60",
+        "SELECT g, v FROM t ORDER BY v FETCH FIRST 33 ROWS WITH TIES",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v LIMIT 30 OFFSET 10) x",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v DESC OFFSET 20 FETCH FIRST 15 ROWS WITH TIES) x",
+    ];
+    for seed in [3, 4, 5] {
+        random_changes_keep_views_equal_from(&format!("topk-random-large-{seed}"), &large, 100, seed * 7919, 150);
+    }
+}
+
+/// Window functions of every kind, with ROWS, RANGE (also offsets) and
+/// GROUPS frames, follow random changes, multiplicities, ties, NULLs and
+/// errors included: a change recomputes the rows whose values it can
+/// change, over the rows their frames reach.
+#[test]
+fn windows_follow_random_changes() {
+    let queries = [
+        "SELECT id, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM t",
+        "SELECT id, rank() OVER w AS r, dense_rank() OVER w AS d, percent_rank() OVER w AS pr, cume_dist() OVER w AS cd FROM t WINDOW w AS (PARTITION BY g ORDER BY v)",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, count(*) OVER (PARTITION BY g ORDER BY v) AS c FROM t",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v, id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS s, min(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS m FROM t",
+        "SELECT id, min(v) OVER w AS mn, max(v) OVER w AS mx, avg(v) OVER w AS a, count(v) OVER w AS c FROM t WINDOW w AS (PARTITION BY g ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING)",
+        "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS s, count(v) OVER (ORDER BY v DESC RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING) AS c, max(v) OVER (ORDER BY v NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS mx FROM t",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, count(*) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS c FROM t",
+        "SELECT id, lag(v) OVER (PARTITION BY g ORDER BY id) AS l1, lead(v, 2, -1) OVER (PARTITION BY g ORDER BY id) AS l2, ntile(3) OVER (PARTITION BY g ORDER BY id) AS nt FROM t",
+        "SELECT id, first_value(v) OVER w AS f, last_value(v) OVER w AS l, nth_value(v, 2) OVER w AS n2 FROM t WINDOW w AS (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING)",
+        "SELECT id, first_value(v) OVER (PARTITION BY g ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS f, last_value(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS l FROM t",
+        "SELECT id, string_agg(v::text, ',') OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS sa, array_agg(v) OVER (PARTITION BY g ORDER BY id) AS aa FROM t",
+        "SELECT g, v, count(*) OVER (PARTITION BY g ORDER BY v) AS c, sum(v) OVER (PARTITION BY g ORDER BY v ROWS UNBOUNDED PRECEDING) AS s, row_number() OVER (PARTITION BY g ORDER BY v) AS rn FROM t",
+        "SELECT id, count(*) OVER (PARTITION BY g) AS c, sum(v) OVER () AS s, max(v) OVER () AS mx FROM t",
+        "SELECT id, rank() OVER w AS r, sum(v) OVER (w ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s, max(v) OVER (w ROWS UNBOUNDED PRECEDING) AS m, sum(v) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) AS p FROM t WINDOW w AS (PARTITION BY g ORDER BY v, id)",
+        "SELECT id, dense_rank() OVER (ORDER BY v) AS d, sum(v) OVER (ORDER BY v ROWS BETWEEN 3 FOLLOWING AND UNBOUNDED FOLLOWING) AS s FROM t",
+        "SELECT id, ntile(v) OVER (PARTITION BY g ORDER BY id) AS nt FROM t",
+        "SELECT id, count(*) OVER (PARTITION BY g ORDER BY d RANGE BETWEEN interval '2 days' PRECEDING AND interval '1 day' FOLLOWING) AS c FROM (SELECT id, g, date '2026-01-01' + v AS d FROM t) s",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 40 PRECEDING AND 1 PRECEDING) AS s, lag(v, 2) OVER (PARTITION BY g ORDER BY id) AS l FROM t",
+    ];
+    // (partitions of more than 32 rows are changed in part, smaller ones whole)
+    for seed in [1, 2] {
+        random_changes_keep_views_equal(&format!("window-random-{seed}"), &queries, 60, seed * 104_729);
+    }
+    for seed in [3, 4, 5] {
+        random_changes_keep_views_equal_from(&format!("window-random-large-{seed}"), &queries, 80, seed * 104_729, 150);
+    }
+}
+
+/// The partitions of a window operator that are in error are remembered
+/// (and checkpointed): a change to part of such a partition, also after a
+/// restart, keeps it in error until the failing row is gone, and changes
+/// to other partitions are applied in part (partitions of more than 32
+/// rows).
+#[test]
+fn window_partition_errors_across_restart() {
+    let dir = tmpdir("window-errors");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+    exec(&h, "INSERT INTO t SELECT i, i % 2, 1 + i % 5 FROM generate_series(1, 200) i");
+    let q = "SELECT id, ntile(v) OVER (PARTITION BY g ORDER BY id) AS nt, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM t";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW w AS {q}"));
+    let check = |h: &EngineHandle| assert_eq!(rows_of(h, "SELECT * FROM w").map(sorted), rows_of(h, q).map(sorted));
+    check(&h);
+    exec(&h, "UPDATE t SET v = 0 WHERE id = 10");
+    assert_eq!(read_error(&h, "SELECT * FROM w"), Some("22014 argument of ntile must be greater than zero".to_string()));
+    exec(&h, "UPDATE t SET v = 3 WHERE id = 12");
+    exec(&h, "CHECKPOINT");
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "UPDATE t SET v = 2 WHERE id = 14");
+    exec(&h, "UPDATE t SET v = 2 WHERE id = 15");
+    assert_eq!(read_error(&h, "SELECT * FROM w"), Some("22014 argument of ntile must be greater than zero".to_string()));
+    exec(&h, "UPDATE t SET v = 1 WHERE id = 10");
+    check(&h);
+    exec(&h, "INSERT INTO t VALUES (201, 1, 4)");
+    check(&h);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

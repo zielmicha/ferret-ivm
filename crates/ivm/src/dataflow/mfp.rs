@@ -171,6 +171,28 @@ impl Mfp {
         defs[self.projection[c]].clone()
     }
 
+    /// Can evaluating the steps fail on some row of the `input` types? (No
+    /// only when every step provably evaluates without error.)
+    pub fn may_fail(&self, input: &[ColumnType]) -> bool {
+        let mut ext: Vec<ColumnType> = input.to_vec();
+        for s in &self.steps {
+            match s {
+                MfpStep::Map(e) => {
+                    if !cannot_fail(e, &ext) {
+                        return true;
+                    }
+                    ext.push(e.column_type(&ext));
+                }
+                MfpStep::Filter(e) => {
+                    if !cannot_fail(e, &ext) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Predicates expressed over input columns.
     pub fn predicates_over_input(&self) -> Vec<Expr> {
         let mut defs: Vec<Expr> = (0..self.input_arity).map(Expr::Column).collect();
@@ -185,5 +207,36 @@ impl Mfp {
             }
         }
         out
+    }
+}
+
+/// Does `e` evaluate without error on every row of `types`? Conservative:
+/// columns, constants, comparisons of two values of the same (scalar) type,
+/// and null tests, boolean connectives, CASE and COALESCE over those.
+fn cannot_fail(e: &Expr, types: &[ColumnType]) -> bool {
+    use crate::types::SqlType as T;
+    let ok = |x: &Expr| cannot_fail(x, types);
+    // comparing values of one type cannot fail (no casts, no overflow)
+    let comparable = |xs: &[&Expr]| {
+        let t = xs[0].ty(types);
+        matches!(
+            t,
+            T::Bool | T::Int2 | T::Int4 | T::Int8 | T::Float4 | T::Float8 | T::Numeric | T::Text | T::Bytea | T::Date | T::Time
+                | T::Timestamp | T::TimestampTz | T::Interval | T::Uuid | T::Oid
+        ) && xs.iter().all(|x| x.ty(types) == t && ok(x))
+    };
+    match e {
+        Expr::Column(_) | Expr::Literal(..) => true,
+        Expr::Not(x) | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::BoolTest(x, _) => ok(x),
+        Expr::And(xs) | Expr::Or(xs) | Expr::Coalesce(xs, _) => xs.iter().all(ok),
+        Expr::Case(c) => c.whens.iter().all(|(w, t)| ok(w) && ok(t)) && ok(&c.else_),
+        Expr::IsDistinct(a, b, _) | Expr::NullIf(a, b) => comparable(&[a, b]),
+        Expr::InList(x, list, _) => comparable(&std::iter::once(&**x).chain(list).collect::<Vec<_>>()),
+        Expr::Call(c) => {
+            matches!(crate::expr::func::func_def(c.func).name, "=" | "<>" | "<" | "<=" | ">" | ">=")
+                && c.args.len() == 2
+                && comparable(&[&c.args[0], &c.args[1]])
+        }
+        _ => false,
     }
 }

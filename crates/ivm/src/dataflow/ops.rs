@@ -689,26 +689,221 @@ impl TopKPlan {
     }
 }
 
-/// Rows of a group's top-k as of `at`.
-fn topk_rows(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], at: ReadAt, p: &TopKPlan) -> Result<Delta> {
+/// A group of a TopK's input index: its key range, read with the count
+/// summaries (positions count rows with their multiplicities).
+struct TopKGroup<'a> {
+    tree: TreeId,
+    layout: &'a Layout,
+    lo: Vec<u8>,
+    hi: Option<Vec<u8>>,
+}
+
+impl TopKGroup<'_> {
+    fn hi(&self) -> Bound<&[u8]> {
+        match &self.hi {
+            Some(h) => Bound::Excluded(h.as_slice()),
+            None => Bound::Unbounded,
+        }
+    }
+
+    /// Visit the entries from `from` up to `to` (within the group).
+    fn for_each(&self, env: &mut Env, from: &[u8], to: &Bound<Vec<u8>>, f: &mut dyn FnMut(&[u8], &History) -> Result<bool>) -> Result<()> {
+        let to = match to {
+            Bound::Unbounded => self.hi(),
+            b => b.as_ref().map(|k| k.as_slice()),
+        };
+        env.for_each(self.tree, Bound::Included(from), to, f)
+    }
+
+    /// Rows of the group before `key` (current weights).
+    fn rank(&self, env: &mut Env, key: &[u8]) -> Result<i64> {
+        Ok(env.range_summary(self.tree, Bound::Included(&self.lo), Bound::Excluded(key))?.count)
+    }
+
+    /// The entry holding the row at position `pos` (current weights), with
+    /// the position of the row within the entry's multiplicity.
+    fn nth(&self, env: &mut Env, pos: i64) -> Result<Option<(Box<[u8]>, i64)>> {
+        Ok(env.nth(self.tree, Bound::Included(&self.lo), self.hi(), pos)?.map(|(k, _, o)| (k, o)))
+    }
+
+    /// Canonical key of an entry: rows tied in the ORDER BY share it.
+    fn tie_key<'k>(&self, key: &'k [u8]) -> Result<&'k [u8]> {
+        Ok(&key[..self.layout.prefix_len(key, self.layout.key_len())?])
+    }
+}
+
+/// The entries of a group changed by a step, in key order, with their weight
+/// before and after it and their position in the current order.
+struct Changed {
+    key: Vec<u8>,
+    before: i64,
+    after: i64,
+    rank: i64,
+}
+
+/// One version (before or after a step) of the group's index: the current
+/// weights, or the weights before the step derived from them and the
+/// changed entries (positions move by the changes before them).
+#[derive(Clone, Copy)]
+struct Version<'a> {
+    changed: &'a [Changed],
+    before: bool,
+}
+
+impl Version<'_> {
+    /// Change of position of the entries at or after `key` (but before the
+    /// next changed entry) from the version before the step to the current.
+    fn shift(&self, key: &[u8]) -> i64 {
+        self.changed.iter().take_while(|c| c.key.as_slice() < key).map(|c| c.after - c.before).sum()
+    }
+
+    /// Rows in the group.
+    fn len(&self, total: i64) -> i64 {
+        if self.before { total - self.changed.iter().map(|c| c.after - c.before).sum::<i64>() } else { total }
+    }
+
+    /// The entry holding the row at position `pos`, as `TopKGroup::nth`.
+    fn nth(&self, env: &mut Env, g: &TopKGroup, pos: i64) -> Result<Option<(Box<[u8]>, i64)>> {
+        if !self.before {
+            return g.nth(env, pos);
+        }
+        // the unchanged entries between two changed ones keep their order,
+        // their positions shifted by the changes before them
+        let mut shift = 0;
+        for c in self.changed {
+            let rank = c.rank - shift;
+            if pos < rank {
+                break;
+            }
+            if pos < rank + c.before.max(0) {
+                return Ok(Some((c.key.clone().into_boxed_slice(), pos - rank)));
+            }
+            shift += c.after - c.before;
+        }
+        g.nth(env, pos + shift)
+    }
+}
+
+/// End of a top-k window.
+enum WinEnd {
+    /// Before the row at this position.
+    Pos(i64),
+    /// With the rest of entry `last` and the entries tied with it (keys
+    /// before `tie_end`, if any).
+    Ties { last: Box<[u8]>, tie_end: Option<Vec<u8>> },
+}
+
+/// The rows of one version of a group that a TopK outputs.
+struct Window {
+    offset: i64,
+    /// The entry holding the row at position `offset` (None: empty
+    /// window), and that row's position within the entry's multiplicity.
+    first: Option<(Box<[u8]>, i64)>,
+    end: WinEnd,
+    /// The entry holding the window's last row when it ends at a position,
+    /// and the row's position within it (None: through the end of the
+    /// group).
+    last: Option<(Box<[u8]>, i64)>,
+}
+
+impl Window {
+    fn of(env: &mut Env, g: &TopKGroup, v: Version, total: i64, p: &TopKPlan) -> Result<Window> {
+        let n = v.len(total);
+        let offset = i64::try_from(p.offset).unwrap_or(i64::MAX);
+        let first = if offset < n { v.nth(env, g, offset)? } else { None };
+        let limit = p.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX));
+        let (end, last) = match limit {
+            Some(l) if offset.saturating_add(l) <= n => {
+                let e = offset.saturating_add(l);
+                let last = v.nth(env, g, e - 1)?;
+                match (p.with_ties, last) {
+                    (true, Some((last, _))) => {
+                        let tie_end = crate::types::encoding::prefix_successor(g.tie_key(&last)?);
+                        (WinEnd::Ties { last, tie_end }, None)
+                    }
+                    (_, last) => (WinEnd::Pos(e), last),
+                }
+            }
+            _ => (WinEnd::Pos(n), None),
+        };
+        Ok(Window { offset, first, end, last })
+    }
+
+    /// How many of an entry's `w` rows at positions `pos..` are in the window.
+    fn rows(&self, key: &[u8], pos: i64, w: i64) -> i64 {
+        if self.first.is_none() || w <= 0 {
+            return 0;
+        }
+        let from = pos.max(self.offset);
+        match &self.end {
+            WinEnd::Pos(e) => (pos + w).min(*e) - from,
+            WinEnd::Ties { last, tie_end } => {
+                if key <= &last[..] {
+                    pos + w - from
+                } else if tie_end.as_ref().is_none_or(|t| key < t.as_slice()) {
+                    w
+                } else {
+                    0
+                }
+            }
+        }
+        .max(0)
+    }
+
+    /// Key range holding the window's rows: [first, end].
+    fn range(&self) -> Option<(Vec<u8>, Bound<Vec<u8>>)> {
+        let first = self.first.as_ref()?.0.to_vec();
+        Some(match (&self.end, &self.last) {
+            (WinEnd::Ties { tie_end: Some(t), .. }, _) => (first, Bound::Excluded(t.clone())),
+            (WinEnd::Pos(_), Some((l, _))) => (first, Bound::Included(l.to_vec())),
+            _ => (first, Bound::Unbounded),
+        })
+    }
+
+    /// Does an entry come before the window's rows, or after them?
+    fn outside(&self, key: &[u8]) -> bool {
+        let Some((first, _)) = &self.first else { return true };
+        key < &first[..]
+            || match (&self.end, &self.last) {
+                (WinEnd::Ties { tie_end: Some(t), .. }, _) => key >= t.as_slice(),
+                (WinEnd::Pos(_), Some((l, _))) => key > &l[..],
+                _ => false,
+            }
+    }
+}
+
+/// Windows of at most this many rows (OFFSET included) are read from the
+/// start of their group: that costs less than locating them.
+const SMALL_WINDOW: u64 = 32;
+
+fn small_window(p: &TopKPlan) -> bool {
+    p.limit.is_some_and(|l| p.offset.saturating_add(l) <= SMALL_WINDOW)
+}
+
+/// Rows of a group's top-k, now or (with the step's changes) before the
+/// step, walking the group from its start (small windows).
+fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, before: Option<&EntryDeltas>) -> Result<Delta> {
     let mut out = Vec::new();
-    let mut skipped = 0u64;
-    let mut taken = 0u64;
+    let (mut skipped, mut taken) = (0u64, 0u64);
     let limit = p.limit.unwrap_or(u64::MAX);
     if limit == 0 {
         return Ok(out);
     }
     let mut last_key: Option<Vec<u8>> = None;
-    env.for_each_prefix(tree, prefix, &mut |k, h| {
-        let mut w = h.weight(at);
+    g.for_each(env, &g.lo, &Bound::Unbounded, &mut |k, h| {
+        visited(1);
+        let mut w = match before {
+            Some(d) => d.before(k, h.total()),
+            None => h.total(),
+        };
         if w <= 0 {
             return Ok(true);
         }
         if taken >= limit {
             // past the limit only rows tied with the last one remain
             return match &last_key {
-                Some(lk) if p.with_ties && layout.key_bytes(k)? == lk.as_slice() => {
-                    out.push((layout.decode_row(k)?, w));
+                Some(lk) if p.with_ties && g.tie_key(k)? == lk.as_slice() => {
+                    out.push((g.layout.decode_row(k)?, w));
                     Ok(true)
                 }
                 _ => Ok(false),
@@ -724,10 +919,10 @@ fn topk_rows(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], at: Re
         }
         // with ties, the rest of an entry's multiplicity is tied too
         let take = if p.with_ties { w as u64 } else { (limit - taken).min(w as u64) };
-        out.push((layout.decode_row(k)?, take as i64));
+        out.push((g.layout.decode_row(k)?, take as i64));
         taken += take;
         if p.with_ties {
-            last_key = Some(layout.key_bytes(k)?.to_vec());
+            last_key = Some(g.tie_key(k)?.to_vec());
             Ok(true)
         } else {
             Ok(taken < limit)
@@ -736,29 +931,205 @@ fn topk_rows(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], at: Re
     Ok(out)
 }
 
-fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
+/// Rows of a group's top-k (current weights), from the row at position
+/// OFFSET on (found through the count summaries, not by walking the rows
+/// before it).
+fn topk_rows(env: &mut Env, g: &TopKGroup, p: &TopKPlan) -> Result<Delta> {
+    if small_window(p) {
+        return topk_walk(env, g, p, None);
+    }
+    let mut out = Vec::new();
+    if p.limit == Some(0) {
+        return Ok(out);
+    }
+    let total = env.range_summary(g.tree, Bound::Included(&g.lo), g.hi())?.count;
+    let w = Window::of(env, g, Version { changed: &[], before: false }, total, p)?;
+    let Some((from, to)) = w.range() else { return Ok(out) };
+    let mut pos = g.rank(env, &from)?;
+    g.for_each(env, &from, &to, &mut |k, h| {
+        visited(1);
+        let n = h.total();
+        let take = w.rows(k, pos, n);
+        if take > 0 {
+            out.push((g.layout.decode_row(k)?, take));
+        }
+        pos += n.max(0);
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+/// Key ranges [from, to] to visit, merged where they overlap.
+fn merge_ranges(mut ranges: Vec<(Vec<u8>, Bound<Vec<u8>>)>) -> Vec<(Vec<u8>, Bound<Vec<u8>>)> {
+    ranges.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out: Vec<(Vec<u8>, Bound<Vec<u8>>)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        if let Some((_, last)) = out.last_mut() {
+            let overlaps = match &*last {
+                Bound::Unbounded => true,
+                Bound::Included(e) => from <= *e,
+                Bound::Excluded(e) => from < *e,
+            };
+            if overlaps {
+                let longer = match (&*last, &to) {
+                    (Bound::Unbounded, _) => false,
+                    (_, Bound::Unbounded) => true,
+                    (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) if a != b => b > a,
+                    (Bound::Excluded(_), Bound::Included(_)) => true,
+                    _ => false,
+                };
+                if longer {
+                    *last = to;
+                }
+                continue;
+            }
+        }
+        out.push((from, to));
+    }
+    out
+}
+
+/// The change of one group's top-k at a step: the difference between the
+/// window of the group before the step and after it, computed only where
+/// they can differ. Rows are counted with their multiplicities in index
+/// order; entries whose rows are in neither window, or (unchanged) wholly
+/// in both, are not visited: those between the two windows' first rows,
+/// those between their last rows, and the changed entries are.
+fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, deltas: &EntryDeltas, out: &mut Delta) -> Result<()> {
+    if p.limit == Some(0) {
+        return Ok(());
+    }
+    if small_window(p) {
+        out.extend(topk_walk(env, g, p, Some(deltas))?.into_iter().map(|(r, w)| (r, -w)));
+        out.extend(topk_walk(env, g, p, None)?);
+        return Ok(());
+    }
+    let mut changed: Vec<Changed> = Vec::with_capacity(deltas.entries().len());
+    for (key, d) in deltas.entries() {
+        let after = env.get(g.tree, key)?.map(|h| h.total()).unwrap_or(0);
+        changed.push(Changed { key: key.clone(), before: after - d, after, rank: 0 });
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    for c in changed.iter_mut() {
+        c.rank = g.rank(env, &c.key)?;
+    }
+    // Changes after the windows (of both versions: the positions before the
+    // first change are the same in both) change nothing.
+    let first = &changed[0];
+    let offset = i64::try_from(p.offset).unwrap_or(i64::MAX);
+    if let Some(l) = p.limit.map(|l| i64::try_from(l).unwrap_or(i64::MAX)) {
+        let e = offset.saturating_add(l);
+        if first.rank >= e {
+            if !p.with_ties {
+                return Ok(());
+            }
+            // (with ties, unless the first change is tied with the last row)
+            let (last, _) = g.nth(env, e - 1)?.expect("row before a changed entry");
+            if g.tie_key(&last)? != g.tie_key(&first.key)? {
+                return Ok(());
+            }
+        }
+    }
+    let total = env.range_summary(g.tree, Bound::Included(&g.lo), g.hi())?.count;
+    let (old_v, new_v) = (Version { changed: &changed, before: true }, Version { changed: &changed, before: false });
+    let old = Window::of(env, g, old_v, total, p)?;
+    let new = Window::of(env, g, new_v, total, p)?;
+    // Where the windows can differ: the changed entries in either window,
+    // and between the two windows' first rows and their last rows (unless
+    // those are the same unchanged entries, at the same position in them).
+    let is_changed = |k: &[u8]| changed.binary_search_by(|c| c.key.as_slice().cmp(k)).is_ok();
+    let mut ranges: Vec<(Vec<u8>, Bound<Vec<u8>>)> = changed
+        .iter()
+        .filter(|c| !old.outside(&c.key) || !new.outside(&c.key))
+        .map(|c| (c.key.clone(), Bound::Included(c.key.clone())))
+        .collect();
+    let span = |a: &[u8], b: &[u8]| if a <= b { (a.to_vec(), b.to_vec()) } else { (b.to_vec(), a.to_vec()) };
+    let differ = |a: &(Box<[u8]>, i64), b: &(Box<[u8]>, i64)| a != b || is_changed(&a.0);
+    match (&old.first, &new.first) {
+        (Some(fo), Some(fn_)) => {
+            if differ(fo, fn_) {
+                let (a, b) = span(&fo.0, &fn_.0);
+                ranges.push((a, Bound::Included(b)));
+            }
+            match (&old.end, &new.end, &old.last, &new.last) {
+                (WinEnd::Pos(_), WinEnd::Pos(_), Some(lo), Some(ln)) => {
+                    if differ(lo, ln) {
+                        let (a, b) = span(&lo.0, &ln.0);
+                        ranges.push((a, Bound::Included(b)));
+                    }
+                }
+                (WinEnd::Ties { last: lo, tie_end: to }, WinEnd::Ties { last: ln, tie_end: tn }, _, _) => {
+                    // (the changed entries among the ties are visited anyway)
+                    if lo != ln || to != tn {
+                        let end = match (to, tn) {
+                            (Some(x), Some(y)) => Bound::Excluded(x.max(y).clone()),
+                            _ => Bound::Unbounded,
+                        };
+                        ranges.push((lo.min(ln).to_vec(), end));
+                    }
+                }
+                // one through the end of the group: from the other's last row
+                (_, _, Some((l, _)), None) | (_, _, None, Some((l, _))) => ranges.push((l.to_vec(), Bound::Unbounded)),
+                (WinEnd::Ties { last, .. }, _, _, _) | (_, WinEnd::Ties { last, .. }, _, _) => ranges.push((last.to_vec(), Bound::Unbounded)),
+                // both through the end of the group
+                _ => {}
+            }
+        }
+        // one window is empty: the other one entirely
+        _ => ranges.extend(old.range().into_iter().chain(new.range())),
+    }
+    for (from, to) in merge_ranges(ranges) {
+        let mut pos_new = g.rank(env, &from)?;
+        let mut pos_old = pos_new - old_v.shift(&from);
+        g.for_each(env, &from, &to, &mut |k, h| {
+            visited(1);
+            let wn = h.total();
+            let wo = deltas.before(k, wn);
+            let d = new.rows(k, pos_new, wn) - old.rows(k, pos_old, wo);
+            if d != 0 {
+                out.push((g.layout.decode_row(k)?, d));
+            }
+            pos_new += wn.max(0);
+            pos_old += wo.max(0);
+            Ok(true)
+        })?;
+    }
+    Ok(())
+}
+
+fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &NodeDelta, _gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
-    let groups = affected_keys(env, delta, gsn, &|row| {
-        let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
-        Ok(layout.encode_prefix(&kv))
-    })?;
-    groups.for_each(env, &mut |env, prefix| {
-        for (r, w) in topk_rows(env, a.tree, &layout, prefix, ReadAt::Before(gsn), p)? {
-            out.push(env, r, -w)?;
-        }
-        for (r, w) in topk_rows(env, a.tree, &layout, prefix, ReadAt::Latest, p)? {
-            out.push(env, r, w)?;
+    // the changes by group
+    let mut groups: BTreeMap<Vec<u8>, Vec<(Row, i64)>> = BTreeMap::new();
+    delta.for_each_batch(env, &mut |_, batch| {
+        for (row, w) in batch {
+            let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
+            groups.entry(layout.encode_prefix(&kv)).or_default().push((row.clone(), *w));
         }
         Ok(())
-    })
+    })?;
+    for (prefix, rows) in groups {
+        let deltas = EntryDeltas::of(&layout, rows.iter().map(|(r, w)| (r, *w)))?;
+        let hi = crate::types::encoding::prefix_successor(&prefix);
+        let grp = TopKGroup { tree: a.tree, layout: &layout, lo: prefix, hi };
+        let mut d = Vec::new();
+        topk_group(env, &grp, p, &deltas, &mut d)?;
+        for (r, w) in d {
+            out.push(env, r, w)?;
+        }
+    }
+    Ok(())
 }
 
 fn topk_snapshot(g: &Graph, env: &mut Env, p: &TopKPlan, out: &mut SnapOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
     let ng = p.group_key.len();
-    // enumerate distinct group prefixes, seeking from one group to the next
+    // groups in key order, seeking from one group's first live entry to the
+    // next group
     let mut from: Option<Vec<u8>> = None;
     loop {
         let lo = match &from {
@@ -770,19 +1141,21 @@ fn topk_snapshot(g: &Graph, env: &mut Env, p: &TopKPlan, out: &mut SnapOut) -> R
             if h.total() <= 0 {
                 return Ok(true);
             }
-            let (vals, _) = layout.decode_key_values(k)?;
-            next = Some(layout.encode_prefix(&vals[..ng]));
+            next = Some(k[..layout.prefix_len(k, ng)?].to_vec());
             Ok(false)
         })?;
-        let Some(prefix) = next else { return Ok(()) };
-        for (r, w) in topk_rows(env, a.tree, &layout, &prefix, ReadAt::Latest, p)? {
+        let Some(prefix) = next else { break };
+        let hi = crate::types::encoding::prefix_successor(&prefix);
+        from = hi.clone();
+        let grp = TopKGroup { tree: a.tree, layout: &layout, lo: prefix, hi };
+        for (r, w) in topk_rows(env, &grp, p)? {
             out.push(env, r, w)?;
         }
-        from = crate::types::encoding::prefix_successor(&prefix);
         if from.is_none() {
-            return Ok(());
+            break;
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- recursion

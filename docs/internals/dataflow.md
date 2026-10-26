@@ -58,9 +58,10 @@ message) and flow to the consumers (see [Errors](#errors)).
 
 `dataflow::Graph` holds:
 
-- **nodes** (`Node`): an operator (`NodeKind`), its input node ids, its
-  output schema, a structural fingerprint, a reference count, the ids of its
-  arrangements, and a `hydrated` flag;
+- **nodes** (`Node`): an operator (`NodeKind`), its input node ids and the
+  ids of the nodes that read it (its consumers), its output schema, a
+  structural fingerprint, a reference count, the ids of its arrangements, a
+  creation sequence number, and a `hydrated` flag;
 - **arrangements** (`Arrangement`): persistent indexes of a node's output —
   a storage tree plus a `Layout` (key expressions, sort order, per-node
   summaries) — with a fingerprint, a reference count, a `hydrated` flag and
@@ -71,8 +72,11 @@ message) and flow to the consumers (see [Errors](#errors)).
   per-node activity counters (for the web UI), and, during recovery, the
   maps of recovered trees and their `since` by fingerprint.
 
-Node ids are assigned in creation order and a node is always created after
-its inputs, so **id order is a topological order**.
+Nodes and arrangements live in slots indexed by their ids; the slot of one
+that is freed is reused (a `SUBSCRIBE (query)` would otherwise leave its
+slots, and the statistics of its nodes, behind for good). A node is always
+created after its inputs, so **creation order (`Node::seq`) is a
+topological order**.
 
 ### Hash-consing
 
@@ -120,7 +124,9 @@ table node) and every `Tick` record (with no changes), in two phases:
 changes (a table's changes may come in several batches, in their order),
 then `step_finish`; `Graph::step_observed(env, gsn, changes, observed)` does
 all three. `observed` names the nodes whose rows the caller needs (the
-engine passes the nodes of subscriptions and sinks).
+engine passes the nodes of subscriptions and sinks). Only the nodes that
+can produce something are considered, so the cost of a step does not
+depend on the size of the graph:
 
 1. **Feeding** a table's changes: they are applied in chunks of about the
    spill threshold (by `row_bytes`). `ops::table_step` turns a chunk into a
@@ -132,12 +138,15 @@ engine passes the nodes of subscriptions and sinks).
    other arrangements when the table node is propagated. If nothing will
    read the table's delta (no hydrated consumer, not observed), a large
    one goes to those arrangements directly, through `TreeBuilder`s.
-2. **Propagating**: visit nodes in topological order, skipping nodes that
-   are not hydrated. A `Table` node that was fed completes its
-   arrangements and hands on its accumulated delta. Any other node runs if
-   one of its inputs produced output at this GSN — or, for a temporal
-   filter, if the clock moved since the previous step — reading its inputs'
-   deltas in batches.
+2. **Propagating**: nodes run in topological (creation) order, taken from
+   a queue that starts with the fed tables' nodes and, if the clock moved
+   since the previous step, every temporal filter; a node that produces
+   output queues its hydrated consumers (every node knows its consumers).
+   Nodes that are not hydrated are skipped. A `Table` node completes its
+   arrangements and hands on its accumulated delta. Any other node runs
+   because one of its inputs produced output at this GSN — or, for a
+   temporal filter, because the clock moved — reading its inputs' deltas
+   in batches.
 3. The node's output delta is applied to **all of its arrangements at
    `gsn`** before any consumer runs (a spilled one by merging its trees),
    and its error records are added to the node's accumulated ones. The
@@ -156,7 +165,8 @@ engine passes the nodes of subscriptions and sinks).
 
 The engine merges the error records of each view's root into the view's
 error counts and forwards the data deltas of subscribed nodes to
-subscriptions and sinks (a spilled one read into memory for that).
+subscriptions and sinks (a spilled one read into memory for that;
+[Architecture](architecture.md#the-engine-loop)).
 
 ## Arrangements and layouts
 
@@ -186,7 +196,7 @@ Kinds of arrangements:
 | aggregation input | group columns (+ `ORDER BY` columns of an ordered aggregate) | the aggregates' needs | `Reduce` |
 | aggregation output | group columns | — | `Reduce` |
 | full index | all columns | — | `Distinct`, `SetOp`, `Recursive` (its output, and source relations that have no arrangement), a view's read index |
-| top-k / window input | group/partition columns, then sort columns | — | `TopK`, `Window` |
+| top-k / window input | group/partition columns, then sort columns | — (window: the summaries of aggregates whose frames reach a partition's end) | `TopK`, `Window` |
 | temporal events | (time, kind) | — | `TemporalFilter` (private state) |
 | user index | `CREATE INDEX` columns | — | `CREATE INDEX` |
 
@@ -319,14 +329,24 @@ extended along *i*'s path. Input *j* is read *after* the GSN if `j < i` and
 - When all inputs are bound, the joined row goes to the output.
 - For hydration, the join drives the path of its smallest regular input
   (by index size) over that input's snapshot, in chunks of about 8 MiB of
-  rows (estimated by `row_bytes`); the MFPs of the other regular inputs are
-  evaluated over their contents too, so that their expression errors are
-  counted once per row, as the steps count them.
+  rows (estimated by `row_bytes`); the other inputs are only looked up.
 - A path is extended depth first in chunks: a lookup step takes at most
   8 MiB of its frontier at a time, hands its output on in chunks of 8 MiB,
   and reads a key's matches in batches of 1,024 rows (or 1 MiB of entries),
   so the rows in flight stay bounded whatever the fan-out. Within a chunk,
   rows are looked up in key order (rows with equal keys share a lookup).
+- Expression errors of an input's MFP count once per input row, by the
+  input's **error tracker**: an input whose MFP may fail (every step but
+  columns, constants, comparisons of two values of one scalar type, null
+  tests, `AND`/`OR`/`NOT`, `CASE` and `COALESCE` over those) gets an `Mfp`
+  node applying the MFP to the input's rows and keeping none, with an
+  arrangement that stays empty. It is an input of the join, so its error
+  records reach the join's output and contents like any input's; being
+  arranged, its error records are authoritative and checkpointed: a join
+  hydrated later over the same input reads them instead of evaluating the
+  MFP over the input again (only the tracker's own hydration does, once).
+  Joins whose input MFPs cannot fail have no trackers, and their
+  hydration reads no input but the one it drives.
 
 Lookup order is chosen per path by the planner ([Planner](planner.md#delta-join-planning)):
 the next input is the one with the most equality conditions to the bound
@@ -366,7 +386,7 @@ every subtree:
 | `bool_and(x)` | count of false, non-null count |
 | `bool_or(x)` | count of true, non-null count |
 | `stddev*`, `var*` | sum, sum of squares, non-null count (for `bigint`, `numeric` sums of the argument cast to `numeric`: squares of `bigint` values would overflow `i128` sums) |
-| `percentile_cont/disc` | non-null count (values located by rank); with `FILTER`, none (the group is scanned) |
+| `percentile_cont/disc` | non-null count (values read at their ranks with `Env::nth`); with `FILTER`, none (the group is scanned) |
 | `string_agg`, `array_agg`, `json(b)_agg`, `json(b)_object_agg`, `mode` | none (the group is scanned) |
 
 `FILTER (WHERE f)` is folded into the argument (`CASE WHEN f THEN x END`).
@@ -380,13 +400,16 @@ input index — O(log n) whatever the group size (a `min`/`max` value wider
 than node summaries hold takes a second descent to its entry, see
 [Storage](storage.md#wide-min-and-max-values)) — with the group's key
 values taken from its first live entry (so the representation is that of the
-first entry in index order). Ordered aggregates additionally scan the group.
-Percentiles read the values at the required ranks with `Env::nth`; when the
-`ORDER BY` column sorts NULLs first (`DESC`, `NULLS FIRST`), they skip the
-group's NULL entries first. If old and new rows differ (by exact
-comparison), `−old, +new` is emitted. (A spilled input delta's groups are
-collected as their key prefixes, through a temporary tree if they exceed
-the spill threshold, and each group is summarised from the index.)
+first entry in index order). Percentiles (without `FILTER`) read the values
+at the required ranks with `Env::nth` — O(log n) each, whatever the group
+size; when the `ORDER BY` column sorts NULLs first (`DESC`, `NULLS FIRST`),
+they skip the group's NULL entries first. The other ordered aggregates
+(`string_agg`, `array_agg`, `json(b)_agg`, the object aggregates, `mode`,
+and percentiles with `FILTER`) additionally scan the group. If old and new
+rows differ (by exact comparison), `−old, +new` is emitted. (A spilled
+input delta's groups are collected as their key prefixes, through a
+temporary tree if they exceed the spill threshold, and each group is
+summarised from the index.)
 
 - **Group cache**: the summaries (and key values) of recently touched groups
   are kept in memory. A small change to a large group is folded into the
@@ -394,8 +417,11 @@ the spill threshold, and each group is summarised from the index.)
   delta). When folding is
   not exact — a `min`/`max` loses its extreme, or the group key has types with
   several representations and a row is retracted or arrives in another
-  representation — the group is summarised from the index. Disabled for
-  ordered aggregates and with `IVM_NO_GROUP_CACHE`. The caches of all
+  representation — the group is summarised from the index. A group with a
+  percentile takes its previous output row from the output index (the
+  values at the ranks before the step are no longer in the input index)
+  and reads the new values at their ranks. Disabled for aggregates that
+  scan the group and with `IVM_NO_GROUP_CACHE`. The caches of all
   `Reduce`s share one byte budget, an eighth of the memory budget
   (`Graph::group_caches`, see [Memory](architecture.md#memory)); an entry is
   counted at its size in memory (the map's slot, the key, the summary's
@@ -450,23 +476,84 @@ as `Distinct(Union)`.)
 ### TopK
 
 `ORDER BY ... LIMIT/OFFSET`, `FETCH ... WITH TIES` and `DISTINCT ON` (limit
-1 per group). The input is arranged by (group columns, sort columns). For
-each changed group the operator reads the group's first `offset + limit`
-rows before and after the GSN (walking entries and multiplicities) and emits
-the difference. `WITH TIES` keeps rows whose canonical sort key equals the
-last kept row's.
+1 per group). The input is arranged by (group columns, sort columns). A
+group's output is its *window*: the rows (counted with their
+multiplicities, in index order) at positions `offset` to
+`offset + limit − 1`; `WITH TIES` extends it with the rest of the last row's
+entry and the entries whose canonical sort key equals that entry's.
+Positions are found with the count summaries (`Env::nth`, `range_summary`),
+never by walking the rows before them.
+
+For each changed group the operator compares the window before the GSN
+with the window after it, without reading either in full:
+
+- the positions before the GSN are those after it, shifted by the weight
+  changes of the changed entries before them, so the window before the GSN
+  is located from the current counts as well. An entry's weight before the
+  GSN is its current weight minus the step's change to it (the operator's
+  input delta, `EntryDeltas`), not read from its history;
+- if the first changed entry comes after the window (its position is past
+  `offset + limit`, and with ties it is not tied with the last row), nothing
+  changes;
+- otherwise only the entries where the two windows can differ are visited:
+  between the two windows' first rows, between their last rows (or through
+  the tie groups), and the changed entries inside either window. Every
+  other entry has all or none of its rows in both windows. Each visited
+  entry contributes the difference of its rows in the two windows.
+
+The work is proportional to the number of changes and to how far the
+window moves, not to `offset` or `limit` (when the window moves past its
+own length, the two windows are read). Windows of at most 32 rows
+(`offset` included) are instead read from the start of their group, before
+and after the GSN, which costs less than locating them.
 
 ### Window
 
-The input is arranged by (partition columns, `ORDER BY` columns); window
-functions with the same partitioning and order share one operator. For each
-changed partition, all window values are computed for the partition before
-and after the GSN (`compute_partition`: peer groups, frame bounds per row,
-running aggregates for frames starting at `UNBOUNDED PRECEDING`), and the old
-rows are retracted and the new ones inserted. Cost is proportional to the
-partition size — intrinsic for functions like `row_number` where one insert
-shifts every later row. An error in a partition (for example `ntile(0)`)
-becomes an error record.
+The input is arranged by (partition columns, `ORDER BY` columns), with
+summaries for the aggregates whose frames reach a partition's start or end
+(`UNBOUNDED PRECEDING`, `UNBOUNDED FOLLOWING`); window functions with the
+same partitioning and order share one operator.
+
+Values are computed over a *run* of consecutive rows of a partition
+(`compute`): frames slide over it — rows entering a frame are added to and
+rows leaving it subtracted from the invertible states (counts, sums),
+`min`/`max` are kept in monotonic deques (the leftmost of equal values
+first, as summaries keep it), and ordered aggregates read the frame's rows
+in place — so a run costs time proportional to its length, whatever the
+frames. The parts of frames up to the partition's ends that lie outside the
+run come from range summaries of the input index, and the rows at
+positions outside it (for `lag`, `lead`, `first_value`, ...) from
+`Env::nth`. A row's multiplicity is expanded into positions, but
+consecutive equal output rows are emitted once, with their count.
+
+For each changed partition, the operator determines from the functions and
+their frames which rows' values the change can change: rows whose frame
+holds a changed row (frames ending after it reach back from it, frames
+starting before it forward from it), the rows after it for `row_number` and
+`rank` when the partition's size changes (for `dense_rank` always; every row
+for `percent_rank`, `cume_dist` and `ntile`), the next row for `lag` (any
+row with an explicit offset), and so on. It reads the run those rows'
+values depend on — their frames, except the parts that summaries or row
+lookups provide; whole peer groups; from the partition's start for
+`dense_rank` — computes their values before and after the GSN, and emits
+the difference. Positions outside the changed rows are the same in both
+versions, so both are computed from one read of the run (an entry's weight
+before the GSN being its current weight minus the step's change to it,
+`EntryDeltas`). The work is proportional to the rows
+that change and the rows their frames reach: appending to a partition with
+a running sum reads a few rows, while a change that changes every row (an
+insert at the start with `row_number`, any change with frames reaching the
+partition's end) reads the partition once. Partitions of at most 32 rows
+are recomputed whole: finding what to read would cost more.
+
+An error in a partition (for example `ntile(0)`) becomes an error record,
+and none of its rows is output. The partitions in error are remembered
+(`WindowPlan::errors`): a change to a partition in error, or one that puts
+it in error, recomputes the whole partition before and after the GSN. The
+state is computed by the operator's snapshot or restored from a checkpoint;
+an operator for which neither happened (a new one whose snapshot was not
+taken, or one recovered from a checkpoint of an older version) computes it
+at the end of hydration.
 
 ### Recursive
 
@@ -485,10 +572,29 @@ again.
 ### TemporalFilter
 
 Rows pass while temporal predicates over the clock hold. For each row the
-operator bisects its validity interval `[lo, hi)`, emits it if valid now,
-and stores future `(time, kind, row)` events in a private arrangement keyed
-by (time `bigint`, kind `smallint`) — kind 0 "becomes valid", kind 1
-"expires". At each step it releases the events due at the current clock.
+operator computes its validity interval `[lo, hi)` (below), emits it if
+valid now, and stores future `(time, kind, row)` events in a private
+arrangement keyed by (time `bigint`, kind `smallint`) — kind 0 "becomes
+valid", kind 1 "expires". At each step it releases the events that became
+due since the previous step: those after the previous step's clock
+(`Graph::released_through`), up to the current one. Events are only ever
+scheduled after the clock, so none at or before the previous step's clock
+is still pending; released events stay in the arrangement as entries of
+weight zero until compaction removes them, and are never visited again. A
+graph rebuilt by recovery starts from the checkpoint's clock
+(`Graph::restore_clock`), up to which the checkpointed filters released
+everything.
+
+Each predicate is `clock_side op row_side`; its value changes where
+`clock_side(t)` reaches the row side's value `x`. The operator first tries
+the time where a shift of the clock reaches `x` — `t0 + (y − clock_side(t0))`
+at `t0 = y`, `y` being `x` or the next value of its type for a strict
+condition — and takes it if the predicate changes exactly there (two
+evaluations); only otherwise does it bisect the predicate over the searched
+range. Shifts of the clock by constant intervals therefore take three
+evaluations of the clock side per predicate instead of about 55, and the
+result is exact whatever the arithmetic (months, time zones, `date_trunc`),
+because it is a verified change of the predicate itself.
 See [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal-filters-are-maintained).
 
 ## Hydration
@@ -660,10 +766,11 @@ the engine, as one inline would.
 ## Errors
 
 Error records are produced by `Mfp` and `FlatMap` (per row), `Reduce` (per
-group), `Window` (per partition), `TemporalFilter` (per row), `Recursive`
-(per query) and `DeltaJoin` (errors in the MFP of the delta's own input; a
-looked-up row whose MFP fails is skipped, as that input's own path counts
-its error). They pass through every other operator. Errors in a join's
+group), `Window` (per partition), `TemporalFilter` (per row) and `Recursive`
+(per query). Errors in the MFPs of a `DeltaJoin`'s inputs are counted by
+the inputs' error trackers (`Mfp` nodes, see [DeltaJoin](#deltajoin)); a
+looked-up row whose MFP fails is skipped. They pass through every other
+operator. Errors in a join's
 residual conditions (those that are not equalities between two inputs) are
 not records: the condition counts as false, so the joined row is missing
 where PostgreSQL would fail.
@@ -677,8 +784,10 @@ Three kinds of error state are kept:
   fingerprint, so that views created over such a node after a restart see
   its errors too;
 - per operator, the groups currently in error of `Reduce` and `Recursive`
-  (`GroupErrors`, kept durably by node fingerprint), so that a group's
-  error is retracted when it recovers, also after a restart;
+  and the partitions in error of `Window` (`GroupErrors`, kept durably by
+  node fingerprint), so that a group's error is retracted when it
+  recovers, also after a restart (a `Window` operator whose state is not
+  known computes it at the end of the next hydration);
 - per materialized view, a map from (SQLSTATE, message) to count, taken
   from its root when the view is created and updated from the root's output
   at every step: always equal to its root node's records. Reads fail while
