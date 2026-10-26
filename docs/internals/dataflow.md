@@ -677,8 +677,13 @@ engine takes a fork of the storage — every tree as of *g*
 ([Storage](storage.md#forks)) — and a copy of the part of the graph the new
 fragment needs (`Graph::fork_of`: the pending nodes, the nodes owning the
 pending arrangements, and everything they read, transitively, with all of
-those nodes' arrangements; operator error state copied, not shared; after
-hydrating, the thread drops the arrangements no operator of it reads, so
+those nodes' arrangements; operator error state — groups in error, and
+whether they are known — copied, not shared; node and arrangement ids and
+sequence numbers kept, so that its steps run the nodes in the same order,
+each node's consumers and the temporal filters those within the copy, and
+the clock the engine's, its temporal filters having released their events
+up to the same time; after hydrating, the thread drops the nodes the
+fragment does not read and the arrangements no operator of it reads, so
 that its steps maintain only those), and hands both
 to a thread of its own (`ivm-hydrate`). That thread runs `Graph::hydrate` as
 of *g* there — the same computation as inline — and then applies every
@@ -694,7 +699,8 @@ do once it is live). When the thread is at most 100 records behind, the
 engine waits for it to apply them and adopts the new trees
 (`Env::adopt_trees`, which moves their nodes) and the new nodes' state —
 hydration flags, error records and per-group error state
-(`Graph::adopt_hydrated`); from the next record on the fragment is stepped
+(`Graph::adopt_hydrated`; by fingerprint, as the engine may have freed a
+node meanwhile and reused its slot); from the next record on the fragment is stepped
 by the engine with the rest. Its contents are exactly those of an inline
 hydration at *g* followed by the same steps. The version of the inputs it
 reads is the fork, not the trees' history, and the catch-up comes from the
