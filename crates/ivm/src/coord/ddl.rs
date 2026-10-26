@@ -829,12 +829,14 @@ impl Engine {
         crate::dataflow::consolidate(&mut diff);
         // (by view: other views and ad hoc subscriptions may share the old node)
         let same = same_columns(&def.columns, &old_cols);
+        let mut moved = false;
         for s in self.subs.iter_mut() {
             if s.view != Some(id) {
                 continue;
             }
             if same {
                 s.node = new_node;
+                moved = true;
                 if !diff.is_empty() {
                     let _ = s.tx.send(SubEvent::Data { gsn, rows: diff.clone() });
                 }
@@ -846,6 +848,9 @@ impl Engine {
                 )));
                 s.cancel.store(true, std::sync::atomic::Ordering::Release);
             }
+        }
+        if moved {
+            self.subs_changed();
         }
         // subscriptions to queries reading the view (directly or through
         // other views) have dataflows built on its old version, which they

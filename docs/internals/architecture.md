@@ -211,7 +211,7 @@ handles:
 
 | Message | Action |
 |---|---|
-| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
+| `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, send every sink the last applied GSN as its progress, re-check parked reads. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
 | `Request(Checkpoint)` | take a checkpoint |
@@ -232,12 +232,15 @@ takes a checkpoint if one is due, and removes cancelled subscriptions.
 | `Schema` | rebuild the table in its new shape and re-plan dependent views ([Sources](../user-guide/sources.md#upstream-schema-changes)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
-Delivering outputs (`deliver`): the error records of each materialized
-view's root are merged into the view's error counts; each subscription gets
-the data changes of its node, ends at the first error record that is added
-(retracted ones do not end it), and gets a progress mark; each sink gets the
-changes of its node, or the GSN alone as progress when its relation did not
-change.
+Delivering outputs (`deliver`) visits only the consumers of the nodes that
+produced something (subscriptions are indexed by node): the error records
+of each materialized view's root are merged into the view's error counts
+(views are only visited for records with errors); each subscription gets
+the data changes of its node and ends at the first error record that is
+added (retracted ones do not end it); each subscription with `PROGRESS`
+gets a progress mark; each sink gets the changes of its node. Sinks learn
+of the GSNs without changes to their relation from the progress sent after
+each batch (and after replay).
 
 Records at or below the last applied GSN are ignored, which makes replay
 idempotent. After each record the retention frontier is moved to

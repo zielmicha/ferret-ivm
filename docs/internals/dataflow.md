@@ -36,9 +36,10 @@ message) and flow to the consumers (see [Errors](#errors)).
 
 `dataflow::Graph` holds:
 
-- **nodes** (`Node`): an operator (`NodeKind`), its input node ids, its
-  output schema, a structural fingerprint, a reference count, the ids of its
-  arrangements, and a `hydrated` flag;
+- **nodes** (`Node`): an operator (`NodeKind`), its input node ids and the
+  ids of the nodes that read it (its consumers), its output schema, a
+  structural fingerprint, a reference count, the ids of its arrangements, a
+  creation sequence number, and a `hydrated` flag;
 - **arrangements** (`Arrangement`): persistent indexes of a node's output —
   a storage tree plus a `Layout` (key expressions, sort order, per-node
   summaries) — with a fingerprint, a reference count, a `hydrated` flag and
@@ -49,8 +50,11 @@ message) and flow to the consumers (see [Errors](#errors)).
   per-node activity counters (for the web UI), and, during recovery, the
   maps of recovered trees and their `since` by fingerprint.
 
-Node ids are assigned in creation order and a node is always created after
-its inputs, so **id order is a topological order**.
+Nodes and arrangements live in slots indexed by their ids; the slot of one
+that is freed is reused (a `SUBSCRIBE (query)` would otherwise leave its
+slots, and the statistics of its nodes, behind for good). A node is always
+created after its inputs, so **creation order (`Node::seq`) is a
+topological order**.
 
 ### Hash-consing
 
@@ -93,13 +97,18 @@ reference as `shared`.
 ## Processing a GSN
 
 `Graph::step(env, gsn, changes)` runs for every `Commit` record (with the
-changes grouped by table node) and every `Tick` record (with no changes):
+changes grouped by table node) and every `Tick` record (with no changes).
+Only the nodes that can produce something are considered, so the cost of a
+step does not depend on the size of the graph:
 
-1. Visit nodes in topological order, skipping nodes that are not hydrated.
-2. A `Table` node runs if the commit changes its table; it turns the logged
-   changes into a delta (below).
-3. Any other node runs if one of its inputs produced output at this GSN — or,
-   for a temporal filter, if the clock moved since the previous step.
+1. Nodes run in topological (creation) order, taken from a queue that
+   starts with the changed tables' nodes and, if the clock moved since the
+   previous step, every temporal filter; a node that produces output queues
+   its consumers. Nodes that are not hydrated are skipped.
+2. A `Table` node turns the commit's changes to its table into a delta
+   (below).
+3. Any other node runs because one of its inputs produced output at this
+   GSN — or, for a temporal filter, because the clock moved.
 4. The node's output delta is applied to **all of its arrangements at
    `gsn`** before any consumer runs, and its error records are added to the
    node's accumulated ones.
@@ -108,9 +117,10 @@ changes grouped by table node) and every `Tick` record (with no changes):
    (`ReadAt::Latest`), so an operator can compute "old" and "new" results of
    the same key and emit the difference.
 
-The outputs of all nodes are returned to the engine, which merges the error
-records of each view's root into the view's error counts and forwards the
-data deltas of subscribed nodes to subscriptions and sinks.
+The outputs of the nodes that produced something are returned to the
+engine, which merges the error records of each view's root into the view's
+error counts and forwards the data deltas of subscribed nodes to
+subscriptions and sinks ([Architecture](architecture.md#the-engine-loop)).
 
 ## Arrangements and layouts
 

@@ -96,6 +96,27 @@ pub(crate) struct Subscription {
     pub reads: Vec<ObjectId>,
 }
 
+/// Subscriptions by the node they receive the changes of, and those that
+/// want a progress mark after every record (indexes into `Engine::subs`).
+#[derive(Default, PartialEq, Debug)]
+struct SubIndex {
+    by_node: FxHashMap<NodeId, Vec<usize>>,
+    progress: Vec<usize>,
+}
+
+impl SubIndex {
+    fn of(subs: &[Subscription]) -> SubIndex {
+        let mut ix = SubIndex::default();
+        for (i, s) in subs.iter().enumerate() {
+            ix.by_node.entry(s.node).or_default().push(i);
+            if s.progress {
+                ix.progress.push(i);
+            }
+        }
+        ix
+    }
+}
+
 /// A read waiting for the engine to reach a GSN.
 pub(crate) struct Parked {
     pub wait: Wait,
@@ -162,6 +183,9 @@ pub struct Engine {
     pending: HashMap<u64, Sender<Result<ExecResult>>>,
     pub(crate) parked: Vec<Parked>,
     pub(crate) subs: Vec<Subscription>,
+    /// `subs` by node, for delivery; None after `subs` changed (see
+    /// `subs_changed`).
+    sub_index: Option<SubIndex>,
     pub(crate) next_req: u64,
     dml_inflight: Option<u64>,
     dml_queue: VecDeque<Request>,
@@ -376,6 +400,7 @@ pub fn start(cfg: Config) -> Result<Running> {
     for (gsn, rec) in records {
         engine.apply_record(gsn, rec)?;
     }
+    engine.sink_progress();
     // The checkpoint can be ahead of the log if the log lost records it
     // covers (an unsynced tail with --no-sync): GSNs must continue after
     // it, or new records would be taken for already applied ones.
@@ -426,6 +451,7 @@ impl Engine {
             pending: HashMap::new(),
             parked: Vec::new(),
             subs: Vec::new(),
+            sub_index: None,
             next_req: 1,
             dml_inflight: None,
             dml_queue: VecDeque::new(),
@@ -602,6 +628,7 @@ impl Engine {
                         }
                     }
                     self.shared.processed_gsn.store(self.processed, Ordering::Release);
+                    self.sink_progress();
                     self.wake_parked(&handle);
                 }
                 Some(EngineMsg::Request(req)) => self.handle_request(req, &handle),
@@ -833,39 +860,75 @@ impl Engine {
         if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
     }
 
-    /// Route outputs to views (errors) and subscriptions.
+    /// Route outputs to views (errors), subscriptions and sinks. Only the
+    /// consumers of nodes that produced something are visited (and the
+    /// subscriptions that want progress marks).
     fn deliver(&mut self, gsn: Gsn, outputs: &FxHashMap<NodeId, Output>) {
-        for v in self.rt.views.values_mut() {
-            if let Some(o) = outputs.get(&v.node) {
-                merge_errors(&mut v.errors, &o.errs);
+        // (error records are rare: views are only visited for them)
+        if outputs.values().any(|o| !o.errs.is_empty()) {
+            for v in self.rt.views.values_mut() {
+                if let Some(o) = outputs.get(&v.node) {
+                    merge_errors(&mut v.errors, &o.errs);
+                }
             }
         }
-        for s in self.subs.iter() {
-            if let Some(o) = outputs.get(&s.node) {
-                // a new error record ends the subscription, as it fails
-                // reads (a retracted one does not)
-                if !o.errs.is_empty() {
-                    let mut errs = o.errs.clone();
-                    crate::dataflow::consolidate_errs(&mut errs);
-                    if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
-                        let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+        if !self.subs.is_empty() {
+            let index = self.sub_index.get_or_insert_with(|| SubIndex::of(&self.subs));
+            #[cfg(debug_assertions)]
+            assert_eq!(*index, SubIndex::of(&self.subs), "stale subscription index");
+            // smaller of the two: the subscribed nodes, or the nodes that changed
+            let changed: Vec<(&Output, &Vec<usize>)> = if index.by_node.len() <= outputs.len() {
+                index.by_node.iter().filter_map(|(n, subs)| Some((outputs.get(n)?, subs))).collect()
+            } else {
+                outputs.iter().filter_map(|(n, o)| Some((o, index.by_node.get(n)?))).collect()
+            };
+            for (o, subs) in changed {
+                for &i in subs {
+                    let s = &self.subs[i];
+                    // (a cancelled one may refer to a node freed since,
+                    // whose id was reused)
+                    if s.cancel.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    // a new error record ends the subscription, as it fails
+                    // reads (a retracted one does not)
+                    if !o.errs.is_empty() {
+                        let mut errs = o.errs.clone();
+                        crate::dataflow::consolidate_errs(&mut errs);
+                        if let Some(((code, msg), _)) = errs.into_iter().find(|(_, w)| *w > 0) {
+                            let _ = s.tx.send(SubEvent::Error(SqlError::new(&code, msg)));
+                        }
+                    }
+                    if !o.data.is_empty() {
+                        let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
                     }
                 }
-                if !o.data.is_empty() {
-                    let _ = s.tx.send(SubEvent::Data { gsn, rows: o.data.clone() });
-                }
             }
-            if s.progress {
-                let _ = s.tx.send(SubEvent::Progress { gsn });
+            for &i in &index.progress {
+                let _ = self.subs[i].tx.send(SubEvent::Progress { gsn });
             }
         }
+        // (sinks learn the GSNs without changes from `sink_progress`)
         for sink in self.sink_handles.values() {
             if let Some(o) = outputs.get(&sink.node) {
                 sink.send(gsn, &o.data);
-            } else {
-                sink.progress(gsn);
             }
         }
+    }
+
+    /// Tell every sink that everything up to the last applied record is
+    /// delivered (after a batch of records, not after each: sinks only
+    /// record the GSN they are current as of).
+    fn sink_progress(&self) {
+        for sink in self.sink_handles.values() {
+            sink.progress(self.processed);
+        }
+    }
+
+    /// `subs` changed (added, removed, or moved to another node): the
+    /// delivery index is rebuilt.
+    pub(crate) fn subs_changed(&mut self) {
+        self.sub_index = None;
     }
 
     fn prune_subscriptions(&mut self) {
@@ -873,6 +936,7 @@ impl Engine {
         while i < self.subs.len() {
             if self.subs[i].cancel.load(Ordering::Acquire) {
                 let s = self.subs.swap_remove(i);
+                self.sub_index = None;
                 if let Some(n) = s.pinned {
                     let _ = self.graph.release_node(&mut self.env, n);
                 }
@@ -1012,6 +1076,9 @@ pub(crate) fn merge_errors(map: &mut BTreeMap<(String, String), i64>, errs: &Err
         }
     }
 }
+
+#[cfg(test)]
+mod work_tests;
 
 #[cfg(test)]
 mod tests {

@@ -488,6 +488,7 @@ impl Engine {
         }
         let _ = tx.send(SubEvent::Progress { gsn: self.processed });
         self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
+        self.subs_changed();
         Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
     }
 

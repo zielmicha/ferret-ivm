@@ -109,8 +109,13 @@ impl NodeKind {
 
 pub struct Node {
     pub id: NodeId,
+    /// Creation sequence number. A node is created after its inputs, so
+    /// sequence order is a topological order (ids are reused, see `Graph`).
+    pub seq: u64,
     pub kind: NodeKind,
     pub inputs: Vec<NodeId>,
+    /// Nodes that have this node as an input (the reverse of `inputs`).
+    pub consumers: Vec<NodeId>,
     pub schema: Vec<ColumnType>,
     pub fp: Vec<u8>,
     /// Consumers + external pins.
@@ -121,6 +126,8 @@ pub struct Node {
 
 pub struct Arrangement {
     pub id: ArrId,
+    /// Creation sequence number (ids are reused).
+    pub seq: u64,
     pub node: NodeId,
     pub layout: Arc<Layout>,
     pub tree: TreeId,
@@ -147,14 +154,26 @@ impl Arrangement {
 /// Recovered arrangement trees, by fingerprint.
 pub type RecoveryMap = FxHashMap<Vec<u8>, TreeId>;
 
+/// Nodes and arrangements live in slots indexed by their ids; the slots of
+/// freed ones are reused (a subscription to a query would otherwise leave
+/// its slots behind for good), so creation order is kept as sequence
+/// numbers.
 #[derive(Default)]
 pub struct Graph {
     pub nodes: Vec<Option<Node>>,
     pub arrs: Vec<Option<Arrangement>>,
+    free_nodes: Vec<NodeId>,
+    free_arrs: Vec<ArrId>,
+    /// Nodes and arrangements created so far (the next sequence numbers).
+    node_seq: u64,
+    arr_seq: u64,
     node_by_fp: FxHashMap<Vec<u8>, NodeId>,
     arr_by_fp: FxHashMap<Vec<u8>, ArrId>,
+    /// Live nodes in sequence order.
     topo: Vec<NodeId>,
     topo_dirty: bool,
+    /// Temporal filter nodes: they run whenever the clock moves.
+    temporal: std::collections::BTreeSet<NodeId>,
     /// Trees from the checkpoint to attach instead of creating new ones.
     pub recovery: RecoveryMap,
     /// `since` of the recovered trees, by fingerprint.
@@ -296,6 +315,55 @@ impl Graph {
         hash128(&fp).to_vec()
     }
 
+    /// Store a new node (unreferenced, with a placeholder operator until
+    /// `link` is called) in a free slot.
+    fn insert_node(&mut self, kind: NodeKind, inputs: Vec<NodeId>, schema: Vec<ColumnType>, fp: Vec<u8>) -> NodeId {
+        let id = match self.free_nodes.pop() {
+            Some(id) => id,
+            None => {
+                self.nodes.push(None);
+                self.nodes.len() - 1
+            }
+        };
+        let seq = self.node_seq;
+        self.node_seq += 1;
+        self.nodes[id] = Some(Node {
+            id,
+            seq,
+            kind,
+            inputs,
+            consumers: vec![],
+            schema,
+            fp: fp.clone(),
+            refs: 0,
+            arrangements: vec![],
+            hydrated: false,
+        });
+        self.node_by_fp.insert(fp, id);
+        // the newest node comes last in sequence order
+        if !self.topo_dirty {
+            self.topo.push(id);
+        }
+        id
+    }
+
+    /// Set a new node's operator: reference its inputs (and register it as
+    /// their consumer) and the arrangements the operator reads.
+    fn link(&mut self, id: NodeId, kind: NodeKind) {
+        for i in self.node(id).inputs.clone() {
+            let n = self.node_mut(i);
+            n.refs += 1;
+            n.consumers.push(id);
+        }
+        for a in operator_arrangements(&kind) {
+            self.arrs[a].as_mut().expect("operator arrangement").refs += 1;
+        }
+        if matches!(kind, NodeKind::Temporal(_)) {
+            self.temporal.insert(id);
+        }
+        self.node_mut(id).kind = kind;
+    }
+
     /// Add (or find) a node. New nodes start with zero references (their
     /// consumers and pins add them); creating a node references its inputs
     /// and the arrangements its operator reads.
@@ -304,16 +372,8 @@ impl Graph {
         if let Some(&id) = self.node_by_fp.get(&fp) {
             return id;
         }
-        for i in &inputs {
-            self.node_mut(*i).refs += 1;
-        }
-        for a in operator_arrangements(&kind) {
-            self.arrs[a].as_mut().expect("operator arrangement").refs += 1;
-        }
-        let id = self.nodes.len();
-        self.nodes.push(Some(Node { id, kind, inputs, schema, fp: fp.clone(), refs: 0, arrangements: vec![], hydrated: false }));
-        self.node_by_fp.insert(fp, id);
-        self.topo_dirty = true;
+        let id = self.insert_node(NodeKind::Constant { rows: vec![] }, inputs, schema, fp);
+        self.link(id, kind);
         id
     }
 
@@ -335,28 +395,10 @@ impl Graph {
         if let Some(&id) = self.node_by_fp.get(&fp) {
             return id;
         }
-        let id = self.nodes.len();
-        self.nodes.push(Some(Node {
-            id,
-            kind: NodeKind::Constant { rows: vec![] },
-            inputs: inputs.clone(),
-            schema: schema.clone(),
-            fp: fp.clone(),
-            refs: 0,
-            arrangements: vec![],
-            hydrated: false,
-        }));
-        self.node_by_fp.insert(fp, id);
+        let id = self.insert_node(NodeKind::Constant { rows: vec![] }, inputs, schema, fp);
         let arr = self.add_arrangement(env, id, key, specs, vec![]);
         patch(&mut kind, arr);
-        for i in &inputs {
-            self.node_mut(*i).refs += 1;
-        }
-        for a in operator_arrangements(&kind) {
-            self.arrs[a].as_mut().expect("operator arrangement").refs += 1;
-        }
-        self.node_mut(id).kind = kind;
-        self.topo_dirty = true;
+        self.link(id, kind);
         id
     }
 
@@ -380,18 +422,7 @@ impl Graph {
         if let Some(&id) = self.node_by_fp.get(&fp) {
             return id;
         }
-        let id = self.nodes.len();
-        self.nodes.push(Some(Node {
-            id,
-            kind: NodeKind::Constant { rows: vec![] },
-            inputs: inputs.clone(),
-            schema,
-            fp: fp.clone(),
-            refs: 0,
-            arrangements: vec![],
-            hydrated: false,
-        }));
-        self.node_by_fp.insert(fp.clone(), id);
+        let id = self.insert_node(NodeKind::Constant { rows: vec![] }, inputs, schema, fp.clone());
         // the state arrangement is identified by its owner's structure
         let mut afp = fp;
         afp.extend_from_slice(b"state");
@@ -411,42 +442,60 @@ impl Graph {
             _ => (env.create_tree(summarizer), false),
         };
         let since = self.recovery_since.get(&afp).copied().unwrap_or(0);
-        let arr = self.arrs.len();
-        self.arrs.push(Some(Arrangement { id: arr, node: id, layout, tree, refs: 0, fp: afp.clone(), hydrated, since }));
-        self.arr_by_fp.insert(afp, arr);
+        let arr = self.insert_arr(id, layout, tree, afp, hydrated, since);
         patch(&mut kind, arr);
-        for i in &inputs {
-            self.node_mut(*i).refs += 1;
-        }
-        for a in operator_arrangements(&kind) {
-            self.arrs[a].as_mut().expect("operator arrangement").refs += 1;
-        }
-        self.node_mut(id).kind = kind;
-        self.topo_dirty = true;
+        self.link(id, kind);
         id
     }
 
-    pub fn node_count(&self) -> usize {
-        self.nodes.len()
+    /// Store a new (unreferenced) arrangement in a free slot.
+    fn insert_arr(&mut self, node: NodeId, layout: Arc<Layout>, tree: TreeId, fp: Vec<u8>, hydrated: bool, since: Gsn) -> ArrId {
+        let id = match self.free_arrs.pop() {
+            Some(id) => id,
+            None => {
+                self.arrs.push(None);
+                self.arrs.len() - 1
+            }
+        };
+        let seq = self.arr_seq;
+        self.arr_seq += 1;
+        self.arrs[id] = Some(Arrangement { id, seq, node, layout, tree, refs: 0, fp: fp.clone(), hydrated, since });
+        self.arr_by_fp.insert(fp, id);
+        id
     }
 
+    /// Nodes created so far (a mark for `gc_since`).
+    pub fn node_count(&self) -> usize {
+        self.node_seq as usize
+    }
+
+    /// Arrangements created so far (a mark for `gc_since`).
     pub fn arr_count(&self) -> usize {
-        self.arrs.len()
+        self.arr_seq as usize
     }
 
     /// Remove nodes and arrangements created at or after the given marks that
     /// ended up unreferenced (planning leftovers).
     pub fn gc_since(&mut self, env: &mut Env, node_mark: usize, arr_mark: usize) -> Result<()> {
-        for id in (node_mark..self.nodes.len()).rev() {
+        // newest first: consumers before their inputs
+        let mut new: Vec<(u64, NodeId)> =
+            self.live_nodes().filter(|n| n.seq >= node_mark as u64).map(|n| (n.seq, n.id)).collect();
+        new.sort_unstable_by(|a, b| b.cmp(a));
+        for (seq, id) in new {
+            // (releasing a node may have freed one of its inputs already)
             if let Some(n) = &self.nodes[id]
+                && n.seq == seq
                 && n.refs == 0
             {
                 self.node_mut(id).refs = 1;
                 self.release_node(env, id)?;
             }
         }
-        for id in arr_mark..self.arrs.len() {
+        let new: Vec<(u64, ArrId)> =
+            self.live_arrangements().filter(|a| a.seq >= arr_mark as u64).map(|a| (a.seq, a.id)).collect();
+        for (seq, id) in new {
             if let Some(a) = &self.arrs[id]
+                && a.seq == seq
                 && a.refs == 0
             {
                 self.arrs[id].as_mut().unwrap().refs = 1;
@@ -497,9 +546,7 @@ impl Graph {
             _ => (env.create_tree(summarizer), false),
         };
         let since = self.recovery_since.get(&full_fp).copied().unwrap_or(0);
-        let id = self.arrs.len();
-        self.arrs.push(Some(Arrangement { id, node, layout, tree, refs: 0, fp: full_fp.clone(), hydrated, since }));
-        self.arr_by_fp.insert(full_fp, id);
+        let id = self.insert_arr(node, layout, tree, full_fp, hydrated, since);
         self.node_mut(node).arrangements.push(id);
         id
     }
@@ -518,6 +565,7 @@ impl Graph {
         a.refs -= 1;
         if a.refs == 0 {
             let a = self.arrs[id].take().unwrap();
+            self.free_arrs.push(id);
             self.arr_by_fp.remove(&a.fp);
             env.drop_tree(a.tree)?;
             if let Some(n) = self.nodes[a.node].as_mut() {
@@ -535,15 +583,23 @@ impl Graph {
             return Ok(());
         }
         let node = self.nodes[id].take().unwrap();
+        self.free_nodes.push(id);
         self.node_by_fp.remove(&node.fp);
         self.node_errors.remove(&id);
         self.counters.remove(&id);
+        self.stats.remove(&id);
+        self.temporal.remove(&id);
         self.topo_dirty = true;
         // arrangements used by this operator
         for a in operator_arrangements(&node.kind) {
             self.release_arr(env, a)?;
         }
         for i in node.inputs {
+            if let Some(n) = self.nodes[i].as_mut()
+                && let Some(p) = n.consumers.iter().position(|c| *c == id)
+            {
+                n.consumers.swap_remove(p);
+            }
             self.release_node(env, i)?;
         }
         Ok(())
@@ -552,8 +608,10 @@ impl Graph {
     /// Topological order of live nodes.
     pub fn topo(&mut self) -> &[NodeId] {
         if self.topo_dirty {
-            // node ids are assigned after their inputs, so id order is topological
-            self.topo = self.nodes.iter().flatten().map(|n| n.id).collect();
+            // nodes are created after their inputs, so creation order is topological
+            let mut live: Vec<(u64, NodeId)> = self.live_nodes().map(|n| (n.seq, n.id)).collect();
+            live.sort_unstable();
+            self.topo = live.into_iter().map(|(_, id)| id).collect();
             self.topo_dirty = false;
         }
         &self.topo
@@ -567,6 +625,7 @@ impl Graph {
         let layout = &a.layout;
         let mut out = Vec::with_capacity(env.tree_count(a.tree).clamp(0, 1 << 24) as usize);
         env.for_each(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
+            visited(1);
             let w = h.weight(at);
             if w != 0 {
                 out.push((layout.decode_row(k)?, w));
@@ -672,17 +731,28 @@ impl Graph {
 
     /// Process one GSN. `changes` holds base table changes keyed by table node.
     /// Returns the output of every node that produced something.
+    ///
+    /// Only nodes that can produce something run: the tables changed, the
+    /// consumers of nodes that produced output and, when the clock moved,
+    /// the temporal filters. They run in sequence (topological) order, so
+    /// every input is done before its consumers.
     pub fn step(
         &mut self,
         env: &mut Env,
         gsn: Gsn,
         mut changes: FxHashMap<NodeId, Vec<TableChange>>,
     ) -> Result<FxHashMap<NodeId, Output>> {
-        let order: Vec<NodeId> = self.topo().to_vec();
         let mut outputs: FxHashMap<NodeId, Output> = FxHashMap::default();
         let time_moved = self.now != self.stepped_now;
         self.stepped_now = self.now;
-        for id in order {
+        // (a node is only ever queued by nodes before it, so none is queued
+        // again once it ran)
+        let mut queue: std::collections::BTreeSet<(u64, NodeId)> = changes.keys().map(|&id| (self.node(id).seq, id)).collect();
+        if time_moved {
+            queue.extend(self.temporal.iter().map(|&id| (self.node(id).seq, id)));
+        }
+        while let Some((_, id)) = queue.pop_first() {
+            considered();
             let node = self.node(id);
             if !node.hydrated {
                 continue;
@@ -697,10 +767,6 @@ impl Graph {
                     None => continue,
                 }
             } else {
-                let timed = time_moved && matches!(node.kind, NodeKind::Temporal(_));
-                if !timed && !node.inputs.iter().any(|i| outputs.get(i).is_some_and(|o| !o.is_empty())) {
-                    continue;
-                }
                 let empty = Output::default();
                 let inputs: Vec<&Output> = node.inputs.iter().map(|i| outputs.get(i).unwrap_or(&empty)).collect();
                 (started, in_rows) = (std::time::Instant::now(), inputs.iter().map(|o| o.data.len()).sum());
@@ -710,6 +776,7 @@ impl Graph {
                 self.count_step(id, in_rows, 0, started);
                 continue;
             }
+            queue.extend(node.consumers.iter().map(|&c| (self.node(c).seq, c)));
             self.add_errors(id, &out.errs);
             self.apply_to_arrangements(env, id, &out.data, gsn)?;
             self.count_step(id, in_rows, out.data.len(), started);
@@ -919,4 +986,33 @@ pub fn consolidate_errs(errs: &mut ErrDelta) {
 
 pub fn err_record(e: &SqlError) -> (String, String) {
     (e.code.clone(), e.message.clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Work done on this thread: index entries operators visited and nodes
+    /// a step considered (see `visited`).
+    pub(crate) static WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Count index entries an operator visits: tests check that the work of a
+/// step does not grow with what the step cannot change (a count, unlike
+/// timings). Nothing outside tests.
+#[inline]
+pub(crate) fn visited(_n: u64) {
+    #[cfg(test)]
+    WORK.with(|w| {
+        let (e, s) = w.get();
+        w.set((e + _n, s))
+    });
+}
+
+/// Count a node a step considers running (tests, as `visited`).
+#[inline]
+fn considered() {
+    #[cfg(test)]
+    WORK.with(|w| {
+        let (e, s) = w.get();
+        w.set((e, s + 1))
+    });
 }
