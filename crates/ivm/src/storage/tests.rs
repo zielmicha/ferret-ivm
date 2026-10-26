@@ -1287,6 +1287,35 @@ impl HistModel {
     }
 }
 
+/// A checkpoint taken while a temporary tree exists, with nodes written
+/// early and dirty ones, records neither the tree nor its bytes: after a
+/// reopen the tree is gone, nothing is left unattached, and the segment
+/// accounting has no bytes of it.
+#[test]
+fn checkpoints_do_not_record_temporary_trees() {
+    let tmp = TempDir::new("storage-temp");
+    let opts = EnvOptions { cache_bytes: 64 << 10, leaf_bytes: 1024, internal_bytes: 1024, segment_bytes: 256 << 10 };
+    let (mut env, _) = Env::open(tmp.path(), opts.clone()).unwrap();
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    let tmpt = env.create_temp_tree(Arc::new(CountSummarizer));
+    assert!(tmpt >= TEMP_TREES);
+    let key = |i: u64| i.to_be_bytes().to_vec();
+    env.apply(t, &mut (0..2_000).map(|i| (key(i), 1)).collect(), 1).unwrap();
+    env.apply(tmpt, &mut (0..20_000u64).map(|i| (key(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)), 1)).collect(), 1).unwrap();
+    assert!(!env.trees[&tmpt].seg_live.is_empty(), "nothing of the temporary tree was written early");
+    env.checkpoint(1, b"one").unwrap();
+    check_structure(&mut env, false, None);
+    env.drop_tree(tmpt).unwrap();
+    drop(env);
+    let (mut env, rec) = Env::open(tmp.path(), opts).unwrap();
+    assert_eq!(rec.unwrap().app, b"one");
+    assert_eq!(env.tree_ids(), vec![t]);
+    env.attach_tree(t, Arc::new(CountSummarizer)).unwrap();
+    assert!(env.unattached_trees().is_empty());
+    assert_eq!(env.tree_count(t), 2_000);
+    check_structure(&mut env, false, None);
+}
+
 /// Dirty nodes are written early and evicted like clean ones: a batch many
 /// times the cache leaves the buffer pool within the cache, lookups after it
 /// sweep a few slots each (instead of every slot, finding nothing it may

@@ -525,7 +525,8 @@ the leftmost one) and takes every root's `due` as 0.
 
 Every record is complete: it lists every tree (the metadata tree included),
 every segment and every tree's live bytes per segment, so only the last
-record matters. The first record of a new data directory, ten seconds after
+record matters. Temporary trees (below) are not listed, and the segment
+table does not count their bytes as live. The first record of a new data directory, ten seconds after
 `CREATE TABLE customers (id int PRIMARY KEY, region text)`, `INSERT INTO
 customers VALUES (1, 'eu'), (2, 'us'), (3, 'x')` and `CREATE MATERIALIZED
 VIEW c AS SELECT id, region::int AS r FROM customers` (three error records,
@@ -1127,12 +1128,12 @@ checkpoint of a running engine).
 - **Unreferenced trees**: trees present in the checkpoint but not attached by
   any arrangement after recovery (arrangements that no longer exist, whose
   fingerprint changed, or of views and indexes that could not be built and
-  are kept as broken, and temporary trees, below) are dropped during
-  start-up, after hydration.
+  are kept as broken) are dropped during start-up, after hydration.
 - **Temporary trees** (sorted runs, spilled deltas) take tree ids counting
-  down from 2^64 − 1, outside the range of `next_tree_id`, and are dropped
-  by the operation that creates them; a checkpoint does not happen during
-  one, but would record such a tree like any other.
+  down from 2^64 − 1 (never below 2^63), outside the range of
+  `next_tree_id`, and are dropped by the operation that creates them. A
+  checkpoint taken while one exists does not record it: its nodes, also
+  those written early, are garbage in that checkpoint.
 - **Retention**: history elements at or before the retention frontier
   (`processed GSN − --retention-gsns`) are merged when a leaf is next
   modified or by a maintenance pass (in the metadata tree too, which merges

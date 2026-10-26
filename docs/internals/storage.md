@@ -390,10 +390,11 @@ nodes nobody reads to their arrangements:
   entries, in batches of a quarter of the buffer, and drops the runs.
 
 Temporary trees (`Env::create_temp_tree`: sort runs, spilled deltas) take
-their ids from the top of the id range downwards, so the ids of persistent
-trees do not depend on them; they are not meant to outlive the operation
-that creates them, and one that a checkpoint happens to record is not
-attached after recovery and is dropped with the other unreferenced trees.
+their ids from the top of the id range downwards (down to 2^63,
+`TEMP_TREES`), so the ids of persistent trees do not depend on them; they
+are not meant to outlive the operation that creates them. A checkpoint does
+not record them, nor count their nodes as live in its segment table, and
+maintenance passes leave them alone.
 `Env::tree_is_empty` tells a tree without entries (its count, the sum of
 the current weights, can be zero while entries remain).
 

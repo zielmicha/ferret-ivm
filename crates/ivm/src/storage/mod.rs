@@ -99,6 +99,10 @@ impl Default for EnvOptions {
 
 const NONE: u32 = u32::MAX;
 
+/// Ids of temporary trees (`Env::create_temp_tree`) count down from the top
+/// of the id range to this; those of `create_tree` count up from 1.
+pub const TEMP_TREES: TreeId = 1 << 63;
+
 /// Memory of an arena slot itself, counted with its node.
 const SLOT_BYTES: usize = std::mem::size_of::<Option<Slot>>();
 
@@ -464,15 +468,17 @@ impl Env {
     }
 
     /// A tree for temporary contents (sort runs, spilled deltas), which its
-    /// user drops. Its id is taken from the top of the id range downwards,
-    /// leaving the ids of `create_tree` a function of the operations that
-    /// create trees. One that a checkpoint happens to record is not attached
-    /// after recovery, so the engine drops it then.
+    /// user drops. Its id is taken from the top of the id range downwards
+    /// (at least `TEMP_TREES`), leaving the ids of `create_tree` a function
+    /// of the operations that create trees. A checkpoint does not record it
+    /// (it is no part of the state the checkpoint makes durable): its nodes
+    /// are garbage in the checkpoint, and it does not exist after recovery.
     pub fn create_temp_tree(&mut self, summarizer: Arc<dyn Summarizer>) -> TreeId {
         let mut id = TreeId::MAX;
         while self.trees.contains_key(&id) {
             id -= 1;
         }
+        debug_assert!(id >= TEMP_TREES, "temporary trees exhausted their ids");
         let summary = Summary::empty(summarizer.spec());
         let state = TreeState { root: None, summary, min_seg: u32::MAX, summarizer, attached: true, due: Gsn::MAX, seg_live: BTreeMap::new() };
         self.trees.insert(id, state);
@@ -2046,7 +2052,18 @@ impl Env {
         let tree_ids = self.tree_ids();
         let mut records = Vec::with_capacity(tree_ids.len());
         let mut space = Vec::with_capacity(tree_ids.len());
+        // live bytes per segment as the checkpoint has them: without the
+        // nodes of temporary trees, which it does not record
+        let mut segments = self.seg_live.clone();
         for tid in tree_ids {
+            if tid >= TEMP_TREES {
+                for (seg, live) in &self.trees[&tid].seg_live {
+                    if let Some(e) = segments.get_mut(seg) {
+                        e.1 = e.1.saturating_sub(*live);
+                    }
+                }
+                continue;
+            }
             let loc = match self.trees[&tid].root {
                 None => None,
                 Some(NodePtr::Disk(loc)) => Some(loc),
@@ -2063,12 +2080,13 @@ impl Env {
         let active = self.segs.active_id();
         let active_len = self.segs.active_len();
         self.seg_live.entry(active).or_insert((0, 0));
+        segments.entry(active).or_insert((0, 0));
         self.checkpoint_seq += 1;
         let rec = CheckpointRecord {
             seq: self.checkpoint_seq,
             gsn,
             trees: records,
-            segments: self.seg_live.iter().map(|(id, (t, l))| (*id, *t, *l)).collect(),
+            segments: segments.iter().map(|(id, (t, l))| (*id, *t, *l)).collect(),
             active_seg: active,
             active_len,
             next_tree_id: self.next_tree_id,
@@ -2191,8 +2209,9 @@ impl Env {
         for tid in self.tree_ids() {
             let t = &self.trees[&tid];
             let Some(root) = t.root else { continue };
-            // (trees not attached after recovery are about to be dropped)
-            if !t.attached {
+            // (trees not attached after recovery are about to be dropped,
+            // temporary ones are dropped by their users)
+            if !t.attached || tid >= TEMP_TREES {
                 continue;
             }
             let dirty = matches!(root, NodePtr::Mem(id) if self.slot(id).dirty);
