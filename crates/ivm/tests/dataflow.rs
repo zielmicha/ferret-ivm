@@ -668,8 +668,11 @@ fn windows_follow_random_changes() {
         "SELECT id, count(*) OVER (PARTITION BY g ORDER BY d RANGE BETWEEN interval '2 days' PRECEDING AND interval '1 day' FOLLOWING) AS c FROM (SELECT id, g, date '2026-01-01' + v AS d FROM t) s",
         "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 40 PRECEDING AND 1 PRECEDING) AS s, lag(v, 2) OVER (PARTITION BY g ORDER BY id) AS l FROM t",
     ];
-    for seed in [1, 2, 3] {
-        random_changes_keep_views_equal(&format!("window-random-{seed}"), &queries, 120, seed * 104_729);
+    // (partitions of more than 32 rows are changed in part, smaller ones whole)
+    for seed in [1, 2] {
+        random_changes_keep_views_equal(&format!("window-random-{seed}"), &queries, 60, seed * 104_729);
     }
-    random_changes_keep_views_equal_from("window-random-large", &queries, 60, 77, 150);
+    for seed in [3, 4, 5] {
+        random_changes_keep_views_equal_from(&format!("window-random-large-{seed}"), &queries, 80, seed * 104_729, 150);
+    }
 }

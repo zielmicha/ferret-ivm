@@ -460,7 +460,8 @@ weight before and after the GSN). The work is proportional to the rows
 that change and the rows their frames reach: appending to a partition with
 a running sum reads a few rows, while a change that changes every row (an
 insert at the start with `row_number`, any change with frames reaching the
-partition's end) reads the partition once.
+partition's end) reads the partition once. Partitions of at most 32 rows
+are recomputed whole: finding what to read would cost more.
 
 An error in a partition (for example `ntile(0)`) becomes an error record,
 and none of its rows is output. The partitions in error are remembered

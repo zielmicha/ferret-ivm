@@ -840,6 +840,9 @@ struct Changed {
     rank: i64,
 }
 
+/// Partitions of at most this many rows are recomputed whole.
+const SMALL_PARTITION: i64 = 32;
+
 fn data_error(e: SqlError) -> Result<SqlError> {
     if super::reduce::is_data_error(&e) { Ok(e) } else { Err(e) }
 }
@@ -866,11 +869,15 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, keys: &[Vec<u8>], 
     if !p.errors_known.load(std::sync::atomic::Ordering::Acquire) || p.errors.lock().contains_key(&part.lo) {
         return Ok(None);
     }
+    let n = part.len(env)?;
+    let resize: i64 = changed.iter().map(|c| c.after - c.before).sum();
+    // (reading a small partition costs less than finding what to read)
+    if n.max(n - resize) <= SMALL_PARTITION {
+        return Ok(None);
+    }
     for c in changed.iter_mut() {
         c.rank = part.rank(env, &c.key)?;
     }
-    let n = part.len(env)?;
-    let resize: i64 = changed.iter().map(|c| c.after - c.before).sum();
     let (first, last) = (&changed[0], &changed[changed.len() - 1]);
     let (at, at_end) = (first.rank, last.rank + last.after);
     // the rows whose values can change: positions [reg_lo, reg_hi) of the
