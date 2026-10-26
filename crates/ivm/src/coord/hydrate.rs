@@ -53,6 +53,13 @@ impl Applied {
         *self.gsn.lock() = g;
         self.moved.notify_all();
     }
+
+    /// Changes forwarded were applied (their memory released) within a
+    /// record: wake the engine if it waits for room.
+    fn nudge(&self) {
+        let _g = self.gsn.lock();
+        self.moved.notify_all();
+    }
 }
 
 /// A hydration in progress.
@@ -74,8 +81,26 @@ pub(crate) struct Hydration {
     /// Records it may be behind when the next one is forwarded, once it
     /// has hydrated: one less every time, so that it catches up.
     allowed: u64,
+    /// The memory of the changes forwarded and not applied yet.
+    forwarded_bytes: Arc<crate::memory::Meter>,
     /// What to do once the fragment is live.
     pub then: Vec<Then>,
+}
+
+impl Hydration {
+    /// Wait until `ok(applied GSN, forwarded bytes)` holds (polled as the
+    /// hydration applies records; a hydration that ended fails it).
+    fn wait(&self, ok: impl Fn(Gsn, usize) -> bool) -> Result<()> {
+        let mut g = self.applied.gsn.lock();
+        while !ok(*g, self.forwarded_bytes.used()) {
+            if self.applied.moved.wait_for(&mut g, Duration::from_millis(100)).timed_out()
+                && let Ok(r) = self.done.try_recv()
+            {
+                return Err(r.err().unwrap_or_else(|| SqlError::internal("hydration ended early")));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What follows a hydration, on the engine thread.
@@ -195,11 +220,17 @@ pub(crate) struct PendingSub {
     pub reply: Sender<Result<ExecResult>>,
 }
 
+/// A record's dataflow input, as the engine applies it: a Commit's table
+/// changes in batches (`Feed`, as many as it has parts), then `Step` (a
+/// Tick has only that); `Abort` if the engine failed to apply it.
 enum ToFork {
-    /// A Commit's or Tick's dataflow input: table changes and the clock,
-    /// with their memory in the budget's part for forwarded changes
-    /// (`MemBudget::forwarded`) until they are applied.
-    Step { gsn: Gsn, changes: FxHashMap<NodeId, Vec<TableChange>>, now: i64, charge: crate::memory::Charge },
+    /// Table changes of the record at `gsn`, with their memory in the
+    /// budget's part for forwarded changes (`MemBudget::forwarded`) until
+    /// they are fed to the fork's dataflow.
+    Feed { gsn: Gsn, changes: FxHashMap<NodeId, Vec<TableChange>>, charge: crate::memory::Charge },
+    /// The record at `gsn` is complete: step it with the clock at `now`.
+    Step { gsn: Gsn, now: i64 },
+    Abort,
     Finish,
 }
 
@@ -266,18 +297,33 @@ fn run(
     let _ = wake.send(EngineMsg::Wake);
     let mut steps = Vec::new();
     let watched: rustc_hash::FxHashSet<NodeId> = watch.iter().map(|(n, _)| *n).collect();
+    // (the record being fed)
+    let mut input: Option<crate::dataflow::StepInput> = None;
     loop {
         match rx.recv() {
-            Ok(ToFork::Step { gsn, changes, now, charge }) => {
-                graph.now = now;
+            Ok(ToFork::Feed { gsn, changes, charge }) => {
                 // (the rows of the watched nodes only: the others' outputs
                 // stay spilled, or are freed as the step goes)
-                let out = graph.step_observed(&mut env, gsn, changes, watched.clone())?;
+                let inp = input.get_or_insert_with(|| graph.step_begin(gsn, watched.clone()));
+                for (node, ch) in changes {
+                    graph.step_feed(&mut env, inp, node, ch)?;
+                }
+                drop(charge);
+                applied.nudge();
+            }
+            Ok(ToFork::Abort) => {
+                if let Some(inp) = input.take() {
+                    inp.abort(&mut env)?;
+                }
+            }
+            Ok(ToFork::Step { gsn, now }) => {
+                graph.now = now;
+                let inp = input.take().unwrap_or_else(|| graph.step_begin(gsn, watched.clone()));
+                let out = graph.step_finish(&mut env, inp)?;
                 crate::dataflow::reduce::trim_caches(&graph);
                 if !watch.is_empty() {
                     steps.push((gsn, watch.iter().filter_map(|(n, _)| out.get(n).map(|o| (*n, o.clone()))).collect()));
                 }
-                drop(charge);
                 applied.set(gsn);
                 if rx.is_empty() {
                     // caught up with the engine, which may be waiting for that
@@ -369,7 +415,8 @@ impl Engine {
             let _ = dtx.send(r);
         })?;
         log::debug!("hydrating {} nodes and {} arrangements as of gsn {gsn} in the background", nodes.len(), arrs.len());
-        self.hydration = Some(Hydration { gsn, nodes, arrs, tables, tx, done, hydrated, applied, forwarded: gsn, allowed: u64::MAX, then });
+        let forwarded_bytes = self.shared.mem.forwarded.clone();
+        self.hydration = Some(Hydration { gsn, nodes, arrs, tables, tx, done, hydrated, applied, forwarded: gsn, allowed: u64::MAX, forwarded_bytes, then });
         Ok(())
     }
 
@@ -505,19 +552,15 @@ impl Engine {
         }
     }
 
-    /// Forward a Commit's or Tick's table changes (by node) to the
-    /// hydration in progress, before the engine applies them. The changes
-    /// forwarded and not applied there yet are kept in memory, within their
-    /// part of the memory budget (`MemBudget::forwarded_limit`): beyond, the
-    /// engine waits for the hydration (which may still be hydrating). Once
-    /// it has hydrated its fragment it must catch up too: the engine then
-    /// waits until it is one record less behind than at the previous record
-    /// (it applies two records for every one forwarded, so the engine goes
-    /// on at about half the speed of maintaining everything including the
-    /// new fragment, which is what it will have to do once it is live).
-    pub(crate) fn forward_to_hydration(&mut self, gsn: Gsn, by_node: &FxHashMap<NodeId, Vec<TableChange>>) -> Result<()> {
-        let now = self.graph.now;
-        let mem = self.shared.clone();
+    /// Before a Commit or Tick is applied, the hydration in progress is
+    /// forwarded its dataflow input (`forward_feed`, `forward_step`); first
+    /// the engine waits for it to keep up. Once it has hydrated its
+    /// fragment it must catch up: the engine waits until it is one record
+    /// less behind than at the previous record (it applies two records for
+    /// every one forwarded, so the engine goes on at about half the speed
+    /// of maintaining everything including the new fragment, which is what
+    /// it will have to do once it is live).
+    pub(crate) fn forward_begin(&mut self) -> Result<()> {
         let Some(h) = self.hydration.as_mut() else { return Ok(()) };
         let target = if h.hydrated.load(Ordering::Acquire) {
             let lag = h.forwarded.saturating_sub(h.applied.get());
@@ -526,18 +569,26 @@ impl Engine {
         } else {
             0
         };
-        let limit = mem.mem.forwarded_limit();
-        let mut g = h.applied.gsn.lock();
-        while *g < target || mem.mem.forwarded.used() > limit {
-            if h.applied.moved.wait_for(&mut g, Duration::from_millis(100)).timed_out()
-                && let Ok(r) = h.done.try_recv()
-            {
-                return Err(r.err().unwrap_or_else(|| SqlError::internal("hydration ended early")));
-            }
-        }
-        drop(g);
+        h.wait(|g, _| g >= target)
+    }
+
+    /// Forward a batch of a Commit's table changes (by node) to the
+    /// hydration in progress, before the engine applies them. The changes
+    /// forwarded and not applied there yet are kept in memory, within their
+    /// part of the memory budget (`MemBudget::forwarded_limit`): beyond, the
+    /// engine waits for the hydration (which may still be hydrating; a
+    /// commit's batches are fed there as they come, so a commit of any size
+    /// passes).
+    pub(crate) fn forward_feed(&mut self, gsn: Gsn, by_node: &FxHashMap<NodeId, Vec<TableChange>>) -> Result<()> {
+        let mem = self.shared.clone();
+        let Some(h) = self.hydration.as_mut() else { return Ok(()) };
         let changes: FxHashMap<NodeId, Vec<TableChange>> =
             by_node.iter().filter(|(n, _)| h.tables.contains(n)).map(|(n, c)| (*n, c.clone())).collect();
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let limit = mem.mem.forwarded_limit();
+        h.wait(|_, forwarded| forwarded <= limit)?;
         let bytes = changes
             .values()
             .map(|c| crate::memory::heap_block(c.capacity() * std::mem::size_of::<TableChange>()) + c.iter().map(crate::memory::change_heap).sum::<usize>())
@@ -545,9 +596,26 @@ impl Engine {
             + std::mem::size_of::<ToFork>();
         let charge = mem.mem.forwarded.charge(bytes);
         // (a hydration that failed reports it when polled)
-        let _ = h.tx.send(ToFork::Step { gsn, changes, now, charge });
-        h.forwarded = gsn;
+        let _ = h.tx.send(ToFork::Feed { gsn, changes, charge });
         Ok(())
+    }
+
+    /// The record at `gsn` was applied (its batches forwarded): the
+    /// hydration steps it too, with the clock as of it.
+    pub(crate) fn forward_step(&mut self, gsn: Gsn) {
+        let now = self.graph.now;
+        if let Some(h) = self.hydration.as_mut() {
+            let _ = h.tx.send(ToFork::Step { gsn, now });
+            h.forwarded = gsn;
+        }
+    }
+
+    /// The engine failed to apply the record being fed: the hydration
+    /// drops what it was fed of it.
+    pub(crate) fn forward_abort(&mut self) {
+        if let Some(h) = self.hydration.as_mut() {
+            let _ = h.tx.send(ToFork::Abort);
+        }
     }
 
     /// Is a relation that `rel` reads still being hydrated (a view, or a

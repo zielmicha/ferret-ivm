@@ -151,8 +151,10 @@ snapshot requests queued at the engine.
    that GSN (`Graph::step_observed`, which returns the rows of the nodes
    subscriptions and sinks read), and the outputs are delivered to
    subscriptions and sinks. A `CommitParts` record's changes are read from
-   its parts file one part at a time (`apply_commit`); the dataflow then
-   steps the GSN with all of them.
+   its parts file and fed to the dataflow one part at a time
+   (`apply_commit`, `Graph::step_feed`), which applies them to the tables
+   in bounded chunks; the GSN is then propagated (`Graph::step_finish`). A
+   commit is never held in memory whole, however large.
 
 Source progress (snapshot bookkeeping) and schema records are logged with
 the blocking `EngineHandle::log`, which returns once the record is durable.
@@ -296,7 +298,7 @@ checkpoint.
 
 | Record | Effect |
 |---|---|
-| `Commit`, `CommitParts` | group the changes by table (changes to tables that no longer exist are skipped; a `CommitParts` record's are read from its parts file, one part at a time), `Graph::step_observed` at the GSN, deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
+| `Commit`, `CommitParts` | feed the changes to the dataflow by table (`Graph::step_feed`; changes to tables that no longer exist are skipped; a `CommitParts` record's are read from its parts file and fed one part at a time), then step the GSN (`Graph::step_finish`) and deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); write the catalog's changes into the metadata tree at the record's GSN (`persist_meta`); reply |
 | `Progress` | store the source's opaque state (snapshot progress), if the source still exists |
 | `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
@@ -336,7 +338,7 @@ do not depend on how wide rows are or how they serialize:
 | aggregation group caches | `Graph::group_caches` | an eighth | the group is not cached, and all caches shrink after the record ([Dataflow](dataflow.md#reduce)) |
 | transient working memory: in-memory deltas and key sets of a GSN, sort buffers of `TreeBuilder`s (the engine's and its forks') | `MemBudget::work` (`memory::Work`, which the engine gives its `Env`, `Env::set_work`, and forks share) | an eighth, set aside from the pool's share | a buffer spills to temporary trees (or applies to its index) beyond half the share (`Work::buffer`, within per-use bounds), or beyond a sixteenth of that while the buffers together exceed the share (`Work::full`) |
 | the buffer pool of a fork of the storage (a hydration, a large read or snapshot) | `MemBudget::forks` (a charge each fork holds while it lives, `Env::hold`) | a sixteenth each (at least 1 MiB) | the fork writes and evicts its own nodes; those it shares with the engine are not counted |
-| table changes forwarded to a hydration, not applied there yet | `MemBudget::forwarded` (a charge per forwarded record) | an eighth, at least 4 MiB | the engine waits for the hydration |
+| table changes forwarded to a hydration, not applied there yet | `MemBudget::forwarded` (a charge per forwarded batch of changes) | an eighth, at least 4 MiB | the engine waits for the hydration |
 | buffer pool | `Env`'s own accounting ([Storage](storage.md#the-node-arena-buffer-pool)) | the rest, at least a quarter | clean nodes are evicted, dirty ones written and evicted |
 
 After every applied record and every message, the engine sets the buffer

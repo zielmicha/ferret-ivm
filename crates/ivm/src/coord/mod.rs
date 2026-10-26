@@ -1040,9 +1040,8 @@ impl Engine {
                 while self.ticks.len() > 1 && self.ticks[1].0 <= frontier {
                     self.ticks.pop_front();
                 }
-                if self.hydration.is_some() {
-                    self.forward_to_hydration(gsn, &FxHashMap::default())?;
-                }
+                self.forward_begin()?;
+                self.forward_step(gsn);
                 // temporal filters release the events that became due
                 let observed = self.delivered_nodes();
                 let rows_before = self.graph.step_totals.out_rows;
@@ -1060,27 +1059,48 @@ impl Engine {
     }
 
     /// Apply a commit whose changes come in batches, in order: one for a
-    /// `Commit` record, one per part of a `CommitParts` record.
+    /// `Commit` record, one per part of a `CommitParts` record. The batches
+    /// are fed to the dataflow as they are read (`Graph::step_feed`), so a
+    /// commit larger than memory goes from the log through the dataflow to
+    /// the arrangements in bounded memory; the GSN is then propagated
+    /// (`Graph::step_finish`).
     fn apply_commit(&mut self, gsn: Gsn, source: ObjectId, lsn: u64, batches: impl Iterator<Item = Result<Vec<(ObjectId, TableChange)>>>) -> Result<()> {
         // local DML is planned when it arrives, but DDL logged before it (a
         // DROP of its table) applies first: then it applies nothing
         let mut dropped = false;
-        // (the dataflow steps a GSN with all of its changes: the parts of a
-        // commit are assembled here, read one at a time)
-        let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
+        self.forward_begin()?;
+        let observed = self.delivered_nodes();
+        let mut input = self.graph.step_begin(gsn, observed);
+        let mut fed = Ok(());
         for batch in batches {
-            for (table, ch) in batch? {
-                match self.rt.tables.get(&table) {
-                    Some(n) => by_node.entry(*n).or_default().push(ch),
-                    None => dropped |= source == 0,
+            let mut by_node: FxHashMap<NodeId, Vec<TableChange>> = FxHashMap::default();
+            fed = batch.map(|batch| {
+                for (table, ch) in batch {
+                    match self.rt.tables.get(&table) {
+                        Some(n) => by_node.entry(*n).or_default().push(ch),
+                        None => dropped |= source == 0,
+                    }
+                }
+            });
+            if fed.is_ok() && self.hydration.is_some() {
+                fed = self.forward_feed(gsn, &by_node);
+            }
+            for (node, ch) in by_node {
+                if fed.is_ok() {
+                    fed = self.graph.step_feed(&mut self.env, &mut input, node, ch);
                 }
             }
+            if fed.is_err() {
+                break;
+            }
         }
-        if self.hydration.is_some() {
-            self.forward_to_hydration(gsn, &by_node)?;
+        if let Err(e) = fed {
+            self.forward_abort();
+            input.abort(&mut self.env)?;
+            return Err(e);
         }
-        let observed = self.delivered_nodes();
-        let outputs = self.graph.step_observed(&mut self.env, gsn, by_node, observed)?;
+        self.forward_step(gsn);
+        let outputs = self.graph.step_finish(&mut self.env, input)?;
         self.processed = gsn;
         self.deliver(gsn, outputs);
         if source == 0 {

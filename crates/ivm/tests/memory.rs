@@ -344,12 +344,39 @@ fn memory_stays_within_the_cache() {
     let dir = dir("bounds");
     let cache = 4 * MB;
     let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, memory_bytes: cache, ..Default::default() };
-    let running = coord::start(cfg).expect("engine starts");
+    let running = coord::start(cfg.clone()).expect("engine starts");
     let h = running.handle.clone();
     hydration(&h, cache);
     large_commit(&h, cache);
+    let running = large_commit_replayed(running, cfg, cache);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A commit too large for a log frame is logged as parts, and replayed
+/// after a crash a part at a time: from the log through the dataflow (the
+/// table and the views of `large_commit`) into the arrangements, its rows
+/// are never all in memory at once. (Replay used to assemble every part
+/// of the commit before the dataflow stepped it.)
+fn large_commit_replayed(running: coord::Running, cfg: coord::Config, cache: usize) -> coord::Running {
+    let h = running.handle.clone();
+    exec(&h, "CHECKPOINT");
+    exec(&h, "INSERT INTO q SELECT g, g % 1000, repeat('r', 300) || g FROM generate_series(150001, 300000) g");
+    let parts = std::fs::read_dir(cfg.data_dir.join("log")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("parts-")).count();
+    assert_eq!(parts, 1, "the commit is logged as parts");
+    running.crash();
+    let (before, _) = heap();
+    let running = coord::start(cfg).expect("engine restarts");
+    let (_, peak) = heap();
+    let used = peak.saturating_sub(before);
+    println!("replaying a commit of 150,000 wide rows from its parts: peak {} MiB", used / MB);
+    // (the rows alone take about 70 MiB in memory)
+    assert!(used < cache + 40 * MB, "replaying the commit used {} MiB", used / MB);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT count(*) FROM q"), ["300000"]);
+    assert_eq!(rows(&h, "SELECT count(*), sum(k) FROM qf"), rows(&h, "SELECT count(*), sum(k) FROM q"));
+    assert_eq!(rows(&h, "SELECT count(*), sum(c) FROM qa"), ["1000|300000"]);
+    running
 }
 
 /// Hydrating views of a table about ten times the buffer pool, and views

@@ -104,8 +104,9 @@ with status 1 at once) and accepts connections only once recovery is done.
    replayed `CREATE SINK` starts then), and slot drops of replayed
    `DROP SOURCE`s are recorded. The log is read one frame at a time
    (`log::read_from` is an iterator; a `CommitParts` record's parts are read
-   one at a time when it is applied), so what replay holds is bounded by the
-   largest frame, not by the backlog. Reading it refuses invalid data
+   and fed to the dataflow one at a time when it is applied), so what replay
+   holds is bounded by the largest frame, not by the backlog or the largest
+   commit. Reading it refuses invalid data
    anywhere but at the end of the newest segment, a frame that does not
    decode, and a gap in the GSNs after the checkpoint, as corruption:
    replaying around them would silently skip records. A DDL or schema record that fails is only logged,

@@ -688,9 +688,11 @@ that its steps maintain only those), and hands both
 to a thread of its own (`ivm-hydrate`). That thread runs `Graph::hydrate` as
 of *g* there — the same computation as inline — and then applies every
 `Commit` and `Tick` record after *g*: the engine forwards each one's table
-changes (of the fork's tables) and the clock before
-applying it itself, and the thread runs `Graph::step` on its copy of the
-graph, which steps the new fragment and the existing nodes it reads. Once the
+changes (of the fork's tables) as it feeds them to its own dataflow, a
+batch at a time (`Feed` messages; a commit read from its parts takes one
+per part), and then the clock (`Step`), and the thread feeds and steps its
+copy of the graph the same way (`Graph::step_feed`, `Graph::step_finish`),
+which steps the new fragment and the existing nodes it reads. Once the
 thread has hydrated the fragment, the engine makes it catch up: before
 forwarding a record it waits until the thread is one record less behind
 than at the previous record (so the engine goes on at about half the speed
@@ -735,9 +737,11 @@ Meanwhile:
   view takes its root's error records then, as every view does
   ([Recovery](recovery.md#hydrations-in-progress)).
 - The changes forwarded to the thread and not applied there yet are kept
-  in memory, each `Step` message charging its bytes to the memory budget's
-  part for them (`MemBudget::forwarded`, an eighth, at least 4 MiB); beyond
-  it the engine waits for the thread (also while it is still hydrating).
+  in memory, each `Feed` message charging its bytes to the memory budget's
+  part for them (`MemBudget::forwarded`, an eighth, at least 4 MiB) until the
+  thread has fed them to its dataflow; beyond it the engine waits for the
+  thread (also while it is still hydrating), within a record too, so that a
+  commit of any size is forwarded in bounded memory.
   The thread steps its graph observing only the nodes whose outputs it
   keeps for subscriptions and replaced views, so the outputs of the others
   stay spilled or are freed as the step goes, as in the engine; its group
