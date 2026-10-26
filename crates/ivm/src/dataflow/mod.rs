@@ -1652,46 +1652,6 @@ pub fn row_bytes(row: &[crate::types::Datum]) -> usize {
             .sum::<usize>()
 }
 
-/// The changes of one step to an arrangement's entries, by entry key: the
-/// arrangement of a node is changed at a step by exactly the node's output
-/// delta, so an entry's weight before the step is its current weight minus
-/// its change. Operators that compare a group before and after a step
-/// (TopK, Window) take the weights before it from here, not from the
-/// entries' histories.
-pub struct EntryDeltas(Vec<(Vec<u8>, i64)>);
-
-impl EntryDeltas {
-    /// The changes of `rows` (a node's output delta, or part of it) to
-    /// entries of `layout`.
-    pub fn of<'r>(layout: &Layout, rows: impl Iterator<Item = (&'r Row, i64)>) -> Result<EntryDeltas> {
-        let mut v: Vec<(Vec<u8>, i64)> = rows.map(|(r, w)| Ok((layout.encode_row(r)?, w))).collect::<Result<_>>()?;
-        v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        v.dedup_by(|cur, kept| {
-            if cur.0 == kept.0 {
-                kept.1 += cur.1;
-                true
-            } else {
-                false
-            }
-        });
-        v.retain(|(_, w)| *w != 0);
-        Ok(EntryDeltas(v))
-    }
-
-    /// The changed entries, in key order, with their changes.
-    pub fn entries(&self) -> &[(Vec<u8>, i64)] {
-        &self.0
-    }
-
-    /// An entry's weight before the step, given its current weight.
-    pub fn before(&self, key: &[u8], current: i64) -> i64 {
-        match self.0.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-            Ok(i) => current - self.0[i].1,
-            Err(_) => current,
-        }
-    }
-}
-
 /// Consolidate a delta: sort rows by exact identity, sum weights, drop zeros.
 pub fn consolidate(delta: &mut Delta) {
     if delta.len() <= 1 {

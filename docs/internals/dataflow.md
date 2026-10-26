@@ -153,10 +153,19 @@ depend on the size of the graph:
    output of a node that nothing reads goes to its arrangements directly
    once it exceeds the spill threshold (through `TreeBuilder`s), rather
    than into temporary trees first.
-4. Consumers read arrangements through their (GSN, weight) histories either
-   *before* the current GSN (`ReadAt::Before(gsn)`) or *after* it
-   (`ReadAt::Latest`), so an operator can compute "old" and "new" results of
-   the same key and emit the difference.
+4. Consumers read arrangements *after* the current GSN (`ReadAt::Latest`)
+   or *before* it, so an operator can compute "old" and "new" results of
+   the same key and emit the difference. Before the GSN is read through the
+   entries' (GSN, weight) histories (`ReadAt::Before(gsn)`), or — TopK and
+   Window — by overlaying the input's delta on the input's arrangement
+   (`delta::Overlay`): the arrangement was changed at this GSN by exactly
+   that delta, so an entry's weight before it is its current weight minus
+   its change. The delta is read by key range in the arrangement's
+   encoding, from memory or from its temporary tree alike: group by group
+   (`Overlay::groups`, a group's changes collected in memory up to a
+   limit), or merged with the arrangement's entries in chunks
+   (`Overlay::for_each_versioned`, which also visits entries the step left
+   at weight zero or removed).
 5. A node's output is freed as soon as all its consumers have run: handed
    to the caller as `Output` (its rows only if the node is observed, its
    error records always) and its temporary trees dropped. So only the
@@ -491,7 +500,8 @@ with the window after it, without reading either in full:
   changes of the changed entries before them, so the window before the GSN
   is located from the current counts as well. An entry's weight before the
   GSN is its current weight minus the step's change to it (the operator's
-  input delta, `EntryDeltas`), not read from its history;
+  input delta overlaid on its input index, read group by group), not read
+  from its history;
 - if the first changed entry comes after the window (its position is past
   `offset + limit`, and with ties it is not tied with the last row), nothing
   changes;
@@ -505,7 +515,10 @@ The work is proportional to the number of changes and to how far the
 window moves, not to `offset` or `limit` (when the window moves past its
 own length, the two windows are read). Windows of at most 32 rows
 (`offset` included) are instead read from the start of their group, before
-and after the GSN, which costs less than locating them.
+and after the GSN, which costs less than locating them; so are the windows
+of a group with more than 4,096 changed entries, whose changes are then not
+collected in memory but read along with the group's entries (in chunks), so
+that a statement changing a large group at once stays in bounded memory.
 
 ### Window
 
@@ -538,13 +551,15 @@ lookups provide; whole peer groups; from the partition's start for
 `dense_rank` — computes their values before and after the GSN, and emits
 the difference. Positions outside the changed rows are the same in both
 versions, so both are computed from one read of the run (an entry's weight
-before the GSN being its current weight minus the step's change to it,
-`EntryDeltas`). The work is proportional to the rows
+before the GSN being its current weight minus the step's change to it, the
+input delta overlaid on the input index). The work is proportional to the rows
 that change and the rows their frames reach: appending to a partition with
 a running sum reads a few rows, while a change that changes every row (an
 insert at the start with `row_number`, any change with frames reaching the
 partition's end) reads the partition once. Partitions of at most 32 rows
-are recomputed whole: finding what to read would cost more.
+are recomputed whole: finding what to read would cost more. So are
+partitions with more than 4,096 changed entries, read before the GSN with
+the overlay of the delta read along, without collecting their changes.
 
 An error in a partition (for example `ntile(0)`) becomes an error record,
 and none of its rows is output. The partitions in error are remembered

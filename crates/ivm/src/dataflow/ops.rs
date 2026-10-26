@@ -1,6 +1,6 @@
 //! Operator step / snapshot implementations (except join, reduce, window).
 
-use super::delta::{DeltaBuf, KeySet, Keys, NodeDelta, StepOut};
+use super::delta::{DeltaBuf, EntryDeltas, KeySet, Keys, NodeDelta, StepOut, Version as Weights};
 use super::*;
 use crate::storage::History;
 use crate::types::Datum;
@@ -880,9 +880,9 @@ fn small_window(p: &TopKPlan) -> bool {
     p.limit.is_some_and(|l| p.offset.saturating_add(l) <= SMALL_WINDOW)
 }
 
-/// Rows of a group's top-k, now or (with the step's changes) before the
-/// step, walking the group from its start (small windows).
-fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, before: Option<&EntryDeltas>) -> Result<Delta> {
+/// Rows of a group's top-k, now or before the step, walking the group from
+/// its start (small windows, and groups with many changes).
+fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, version: Weights) -> Result<Delta> {
     let mut out = Vec::new();
     let (mut skipped, mut taken) = (0u64, 0u64);
     let limit = p.limit.unwrap_or(u64::MAX);
@@ -890,12 +890,9 @@ fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, before: Option<&EntryDe
         return Ok(out);
     }
     let mut last_key: Option<Vec<u8>> = None;
-    g.for_each(env, &g.lo, &Bound::Unbounded, &mut |k, h| {
+    version.for_each(env, g.tree, Bound::Included(&g.lo), g.hi(), &mut |k, w| {
         visited(1);
-        let mut w = match before {
-            Some(d) => d.before(k, h.total()),
-            None => h.total(),
-        };
+        let mut w = w;
         if w <= 0 {
             return Ok(true);
         }
@@ -936,7 +933,7 @@ fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, before: Option<&EntryDe
 /// before it).
 fn topk_rows(env: &mut Env, g: &TopKGroup, p: &TopKPlan) -> Result<Delta> {
     if small_window(p) {
-        return topk_walk(env, g, p, None);
+        return topk_walk(env, g, p, Weights::Now);
     }
     let mut out = Vec::new();
     if p.limit == Some(0) {
@@ -1000,8 +997,8 @@ fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, deltas: &EntryDeltas, 
         return Ok(());
     }
     if small_window(p) {
-        out.extend(topk_walk(env, g, p, Some(deltas))?.into_iter().map(|(r, w)| (r, -w)));
-        out.extend(topk_walk(env, g, p, None)?);
+        out.extend(topk_walk(env, g, p, Weights::Before(deltas))?.into_iter().map(|(r, w)| (r, -w)));
+        out.extend(topk_walk(env, g, p, Weights::Now)?);
         return Ok(());
     }
     let mut changed: Vec<Changed> = Vec::with_capacity(deltas.entries().len());
@@ -1099,29 +1096,32 @@ fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, deltas: &EntryDeltas, 
     Ok(())
 }
 
+/// A group's changes beyond this many entries are not collected: both
+/// windows are read by walking the group with the overlay of the delta.
+const MANY_CHANGES: usize = 4096;
+
 fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &NodeDelta, _gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
-    // the changes by group
-    let mut groups: BTreeMap<Vec<u8>, Vec<(Row, i64)>> = BTreeMap::new();
-    delta.for_each_batch(env, &mut |_, batch| {
-        for (row, w) in batch {
-            let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
-            groups.entry(layout.encode_prefix(&kv)).or_default().push((row.clone(), *w));
-        }
-        Ok(())
-    })?;
-    for (prefix, rows) in groups {
-        let deltas = EntryDeltas::of(&layout, rows.iter().map(|(r, w)| (r, *w)))?;
-        let hi = crate::types::encoding::prefix_successor(&prefix);
-        let grp = TopKGroup { tree: a.tree, layout: &layout, lo: prefix, hi };
+    // the changes by group, in the input index's key order
+    let changes = delta.overlay(p.input_arr)?;
+    changes.groups(env, &layout, p.group_key.len(), MANY_CHANGES, &mut |env, prefix, deltas| {
+        let hi = crate::types::encoding::prefix_successor(prefix);
+        let grp = TopKGroup { tree: a.tree, layout: &layout, lo: prefix.to_vec(), hi };
         let mut d = Vec::new();
-        topk_group(env, &grp, p, &deltas, &mut d)?;
+        match deltas {
+            Some(deltas) => topk_group(env, &grp, p, deltas, &mut d)?,
+            None if p.limit == Some(0) => {}
+            None => {
+                d.extend(topk_walk(env, &grp, p, Weights::BeforeStep(&changes))?.into_iter().map(|(r, w)| (r, -w)));
+                d.extend(topk_walk(env, &grp, p, Weights::Now)?);
+            }
+        }
         for (r, w) in d {
             out.push(env, r, w)?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn topk_snapshot(g: &Graph, env: &mut Env, p: &TopKPlan, out: &mut SnapOut) -> Result<()> {

@@ -15,7 +15,7 @@
 //! example `row_number` after an insert at its start), which is intrinsic.
 
 use super::agg::AggSpec;
-use super::delta::{NodeDelta, StepOut};
+use super::delta::{EntryDeltas, NodeDelta, StepOut, Version};
 use super::*;
 use crate::sql::plan::{FrameBound, FrameUnits, RangeOffsets, SortKey, WindowFunc};
 use crate::storage::{AggKind, Summary};
@@ -985,15 +985,11 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDelt
     Ok(Some(out))
 }
 
-/// A partition's rows, now or (with the step's changes) before the step.
-fn partition_rows(env: &mut Env, part: &Part, before: Option<&EntryDeltas>) -> Result<Vec<(Row, i64)>> {
+/// A partition's rows, now or before the step.
+fn partition_rows(env: &mut Env, part: &Part, version: Version) -> Result<Vec<(Row, i64)>> {
     let mut out = Vec::new();
-    env.for_each(part.tree, Bound::Included(&part.lo), part.hi(), &mut |k, h| {
+    version.for_each(env, part.tree, Bound::Included(&part.lo), part.hi(), &mut |k, w| {
         visited(1);
-        let w = match before {
-            Some(d) => d.before(k, h.total()),
-            None => h.total(),
-        };
         if w > 0 {
             out.push((part.layout.decode_row(k)?, w));
         }
@@ -1004,9 +1000,9 @@ fn partition_rows(env: &mut Env, part: &Part, before: Option<&EntryDeltas>) -> R
 
 /// Recompute a whole partition before and after the step, emitting the
 /// difference (an error record while it is in error).
-fn step_whole(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDeltas, out: &mut StepOut) -> Result<()> {
-    let old = partition_rows(env, part, Some(deltas))?;
-    let new = partition_rows(env, part, None)?;
+fn step_whole(env: &mut Env, p: &WindowPlan, part: &Part, before: Version, out: &mut StepOut) -> Result<()> {
+    let old = partition_rows(env, part, before)?;
+    let new = partition_rows(env, part, Version::Now)?;
     let mut errors = p.errors.lock();
     match compute_partition(&old, &p.order, &p.funcs) {
         Ok(rows) => {
@@ -1032,35 +1028,32 @@ fn step_whole(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDeltas, 
     Ok(())
 }
 
+/// A partition's changes beyond this many entries are not collected: the
+/// partition is recomputed whole, read with the overlay of the delta.
+const MANY_CHANGES: usize = 4096;
+
 pub fn step(g: &Graph, env: &mut Env, p: &WindowPlan, delta: &NodeDelta, _gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
-    // the changes by partition
-    let mut parts: BTreeMap<Vec<u8>, Vec<(Row, i64)>> = BTreeMap::new();
-    delta.for_each_batch(env, &mut |_, batch| {
-        for (row, w) in batch {
-            let kv: Vec<Datum> = p.partition.iter().map(|c| row[*c].clone()).collect();
-            parts.entry(layout.encode_prefix(&kv)).or_default().push((row.clone(), *w));
+    // the changes by partition, in the input index's key order
+    let changes = delta.overlay(p.input_arr)?;
+    changes.groups(env, &layout, p.partition.len(), MANY_CHANGES, &mut |env, prefix, deltas| {
+        if deltas.is_some_and(|d| d.entries().is_empty()) {
+            return Ok(());
         }
-        Ok(())
-    })?;
-    for (prefix, rows) in parts {
-        let deltas = EntryDeltas::of(&layout, rows.iter().map(|(r, w)| (r, *w)))?;
-        if deltas.entries().is_empty() {
-            continue;
-        }
-        let hi = crate::types::encoding::prefix_successor(&prefix);
-        let part = Part { tree: a.tree, layout: &layout, lo: prefix, hi };
-        match step_partition(env, p, &part, &deltas)? {
+        let hi = crate::types::encoding::prefix_successor(prefix);
+        let part = Part { tree: a.tree, layout: &layout, lo: prefix.to_vec(), hi };
+        let Some(deltas) = deltas else { return step_whole(env, p, &part, Version::BeforeStep(&changes), out) };
+        match step_partition(env, p, &part, deltas)? {
             Some(d) => {
                 for (r, w) in d {
                     out.push(env, r, w)?;
                 }
+                Ok(())
             }
-            None => step_whole(env, p, &part, &deltas, out)?,
+            None => step_whole(env, p, &part, Version::Before(deltas), out),
         }
-    }
-    Ok(())
+    })
 }
 
 /// Contents of the operator (hydration: rebuilds its error state).

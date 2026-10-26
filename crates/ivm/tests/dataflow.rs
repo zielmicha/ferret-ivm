@@ -724,3 +724,43 @@ fn window_partition_errors_across_restart() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Top-k windows and window functions follow statements that change
+/// thousands of rows of one group at once: past a limit, a group's changes
+/// are not collected in memory, and its windows (top-k) or the partition
+/// (window functions) are read before the step through the overlay of the
+/// delta on the input index. Run with `IVM_DELTA_SPILL_BYTES=0` too, where
+/// the overlay is a temporary tree.
+#[test]
+fn topk_and_windows_follow_changes_to_many_rows_of_a_group() {
+    let dir = tmpdir("many-changes");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+    exec(&h, "INSERT INTO t SELECT i, i % 2, (i * 7919) % 1000 FROM generate_series(1, 12000) i");
+    let queries = [
+        "SELECT id, v FROM t ORDER BY v, id LIMIT 20 OFFSET 100",
+        "SELECT g, v FROM t ORDER BY v DESC FETCH FIRST 3 ROWS WITH TIES",
+        "SELECT DISTINCT ON (g) g, v, id FROM t ORDER BY g, v, id",
+        "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM t",
+        "SELECT id, max(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING) AS m FROM t",
+    ];
+    for (i, q) in queries.iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    for sql in [
+        "UPDATE t SET v = v + 1 WHERE g = 0 AND id % 3 <> 0",
+        "DELETE FROM t WHERE g = 1 AND id % 5 < 3",
+        "UPDATE t SET v = 1000 - v WHERE id % 2 = 0",
+        "INSERT INTO t SELECT i, 1, i % 37 FROM generate_series(20001, 26000) i",
+    ] {
+        exec(&h, sql);
+        for (i, q) in queries.iter().enumerate() {
+            let want = rows_of(&h, q).map(sorted);
+            let got = rows_of(&h, &format!("SELECT * FROM v{i}")).map(sorted);
+            assert_eq!(got, want, "after {sql}: view {i}: {q}");
+        }
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

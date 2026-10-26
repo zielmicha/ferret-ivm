@@ -8,8 +8,9 @@
 //! arrangement's entry key: a key prefix of the arrangement is a range of
 //! it. Consumers read the delta in batches, and can read it by key range in
 //! the encoding of any of the node's arrangements (`for_each_entry`) until
-//! they have all run. The spilled trees are merged into the arrangements in
-//! key order. The output of a node that nobody reads goes to its
+//! they have all run: overlaid on that arrangement (`Overlay`), it gives the
+//! entries' weights before the step without their histories. The spilled
+//! trees are merged into the arrangements in key order. The output of a node that nobody reads goes to its
 //! arrangements directly. Sets of affected keys (groups, partitions,
 //! values) spill likewise.
 
@@ -40,6 +41,14 @@ pub type BatchFn<'a> = dyn FnMut(&mut Env, &[(Row, i64)]) -> Result<()> + 'a;
 
 /// Receives a delta's entries in some encoding (false: stop).
 pub type EntryFn<'a> = dyn FnMut(&[u8], i64) -> Result<bool> + 'a;
+
+/// Receives a group's key prefix and its changes (None: too many to
+/// collect).
+pub type GroupFn<'a> = dyn FnMut(&mut Env, &[u8], Option<&EntryDeltas>) -> Result<()> + 'a;
+
+/// Receives an entry with its weights now and before the step (false:
+/// stop).
+pub type VersionedFn<'a> = dyn FnMut(&[u8], i64, i64) -> Result<bool> + 'a;
 
 /// An encoding a node's delta is kept in: an arrangement of the node (with
 /// the tree to apply the delta to, unless that is done already), or an
@@ -237,6 +246,227 @@ impl NodeDelta {
             }
         }
         Ok(())
+    }
+}
+
+// ------------------------------------------------------------------ overlays
+
+/// Changes an operator reads into memory at once while it overlays a delta
+/// on an arrangement in chunks (`Overlay::for_each_versioned`).
+const OVERLAY_CHUNK: usize = 4096;
+
+/// A node's delta at a step as changes to the entries of one of the node's
+/// arrangements. The arrangement was changed at the step by exactly this
+/// delta (it is applied before any consumer runs), so an entry's weight
+/// before the step is its current weight minus its change: an operator that
+/// compares its input before and after a step reads the arrangement and
+/// overlays the delta, by key range, instead of reading the entries'
+/// histories. In memory or spilled alike (the spilled delta is a tree in the
+/// arrangement's encoding).
+pub struct Overlay<'a> {
+    delta: &'a NodeDelta,
+    /// The delta's target in the arrangement's encoding (None: the delta
+    /// has no rows, and was kept in no encoding).
+    target: Option<usize>,
+}
+
+impl NodeDelta {
+    /// The delta as changes to the entries of `arr`, an arrangement of the
+    /// node.
+    pub fn overlay(&self, arr: ArrId) -> Result<Overlay<'_>> {
+        let target = self.targets.iter().position(|t| t.arr == Some(arr));
+        if target.is_none() && !self.rows.is_empty() {
+            return Err(SqlError::internal(format!("a delta read as changes to arrangement {arr}, which it is not kept for")));
+        }
+        Ok(Overlay { delta: self, target })
+    }
+}
+
+impl Overlay<'_> {
+    /// The changes to the entries from `lo` while below `hi`, in key order,
+    /// until `f` returns false.
+    pub fn for_each(&self, env: &mut Env, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: &mut EntryFn) -> Result<()> {
+        match self.target {
+            Some(i) => self.delta.for_each_entry(env, i, lo, hi, f),
+            None => Ok(()),
+        }
+    }
+
+    /// The changes to the entries of each group, in key order: entries
+    /// sharing their first `key_cols` key columns (`Layout::prefix_len` of
+    /// `layout`, the arrangement's), handed to `f` with the group's key
+    /// prefix. A group's changes are collected in memory up to `limit`
+    /// entries; a group with more is handed on as None, to be read by key
+    /// range (`for_each_versioned`).
+    pub fn groups(
+        &self,
+        env: &mut Env,
+        layout: &Layout,
+        key_cols: usize,
+        limit: usize,
+        f: &mut GroupFn,
+    ) -> Result<()> {
+        let mut from: Option<Vec<u8>> = None;
+        loop {
+            let lo = from.as_deref().map_or(Bound::Unbounded, Bound::Included);
+            let mut prefix: Option<Vec<u8>> = None;
+            let mut changes: Vec<(Vec<u8>, i64)> = Vec::new();
+            let (mut next, mut many) = (None, false);
+            self.for_each(env, lo, Bound::Unbounded, &mut |k, w| {
+                let p = &k[..layout.prefix_len(k, key_cols)?];
+                match &prefix {
+                    None => prefix = Some(p.to_vec()),
+                    Some(q) if q.as_slice() != p => {
+                        next = Some(k.to_vec());
+                        return Ok(false);
+                    }
+                    Some(_) => {}
+                }
+                if changes.len() == limit {
+                    many = true;
+                    return Ok(false);
+                }
+                changes.push((k.to_vec(), w));
+                Ok(true)
+            })?;
+            let Some(prefix) = prefix else { return Ok(()) };
+            if many {
+                f(env, &prefix, None)?;
+                // (the next group starts after the prefix's keys)
+                next = crate::types::encoding::prefix_successor(&prefix);
+            } else {
+                f(env, &prefix, Some(&EntryDeltas::new(changes)))?;
+            }
+            match next {
+                Some(k) => from = Some(k),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Visit the entries of `tree` (the arrangement) from `lo` while below
+    /// `hi`, in key order, with their weights now and before the step, until
+    /// `f` returns false: the arrangement's entries merged with the changes,
+    /// read in chunks (an entry the step removed from the tree is visited
+    /// with its weight before the step and none now).
+    pub fn for_each_versioned(
+        &self,
+        env: &mut Env,
+        tree: TreeId,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        f: &mut VersionedFn,
+    ) -> Result<()> {
+        let mut lo: Bound<Vec<u8>> = lo.map(|k| k.to_vec());
+        loop {
+            let mut changes: Vec<(Vec<u8>, i64)> = Vec::new();
+            let mut more = false;
+            self.for_each(env, lo.as_ref().map(|k| k.as_slice()), hi, &mut |k, w| {
+                if changes.len() == OVERLAY_CHUNK {
+                    more = true;
+                    return Ok(false);
+                }
+                changes.push((k.to_vec(), w));
+                Ok(true)
+            })?;
+            // the tree's entries up to the last change read (all of the
+            // range once no more are left)
+            let upto = match changes.last() {
+                Some((k, _)) if more => Bound::Included(k.as_slice()),
+                _ => hi,
+            };
+            let (mut i, mut stopped) = (0, false);
+            env.for_each(tree, lo.as_ref().map(|k| k.as_slice()), upto, &mut |k, h| {
+                while i < changes.len() && changes[i].0.as_slice() < k {
+                    i += 1;
+                    if !f(&changes[i - 1].0, 0, -changes[i - 1].1)? {
+                        stopped = true;
+                        return Ok(false);
+                    }
+                }
+                let now = h.total();
+                let before = if i < changes.len() && changes[i].0.as_slice() == k {
+                    i += 1;
+                    now - changes[i - 1].1
+                } else {
+                    now
+                };
+                if !f(k, now, before)? {
+                    stopped = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+            if stopped {
+                return Ok(());
+            }
+            for (k, w) in &changes[i..] {
+                if !f(k, 0, -w)? {
+                    return Ok(());
+                }
+            }
+            if !more {
+                return Ok(());
+            }
+            lo = Bound::Excluded(changes.pop().expect("a chunk of changes").0);
+        }
+    }
+}
+
+/// The changes of a step to the entries of a key range of an arrangement
+/// (a group's), collected in memory, in key order (`Overlay::groups`).
+pub struct EntryDeltas(Vec<(Vec<u8>, i64)>);
+
+impl EntryDeltas {
+    /// From changes in key order (equal keys, which a consolidated delta
+    /// does not have, are added up).
+    fn new(mut v: Vec<(Vec<u8>, i64)>) -> EntryDeltas {
+        v.dedup_by(|cur, kept| {
+            if cur.0 == kept.0 {
+                kept.1 += cur.1;
+                true
+            } else {
+                false
+            }
+        });
+        v.retain(|(_, w)| *w != 0);
+        EntryDeltas(v)
+    }
+
+    /// The changed entries, in key order, with their changes.
+    pub fn entries(&self) -> &[(Vec<u8>, i64)] {
+        &self.0
+    }
+
+    /// An entry's weight before the step, given its current weight.
+    pub fn before(&self, key: &[u8], current: i64) -> i64 {
+        match self.0.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+            Ok(i) => current - self.0[i].1,
+            Err(_) => current,
+        }
+    }
+}
+
+/// The weights of a key range of an arrangement in one version: now, or
+/// before the step (from its changes collected in memory, or from the
+/// overlay of the delta read along).
+#[derive(Clone, Copy)]
+pub enum Version<'a> {
+    Now,
+    Before(&'a EntryDeltas),
+    BeforeStep(&'a Overlay<'a>),
+}
+
+impl Version<'_> {
+    /// Visit the entries of `tree` from `lo` while below `hi` with their
+    /// weights in this version (also those of weight zero), until `f`
+    /// returns false.
+    pub fn for_each(&self, env: &mut Env, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: &mut dyn FnMut(&[u8], i64) -> Result<bool>) -> Result<()> {
+        match self {
+            Version::Now => env.for_each(tree, lo, hi, &mut |k, h| f(k, h.total())),
+            Version::Before(d) => env.for_each(tree, lo, hi, &mut |k, h| f(k, d.before(k, h.total()))),
+            Version::BeforeStep(o) => o.for_each_versioned(env, tree, lo, hi, &mut |k, _, before| f(k, before)),
+        }
     }
 }
 
@@ -610,6 +840,85 @@ mod tests {
             assert!(applied == model, "applied delta of {n}");
             d.release(&mut env).unwrap();
             env.drop_tree(arr).unwrap();
+            assert!(env.tree_ids().is_empty(), "temporary trees left behind");
+        }
+    }
+
+    /// A delta overlaid on the arrangement it changed gives every entry's
+    /// weight before the step (current minus change), in memory and
+    /// spilled alike, read in chunks smaller than the delta: the entries
+    /// with their weights now and before (also entries no longer in the
+    /// tree, as when a step leaves none behind), and the changes grouped by
+    /// key prefix (collected up to a limit).
+    #[test]
+    fn overlays_give_the_weights_before_the_step() {
+        let tmp = TempDir::new("delta-overlay");
+        let (mut env, _) = Env::open(tmp.path(), EnvOptions { cache_bytes: 1 << 20, ..Default::default() }).unwrap();
+        let schema = vec![ColumnType::new(SqlType::Int8), ColumnType::new(SqlType::Int8)];
+        // arranged by (group, value)
+        let layout = Arc::new(Layout::new(vec![Expr::Column(0), Expr::Column(1)], vec![SortSpec::ASC; 2], &schema, vec![]));
+        let mut rng = Rng::new(11);
+        for n in [300, 30_000] {
+            // the arrangement before the step, and the step's changes
+            let row = |g: i64, v: i64| vec![Datum::Int8(g), Datum::Int8(v)];
+            let mut before: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+            for _ in 0..n {
+                let (g, v) = (rng.below(40) as i64, rng.below(n / 4) as i64);
+                *before.entry(layout.encode_row(&row(g, v)).unwrap()).or_default() += 1 + rng.below(2) as i64;
+            }
+            let mut buf = DeltaBuf::new(7, vec![Target { arr: Some(3), layout: layout.clone(), apply_to: None }]);
+            let mut changes: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+            for _ in 0..n {
+                let (g, v) = (rng.below(40) as i64, rng.below(n / 4) as i64);
+                let k = layout.encode_row(&row(g, v)).unwrap();
+                // (retractions of rows that are there)
+                let w = if before.get(&k).is_some_and(|w| *w > changes.get(&k).map_or(0, |c| -*c)) && rng.chance(50) { -1 } else { 1 };
+                *changes.entry(k).or_default() += w;
+                buf.push(&mut env, row(g, v), w).unwrap();
+            }
+            changes.retain(|_, w| *w != 0);
+            let d = buf.into_delta(&mut env).unwrap();
+            assert_eq!(matches!(d.rows, Rows::Tree { .. }), n > 300, "spilled with {n} rows");
+            // the arrangement now, without the entries the step emptied
+            let mut now = before.clone();
+            for (k, w) in &changes {
+                *now.entry(k.clone()).or_default() += w;
+            }
+            now.retain(|_, w| *w != 0);
+            let tree = env.create_tree(Arc::new(CountSummarizer));
+            let mut ups: Vec<(Vec<u8>, i64)> = now.iter().map(|(k, w)| (k.clone(), *w)).collect();
+            env.apply(tree, &mut ups, 7).unwrap();
+            let o = d.overlay(3).unwrap();
+            let mut seen: BTreeMap<Vec<u8>, (i64, i64)> = BTreeMap::new();
+            o.for_each_versioned(&mut env, tree, Bound::Unbounded, Bound::Unbounded, &mut |k, w_now, w_before| {
+                assert!(seen.insert(k.to_vec(), (w_now, w_before)).is_none(), "an entry visited twice");
+                Ok(true)
+            })
+            .unwrap();
+            let mut keys: Vec<&Vec<u8>> = before.keys().chain(now.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            let want: BTreeMap<Vec<u8>, (i64, i64)> =
+                keys.into_iter().map(|k| (k.clone(), (now.get(k).copied().unwrap_or(0), before.get(k).copied().unwrap_or(0)))).collect();
+            assert!(seen == want, "entries now and before the step, with {n} rows");
+            // by group: their changes, collected up to the limit
+            for limit in [usize::MAX, 50] {
+                let mut groups = Vec::new();
+                o.groups(&mut env, &layout, 1, limit, &mut |_, prefix, ch| {
+                    groups.push((prefix.to_vec(), ch.map(|c| c.entries().to_vec())));
+                    Ok(())
+                })
+                .unwrap();
+                let mut want: BTreeMap<Vec<u8>, Vec<(Vec<u8>, i64)>> = BTreeMap::new();
+                for (k, w) in &changes {
+                    want.entry(k[..layout.prefix_len(k, 1).unwrap()].to_vec()).or_default().push((k.clone(), *w));
+                }
+                let want: Vec<(Vec<u8>, Option<Entries>)> =
+                    want.into_iter().map(|(p, ch)| (p, (ch.len() <= limit).then_some(ch))).collect();
+                assert!(groups == want, "groups of the delta of {n} rows (limit {limit})");
+            }
+            d.release(&mut env).unwrap();
+            env.drop_tree(tree).unwrap();
             assert!(env.tree_ids().is_empty(), "temporary trees left behind");
         }
     }
