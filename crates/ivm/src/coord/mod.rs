@@ -908,8 +908,9 @@ impl Engine {
             slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
+        // reclaim space first, so that this checkpoint writes what it rewrote
+        self.env.maintain()?;
         self.env.checkpoint(self.processed, &bytes)?;
-        self.env.gc(1000)?;
         let keep_from = self.processed.saturating_sub(self.cfg.retention_gsns);
         let _ = self.seq.send(SeqMsg::Truncate(keep_from));
         self.last_checkpoint = Instant::now();

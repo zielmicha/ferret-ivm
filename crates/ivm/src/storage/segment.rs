@@ -25,6 +25,8 @@ pub struct SegmentStore {
     readers: FxHashMap<u32, File>,
     /// Segments rolled since the last sync that still need fsync.
     unsynced: Vec<u32>,
+    /// Bytes of node frames read so far.
+    pub bytes_read: u64,
 }
 
 pub fn segment_path(dir: &Path, id: u32) -> PathBuf {
@@ -51,6 +53,7 @@ impl SegmentStore {
             max_segment_bytes,
             readers: FxHashMap::default(),
             unsynced: Vec::new(),
+            bytes_read: 0,
         })
     }
 
@@ -120,6 +123,7 @@ impl SegmentStore {
     }
 
     pub fn read(&mut self, loc: DiskLoc) -> Result<Vec<u8>> {
+        self.bytes_read += loc.len as u64;
         let mut frame = vec![0u8; loc.len as usize];
         if loc.seg == self.active_id {
             if loc.off + loc.len as u64 > self.written_len {

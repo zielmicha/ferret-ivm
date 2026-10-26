@@ -143,10 +143,12 @@ dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
    in the retention window (at most the last 100,000), and the pending slot
    drops; serialise it as JSON
    ([On-disk format](../on-disk-format.md#checkpoint-application-state-appstate));
-2. `Env::checkpoint(processed_gsn, json)`: write dirty nodes, `fsync`, append
+2. `Env::maintain()`: compact leaves behind the retention frontier, merge
+   underfull nodes, relocate the live nodes of sparse segments
+   ([Storage](storage.md#space-reclamation));
+3. `Env::checkpoint(processed_gsn, json)`: write dirty nodes, `fsync`, append
    the manifest record (the commit point), delete dead segments
    ([Storage](storage.md#segments-and-checkpoints));
-3. `Env::gc(1000)`: relocate live nodes of the oldest sparse segment;
 4. send `Truncate(processed − retention)` to the sequencer, which deletes
    log segments whose records all lie at or before that GSN.
 
