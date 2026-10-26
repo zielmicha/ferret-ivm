@@ -59,7 +59,7 @@ fn run(job: ReadJob) {
 /// since (None: it did not change), delivered after it.
 pub(crate) struct Snapshotting {
     gsn: Gsn,
-    node: NodeId,
+    pub(crate) node: NodeId,
     done: Receiver<Result<Output>>,
     outputs: Vec<(Gsn, Option<Output>)>,
     then: AfterSnapshot,

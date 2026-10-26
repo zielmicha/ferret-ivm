@@ -1029,10 +1029,16 @@ impl Engine {
         if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
     }
 
-    /// Nodes whose rows `deliver` hands on (subscriptions and sinks); of the
-    /// other nodes it only needs the error records.
+    /// Nodes whose rows `deliver` hands on (subscriptions and sinks, and
+    /// those whose snapshots are being taken for them, whose outputs are
+    /// kept meanwhile); of the other nodes it only needs the error records.
     fn delivered_nodes(&self) -> rustc_hash::FxHashSet<NodeId> {
-        self.subs.iter().map(|s| s.node).chain(self.sink_handles.values().map(|s| s.node)).collect()
+        self.subs
+            .iter()
+            .map(|s| s.node)
+            .chain(self.sink_handles.values().map(|s| s.node))
+            .chain(self.snapshotting.iter().map(|s| s.node))
+            .collect()
     }
 
     /// Route outputs to views (errors), subscriptions and sinks. Each node's
