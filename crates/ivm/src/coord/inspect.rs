@@ -84,10 +84,15 @@ pub struct EngineStats {
     pub cache_capacity_bytes: usize,
     pub dirty_bytes: usize,
     /// The other parts of the memory budget: group caches, records waiting
-    /// to be applied, changes queued for subscriptions and sinks.
+    /// to be applied, changes queued for subscriptions and sinks, the
+    /// dataflow's transient working memory in use, the buffer pools of forks
+    /// of the storage, changes forwarded to a hydration.
     pub group_cache_bytes: usize,
     pub input_queue_bytes: usize,
     pub output_queue_bytes: usize,
+    pub work_bytes: usize,
+    pub fork_pool_bytes: usize,
+    pub forwarded_bytes: usize,
     pub nodes: usize,
     pub arrangements: usize,
     /// Monotonic: change whenever nodes or arrangements are created.
@@ -695,6 +700,9 @@ impl Engine {
             group_cache_bytes: self.graph.group_caches.used(),
             input_queue_bytes: self.shared.mem.input.used(),
             output_queue_bytes: self.shared.mem.outputs.used(),
+            work_bytes: self.shared.mem.work.used(),
+            fork_pool_bytes: self.shared.mem.forks.used(),
+            forwarded_bytes: self.shared.mem.forwarded.used(),
             nodes: self.graph.live_nodes().count(),
             arrangements: self.graph.live_arrangements().count(),
             nodes_created: self.graph.node_count(),
