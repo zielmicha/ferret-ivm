@@ -224,6 +224,10 @@ pub struct ErrorState {
     pub nodes: Vec<(Vec<u8>, Vec<((String, String), i64)>)>,
     #[serde(default)]
     pub operators: Vec<(Vec<u8>, Vec<(Vec<u8>, (String, String))>)>,
+    /// The operators whose groups in error are known to be complete
+    /// (`GroupErrors::known`; never in format 1).
+    #[serde(default)]
+    pub known: Vec<Vec<u8>>,
 }
 
 /// One record of the error state, by node fingerprint (see `ErrorState`).
@@ -233,6 +237,9 @@ pub enum ErrorKey {
     Node(Vec<u8>, (String, String)),
     /// The error of an operator's group, by group key (weight 1).
     Group(Vec<u8>, Vec<u8>, (String, String)),
+    /// The operator's groups in error are known to be complete (weight 1;
+    /// see `GroupErrors::known`).
+    Known(Vec<u8>),
 }
 
 fn add_weight<K: Ord>(m: &mut BTreeMap<K, i64>, k: K, w: i64) {
@@ -262,6 +269,14 @@ pub struct GroupErrors {
     groups: BTreeMap<Vec<u8>, (String, String)>,
     /// Weight changes by (group, error); None while not mirrored.
     changes: Option<GroupErrorChanges>,
+    /// `groups` is complete: computed by the operator's snapshot, or
+    /// restored. Kept by the operators that change a group in part only
+    /// when they know it is not in error (Window), which recompute every
+    /// changed group whole while it is not; mirrored durably like the
+    /// groups.
+    known: bool,
+    /// What the durable mirror holds of `known`.
+    known_mirrored: bool,
 }
 
 type GroupErrorChanges = BTreeMap<(Vec<u8>, (String, String)), i64>;
@@ -305,6 +320,17 @@ impl GroupErrors {
     /// Is the group in error?
     pub fn contains(&self, group: &[u8]) -> bool {
         self.groups.contains_key(group)
+    }
+
+    /// Are the groups in error known to be complete?
+    pub fn known(&self) -> bool {
+        self.known
+    }
+
+    /// The groups in error are complete (the operator's snapshot computed
+    /// them).
+    pub fn set_known(&mut self) {
+        self.known = true;
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &(String, String))> {
@@ -957,6 +983,9 @@ impl Graph {
                     add_weight(&mut self.err_changes, ErrorKey::Group(node.fp.clone(), g.clone(), e.clone()), -1);
                 }
             }
+            if std::mem::take(&mut op.known_mirrored) {
+                add_weight(&mut self.err_changes, ErrorKey::Known(node.fp.clone()), -1);
+            }
         }
     }
 
@@ -995,6 +1024,10 @@ impl Graph {
                             add_weight(&mut out, ErrorKey::Group(n.fp.clone(), g.clone(), e.clone()), 1);
                         }
                     }
+                }
+                if op.known != op.known_mirrored {
+                    add_weight(&mut out, ErrorKey::Known(n.fp.clone()), if op.known { 1 } else { -1 });
+                    op.known_mirrored = op.known;
                 }
             }
         }
@@ -1036,6 +1069,17 @@ impl Graph {
                         add_weight(&mut self.err_changes, ErrorKey::Group(fp.clone(), g, e), -1);
                     }
                 }
+                None => {}
+            }
+        }
+        for fp in st.known {
+            match self.node_by_fp.get(&fp).and_then(|&id| operator_errors(&self.node(id).kind)) {
+                Some(errs) => {
+                    let mut errs = errs.lock();
+                    errs.known = true;
+                    errs.known_mirrored = mirrored;
+                }
+                None if mirrored => add_weight(&mut self.err_changes, ErrorKey::Known(fp), -1),
                 None => {}
             }
         }
@@ -1377,7 +1421,7 @@ impl Graph {
         let unknown: Vec<window::WindowPlan> = self
             .live_nodes()
             .filter_map(|n| match &n.kind {
-                NodeKind::Window(p) if n.hydrated && !p.errors_known.load(std::sync::atomic::Ordering::Acquire) => Some(p.clone()),
+                NodeKind::Window(p) if n.hydrated && !p.errors.lock().known() => Some(p.clone()),
                 _ => None,
             })
             .collect();
@@ -1431,10 +1475,7 @@ impl Graph {
                 match &mut kind {
                     NodeKind::Reduce(p) => p.errors = copy(&p.errors),
                     NodeKind::Recursive(p) => p.errors = copy(&p.errors),
-                    NodeKind::Window(p) => {
-                        p.errors = copy(&p.errors);
-                        p.errors_known = Arc::new(std::sync::atomic::AtomicBool::new(p.errors_known.load(std::sync::atomic::Ordering::Acquire)));
-                    }
+                    NodeKind::Window(p) => p.errors = copy(&p.errors),
                     _ => {}
                 }
                 Some(Node {
@@ -1542,9 +1583,6 @@ impl Graph {
             }
             if let (Some(m), Some(t)) = (operator_errors(&mine.kind), operator_errors(&theirs.kind)) {
                 *m.lock() = t.lock().clone();
-            }
-            if let (NodeKind::Window(m), NodeKind::Window(t)) = (&mine.kind, &theirs.kind) {
-                m.errors_known.store(t.errors_known.load(std::sync::atomic::Ordering::Acquire), std::sync::atomic::Ordering::Release);
             }
             let errs = from.errors_of(id);
             self.set_errors(id, &errs);

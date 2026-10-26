@@ -23,7 +23,6 @@ use crate::types::{Datum, SqlType};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::ops::Bound;
-use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug)]
 pub struct WinSpec {
@@ -86,17 +85,16 @@ pub struct WindowPlan {
     pub input_arr: ArrId,
     /// Partitions in error (an error in any of its rows: none of them is
     /// output), by partition key prefix, so that a change can be applied to
-    /// part of a partition; checkpointed with the graph's error state.
+    /// part of a partition; checkpointed with the graph's error state, as is
+    /// whether they are known (computed by a snapshot, or restored;
+    /// hydration computes them otherwise): while they are not, every change
+    /// recomputes its whole partition.
     pub errors: OpErrors,
-    /// Whether `errors` is known (computed by a snapshot, or restored from a
-    /// checkpoint that kept it; hydration computes it otherwise); while it
-    /// is not, every change recomputes its whole partition.
-    pub errors_known: Arc<AtomicBool>,
 }
 
 impl WindowPlan {
     pub fn new(partition: Vec<usize>, order: Vec<SortKey>, funcs: Vec<WinSpec>, input_arr: ArrId) -> WindowPlan {
-        WindowPlan { partition, order, funcs, input_arr, errors: Default::default(), errors_known: Default::default() }
+        WindowPlan { partition, order, funcs, input_arr, errors: Default::default() }
     }
 
     pub fn fingerprint(&self, cx: &FpCtx, fp: &mut Vec<u8>) {
@@ -855,7 +853,11 @@ fn data_error(e: SqlError) -> Result<SqlError> {
 /// partition is or becomes in error, or its error state is unknown): the
 /// whole partition is recomputed instead.
 fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDeltas) -> Result<Option<Delta>> {
-    if !p.errors_known.load(std::sync::atomic::Ordering::Acquire) || p.errors.lock().contains(&part.lo) {
+    let whole = {
+        let errors = p.errors.lock();
+        !errors.known() || errors.contains(&part.lo)
+    };
+    if whole {
         return Ok(None);
     }
     let n = part.len(env)?;
@@ -1083,6 +1085,7 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &WindowPlan, out: &mut super::ops::
         Ok(())
     };
     while let Some((k, h)) = env.cursor_next(&mut c)? {
+        visited(1);
         let w = h.total();
         if w <= 0 {
             continue;
@@ -1103,8 +1106,7 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &WindowPlan, out: &mut super::ops::
     {
         flush(env, &cp, &mut rows, out)?;
     }
-    drop(errors);
-    p.errors_known.store(true, std::sync::atomic::Ordering::Release);
+    errors.set_known();
     Ok(())
 }
 

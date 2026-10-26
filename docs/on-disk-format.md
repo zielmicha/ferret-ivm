@@ -638,6 +638,7 @@ weight is its count.
 | 8 | group error | `bytes node fingerprint`, `bytes group key`, `str sqlstate`, `str message` | 1 |
 | 9 | clock tick | `u64 BE gsn`, `ivarint clock` | 1 |
 | 10 | pending slot drop | `str conninfo`, `str slot` | 1 |
+| 11 | groups in error known | `bytes node fingerprint` | 1 |
 
 The *key* of a record kept by key is its entry up to its value: tag and
 id for tags 1, 3, 4, 5 and 9, tag and field for 2, tag and fingerprint for
@@ -653,7 +654,8 @@ prefix scan.
 | source states, resume LSNs | per source: its `SourceState`; the end LSN of its last logged commit, from which it resumes streaming |
 | arrangements | every hydrated arrangement (also private state arrangements, such as a temporal filter's events): its [structural fingerprint](#structural-fingerprints), its tree, and the GSN from which its history is complete (when it was hydrated, or created with its table): `AS OF` reads of earlier GSNs do not use it |
 | node error records | the error records in the contents of every arranged node, by node fingerprint, so that views created later over the node start with them (an arrangement holds rows only); a materialized view's error records are those of its root node |
-| group errors | for every `Reduce` and `Recursive` node, the groups in error with their error record, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers |
+| group errors | for every `Reduce`, `Recursive` and `Window` node, the groups (a window's partitions) in error with their error record, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (of a window's partition columns; empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers |
+| groups in error known | the `Window` nodes whose group errors are complete (computed by a snapshot, or restored), also when none is in error. A window operator changes a partition in part only when it knows that the partition is not in error; one recovered without this record (from an earlier version, or format 1) computes its partitions in error at the end of the hydration after recovery, reading its input once |
 | clock ticks | `(gsn, clock)` of the clock ticks of the retention window, for `now()` in reads as of earlier GSNs: the last tick at or before the retention frontier and every later one. `clock` is microseconds since the PostgreSQL epoch; the logical clock is the last tick's (0 without ticks) |
 | pending slot drops | replication slots of dropped sources not dropped upstream yet, retried after the start |
 
@@ -669,7 +671,8 @@ entry differs from the one the tree holds; and the changes to the error
 state (`Graph::take_error_changes`: a node's error records are added when
 it is first seen with an arrangement and retracted when it loses its last
 one or leaves the graph; an operator's group errors when it is first seen
-and when it leaves).
+and when it leaves, its record of being known when it becomes known and when
+it leaves).
 
 **Reading** (recovery, `meta::load`): every entry with a non-zero weight.
 An entry with an unknown tag or trailing bytes, a record kept by key whose
@@ -1226,7 +1229,7 @@ Consequences of code changes for an existing data directory:
 |---|---|
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag truncates the newest log segment at the first such record (see above), losing it and everything after it |
 | `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
-| metadata record layouts (tags 1–10), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`) |
+| metadata record layouts (tags 1–11), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tag 11 was added within format 2 (a directory without it recomputes its window operators' partitions in error once, at the first start) |
 | format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tags 8–10 (float sums as normalized dyadic rationals, `min`/`max` prefixes) are written instead of format 1's tag 5 and wide values under tags 6 and 7, which are still read (as described [above](#summary)) |

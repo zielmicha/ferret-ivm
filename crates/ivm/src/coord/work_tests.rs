@@ -42,6 +42,20 @@ impl T {
         rx.try_recv().expect("a started subscription").unwrap()
     }
 
+    /// Checkpoint, stop, and start again from the checkpoint (an engine
+    /// without its threads, as `new`).
+    fn restart(self) -> T {
+        let T { mut e, gsn, _dir } = self;
+        e.checkpoint().unwrap();
+        drop(e);
+        let (env, recovered) = Env::open(&_dir.path().join("store"), EnvOptions::default()).unwrap();
+        let (seq, _) = unbounded();
+        let mut e = Engine::new(Config { data_dir: _dir.path().to_path_buf(), ..Default::default() }, env, seq, Arc::new(Shared::default()));
+        e.recover(recovered).unwrap();
+        e.replaying = false;
+        T { e, gsn, _dir }
+    }
+
     fn id(&self, name: &str) -> ObjectId {
         self.e.catalog.by_name(name).unwrap().id
     }
@@ -378,10 +392,10 @@ fn windows_read_only_what_a_change_reaches() {
                 crate::dataflow::NodeKind::Window(p) => Some(p.clone()),
                 _ => None,
             });
-            let known = &p.unwrap().errors_known;
-            known.store(false, Ordering::Release);
+            let errors = p.unwrap().errors;
+            *errors.lock() = Default::default();
             t.e.graph.hydrate(&mut t.e.env, t.gsn).unwrap();
-            assert!(known.load(Ordering::Acquire));
+            assert!(errors.lock().known());
         }
         let (update, _) = t.work(|t| t.upsert(name, vec![vec![int(n - 1), int(1), int(n)]]));
         let (append, _) = t.work(|t| t.upsert(name, vec![vec![int(n), int(1), int(n + 1)]]));
@@ -406,4 +420,45 @@ fn windows_read_only_what_a_change_reaches() {
         };
         assert_eq!(got, want, "{name}");
     }
+}
+
+/// A window operator's partitions in error, and that they are known (also
+/// without any in error), are kept in the metadata tree: recovery restores
+/// them without reading the operator's input, and a change after it is
+/// applied to part of a partition at once.
+#[test]
+fn window_error_state_is_recovered_without_reading_the_input() {
+    let mut t = T::new("work-window-recovery");
+    t.ddl("CREATE TABLE w (id bigint PRIMARY KEY, g bigint, v bigint)");
+    t.upsert("w", (0..3000).map(|i| vec![int(i), int(i % 2), int(1 + i % 5)]).collect());
+    let q = "SELECT id, ntile(v::int) OVER (PARTITION BY g ORDER BY id) AS nt, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM w";
+    t.ddl(&format!("CREATE MATERIALIZED VIEW wv AS {q}"));
+    t.ddl("CREATE MATERIALIZED VIEW ok AS SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM w");
+    // (partition 0 in error: ntile(0))
+    t.upsert("w", vec![vec![int(10), int(0), int(0)]]);
+    // (whether every window operator's state is known, partitions in error)
+    let window_errors = |t: &T| -> (bool, usize) {
+        let mut st = (true, 0);
+        for n in t.e.graph.live_nodes() {
+            if let crate::dataflow::NodeKind::Window(p) = &n.kind {
+                let e = p.errors.lock();
+                st = (st.0 && e.known(), st.1 + e.iter().count());
+            }
+        }
+        st
+    };
+    assert_eq!(window_errors(&t), (true, 1));
+    WORK.with(|w| w.set((0, 0)));
+    let mut t = t.restart();
+    let (entries, _) = WORK.with(|w| w.get());
+    assert_eq!(entries, 0, "recovery read the windows' input");
+    assert_eq!(window_errors(&t), (true, 1));
+    // changed in part (not whole, as without the state known)
+    let (entries, _) = t.work(|t| t.upsert("w", vec![vec![int(2999), int(1), int(7)]]));
+    assert!(entries <= 40, "{entries} entries");
+    t.upsert("w", vec![vec![int(10), int(0), int(3)]]);
+    assert_eq!(window_errors(&t), (true, 0));
+    // (as a view hydrated now)
+    t.ddl(&format!("CREATE MATERIALIZED VIEW fresh AS {q}"));
+    assert_eq!(t.rows("wv"), t.rows("fresh"));
 }

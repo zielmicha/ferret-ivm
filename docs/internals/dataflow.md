@@ -565,10 +565,12 @@ An error in a partition (for example `ntile(0)`) becomes an error record,
 and none of its rows is output. The partitions in error are remembered
 (`WindowPlan::errors`): a change to a partition in error, or one that puts
 it in error, recomputes the whole partition before and after the GSN. The
-state is computed by the operator's snapshot or restored from a checkpoint;
-an operator for which neither happened (a new one whose snapshot was not
-taken, or one recovered from a checkpoint of an older version) computes it
-at the end of hydration.
+state is computed by the operator's snapshot or restored from a checkpoint
+(with the record that it is known: [Errors](#errors)); an operator for which
+neither happened (a new one whose snapshot was not taken, or one recovered
+from a checkpoint of an older version) computes it at the end of hydration.
+A hydration on another thread hands the state it computed over with the
+operator (`Graph::adopt_hydrated`).
 
 ### Recursive
 
@@ -809,8 +811,10 @@ Three kinds of error state are kept:
 - per operator, the groups currently in error of `Reduce` and `Recursive`
   and the partitions in error of `Window` (`GroupErrors`, kept durably by
   node fingerprint), so that a group's error is retracted when it
-  recovers, also after a restart (a `Window` operator whose state is not
-  known computes it at the end of the next hydration);
+  recovers, also after a restart; for `Window`, also whether they are
+  known (`GroupErrors::known`, kept durably as a record of its own, so that
+  it holds also without partitions in error): an operator whose state is
+  not known computes it at the end of the next hydration;
 - per materialized view, a map from (SQLSTATE, message) to count, taken
   from its root when the view is created and updated from the root's output
   at every step: always equal to its root node's records. Reads fail while
@@ -819,8 +823,8 @@ Three kinds of error state are kept:
 
 The durable copy lives in the metadata tree
 ([On-disk format](../on-disk-format.md#the-metadata-tree)), as one entry per
-error record weighted by its count (and one per group in error), and is
-kept by changes: `Graph::take_error_changes` returns what changed since its
+error record weighted by its count (and one per group in error, and one
+per operator whose groups in error are known), and is kept by changes: `Graph::take_error_changes` returns what changed since its
 last call — the error deltas of arranged nodes and the groups' changes as
 they happen, a node's whole records when it is first seen arranged (an
 operator's when it is first seen), and their retraction when it loses its

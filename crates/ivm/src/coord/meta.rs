@@ -62,6 +62,8 @@ const T_GROUP_ERROR: u8 = 8;
 const T_TICK: u8 = 9;
 /// `str conninfo`, `str slot`
 const T_SLOT_DROP: u8 = 10;
+/// `bytes fingerprint`: the operator's groups in error are complete
+const T_GROUPS_KNOWN: u8 = 11;
 
 const F_NEXT_ID: u8 = 1;
 const F_INSTANCE_ID: u8 = 2;
@@ -143,6 +145,10 @@ fn error_entry(k: &ErrorKey) -> Vec<u8> {
             put_bytes(&mut e, group);
             put_str(&mut e, code);
             put_str(&mut e, msg);
+        }
+        ErrorKey::Known(fp) => {
+            e.push(T_GROUPS_KNOWN);
+            put_bytes(&mut e, fp);
         }
     }
     e
@@ -336,6 +342,7 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
     let mut next_id = None;
     let mut node_errors: BTreeMap<Vec<u8>, ErrDelta> = BTreeMap::new();
     let mut group_errors: BTreeMap<Vec<u8>, Vec<(Vec<u8>, ErrRecord)>> = BTreeMap::new();
+    let mut known = Vec::new();
     for (e, w) in entries {
         let bad = |what: &str| SqlError::corrupt(format!("bad metadata entry ({what}): {e:02x?}"));
         let tag = e[0];
@@ -404,6 +411,10 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
                 group_errors.entry(fp).or_default().push((group, rec));
                 None
             }
+            T_GROUPS_KNOWN => {
+                known.push(get_bytes(&mut b)?.to_vec());
+                None
+            }
             T_TICK => {
                 st.ticks.push((be64(&mut b)?, get_ivarint(&mut b)?));
                 None
@@ -427,7 +438,7 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
     }
     st.catalog.next_id = next_id.ok_or_else(|| SqlError::corrupt("the metadata tree has no next object id"))?;
     st.clock = st.ticks.last().map(|t| t.1).unwrap_or(0);
-    st.errors = ErrorState { nodes: node_errors.into_iter().collect(), operators: group_errors.into_iter().collect() };
+    st.errors = ErrorState { nodes: node_errors.into_iter().collect(), operators: group_errors.into_iter().collect(), known };
     meta.history = (st.catalog.history.first().map(|h| h.0).unwrap_or(0), st.catalog.history.last().map(|h| h.0).unwrap_or(0));
     meta.ticks = (st.ticks.first().map(|t| t.0).unwrap_or(0), st.ticks.last().map(|t| t.0).unwrap_or(0));
     Ok((st, meta))
