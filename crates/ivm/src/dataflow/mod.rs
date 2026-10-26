@@ -1447,8 +1447,11 @@ impl Graph {
     /// A copy of nodes `roots` and what they read, transitively — their
     /// inputs and the nodes owning the arrangements their operators read —
     /// with all of those nodes' arrangements, for another thread (with a
-    /// fork of the storage). Operator state is copied, not shared; node and
-    /// arrangement ids stay the same.
+    /// fork of the storage). Operator state is copied, not shared (groups
+    /// in error, and whether they are known); node and arrangement ids and
+    /// sequence numbers stay the same, consumers and temporal filters are
+    /// those within the copy, and the clock is the graph's, temporal
+    /// filters having released their events up to the same time.
     pub fn fork_of(&self, roots: &[NodeId]) -> Graph {
         let keep_nodes = self.closure(roots);
         // (its group caches count in the engine's share of the budget)

@@ -872,3 +872,62 @@ fn concurrent_ddl_dml_reads_and_checkpoints_stay_consistent() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A view with a temporal filter, window functions and a top-k window is
+/// hydrated on a fork while clock ticks and commits go on: the fork steps
+/// its copy of the graph (its temporal filter releasing the events due
+/// since the step before, its window operator changing a partition in part
+/// once it knows that it is not in error) with the records forwarded to it,
+/// and after it is adopted the engine goes on from that state. The view
+/// then equals its query, also after a restart.
+#[test]
+fn temporal_window_and_topk_views_hydrate_while_the_clock_ticks() {
+    let _serial = serial();
+    let dir = tmpdir("hydrate-operators");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    let base = 1_767_225_600_000_000i64; // 2026-01-01T00:00:00Z in Unix microseconds
+    let tick = |h: &EngineHandle, secs: i64| {
+        h.log(ivm::log::LogRecord::Tick { micros: base + secs * 1_000_000 }).unwrap();
+    };
+    tick(&h, 0);
+    load_big(&h);
+    exec(&h, "CREATE TABLE ev (id int PRIMARY KEY, ts timestamptz, g int)");
+    exec(&h, "INSERT INTO ev SELECT i, timestamptz '2026-01-01 00:00:00+00' + (i - 200) * interval '1 second', i % 97 FROM generate_series(0, 399) i");
+    // (one view, so that it hydrates on one fork: the slow aggregation of
+    // big, with a window, a top-k and a temporal join over it)
+    let q = format!(
+        "SELECT 'w' AS k, g AS a, row_number() OVER (ORDER BY n DESC, g) AS b, sum(n) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c FROM ({SLOW_VIEW}) s
+         UNION ALL SELECT 't', g, n, s FROM (SELECT g, n, s FROM ({SLOW_VIEW}) s ORDER BY n, g LIMIT 10 OFFSET 40) t
+         UNION ALL SELECT 'e', e.id, s.n, s.s FROM ev e JOIN ({SLOW_VIEW}) s ON s.g = e.g WHERE e.ts > now() - interval '30 seconds'"
+    );
+    let create = start_ddl(&h, &format!("CREATE MATERIALIZED VIEW ops AS {q}"), "ops");
+    let (mut secs, mut i) = (0, 0);
+    while !create.is_finished() && i < 200 {
+        secs += 3;
+        tick(&h, secs);
+        exec(&h, &format!("INSERT INTO ev VALUES ({}, timestamptz '2026-01-01 00:00:00+00' + {} * interval '1 second', {})", 1000 + i, secs + 20, i % 97));
+        exec(&h, &format!("UPDATE big SET g = {} WHERE id = {}", i % 97, (i * 104_729) % BIG));
+        i += 1;
+    }
+    assert!(i > 0, "the view was hydrated before any record was applied");
+    create.join().unwrap().unwrap();
+    let check = |h: &EngineHandle, when: &str| assert_eq!(rows(h, "SELECT * FROM ops"), rows(h, &q), "{when}");
+    check(&h, "after the hydration");
+    // the engine goes on from the fork's state
+    for j in 0..5 {
+        secs += 7;
+        tick(&h, secs);
+        exec(&h, &format!("UPDATE big SET g = {} WHERE id % 50 = {j}", j * 3));
+    }
+    check(&h, "after more changes");
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    check(&h, "after a restart");
+    tick(&h, secs + 45);
+    exec(&h, "UPDATE big SET g = 5 WHERE id % 1000 = 3");
+    check(&h, "after a restart and more changes");
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
