@@ -2739,6 +2739,8 @@ impl Env {
     /// continues). No summary changes: compaction keeps every entry's
     /// current weight, and merging keeps the entries.
     pub fn maintain_with(&mut self, budget: MaintBudget) -> Result<MaintStats> {
+        // (segments' totals with what forks wrote, for choosing victims)
+        self.count_foreign();
         let (victims, left_out) = self.gc_victims(budget.gc);
         let mut m = Maint {
             frontier: self.frontier,
