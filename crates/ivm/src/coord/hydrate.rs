@@ -123,30 +123,41 @@ struct Conversion {
 /// Fill a rebuilt table's new primary index, as of `gsn`, with the old
 /// version's rows in the new shape: columns mapped by name and cast to their
 /// new types (NULL where that fails); rows without their (new) key are left
-/// to the re-snapshot, which upserts by key.
+/// to the re-snapshot, which upserts by key. The old rows are streamed in
+/// batches into a `TreeBuilder`, so a table of any size is rebuilt in
+/// bounded memory.
 fn fill_rebuilt(graph: &mut Graph, env: &mut Env, c: &Conversion, gsn: Gsn) -> Result<()> {
-    let old_rows = graph.snapshot(env, c.old_node)?.data;
     let crate::dataflow::NodeKind::Table { primary, .. } = graph.node(c.new_node).kind else {
         return Err(SqlError::internal("rebuilt table without a table node"));
     };
     let arr = graph.arr(primary);
-    let mut ups = Vec::with_capacity(old_rows.len());
-    for (r, w) in old_rows {
-        let nr: crate::types::Row = c
-            .mapping
-            .iter()
-            .zip(&c.columns)
-            .map(|(m, col)| match m {
-                Some(i) => crate::expr::cast::cast_datum(&r[*i], &col.ty.ty, col.ty.typmod, true).unwrap_or(crate::types::Datum::Null),
-                None => crate::types::Datum::Null,
-            })
-            .collect();
-        if c.pk.iter().any(|k| nr[*k].is_null()) {
-            continue;
+    let (tree, layout) = (arr.tree, arr.layout.clone());
+    let mut b = crate::storage::TreeBuilder::new(env, tree, gsn);
+    let r = crate::dataflow::ops::snapshot_stream(graph, env, c.old_node, &mut |env, batch| {
+        for (r, w) in batch {
+            let nr: crate::types::Row = c
+                .mapping
+                .iter()
+                .zip(&c.columns)
+                .map(|(m, col)| match m {
+                    Some(i) => crate::expr::cast::cast_datum(&r[*i], &col.ty.ty, col.ty.typmod, true).unwrap_or(crate::types::Datum::Null),
+                    None => crate::types::Datum::Null,
+                })
+                .collect();
+            if c.pk.iter().any(|k| nr[*k].is_null()) {
+                continue;
+            }
+            b.push(env, layout.encode_row(&nr)?, w)?;
         }
-        ups.push((arr.layout.encode_row(&nr)?, w));
+        Ok(())
+    });
+    match r {
+        Ok(_) => b.finish(env)?,
+        Err(e) => {
+            b.abort(env)?;
+            return Err(e);
+        }
     }
-    env.apply(arr.tree, &mut ups, gsn)?;
     let a = graph.arrs[primary].as_mut().unwrap();
     a.hydrated = true;
     a.since = gsn;
