@@ -839,16 +839,6 @@ impl Graph {
         (nodes, arrs)
     }
 
-    /// A copy of the part of the graph needed to hydrate the pending nodes
-    /// and arrangements and then step them, for another thread (with a fork
-    /// of the storage): them, the nodes owning the pending arrangements, and
-    /// what those read, transitively (`fork_of`).
-    pub fn fork_pending(&self) -> Graph {
-        let (mut roots, parrs) = self.pending();
-        roots.extend(parrs.iter().map(|a| self.arr(*a).node));
-        self.fork_of(&roots)
-    }
-
     /// A copy of nodes `roots` and what they read, transitively — their
     /// inputs and the nodes owning the arrangements their operators read —
     /// with all of those nodes' arrangements, for another thread (with a

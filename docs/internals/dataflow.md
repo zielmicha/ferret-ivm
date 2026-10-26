@@ -464,10 +464,11 @@ starts the hydration once it has been applied. At the GSN *g* the statement is
 applied at (its DDL record, or the last applied record for `SUBSCRIBE`), the
 engine takes a fork of the storage — every tree as of *g*
 ([Storage](storage.md#forks)) — and a copy of the part of the graph the new
-fragment needs (`Graph::fork_pending`: the pending nodes and arrangements,
-the nodes owning those arrangements, and everything they read, transitively,
-with the arrangements their operators read and one arrangement per node to
-snapshot it from; operator error state copied, not shared), and hands both
+fragment needs (`Graph::fork_of`: the pending nodes, the nodes owning the
+pending arrangements, and everything they read, transitively, with all of
+those nodes' arrangements; operator error state copied, not shared; after
+hydrating, the thread drops the arrangements no operator of it reads, so
+that its steps maintain only those), and hands both
 to a thread of its own (`ivm-hydrate`). That thread runs `Graph::hydrate` as
 of *g* there — the same computation as inline — and then applies every
 `Commit` and `Tick` record after *g*: the engine forwards each one's table

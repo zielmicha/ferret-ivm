@@ -331,6 +331,53 @@ fn schema_changes_rebuild_tables_off_the_engine_thread() {
     }
 }
 
+/// A view replaced by a definition another view already has (its new root
+/// exists, hydrated) while a view reading it is re-planned (new nodes to
+/// hydrate): its subscription still gets the change to the new contents and
+/// then every change after it.
+#[test]
+fn replacing_a_view_by_an_existing_definition_keeps_its_subscription_complete() {
+    let _serial = serial();
+    let dir = tmpdir("replace-shared");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    load_big(&h);
+    let a = "SELECT g, count(*) AS n, sum(x) AS s FROM big GROUP BY g";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW w AS {a}"));
+    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT g, count(*) AS n, sum(id) AS s FROM big GROUP BY g");
+    exec(&h, "CREATE MATERIALIZED VIEW u AS SELECT a.g, a.n FROM v a JOIN big b ON a.n = b.id");
+    let ExecResult::Subscribe { rx, cancel, .. } = exec(&h, "SUBSCRIBE v WITH (PROGRESS)") else { panic!("not a subscription") };
+    let h2 = h.clone();
+    let replace = std::thread::spawn(move || try_exec(&h2, &format!("CREATE OR REPLACE MATERIALIZED VIEW v AS {a}")).unwrap());
+    let mut i = 0;
+    while !replace.is_finished() || i < 3 {
+        exec(&h, &format!("INSERT INTO big VALUES ({}, {}, {})", -1 - i, i * 13, i % 5));
+        i += 1;
+    }
+    replace.join().unwrap();
+    exec(&h, "INSERT INTO big VALUES (-1000000, 3, 3)");
+    let last = gsn(&h);
+    let mut acc: std::collections::BTreeMap<String, i64> = Default::default();
+    for ev in rx.iter() {
+        match ev {
+            SubEvent::Data { rows, .. } => {
+                for (r, w) in rows {
+                    *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_default() += w;
+                }
+            }
+            SubEvent::Progress { gsn } if gsn >= last => break,
+            SubEvent::Progress { .. } => {}
+            SubEvent::Error(e) => panic!("{e}"),
+        }
+    }
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    let got: Vec<String> = acc.into_iter().filter(|(_, w)| *w != 0).map(|(r, _)| r).collect();
+    assert_eq!(got, rows(&h, a));
+    assert_eq!(rows(&h, "SELECT * FROM u"), rows(&h, "SELECT a.g, a.n FROM v a JOIN big b ON a.n = b.id"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A crash while a view is being hydrated (after its DDL record, with
 /// commits to its tables and a checkpoint meanwhile) recovers to the state
 /// an uninterrupted run reaches: recovery replays the DDL record and

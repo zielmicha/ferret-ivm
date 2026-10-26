@@ -1,23 +1,26 @@
 //! Hydration off the engine thread.
 //!
-//! The new nodes and arrangements of a statement (a materialized view's or
-//! an index's, a subscription's query) are hydrated as of the GSN *g* it is
-//! applied at, but not on the engine thread: a fork of the storage (a
-//! version of every tree as of *g*, `Env::fork`) and of the part of the
-//! graph they read (`Graph::fork_pending`) go to a thread of their own,
-//! which hydrates them there and then applies the records after *g* that
-//! the engine forwards to it — the same `Graph::step`, on that part of the
-//! graph only — until it has caught up. The engine then adopts the new
-//! trees (`Env::adopt_trees`, which moves their nodes) and the fragment is
-//! maintained with the rest from the next record on. Its contents are
-//! exactly those an inline hydration at *g* followed by the same steps
-//! would have produced. (The version read is the fork, never the trees'
-//! history; the catch-up comes from the forwarded changes.)
+//! The new nodes and arrangements of a statement (a new or replaced
+//! materialized view's and those of the views re-planned with it, an
+//! index's, a table's rebuilt after an upstream schema change, a
+//! subscription's query) are hydrated as of the GSN *g* it is applied at,
+//! but not on the engine thread: a fork of the storage (a version of every
+//! tree as of *g*, `Env::fork`) and of the part of the graph they read
+//! (`Graph::fork_of`) go to a thread of their own, which hydrates them
+//! there and then applies the records after *g* that the engine forwards to
+//! it — the same `Graph::step`, on that part of the graph only — until it
+//! has caught up. The engine then adopts the new trees (`Env::adopt_trees`,
+//! which moves their nodes) and the fragment is maintained with the rest
+//! from the next record on, and what waited for it follows (`Then`). Its
+//! contents are exactly those an inline hydration at *g* followed by the
+//! same steps would have produced. (The version read is the fork, never
+//! the trees' history; the catch-up comes from the forwarded changes.)
 //!
 //! Meanwhile the engine applies records (the views that exist go on being
-//! maintained), but stops at the next DDL or schema record until the
-//! hydration is done; requests that read the new fragment wait for it.
-//! Replay and recovery hydrate inline: the result is the same.
+//! maintained) and DDL that only adds to the graph (its fragment is
+//! hydrated next); records that replace or rebuild something must wait
+//! (`must_wait_for_hydration`); requests that read the new fragment wait
+//! for it. Replay and recovery hydrate inline: the result is the same.
 
 use super::*;
 use crate::dataflow::Delta;
@@ -81,7 +84,7 @@ pub(crate) struct Hydration {
 
 /// What follows a hydration, on the engine thread.
 pub(crate) enum Then {
-    /// Reply to the DDL statement whose record started the hydration.
+    /// Reply to a DDL statement whose record built what is hydrated.
     Reply { req: u64, res: Result<ExecResult> },
     /// A new materialized view starts with the error records of its root.
     ViewErrors(ObjectId),
@@ -338,6 +341,10 @@ impl Engine {
                 _ => {}
             }
         }
+        // (a watched node may be no part of the fragment: a replacement by a
+        // version that exists already; it is stepped there too)
+        roots.extend(watch.iter().map(|(n, _)| *n));
+        fork_roots.extend(watch.iter().map(|(n, _)| *n));
         let env = self.env.fork()?;
         let graph = self.graph.fork_of(&fork_roots);
         let tables = graph.live_nodes().filter(|n| matches!(n.kind, crate::dataflow::NodeKind::Table { .. })).map(|n| n.id).collect();
