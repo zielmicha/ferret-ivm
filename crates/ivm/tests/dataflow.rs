@@ -637,8 +637,22 @@ fn topk_follows_random_changes() {
         "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v LIMIT 2 OFFSET 1) x",
         "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v DESC FETCH FIRST 2 ROWS WITH TIES) x",
     ];
-    for seed in [1, 2, 3] {
-        random_changes_keep_views_equal(&format!("topk-random-{seed}"), &queries, 150, seed * 7919);
+    for seed in [1, 2] {
+        random_changes_keep_views_equal(&format!("topk-random-{seed}"), &queries, 100, seed * 7919);
+    }
+    // windows of more than 32 rows are located through the count summaries,
+    // smaller ones read from the start of their group
+    let large = [
+        "SELECT id, v FROM t ORDER BY v, id LIMIT 20 OFFSET 30",
+        "SELECT g, v FROM t ORDER BY v DESC NULLS LAST OFFSET 25 FETCH FIRST 10 ROWS WITH TIES",
+        "SELECT v FROM t ORDER BY v LIMIT 40 OFFSET 7",
+        "SELECT v FROM t ORDER BY v NULLS FIRST OFFSET 60",
+        "SELECT g, v FROM t ORDER BY v FETCH FIRST 33 ROWS WITH TIES",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v LIMIT 30 OFFSET 10) x",
+        "SELECT k.g, x.v FROM (SELECT DISTINCT g FROM t) k, LATERAL (SELECT v FROM t WHERE t.g = k.g ORDER BY v DESC OFFSET 20 FETCH FIRST 15 ROWS WITH TIES) x",
+    ];
+    for seed in [3, 4, 5] {
+        random_changes_keep_views_equal_from(&format!("topk-random-large-{seed}"), &large, 100, seed * 7919, 150);
     }
 }
 

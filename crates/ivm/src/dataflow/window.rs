@@ -853,6 +853,14 @@ fn data_error(e: SqlError) -> Result<SqlError> {
 /// partition is or becomes in error, or its error state is unknown): the
 /// whole partition is recomputed instead.
 fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, keys: &[Vec<u8>], gsn: Gsn) -> Result<Option<Delta>> {
+    if !p.errors_known.load(std::sync::atomic::Ordering::Acquire) || p.errors.lock().contains_key(&part.lo) {
+        return Ok(None);
+    }
+    let n = part.len(env)?;
+    // (reading a small partition costs less than finding what to read)
+    if n <= SMALL_PARTITION {
+        return Ok(None);
+    }
     let mut changed: Vec<Changed> = Vec::with_capacity(keys.len());
     for key in keys {
         let (before, after) = match env.get(part.tree, key)? {
@@ -866,15 +874,7 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, keys: &[Vec<u8>], 
     if changed.is_empty() {
         return Ok(Some(vec![]));
     }
-    if !p.errors_known.load(std::sync::atomic::Ordering::Acquire) || p.errors.lock().contains_key(&part.lo) {
-        return Ok(None);
-    }
-    let n = part.len(env)?;
     let resize: i64 = changed.iter().map(|c| c.after - c.before).sum();
-    // (reading a small partition costs less than finding what to read)
-    if n.max(n - resize) <= SMALL_PARTITION {
-        return Ok(None);
-    }
     for c in changed.iter_mut() {
         c.rank = part.rank(env, &c.key)?;
     }

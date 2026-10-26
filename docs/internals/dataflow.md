@@ -423,7 +423,9 @@ with the window after it, without reading either in full:
 
 The work is proportional to the number of changes and to how far the
 window moves, not to `offset` or `limit` (when the window moves past its
-own length, the two windows are read).
+own length, the two windows are read). Windows of at most 32 rows
+(`offset` included) are instead read from the start of their group, before
+and after the GSN, which costs less than locating them.
 
 ### Window
 

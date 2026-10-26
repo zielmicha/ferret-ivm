@@ -726,10 +726,69 @@ impl Window {
     }
 }
 
+/// Windows of at most this many rows (OFFSET included) are read from the
+/// start of their group: that costs less than locating them.
+const SMALL_WINDOW: u64 = 32;
+
+fn small_window(p: &TopKPlan) -> bool {
+    p.limit.is_some_and(|l| p.offset.saturating_add(l) <= SMALL_WINDOW)
+}
+
+/// Rows of a group's top-k as of `at`, walking the group from its start
+/// (small windows).
+fn topk_walk(env: &mut Env, g: &TopKGroup, p: &TopKPlan, at: ReadAt) -> Result<Delta> {
+    let mut out = Vec::new();
+    let (mut skipped, mut taken) = (0u64, 0u64);
+    let limit = p.limit.unwrap_or(u64::MAX);
+    if limit == 0 {
+        return Ok(out);
+    }
+    let mut last_key: Option<Vec<u8>> = None;
+    g.for_each(env, &g.lo, &Bound::Unbounded, &mut |k, h| {
+        visited(1);
+        let mut w = h.weight(at);
+        if w <= 0 {
+            return Ok(true);
+        }
+        if taken >= limit {
+            // past the limit only rows tied with the last one remain
+            return match &last_key {
+                Some(lk) if p.with_ties && g.tie_key(k)? == lk.as_slice() => {
+                    out.push((g.layout.decode_row(k)?, w));
+                    Ok(true)
+                }
+                _ => Ok(false),
+            };
+        }
+        if skipped < p.offset {
+            let s = (p.offset - skipped).min(w as u64);
+            skipped += s;
+            w -= s as i64;
+            if w == 0 {
+                return Ok(true);
+            }
+        }
+        // with ties, the rest of an entry's multiplicity is tied too
+        let take = if p.with_ties { w as u64 } else { (limit - taken).min(w as u64) };
+        out.push((g.layout.decode_row(k)?, take as i64));
+        taken += take;
+        if p.with_ties {
+            last_key = Some(g.tie_key(k)?.to_vec());
+            Ok(true)
+        } else {
+            Ok(taken < limit)
+        }
+    })?;
+    Ok(out)
+}
+
 /// Rows of a group's top-k (current weights), from the row at position
 /// OFFSET on (found through the count summaries, not by walking the rows
 /// before it).
 fn topk_rows(env: &mut Env, g: &TopKGroup, p: &TopKPlan) -> Result<Delta> {
+    if small_window(p) {
+        return topk_walk(env, g, p, ReadAt::Latest);
+    }
     let mut out = Vec::new();
     if p.limit == Some(0) {
         return Ok(out);
@@ -789,6 +848,11 @@ fn merge_ranges(mut ranges: Vec<(Vec<u8>, Bound<Vec<u8>>)>) -> Vec<(Vec<u8>, Bou
 /// those between their last rows, and the changed entries are.
 fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, delta: &[Vec<u8>], gsn: Gsn, out: &mut Delta) -> Result<()> {
     if p.limit == Some(0) {
+        return Ok(());
+    }
+    if small_window(p) {
+        out.extend(topk_walk(env, g, p, ReadAt::Before(gsn))?.into_iter().map(|(r, w)| (r, -w)));
+        out.extend(topk_walk(env, g, p, ReadAt::Latest)?);
         return Ok(());
     }
     let mut changed: Vec<Changed> = Vec::with_capacity(delta.len());
