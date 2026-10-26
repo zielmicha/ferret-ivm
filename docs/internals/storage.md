@@ -41,11 +41,15 @@ for leaves and for internal nodes. A node whose contents after an update
 exceed the target is split into chunks of balanced size (internal nodes keep
 at least two children per chunk); when they exceed twice the target (a bulk
 load, hydration), the chunks are filled to 90% of it, so that the next
-inserts do not split every node right away. When a leaf splits, the
-separator of each new chunk is the shortest prefix of its first key that is
-greater than the previous chunk's last key (suffix truncation); a new
-internal node takes its first child's separator. The first chunk keeps the
-node's place (and separator) in its parent.
+inserts do not split every node right away. After an append — a leaf
+whose updates all lie past its last key, or an internal node whose updates
+all went to its last child — every chunk but the last is filled to 90%
+instead: the appends that follow go to the last chunk, so balanced chunks
+would stay half full (sequential keys used to leave leaves at about 8 KiB).
+When a leaf splits, the separator of each new chunk is the shortest prefix
+of its first key that is greater than the previous chunk's last key (suffix
+truncation); a new internal node takes its first child's separator. The
+first chunk keeps the node's place (and separator) in its parent.
 
 A node that an update or the maintenance pass leaves smaller than a quarter
 of its target is merged with its right neighbour, or else its left one,
@@ -141,7 +145,7 @@ changes at one GSN:
    updates into its entries, compacting every untouched entry on the way.
    (So the first change to a leaf after a checkpoint always rebuilds and
    compacts it.)
-4. Split oversized nodes into balanced chunks; a root that splits gets a
+4. Split oversized nodes into chunks (see above); a root that splits gets a
    new parent; a root left with a single child is replaced by it; empty
    nodes are removed; children the update made smaller than a quarter of
    their target are merged with a neighbour (loading it if needed).

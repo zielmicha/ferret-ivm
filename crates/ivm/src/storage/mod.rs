@@ -753,7 +753,7 @@ impl Env {
             }
             self.slot_mut(root).loaded_children = parts.len() as u32;
             let children = parts.into_iter().map(Part::into_child).collect();
-            let mut new_parts = self.finish_internal(root, children, None, summ)?;
+            let mut new_parts = self.finish_internal(root, children, None, summ, false)?;
             if new_parts.len() == 1 {
                 return Ok(new_parts.pop().unwrap());
             }
@@ -784,6 +784,9 @@ impl Env {
         match node {
             Node::Leaf(entries) => {
                 let frontier = self.frontier;
+                // only inserts past the leaf's last key: an append, which
+                // will not come back to the leaf's left part
+                let append = entries.last().is_none_or(|e| *ups[0].0 > *e.key);
                 // weight changes as (index into ups, total weight before),
                 // folded into the leaf's old summary afterwards if the leaf
                 // does not split and that is cheaper than recomputing it
@@ -882,7 +885,7 @@ impl Env {
                     // the first part keeps the node's place (and separator) in the parent
                     return Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary, min_seg: u32::MAX, due: 0 }]);
                 }
-                let chunks = split_by_bytes(out, self.opts.leaf_bytes, entry_size, 1);
+                let chunks = split_by_bytes(out, self.opts.leaf_bytes, entry_size, 1, append);
                 let single = chunks.len() == 1;
                 let parent = self.slot(id).parent;
                 let tree = self.slot(id).tree;
@@ -979,7 +982,9 @@ impl Env {
                     let mut unlimited = u64::MAX;
                     self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut unlimited, false)?;
                 }
-                self.finish_internal_sized(id, children, incr, summ, size)
+                // splits of the last child only: an append at the right edge
+                let append = runs.len() == 1 && runs[0].0 + 1 == n;
+                self.finish_internal_sized(id, children, incr, summ, size, append)
             }
         }
     }
@@ -1110,9 +1115,10 @@ impl Env {
         summary: Option<Summary>,
         summ: &Arc<dyn Summarizer>,
         size: usize,
+        append: bool,
     ) -> Result<Parts> {
         if size > self.opts.internal_bytes {
-            return self.finish_internal(id, children, summary, summ);
+            return self.finish_internal(id, children, summary, summ, append);
         }
         #[cfg(debug_assertions)]
         {
@@ -1135,20 +1141,22 @@ impl Env {
         Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary: s, min_seg, due }])
     }
 
-    /// Store `children` in internal node `id`, splitting by size. `summary`
-    /// is the node's summary if known (used when it does not split).
+    /// Store `children` in internal node `id`, splitting by size (see
+    /// `split_by_bytes` for `append`). `summary` is the node's summary if
+    /// known (used when it does not split).
     fn finish_internal(
         &mut self,
         id: u32,
         children: Vec<Child>,
         summary: Option<Summary>,
         summ: &Arc<dyn Summarizer>,
+        append: bool,
     ) -> Result<Parts> {
         let parent = self.slot(id).parent;
         let tree = self.slot(id).tree;
         // internal nodes keep at least two children per chunk so that a tree
         // with oversized separators still converges to a single root
-        let chunks = split_by_bytes(children, self.opts.internal_bytes, node::child_size, 2);
+        let chunks = split_by_bytes(children, self.opts.internal_bytes, node::child_size, 2, append);
         let single = chunks.len() == 1;
         let mut summary = summary;
         let mut parts = Parts::with_capacity(chunks.len());
@@ -1949,7 +1957,7 @@ impl Env {
             self.free_slot(id);
             return Ok(Visit::New(Parts::new()));
         }
-        Ok(Visit::New(self.finish_internal_sized(id, children, Some(old.clone()), summ, size)?))
+        Ok(Visit::New(self.finish_internal_sized(id, children, Some(old.clone()), summ, size, false)?))
     }
 
     pub fn stats(&self) -> EnvStats {
@@ -1973,17 +1981,21 @@ impl Env {
 }
 
 /// Split a sorted vector into chunks of about `target` bytes, each with at
-/// least `min_items` items, balancing chunk sizes.
-fn split_by_bytes<T>(items: Vec<T>, target: usize, size: fn(&T) -> usize, min_items: usize) -> Vec<Vec<T>> {
+/// least `min_items` items, balancing chunk sizes. After an append past the
+/// node's previous last key (`append`), all chunks but the last are filled
+/// to 90% instead: the appends that follow go to the last one, so the others
+/// would stay half empty (the 10% leave room for the history of later
+/// updates and retractions).
+fn split_by_bytes<T>(items: Vec<T>, target: usize, size: fn(&T) -> usize, min_items: usize, append: bool) -> Vec<Vec<T>> {
     let total: usize = items.iter().map(size).sum();
     if total <= target || items.len() < 2 * min_items.max(1) {
         return vec![items];
     }
     // A batch spread over many nodes (a bulk load) leaves room in each, so
     // that the next inserts do not split full nodes right away.
-    let fill = if total > 2 * target { target - target / 10 } else { target };
+    let fill = if total > 2 * target || append { target - target / 10 } else { target };
     let nchunks = total.div_ceil(fill).max(2).min(items.len() / min_items.max(1));
-    let per = total.div_ceil(nchunks);
+    let per = if append { fill } else { total.div_ceil(nchunks) };
     let mut out = Vec::with_capacity(nchunks);
     let mut cur = Vec::new();
     let mut cur_bytes = 0;

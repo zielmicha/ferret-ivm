@@ -1434,6 +1434,21 @@ fn mass_delete_is_compacted_and_merged() {
     assert!(leaves <= 8 && internal <= 2, "{leaves} leaves ({bytes} bytes) and {internal} internal nodes left of {split} leaves: {st:?}");
 }
 
+/// Appending keys in small batches fills leaves to 90% (they used to split
+/// in half and stay half full, since nothing is inserted on the left again).
+#[test]
+fn appends_fill_leaves() {
+    let tmp = TempDir::new("storage-appends");
+    let (mut env, _) = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    for (g, c) in (0..100_000u64).step_by(10).enumerate() {
+        env.apply(t, &mut (c..c + 10).map(|i| (key8(i, 92), 1)).collect(), g as Gsn + 1).unwrap();
+    }
+    let (leaves, internal, _, bytes) = shape(&mut env, t);
+    let avg = bytes / leaves;
+    assert!(avg * 10 >= 16 * 1024 * 8, "average leaf {avg} bytes ({leaves} leaves, {internal} internal)");
+}
+
 /// A row updated at every GSN whose versions sort after each other (entry =
 /// key ++ payload): a lookup of its key visits the versions within the
 /// retention window and since the last pass, not every version ever
