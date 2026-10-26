@@ -9,8 +9,9 @@ algorithms; byte formats are in [On-disk format](../on-disk-format.md).
 
 Files: `mod.rs` (trees, arena, reads, writes, eviction, checkpoint, GC),
 `node.rs` (node encoding), `history.rs`, `summary.rs`, `segment.rs`,
-`manifest.rs`, `inspect.rs` (buffer-pool residency per tree, for the web UI),
-`tests.rs` (model tests).
+`manifest.rs`, `sort.rs` (loading unordered entries through sorted runs),
+`inspect.rs` (buffer-pool residency per tree, for the web UI), `tests.rs`
+(model tests).
 
 ## Trees
 
@@ -91,8 +92,8 @@ allocates a slot and replaces the pointer by `Mem(slot)`.
 There is no separate in-memory mode: a tree that fits in the cache is served
 from memory, a larger one degrades gradually as nodes are re-read from the
 segment files (through the operating system's page cache). The same holds
-for data that is not yet durable: a batch much larger than the cache is
-written out as it goes.
+for data that is not yet durable: a batch or a hydration much larger than
+the cache is written out as it goes.
 
 ## Histories
 
@@ -237,6 +238,31 @@ only.
   `(N·Q − S²) / (N·(N−1))` (or `N²`). A finite sum whose rounded value
   overflows (for `sum(real)`, overflows `real`) fails with
   `value out of range: overflow`.
+
+## Loading unordered entries
+
+Applying batches of entries in arbitrary key order to a large tree would
+touch, and rewrite, every leaf with every batch. A `TreeBuilder`
+(`sort.rs`), used to build arrangements during hydration, loads entries in
+bounded memory with an external merge sort:
+
+- entries are buffered up to an eighth of the cache (at least 1 MiB, at
+  most 64 MiB, counting 40 bytes per entry besides its key);
+- a full buffer is sorted; if it lies wholly after everything applied to
+  the target so far (the first buffer, or input arriving in key order or
+  nearly so), it is applied to the target directly, at its right edge;
+  otherwise it is stored as a *run* in a temporary tree, whose nodes the
+  buffer pool writes out and evicts like any other;
+- once there are 128 runs, the oldest 64 are merged into one;
+- `finish` merges the remaining runs (at most 64; first merging the oldest
+  64 while there are more) into the target in key order, adding up equal
+  entries, in batches of a quarter of the buffer, and drops the runs.
+
+Temporary trees (`Env::create_temp_tree`) take their ids from the top of
+the id range downwards, so the ids of persistent trees do not depend on
+them; they are not meant to outlive the operation that creates them, and
+one that a checkpoint happens to record is not attached after recovery
+and is dropped with the other unreferenced trees.
 
 ### How aggregates use summaries
 

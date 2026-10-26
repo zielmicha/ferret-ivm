@@ -576,6 +576,42 @@ impl Graph {
         Ok(out)
     }
 
+    /// Rows of an arrangement with weights as of `at`, handed to `sink` in
+    /// batches of at most `ops::BATCH_ROWS` rows and about 1 MiB of entries.
+    pub fn scan_stream(&self, env: &mut Env, arr: ArrId, at: ReadAt, sink: &mut ops::RowSink) -> Result<()> {
+        let a = self.arr(arr);
+        let layout = &a.layout;
+        let mut from: Option<Vec<u8>> = None;
+        loop {
+            let lo = match &from {
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut batch = Vec::new();
+            let mut bytes = 0;
+            let mut last = None;
+            env.for_each(a.tree, lo, std::ops::Bound::Unbounded, &mut |k, h| {
+                let w = h.weight(at);
+                if w != 0 {
+                    batch.push((layout.decode_row(k)?, w));
+                    bytes += k.len();
+                    if batch.len() >= ops::BATCH_ROWS || bytes >= 1 << 20 {
+                        last = Some(k.to_vec());
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if !batch.is_empty() {
+                sink(env, batch)?;
+            }
+            match last {
+                Some(k) => from = Some(k),
+                None => return Ok(()),
+            }
+        }
+    }
+
     /// Rows matching a key prefix.
     pub fn lookup(&self, env: &mut Env, arr: ArrId, key: &[crate::types::Datum], at: ReadAt) -> Result<Delta> {
         let a = self.arr(arr);
@@ -594,10 +630,13 @@ impl Graph {
 
     /// Full contents of a node as of the latest processed time (consolidated).
     pub fn snapshot(&self, env: &mut Env, node: NodeId) -> Result<Output> {
-        let mut cache = FxHashMap::default();
-        let mut out = ops::owned(ops::snapshot_node(self, env, node, &mut cache)?);
-        consolidate(&mut out.data);
-        Ok(out)
+        let mut data = Vec::new();
+        let errs = ops::snapshot_stream(self, env, node, &mut |_, batch| {
+            data.extend(batch);
+            Ok(())
+        })?;
+        consolidate(&mut data);
+        Ok(Output { data, errs })
     }
 
     /// The node's first hydrated arrangement, if any.
@@ -754,77 +793,51 @@ impl Graph {
     /// Bring every new node and arrangement up to date as of `gsn`, computing
     /// their contents from existing state (never from the sources). The
     /// error records in their contents are kept per node (`errors_of`).
+    /// Memory stays bounded: a node's snapshot is streamed into its new
+    /// arrangements a batch at a time, and each arrangement is built by an
+    /// external sort (`TreeBuilder`).
     pub fn hydrate(&mut self, env: &mut Env, gsn: Gsn) -> Result<()> {
         let order: Vec<NodeId> = self.topo().to_vec();
-        let mut cache: ops::SnapCache = FxHashMap::default();
-        // snapshots are cached only while a node still to be hydrated may
-        // read them (large views would otherwise hold every intermediate)
-        let needs = |g: &Graph, id: NodeId| {
-            !g.node(id).hydrated || g.node(id).arrangements.iter().any(|a| !g.arr(*a).hydrated)
-        };
-        let mut readers: FxHashMap<NodeId, usize> = FxHashMap::default();
-        for &id in &order {
-            if needs(self, id) {
-                for i in &self.node(id).inputs {
-                    *readers.entry(*i).or_default() += 1;
-                }
-            }
-        }
         for id in order {
             let needs_node = !self.node(id).hydrated;
-            let pending_arrs: Vec<ArrId> =
-                self.node(id).arrangements.iter().copied().filter(|a| !self.arr(*a).hydrated).collect();
-            if !needs_node && pending_arrs.is_empty() {
-                continue;
-            }
             if needs_node {
                 // stateful operators initialize their own arrangements here
-                ops::hydrate_node(self, env, id, gsn, &mut cache)?;
+                ops::hydrate_node(self, env, id, gsn)?;
             }
             let pending_arrs: Vec<ArrId> =
                 self.node(id).arrangements.iter().copied().filter(|a| !self.arr(*a).hydrated).collect();
             if !pending_arrs.is_empty() {
-                let snap = match cache.get(&id) {
-                    Some(s) => s.clone(),
-                    None => {
-                        let s = ops::snapshot_node(self, env, id, &mut cache)?;
-                        cache.insert(id, s.clone());
-                        s
+                let layouts: Vec<Arc<Layout>> = pending_arrs.iter().map(|a| self.arr(*a).layout.clone()).collect();
+                let mut builders: Vec<crate::storage::TreeBuilder> =
+                    pending_arrs.iter().map(|a| crate::storage::TreeBuilder::new(env, self.arr(*a).tree, gsn)).collect();
+                // the rows go to every new arrangement, in their key orders
+                let r = ops::snapshot_stream(self, env, id, &mut |env, batch| {
+                    for (b, layout) in builders.iter_mut().zip(&layouts) {
+                        for (row, w) in &batch {
+                            b.push(env, layout.encode_row(row)?, *w)?;
+                        }
+                    }
+                    Ok(())
+                });
+                let errs = match r {
+                    Ok(errs) => errs,
+                    Err(e) => {
+                        for b in builders {
+                            b.abort(env)?;
+                        }
+                        return Err(e);
                     }
                 };
-                for a in pending_arrs {
-                    let arr = self.arr(a);
-                    // Entries are applied in key order, in batches that each
-                    // cover a key range: unordered batches would each touch
-                    // (and rewrite) every leaf.
-                    let mut ups = Vec::with_capacity(snap.data.len());
-                    for (row, w) in &snap.data {
-                        ups.push((arr.layout.encode_row(row)?, *w));
-                    }
-                    ups.sort_unstable_by(|x, y| x.0.cmp(&y.0));
-                    while !ups.is_empty() {
-                        let mut batch = ups.split_off(ups.len().saturating_sub(100_000));
-                        env.apply(arr.tree, &mut batch, gsn)?;
-                    }
+                for (a, b) in pending_arrs.into_iter().zip(builders) {
+                    b.finish(env)?;
                     let a = self.arrs[a].as_mut().unwrap();
                     a.hydrated = true;
                     a.since = gsn;
                 }
                 // the arrangement holds the rows; the errors are kept here
-                self.set_errors(id, &snap.errs);
-            } else if needs_node && let Some(s) = cache.get(&id) {
-                let errs = s.errs.clone();
                 self.set_errors(id, &errs);
             }
             self.node_mut(id).hydrated = true;
-            // drop snapshots nobody further down will read (including those
-            // of intermediate nodes computed along the way)
-            for i in self.node(id).inputs.clone() {
-                if let Some(n) = readers.get_mut(&i) {
-                    *n = n.saturating_sub(1);
-                }
-            }
-            cache.retain(|k, _| readers.get(k).copied().unwrap_or(0) > 0);
         }
         Ok(())
     }
@@ -888,6 +901,23 @@ pub fn operator_arrangements(kind: &NodeKind) -> Vec<ArrId> {
         NodeKind::Temporal(p) => vec![p.events],
         _ => vec![],
     }
+}
+
+/// Estimated memory of a row (its values and what they point to, shared or
+/// not), for bounding batches.
+pub fn row_bytes(row: &[crate::types::Datum]) -> usize {
+    use crate::types::Datum;
+    std::mem::size_of_val(row)
+        + 24
+        + row
+            .iter()
+            .map(|d| match d {
+                Datum::Text(s) | Datum::Json(s) => s.len() + 16,
+                Datum::Bytea(b) => b.len() + 16,
+                Datum::Numeric(_) | Datum::Jsonb(_) | Datum::Array(_) => 64,
+                _ => 0,
+            })
+            .sum::<usize>()
 }
 
 /// Consolidate a delta: sort rows by exact identity, sum weights, drop zeros.

@@ -11,7 +11,7 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 
 | Knob | Default | Trade-off |
 |---|---|---|
-| `--cache-mb` | 1024 | Target size of the node cache. Index nodes beyond it are evicted (CLOCK) and re-read from segment files on demand; modified (dirty) nodes are written to the segment files first, and are also written once they exceed half of the cache, ahead of the next checkpoint (which makes them durable). Working sets that fit run from memory; larger ones degrade gradually. A checkpoint is forced if dirty nodes still exceed half of the cache after a record. |
+| `--cache-mb` | 1024 | Target size of the node cache. Index nodes beyond it are evicted (CLOCK) and re-read from segment files on demand; modified (dirty) nodes are written to the segment files first, and are also written once they exceed half of the cache, ahead of the next checkpoint (which makes them durable). Working sets that fit run from memory; larger ones degrade gradually — also large transactions and view hydration, which build their results through the cache. A checkpoint is forced if dirty nodes still exceed half of the cache after a record. |
 | `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash (dirty memory stays within half of the cache either way). The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
 | `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes, more input-log segments on disk, and more clock ticks in each checkpoint. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
@@ -29,6 +29,9 @@ Fixed internal parameters (not configurable):
 | unacknowledged commits per source | 10,000 |
 | initial-snapshot chunk | 10,000 rows |
 | groups cached in memory per aggregation | 2^18 (half evicted when full) |
+| sort buffer when building an index (hydration) | an eighth of the cache, within 1 MiB and 64 MiB |
+| rows per hydration batch | 1,024 (or 1 MiB of index entries) |
+| join rows looked up at once | about 8 MiB |
 | nodes relocated per garbage-collection pass | 1000 |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
@@ -46,9 +49,11 @@ Things to keep in mind when sizing:
   thread, so the engine uses about one core for its work (plus the
   sequencer, one thread per source, sink and client session, and three
   threads for the web UI when it is enabled).
-- **Memory outside the cache**: hydration of a new view holds snapshots of
-  intermediate results; aggregation group caches; subscription and sink
-  queues are unbounded. The queue of logged records the engine has yet to
+- **Memory outside the cache**: hydration of a new view holds a few
+  batches of rows, a sort buffer per index it builds and about 16 MiB of
+  join rows in flight (a window partition or a recursive query's result is
+  computed whole); aggregation group caches; subscription and sink queues
+  are unbounded. The queue of logged records the engine has yet to
   apply is bounded: when the engine is 10,000 records behind, the log stops
   taking new records until it catches up (sources then pause reading the
   replication stream, and the upstream keeps the WAL).

@@ -19,10 +19,12 @@ mod inspect;
 pub mod manifest;
 pub mod node;
 pub mod segment;
+pub mod sort;
 pub mod summary;
 
 pub use history::{History, ReadAt};
 pub use inspect::TreeResidency;
+pub use sort::TreeBuilder;
 pub use summary::{AggKind, AggState, FloatSum, Summary};
 
 use crate::error::{Result, SqlError};
@@ -365,6 +367,21 @@ impl Env {
     /// Id the next `create_tree` will return (deterministic across replay).
     pub fn next_tree_id(&self) -> TreeId {
         self.next_tree_id
+    }
+
+    /// A tree for temporary contents (sort runs), which its user drops. Its
+    /// id is taken from the top of the id range downwards, leaving the ids
+    /// of `create_tree` a function of the operations that create trees. One
+    /// that a checkpoint happens to record is not attached after recovery,
+    /// so the engine drops it then.
+    pub fn create_temp_tree(&mut self, summarizer: Arc<dyn Summarizer>) -> TreeId {
+        let mut id = TreeId::MAX;
+        while self.trees.contains_key(&id) {
+            id -= 1;
+        }
+        let summary = Summary::empty(summarizer.spec());
+        self.trees.insert(id, TreeState { root: None, summary, min_seg: u32::MAX, summarizer, attached: true });
+        id
     }
 
     pub fn attach_tree(&mut self, id: TreeId, summarizer: Arc<dyn Summarizer>) -> Result<()> {

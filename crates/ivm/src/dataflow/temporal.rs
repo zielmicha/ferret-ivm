@@ -273,37 +273,51 @@ pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &Delta, gsn: Gsn,
     env.apply(tree, &mut ups, gsn)
 }
 
-/// Rows of the input valid now.
-pub fn snapshot(g: &Graph, p: &TemporalPlan, input: Output, out: &mut Output) {
-    out.errs = input.errs;
-    for (row, w) in input.data {
+/// Rows of the input valid now (a batch of the input's snapshot).
+pub fn snapshot(g: &Graph, env: &mut Env, p: &TemporalPlan, input: Delta, out: &mut super::ops::SnapOut) -> Result<()> {
+    for (row, w) in input {
         match validity(&p.preds, &row) {
             Ok(Some((lo, hi))) => {
                 if lo <= g.now && g.now < hi {
-                    out.data.push((row, w));
+                    out.push(env, row, w)?;
                 }
             }
             Ok(None) => {}
-            Err(e) => out.errs.push((err_record(&e), w)),
+            Err(e) => out.err(err_record(&e), w),
         }
     }
+    Ok(())
 }
 
-/// Build the pending events of a new operator from its input's contents.
-pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: &Output, gsn: Gsn) -> Result<()> {
+/// Build the pending events of a new operator from the contents of its
+/// input node (streamed, the events sorted in bounded memory).
+pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: NodeId, gsn: Gsn) -> Result<()> {
     if g.arr(p.events).hydrated {
         return Ok(());
     }
     let ev = g.arr(p.events);
     let layout = ev.layout.clone();
-    let tree = ev.tree;
-    let mut ups = Vec::new();
-    for (row, w) in &input.data {
-        if let Ok(Some(iv)) = validity(&p.preds, row) {
-            schedule(&layout, g.now, row, *w, iv, &mut ups)?;
+    let mut events = crate::storage::TreeBuilder::new(env, ev.tree, gsn);
+    let now = g.now;
+    let r = super::ops::snapshot_stream(g, env, input, &mut |env, batch| {
+        let mut ups = Vec::new();
+        for (row, w) in &batch {
+            if let Ok(Some(iv)) = validity(&p.preds, row) {
+                schedule(&layout, now, row, *w, iv, &mut ups)?;
+            }
+        }
+        for (e, w) in ups {
+            events.push(env, e, w)?;
+        }
+        Ok(())
+    });
+    match r {
+        Ok(_) => events.finish(env)?,
+        Err(e) => {
+            events.abort(env)?;
+            return Err(e);
         }
     }
-    env.apply(tree, &mut ups, gsn)?;
     let ev = g.arrs[p.events].as_mut().unwrap();
     ev.hydrated = true;
     ev.since = gsn;

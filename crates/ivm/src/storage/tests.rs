@@ -1192,6 +1192,41 @@ fn dirty_data_larger_than_the_cache_is_evictable() {
     check_structure(&mut env);
 }
 
+/// A tree built from entries in random order through sorted runs in
+/// temporary trees (with several levels of merging): it holds the sums of
+/// the entries' weights, the buffer pool stays within the cache, and the
+/// temporary trees are gone.
+#[test]
+fn tree_builder_sorts_in_bounded_memory() {
+    let tmp = TempDir::new("storage-builder");
+    let opts = EnvOptions { cache_bytes: 64 << 10, leaf_bytes: 1024, internal_bytes: 1024, segment_bytes: 256 << 10 };
+    let (mut env, _) = Env::open(tmp.path(), opts.clone()).unwrap();
+    let t = env.create_tree(summarizer(Kind::Int));
+    let mut b = TreeBuilder::with_limits(t, 7, 8 << 10, 3);
+    let mut model: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    let mut rng = Rng::new(42);
+    let bound = opts.cache_bytes + opts.cache_bytes / 16 + opts.leaf_bytes;
+    for i in 0..30_000u64 {
+        let u = if i < 5_000 { i } else { rng.below(20_000) };
+        let k = format!("{:03}:{u:05}:{}:", u % 7, INT_VALUES[(u % 8) as usize]).into_bytes();
+        // some entries cancel out across runs
+        let w = if rng.chance(20) { -1 } else { 1 };
+        *model.entry(k.clone()).or_default() += w;
+        b.push(&mut env, k, w).unwrap();
+        assert!(env.resident_bytes() <= bound, "{} bytes resident", env.resident_bytes());
+    }
+    b.finish(&mut env).unwrap();
+    assert!(env.resident_bytes() <= bound, "{} bytes resident", env.resident_bytes());
+    assert_eq!(env.tree_ids(), vec![t], "temporary trees left behind");
+    let all = env.scan(t, Bound::Unbounded, Bound::Unbounded).unwrap();
+    assert!(all.iter().all(|(_, h)| h.0.len() == 1 && h.0[0].0 == 7), "histories other than one change at the builder's GSN");
+    let got: Vec<(Vec<u8>, i64)> = all.into_iter().map(|(k, h)| (k.to_vec(), h.total())).collect();
+    let want: Vec<(Vec<u8>, i64)> = model.into_iter().filter(|(_, w)| *w != 0).collect();
+    assert!(got == want, "built tree differs from the model");
+    env.check_summaries(t).unwrap();
+    check_structure(&mut env);
+}
+
 /// Random updates with a moving retention frontier, AS OF reads at every
 /// retained time, checkpoints, crashes (reopen without a checkpoint), GC
 /// and a cache small enough to evict constantly: reads must equal the

@@ -266,9 +266,15 @@ extended along *i*'s path. Input *j* is read *after* the GSN if `j < i` and
   below).
 - When all inputs are bound, the joined row goes to the output.
 - For hydration, the join drives the path of its smallest regular input
-  (by index size) over that input's snapshot; the MFPs of the other regular
-  inputs are evaluated over their contents too, so that their expression
-  errors are counted once per row, as the steps count them.
+  (by index size) over that input's snapshot, in chunks of about 8 MiB of
+  rows (estimated by `row_bytes`); the MFPs of the other regular inputs are
+  evaluated over their contents too, so that their expression errors are
+  counted once per row, as the steps count them.
+- A path is extended depth first in chunks: a lookup step takes at most
+  8 MiB of its frontier at a time, hands its output on in chunks of 8 MiB,
+  and reads a key's matches in batches of 1,024 rows (or 1 MiB of entries),
+  so the rows in flight stay bounded whatever the fan-out. Within a chunk,
+  rows are looked up in key order (rows with equal keys share a lookup).
 
 Lookup order is chosen per path by the planner ([Planner](planner.md#delta-join-planning)):
 the next input is the one with the most equality conditions to the bound
@@ -416,35 +422,44 @@ See [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal
 
 `Graph::hydrate(env, gsn)` brings every node and arrangement that is not yet
 hydrated up to date as of `gsn`, computing their contents **from existing
-state, never from the sources**:
+state, never from the sources**, in memory bounded by the buffer pool and
+a constant:
 
 1. Visit nodes in topological order. For a node that is not hydrated,
    operators with private state initialise it (the temporal filter computes
-   its pending events from its input's snapshot).
-2. If the node has arrangements that are not hydrated, compute the node's
-   *snapshot* — its full contents, rows and error records — and write its
-   rows into each of them at `gsn`: they are encoded as the arrangement's
-   entries, sorted by key and applied in batches of 100,000 that each cover
-   one key range (so a batch rewrites only the leaves of its range). The
-   arrangement's `since` becomes `gsn`. A snapshot (`ops::snapshot_node`)
-   is read from any hydrated arrangement of the node if there is one, with
-   the node's accumulated error records; otherwise it is computed from the
-   inputs' snapshots: a table from its primary index, an `Mfp` by evaluating
-   its input's snapshot, a join by driving one path, a `Reduce` group by
-   group from its input index (seeking from one group's key prefix to the
-   next, and rebuilding the operator's error state), and so on. Every
-   operator's snapshot includes its inputs' error records, as its steps
-   pass them on. Snapshots of row-wise operators (`Mfp`, `Union`, `Negate`,
-   `FlatMap`, `DeltaJoin`, `TemporalFilter`) are passed on unconsolidated:
-   arrangements consolidate entries as they apply them, and
-   `Graph::snapshot` consolidates its result.
-3. The error records of each hydrated node's snapshot become the node's
+   its pending events from its input's snapshot, loading them into its
+   event index through a `TreeBuilder`).
+2. If the node has arrangements that are not hydrated, stream the node's
+   *snapshot* — its full contents, rows and error records — into them at
+   `gsn`: each batch of rows is encoded as each arrangement's entries and
+   pushed to a `TreeBuilder` per arrangement, which loads entries arriving
+   in any order through sorted runs ([Storage](storage.md#loading-unordered-entries)),
+   so that each leaf is written once and at most a buffer of entries is in
+   memory. The arrangement's `since` becomes `gsn`.
+3. A snapshot (`ops::snapshot_stream`) is produced in batches of at most
+   1,024 rows: read from any hydrated arrangement of the node if there is
+   one (`Graph::scan_stream`, batches also bounded by 1 MiB of entries),
+   with the node's accumulated error records; otherwise computed from the
+   inputs' snapshots, a batch at a time: a table from its primary index, an
+   `Mfp` by evaluating its input's batches, a join by driving one path (see
+   [DeltaJoin](#deltajoin)), a `Reduce` group by group from its input index
+   (seeking from one group's key prefix to the next, and rebuilding the
+   operator's error state), a `TopK` likewise, a `SetOp` by merging both
+   input indexes in key order, and so on. Every operator's snapshot
+   includes its inputs' error records, as its steps pass them on. (A window
+   partition and a recursive query's result are computed whole, in
+   memory.) Snapshots are not consolidated: arrangements consolidate
+   entries as they apply them, and `Graph::snapshot` consolidates its
+   result.
+4. The error records of each hydrated node's snapshot become the node's
    error records (`Graph::errors_of`). A new or replaced materialized view
    takes its root's: when the root already existed (an identical view, or
    a view over another materialized view), those are the records the node
    has accumulated, so the view starts with the errors already present.
-4. Snapshots are cached only while a node still to be hydrated will read
-   them, so large intermediate results are freed early.
+
+Nothing is cached between readers: a node with an arrangement is read from
+it (nodes are hydrated before their readers), and a node without one is
+recomputed from its inputs for each reader, a batch at a time.
 
 Hydration is the common path of `CREATE MATERIALIZED VIEW`, `CREATE INDEX`,
 `SUBSCRIBE (query)`, `CREATE OR REPLACE MATERIALIZED VIEW` (and the

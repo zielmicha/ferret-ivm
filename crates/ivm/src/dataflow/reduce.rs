@@ -342,7 +342,7 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &Delta, out: &mu
     Ok(())
 }
 
-pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> Result<()> {
+pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut super::ops::SnapOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
     let tree = a.tree;
@@ -352,13 +352,13 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
     errors.clear();
     if ng == 0 {
         match compute_group(g, env, p, &[], None)?.0 {
-            Ok(Some(r)) => out.data.push((r, 1)),
+            Ok(Some(r)) => out.push(env, r, 1)?,
             Ok(None) => {}
             Err(e) => {
                 // remembered like any group's, so that it retracts on recovery
                 let rec = err_record(&e);
                 errors.insert(Vec::new(), rec.clone());
-                out.errs.push((rec, 1));
+                out.err(rec, 1);
             }
         }
         return Ok(());
@@ -366,7 +366,6 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
     // Enumerate groups in key order, seeking past each group's entries
     // instead of visiting them. The first live entry of a group gives its
     // key prefix and its exact key values.
-    let mut groups: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
     let mut from: Option<Vec<u8>> = None;
     loop {
         let lo = match &from {
@@ -379,25 +378,22 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut Output) -> R
                 return Ok(true);
             }
             let row = layout.decode_row(k)?;
-            next = Some((k[..layout.prefix_len(k, ng)?].to_vec(), p.group_key.iter().map(|c| row[*c].clone()).collect()));
+            next = Some((k[..layout.prefix_len(k, ng)?].to_vec(), p.group_key.iter().map(|c| row[*c].clone()).collect::<Vec<Datum>>()));
             Ok(false)
         })?;
         let Some((prefix, kv)) = next else { break };
         from = crate::types::encoding::prefix_successor(&prefix);
-        groups.push((prefix, kv));
-        if from.is_none() {
-            break;
-        }
-    }
-    for (prefix, kv) in groups {
         match compute_group(g, env, p, &prefix, Some(&kv))?.0 {
-            Ok(Some(r)) => out.data.push((r, 1)),
+            Ok(Some(r)) => out.push(env, r, 1)?,
             Ok(None) => {}
             Err(e) => {
                 let rec = err_record(&e);
                 errors.insert(prefix, rec.clone());
-                out.errs.push((rec, 1));
+                out.err(rec, 1);
             }
+        }
+        if from.is_none() {
+            break;
         }
     }
     Ok(())

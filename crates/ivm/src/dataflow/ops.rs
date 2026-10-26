@@ -73,151 +73,198 @@ pub fn step_node(
 }
 
 /// Hydration hook for operators with private state.
-pub fn hydrate_node(g: &mut Graph, env: &mut Env, id: NodeId, gsn: Gsn, cache: &mut SnapCache) -> Result<()> {
+pub fn hydrate_node(g: &mut Graph, env: &mut Env, id: NodeId, gsn: Gsn) -> Result<()> {
     if let NodeKind::Temporal(p) = &g.node(id).kind {
         let p = p.clone();
-        let input = snapshot_node(g, env, g.node(id).inputs[0], cache)?;
-        temporal::hydrate(g, env, &p, &input, gsn)?;
+        let input = g.node(id).inputs[0];
+        temporal::hydrate(g, env, &p, input, gsn)?;
     }
     Ok(())
 }
 
-/// Snapshots computed during one hydration or snapshot read.
-pub type SnapCache = FxHashMap<NodeId, Arc<Output>>;
+/// Rows a snapshot hands on at once (fewer from a source whose entries are
+/// large: see `Graph::scan_stream`).
+pub const BATCH_ROWS: usize = 1024;
 
-/// Take ownership of a snapshot, copying only if it is shared.
-pub fn owned(s: Arc<Output>) -> Output {
-    Arc::try_unwrap(s).unwrap_or_else(|a| (*a).clone())
+/// Receives rows in batches, with the environment (which their producer
+/// does not hold between batches).
+pub type RowSink<'a> = dyn FnMut(&mut Env, Delta) -> Result<()> + 'a;
+
+/// The output of a snapshot being computed: rows are handed on to a sink
+/// in batches of `BATCH_ROWS`, error records are added up.
+pub struct SnapOut<'s, 'a> {
+    rows: Delta,
+    sink: &'s mut RowSink<'a>,
+    errs: BTreeMap<(String, String), i64>,
 }
 
-/// Contents of a node (latest), computed from arrangements or inputs, as
-/// weighted rows that need not be consolidated (see [`Graph::snapshot`]).
-/// Only snapshots of nodes with several consumers are kept in `cache`; the
-/// rest are handed to their one reader and freed as soon as it is done.
-pub fn snapshot_node(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache) -> Result<Arc<Output>> {
-    if let Some(o) = cache.get(&id) {
-        return Ok(o.clone());
+impl<'s, 'a> SnapOut<'s, 'a> {
+    pub fn new(sink: &'s mut RowSink<'a>) -> Self {
+        SnapOut { rows: Vec::new(), sink, errs: BTreeMap::new() }
     }
+
+    pub fn push(&mut self, env: &mut Env, row: Row, w: i64) -> Result<()> {
+        self.rows.push((row, w));
+        if self.rows.len() >= BATCH_ROWS {
+            self.flush(env)?;
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self, env: &mut Env) -> Result<()> {
+        if !self.rows.is_empty() {
+            (self.sink)(env, std::mem::take(&mut self.rows))?;
+        }
+        Ok(())
+    }
+
+    pub fn err(&mut self, e: (String, String), w: i64) {
+        *self.errs.entry(e).or_default() += w;
+    }
+
+    pub fn errs(&mut self, errs: ErrDelta) {
+        for (e, w) in errs {
+            self.err(e, w);
+        }
+    }
+
+    /// Hand on the last rows; the consolidated error records.
+    pub fn finish(mut self, env: &mut Env) -> Result<ErrDelta> {
+        self.flush(env)?;
+        Ok(self.errs.into_iter().filter(|(_, w)| *w != 0).collect())
+    }
+}
+
+/// Stream the contents of a node (latest), computed from arrangements or
+/// inputs, to `sink` as batches of weighted rows that need not be
+/// consolidated (arrangements consolidate entries when they are applied,
+/// `Graph::snapshot` its result); returns the node's error records. Only a
+/// batch at a time is held per node: a snapshot of a node without an
+/// arrangement is streamed from its inputs' (recomputed for each reader).
+pub fn snapshot_stream(g: &Graph, env: &mut Env, id: NodeId, sink: &mut RowSink) -> Result<ErrDelta> {
     if let Some(a) = g.any_arrangement(id) {
-        let data = g.scan_arr(env, a, ReadAt::Latest)?;
-        return Ok(Arc::new(Output { data, errs: g.errors_of(id) }));
+        g.scan_stream(env, a, ReadAt::Latest, sink)?;
+        return Ok(g.errors_of(id));
     }
     let node = g.node(id);
-    let mut out = Output::default();
+    let mut out = SnapOut::new(sink);
     match &node.kind {
         NodeKind::Table { primary, .. } => {
-            out.data = g.scan_arr(env, *primary, ReadAt::Latest)?;
+            g.scan_stream(env, *primary, ReadAt::Latest, out.sink)?;
         }
         NodeKind::Constant { rows } => {
-            out.data = rows.iter().map(|r| (r.clone(), 1)).collect();
+            for r in rows {
+                out.push(env, r.clone(), 1)?;
+            }
         }
         NodeKind::Mfp { mfp } => {
-            let input = owned(snapshot_node(g, env, node.inputs[0], cache)?);
-            out.errs = input.errs;
-            for (row, w) in input.data {
-                match mfp.eval(&row) {
-                    Ok(Some(r)) => out.data.push((r, w)),
-                    Ok(None) => {}
-                    Err(e) => out.errs.push((err_record(&e), w)),
+            let input = snapshot_stream(g, env, node.inputs[0], &mut |env, batch| {
+                for (row, w) in batch {
+                    match mfp.eval(&row) {
+                        Ok(Some(r)) => out.push(env, r, w)?,
+                        Ok(None) => {}
+                        Err(e) => out.err(err_record(&e), w),
+                    }
                 }
-            }
+                Ok(())
+            })?;
+            out.errs(input);
         }
         NodeKind::Union { negate } => {
             for (i, inp) in node.inputs.iter().enumerate() {
-                let s = owned(snapshot_node(g, env, *inp, cache)?);
                 let sign = if negate[i] { -1 } else { 1 };
-                out.data.extend(s.data.into_iter().map(|(r, w)| (r, w * sign)));
-                out.errs.extend(s.errs);
+                let errs = snapshot_stream(g, env, *inp, &mut |env, mut batch| {
+                    for (_, w) in batch.iter_mut() {
+                        *w *= sign;
+                    }
+                    (out.sink)(env, batch)
+                })?;
+                out.errs(errs);
             }
         }
         NodeKind::Negate => {
-            let s = owned(snapshot_node(g, env, node.inputs[0], cache)?);
-            out.data = s.data.into_iter().map(|(r, w)| (r, -w)).collect();
-            out.errs = s.errs;
+            let errs = snapshot_stream(g, env, node.inputs[0], &mut |env, mut batch| {
+                for (_, w) in batch.iter_mut() {
+                    *w = -*w;
+                }
+                (out.sink)(env, batch)
+            })?;
+            out.errs(errs);
         }
         NodeKind::FlatMap { funcs, ordinality } => {
-            let s = owned(snapshot_node(g, env, node.inputs[0], cache)?);
-            out.errs = s.errs;
-            for (row, w) in s.data {
-                match tablefunc::eval(funcs, &row, *ordinality) {
-                    Ok(rows) => {
-                        for extra in rows {
-                            let mut r = row.clone();
-                            r.extend(extra);
-                            out.data.push((r, w));
+            let input = snapshot_stream(g, env, node.inputs[0], &mut |env, batch| {
+                for (row, w) in batch {
+                    match tablefunc::eval(funcs, &row, *ordinality) {
+                        Ok(rows) => {
+                            for extra in rows {
+                                let mut r = row.clone();
+                                r.extend(extra);
+                                out.push(env, r, w)?;
+                            }
                         }
+                        Err(e) => out.err(err_record(&e), w),
                     }
-                    Err(e) => out.errs.push((err_record(&e), w)),
                 }
-            }
+                Ok(())
+            })?;
+            out.errs(input);
         }
         NodeKind::Join(p) => {
             for i in &node.inputs {
-                let s = snapshot_errs(g, env, *i, cache)?;
-                out.errs.extend(s);
+                let s = snapshot_errs(g, env, *i)?;
+                out.errs(s);
             }
             join::snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Reduce(p) => {
-            out.errs = snapshot_errs(g, env, node.inputs[0], cache)?;
+            let errs = snapshot_errs(g, env, node.inputs[0])?;
+            out.errs(errs);
             reduce::snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Distinct { arr } => {
-            out.errs = snapshot_errs(g, env, node.inputs[0], cache)?;
+            let errs = snapshot_errs(g, env, node.inputs[0])?;
+            out.errs(errs);
             distinct_snapshot(g, env, *arr, &mut out)?;
         }
         NodeKind::SetOp { op, all, left_arr, right_arr } => {
-            out.errs = snapshot_errs(g, env, node.inputs[0], cache)?;
-            out.errs.extend(snapshot_errs(g, env, node.inputs[1], cache)?);
+            let errs = snapshot_errs(g, env, node.inputs[0])?;
+            out.errs(errs);
+            let errs = snapshot_errs(g, env, node.inputs[1])?;
+            out.errs(errs);
             setop_snapshot(g, env, *op, *all, *left_arr, *right_arr, &mut out)?;
         }
         NodeKind::TopK(p) => {
-            out.errs = snapshot_errs(g, env, node.inputs[0], cache)?;
+            let errs = snapshot_errs(g, env, node.inputs[0])?;
+            out.errs(errs);
             topk_snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Window(p) => {
-            out.errs = snapshot_errs(g, env, node.inputs[0], cache)?;
+            let errs = snapshot_errs(g, env, node.inputs[0])?;
+            out.errs(errs);
             window::snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Recursive(p) => {
             for i in &node.inputs {
-                let s = snapshot_errs(g, env, *i, cache)?;
-                out.errs.extend(s);
+                let s = snapshot_errs(g, env, *i)?;
+                out.errs(s);
             }
             recursive_snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Temporal(p) => {
-            let input = owned(snapshot_node(g, env, node.inputs[0], cache)?);
-            temporal::snapshot(g, p, input, &mut out);
+            let errs = snapshot_stream(g, env, node.inputs[0], &mut |env, batch| temporal::snapshot(g, env, p, batch, &mut out))?;
+            out.errs(errs);
         }
     }
-    // Row-wise operators pass multiplicities through, and the rows of a
-    // snapshot are consolidated where that is needed: arrangements
-    // consolidate entries when they are applied, Graph::snapshot its result.
-    // (Sorting millions of hydrated rows at every level was a large part of
-    // creating a view.)
-    let row_wise = matches!(
-        node.kind,
-        NodeKind::Mfp { .. } | NodeKind::Union { .. } | NodeKind::Negate | NodeKind::FlatMap { .. } | NodeKind::Join(_) | NodeKind::Temporal(_)
-    );
-    if !row_wise {
-        consolidate(&mut out.data);
-    }
-    consolidate_errs(&mut out.errs);
-    let out = Arc::new(out);
-    if node.refs > 1 {
-        cache.insert(id, out.clone());
-    }
-    Ok(out)
+    out.finish(env)
 }
 
 /// Errors present in a node's snapshot (arranged nodes keep theirs in the
 /// graph; the others recompute).
-fn snapshot_errs(g: &Graph, env: &mut Env, id: NodeId, cache: &mut SnapCache) -> Result<ErrDelta> {
+fn snapshot_errs(g: &Graph, env: &mut Env, id: NodeId) -> Result<ErrDelta> {
     if g.any_arrangement(id).is_some() {
         return Ok(g.errors_of(id));
     }
-    Ok(snapshot_node(g, env, id, cache)?.errs.clone())
+    snapshot_stream(g, env, id, &mut |_, _| Ok(()))
 }
 
 // ---------------------------------------------------------------- base tables
@@ -411,7 +458,7 @@ fn distinct_step(g: &Graph, env: &mut Env, arr: ArrId, delta: &Delta, gsn: Gsn, 
     Ok(())
 }
 
-fn distinct_snapshot(g: &Graph, env: &mut Env, arr: ArrId, out: &mut Output) -> Result<()> {
+fn distinct_snapshot(g: &Graph, env: &mut Env, arr: ArrId, out: &mut SnapOut) -> Result<()> {
     let a = g.arr(arr);
     let layout = a.layout.clone();
     let mut c = env.cursor(a.tree, Bound::Unbounded, Bound::Unbounded);
@@ -424,7 +471,7 @@ fn distinct_snapshot(g: &Graph, env: &mut Env, arr: ArrId, out: &mut Output) -> 
         if last.as_ref() == Some(&kb) {
             continue;
         }
-        out.data.push((layout.decode_row(&k)?, 1));
+        out.push(env, layout.decode_row(&k)?, 1)?;
         last = Some(kb);
     }
     Ok(())
@@ -483,42 +530,59 @@ fn setop_step(
     Ok(())
 }
 
-fn setop_snapshot(g: &Graph, env: &mut Env, op: SetOpKind, all: bool, la: ArrId, ra: ArrId, out: &mut Output) -> Result<()> {
+fn setop_snapshot(g: &Graph, env: &mut Env, op: SetOpKind, all: bool, la: ArrId, ra: ArrId, out: &mut SnapOut) -> Result<()> {
     let (l, r) = (g.arr(la), g.arr(ra));
-    let (ll, rl) = (l.layout.clone(), r.layout.clone());
-    // collect counts per canonical key from both sides
-    let mut groups: BTreeMap<Vec<u8>, (Option<Row>, i64, Option<Row>, i64)> = BTreeMap::new();
-    for (tree, layout, left) in [(l.tree, &ll, true), (r.tree, &rl, false)] {
-        let mut c = env.cursor(tree, Bound::Unbounded, Bound::Unbounded);
-        while let Some((k, h)) = env.cursor_next(&mut c)? {
-            let w = h.total();
-            if w == 0 {
-                continue;
-            }
-            let kb = layout.key_bytes(&k)?.to_vec();
-            let e = groups.entry(kb).or_insert((None, 0, None, 0));
-            if left {
-                if e.0.is_none() && w > 0 {
-                    e.0 = Some(layout.decode_row(&k)?);
+    let layouts = [l.layout.clone(), r.layout.clone()];
+    // Both indexes in key order at once: a value (canonical key) is a
+    // contiguous range of entries in each. Per value and side, the first
+    // live entry (the representative) and the total weight.
+    let mut cursors = [env.cursor(l.tree, Bound::Unbounded, Bound::Unbounded), env.cursor(r.tree, Bound::Unbounded, Bound::Unbounded)];
+    let mut heads = [None, None];
+    for side in 0..2 {
+        heads[side] = next_live(env, &mut cursors[side], &layouts[side])?;
+    }
+    loop {
+        let value = match (&heads[0], &heads[1]) {
+            (None, None) => return Ok(()),
+            (Some((a, _, _)), Some((b, _, _))) => a.min(b).clone(),
+            (Some((a, _, _)), None) | (None, Some((a, _, _))) => a.clone(),
+        };
+        let mut sides: [(Option<Row>, i64); 2] = [(None, 0), (None, 0)];
+        for side in 0..2 {
+            while let Some((kb, k, w)) = &heads[side] {
+                if *kb != value {
+                    break;
                 }
-                e.1 += w;
-            } else {
-                if e.2.is_none() && w > 0 {
-                    e.2 = Some(layout.decode_row(&k)?);
+                let (rep, total) = &mut sides[side];
+                if rep.is_none() && *w > 0 {
+                    *rep = Some(layouts[side].decode_row(k)?);
                 }
-                e.3 += w;
+                *total += w;
+                heads[side] = next_live(env, &mut cursors[side], &layouts[side])?;
             }
         }
-    }
-    for (_, (lrep, a, rrep, b)) in groups {
+        let [(lrep, a), (rrep, b)] = sides;
         let m = setop_mult(op, all, a, b);
         if m > 0
             && let Some(rep) = lrep.or(rrep)
         {
-            out.data.push((rep, m));
+            out.push(env, rep, m)?;
         }
     }
-    Ok(())
+}
+
+/// An entry with its canonical key and weight.
+type KeyedEntry = (Vec<u8>, Box<[u8]>, i64);
+
+/// The next entry with a non-zero weight.
+fn next_live(env: &mut Env, c: &mut crate::storage::Cursor, layout: &Layout) -> Result<Option<KeyedEntry>> {
+    while let Some((k, h)) = env.cursor_next(c)? {
+        let w = h.total();
+        if w != 0 {
+            return Ok(Some((layout.key_bytes(&k)?.to_vec(), k, w)));
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------- top-k
@@ -609,27 +673,35 @@ fn topk_step(g: &Graph, env: &mut Env, p: &TopKPlan, delta: &Delta, gsn: Gsn, ou
     Ok(())
 }
 
-fn topk_snapshot(g: &Graph, env: &mut Env, p: &TopKPlan, out: &mut Output) -> Result<()> {
+fn topk_snapshot(g: &Graph, env: &mut Env, p: &TopKPlan, out: &mut SnapOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
     let ng = p.group_key.len();
-    // enumerate distinct group prefixes by scanning
-    let mut c = env.cursor(a.tree, Bound::Unbounded, Bound::Unbounded);
-    let mut groups: Vec<Vec<u8>> = Vec::new();
-    while let Some((k, h)) = env.cursor_next(&mut c)? {
-        if h.total() <= 0 {
-            continue;
+    // enumerate distinct group prefixes, seeking from one group to the next
+    let mut from: Option<Vec<u8>> = None;
+    loop {
+        let lo = match &from {
+            Some(f) => Bound::Included(f.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let mut next = None;
+        env.for_each(a.tree, lo, Bound::Unbounded, &mut |k, h| {
+            if h.total() <= 0 {
+                return Ok(true);
+            }
+            let (vals, _) = layout.decode_key_values(k)?;
+            next = Some(layout.encode_prefix(&vals[..ng]));
+            Ok(false)
+        })?;
+        let Some(prefix) = next else { return Ok(()) };
+        for (r, w) in topk_rows(env, a.tree, &layout, &prefix, ReadAt::Latest, p)? {
+            out.push(env, r, w)?;
         }
-        let (vals, _) = layout.decode_key_values(&k)?;
-        let prefix = layout.encode_prefix(&vals[..ng]);
-        if groups.last() != Some(&prefix) {
-            groups.push(prefix);
+        from = crate::types::encoding::prefix_successor(&prefix);
+        if from.is_none() {
+            return Ok(());
         }
     }
-    for prefix in groups {
-        out.data.extend(topk_rows(env, a.tree, &layout, &prefix, ReadAt::Latest, p)?);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------- recursion
@@ -664,15 +736,19 @@ impl RecursivePlan {
 }
 
 /// Contents of a recursive query (hydration: rebuilds its error state).
-fn recursive_snapshot(g: &Graph, env: &mut Env, p: &RecursivePlan, out: &mut Output) -> Result<()> {
+fn recursive_snapshot(g: &Graph, env: &mut Env, p: &RecursivePlan, out: &mut SnapOut) -> Result<()> {
     let mut errors = p.errors.lock();
     errors.clear();
     match crate::exec::eval_recursive(g, env, p) {
-        Ok(rows) => out.data = rows,
+        Ok(rows) => {
+            for (r, w) in rows {
+                out.push(env, r, w)?;
+            }
+        }
         Err(e) if super::reduce::is_data_error(&e) => {
             let rec = err_record(&e);
             errors.insert(Vec::new(), rec.clone());
-            out.errs.push((rec, 1));
+            out.err(rec, 1);
         }
         Err(e) => return Err(e),
     }

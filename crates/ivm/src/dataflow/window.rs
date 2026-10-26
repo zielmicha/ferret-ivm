@@ -386,19 +386,24 @@ pub fn step(g: &Graph, env: &mut Env, p: &WindowPlan, delta: &Delta, gsn: Gsn, o
     Ok(())
 }
 
-pub fn snapshot(g: &Graph, env: &mut Env, p: &WindowPlan, out: &mut Output) -> Result<()> {
+pub fn snapshot(g: &Graph, env: &mut Env, p: &WindowPlan, out: &mut super::ops::SnapOut) -> Result<()> {
     let a = g.arr(p.input_arr);
     let layout = a.layout.clone();
     let np = p.partition.len();
     let mut c = env.cursor(a.tree, Bound::Unbounded, Bound::Unbounded);
     let mut cur_prefix: Option<Vec<u8>> = None;
     let mut rows: Vec<(Row, i64)> = Vec::new();
-    let flush = |rows: &mut Vec<(Row, i64)>, out: &mut Output| {
+    let flush = |env: &mut Env, rows: &mut Vec<(Row, i64)>, out: &mut super::ops::SnapOut| -> Result<()> {
         match compute_partition(rows, &p.order, &p.funcs) {
-            Ok(rs) => out.data.extend(rs.into_iter().map(|r| (r, 1))),
-            Err(e) => out.errs.push((err_record(&e), 1)),
+            Ok(rs) => {
+                for r in rs {
+                    out.push(env, r, 1)?;
+                }
+            }
+            Err(e) => out.err(err_record(&e), 1),
         }
         rows.clear();
+        Ok(())
     };
     while let Some((k, h)) = env.cursor_next(&mut c)? {
         let w = h.total();
@@ -410,14 +415,14 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &WindowPlan, out: &mut Output) -> R
         let prefix = layout.encode_prefix(&kv[..np]);
         if cur_prefix.as_ref() != Some(&prefix) {
             if !rows.is_empty() {
-                flush(&mut rows, out);
+                flush(env, &mut rows, out)?;
             }
             cur_prefix = Some(prefix);
         }
         rows.push((row, w));
     }
     if !rows.is_empty() {
-        flush(&mut rows, out);
+        flush(env, &mut rows, out)?;
     }
     Ok(())
 }

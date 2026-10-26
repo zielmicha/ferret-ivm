@@ -898,7 +898,12 @@ checkpoint of a running engine).
 - **Unreferenced trees**: trees present in the checkpoint but not attached by
   any arrangement after recovery (arrangements that no longer exist, whose
   fingerprint changed, or of views and indexes that could not be built and
-  are kept as broken) are dropped during start-up, after hydration.
+  are kept as broken, and temporary trees, below) are dropped during
+  start-up, after hydration.
+- **Temporary trees** (the sorted runs of hydration) take tree ids counting
+  down from 2^64 − 1, outside the range of `next_tree_id`, and are dropped
+  by the operation that creates them; a checkpoint does not happen during
+  one, but would record such a tree like any other.
 - **Retention**: history elements at or before the retention frontier
   (`processed GSN − --retention-gsns`) are merged when a leaf is next
   modified; input-log segments whose records all lie at or before
