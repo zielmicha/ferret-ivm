@@ -416,10 +416,29 @@ again.
 ### TemporalFilter
 
 Rows pass while temporal predicates over the clock hold. For each row the
-operator bisects its validity interval `[lo, hi)`, emits it if valid now,
-and stores future `(time, kind, row)` events in a private arrangement keyed
-by (time `bigint`, kind `smallint`) — kind 0 "becomes valid", kind 1
-"expires". At each step it releases the events due at the current clock.
+operator computes its validity interval `[lo, hi)` (below), emits it if
+valid now, and stores future `(time, kind, row)` events in a private
+arrangement keyed by (time `bigint`, kind `smallint`) — kind 0 "becomes
+valid", kind 1 "expires". At each step it releases the events that became
+due since the previous step: those after the previous step's clock
+(`Graph::released_through`), up to the current one. Events are only ever
+scheduled after the clock, so none at or before the previous step's clock
+is still pending; released events stay in the arrangement as entries of
+weight zero until compaction removes them, and are never visited again. A
+graph rebuilt by recovery starts from the checkpoint's clock
+(`Graph::restore_clock`), up to which the checkpointed filters released
+everything.
+
+Each predicate is `clock_side op row_side`; its value changes where
+`clock_side(t)` reaches the row side's value `x`. The operator first tries
+the time where a shift of the clock reaches `x` — `t0 + (y − clock_side(t0))`
+at `t0 = y`, `y` being `x` or the next value of its type for a strict
+condition — and takes it if the predicate changes exactly there (two
+evaluations); only otherwise does it bisect the predicate over the searched
+range. Shifts of the clock by constant intervals therefore take three
+evaluations of the clock side per predicate instead of about 55, and the
+result is exact whatever the arithmetic (months, time zones, `date_trunc`),
+because it is a verified change of the predicate itself.
 See [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal-filters-are-maintained).
 
 ## Hydration

@@ -189,7 +189,13 @@ pub struct Graph {
     /// logged clock ticks.
     pub now: i64,
     /// `now` as of the previous step (temporal filters run when it moves).
-    stepped_now: i64,
+    /// Every hydrated temporal filter has released its events up to it, and
+    /// schedules only events after the clock: none at or before it is due.
+    /// None before the first step.
+    stepped_now: Option<i64>,
+    /// During a step, `stepped_now` before it: the events temporal filters
+    /// release are those after it, up to `now`.
+    pub(crate) released_through: Option<i64>,
     /// Error records currently in each node's contents (its accumulated
     /// output errors). Authoritative for nodes with a hydrated arrangement:
     /// their snapshots read the arrangement, which holds rows only.
@@ -743,8 +749,9 @@ impl Graph {
         mut changes: FxHashMap<NodeId, Vec<TableChange>>,
     ) -> Result<FxHashMap<NodeId, Output>> {
         let mut outputs: FxHashMap<NodeId, Output> = FxHashMap::default();
-        let time_moved = self.now != self.stepped_now;
-        self.stepped_now = self.now;
+        let time_moved = self.stepped_now != Some(self.now);
+        self.released_through = self.stepped_now;
+        self.stepped_now = Some(self.now);
         // (a node is only ever queued by nodes before it, so none is queued
         // again once it ran)
         let mut queue: std::collections::BTreeSet<(u64, NodeId)> = changes.keys().map(|&id| (self.node(id).seq, id)).collect();
@@ -786,6 +793,13 @@ impl Graph {
             outputs.insert(id, out);
         }
         Ok(outputs)
+    }
+
+    /// Set the clock of a graph rebuilt for recovery to the checkpoint's:
+    /// the checkpointed temporal filters have released every event up to it.
+    pub fn restore_clock(&mut self, now: i64) {
+        self.now = now;
+        self.stepped_now = Some(now);
     }
 
     fn count_step(&mut self, id: NodeId, in_rows: usize, out_rows: usize, started: std::time::Instant) {

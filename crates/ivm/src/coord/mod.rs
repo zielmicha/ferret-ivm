@@ -484,7 +484,7 @@ impl Engine {
         self.graph.recovery = app.trees.into_iter().collect();
         self.graph.recovery_since = app.arr_since.into_iter().collect();
         self.clock = app.clock;
-        self.graph.now = app.clock;
+        self.graph.restore_clock(app.clock);
         if app.ticks.is_empty() {
             self.ticks.push_back((rec.gsn, app.clock));
         } else {

@@ -114,19 +114,30 @@ Virtual views and ad hoc queries may use `now()` anywhere.
 ### How temporal filters are maintained
 
 For each row, the operator computes the interval of logical time
-`[lo, hi)` during which every temporal conjunct holds, by bisecting the
-condition over clock values between 1900-01-01 and 2200-01-01: a row whose
-validity starts before 1900 is valid from the beginning, and one whose
-validity ends after 2200 never expires, but a row that would only become
-valid after 2200, or that expired before 1900, is never valid. Because the clock side is
-non-decreasing, each conjunct changes value at most once, and bisection keeps
-calendar arithmetic (months, time zones, `date_trunc`) exact.
+`[lo, hi)` during which every temporal conjunct holds, by evaluating the
+condition at clock values between 1900-01-01 and 2200-01-01: first at the
+time where the clock expression reaches the row expression's value (for
+`ts > now() - interval '1 hour'`, one microsecond after `ts + 1 hour`),
+which is taken if the condition changes exactly there; otherwise by
+bisecting the range. A row whose validity starts before 1900 is valid from
+the beginning, and one whose validity ends after 2200 never expires, but a
+row that would only become valid after 2200, or that expired before 1900,
+is never valid. Because the clock side is non-decreasing, each conjunct
+changes value at most once, and evaluating the condition itself keeps
+calendar arithmetic (time zones, `date_trunc`) exact. The exception is
+month arithmetic, which clamps the day to the end of a shorter month
+(`now() - interval '1 month'` is February 28th from March 28th to 31st, at
+each time of day): near a month's end such a conjunct can change value
+several times, and the row's interval ends at one of those changes.
 
 - A row valid now is emitted at once.
 - A row that becomes valid in the future, or expires, is scheduled: the
   operator stores `(time, kind, row)` events in an index ordered by time.
-- At every step in which the clock has moved, the events that are due are
-  released: rows enter (`kind 0`) or leave (`kind 1`) the output.
+- At every step in which the clock has moved, the events that became due
+  since the previous step are released: rows enter (`kind 0`) or leave
+  (`kind 1`) the output. Released events are not looked at again, so the
+  cost of a clock tick does not grow with the number of rows that expired
+  before it.
 - Changes to the input are filtered at the current clock: a deleted row
   retracts both its output and its pending events.
 

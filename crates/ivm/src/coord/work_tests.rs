@@ -114,3 +114,40 @@ fn query_subscriptions_reuse_graph_slots() {
     let live: std::collections::HashSet<NodeId> = t.e.graph.live_nodes().map(|n| n.id).collect();
     assert!(t.e.graph.stats.keys().all(|n| live.contains(n)), "statistics of freed nodes are kept");
 }
+
+/// Clock ticks release the events that became due without visiting those
+/// released before (which stay behind as entries of weight zero), and a
+/// row that is already expired when it arrives visits nothing either.
+#[test]
+fn temporal_filters_skip_released_events() {
+    let mut t = T::new("work-temporal");
+    let t0: i64 = 1_767_225_600_000_000; // 2026-01-01, Unix microseconds
+    t.tick(t0);
+    t.ddl("CREATE TABLE ev (id bigint PRIMARY KEY, ts timestamptz)");
+    t.ddl("CREATE MATERIALIZED VIEW live AS SELECT id FROM ev WHERE ts > now() - interval '1 second'");
+    let pg = |unix: i64| Datum::TimestampTz(unix - 946_684_800_000_000);
+    let n = 2000;
+    t.upsert("ev", (0..n).map(|i| vec![int(i), pg(t0 + i * 1000)]).collect());
+    assert_eq!(t.rows("live").len(), n as usize);
+    // everything expires, in steps
+    let mut now = t0;
+    for _ in 0..4 {
+        now += 1_000_000;
+        t.tick(now);
+    }
+    assert!(t.rows("live").is_empty());
+    let (entries, _) = t.work(|t| {
+        for i in 1..=100 {
+            t.tick(now + i);
+        }
+    });
+    assert_eq!(entries, 0, "idle ticks visited released events");
+    let (entries, _) = t.work(|t| t.upsert("ev", vec![vec![int(n + 1), pg(now - 10_000_000)]]));
+    assert_eq!(entries, 0);
+    // events still pending are released when due
+    t.upsert("ev", vec![vec![int(n + 2), pg(now + 1000)]]);
+    assert_eq!(t.rows("live"), vec![vec![int(n + 2)]]);
+    let (entries, _) = t.work(|t| t.tick(now + 2_000_000));
+    assert_eq!(entries, 1);
+    assert!(t.rows("live").is_empty());
+}
