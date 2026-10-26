@@ -166,6 +166,15 @@ pub struct Env {
     /// Nodes written by `flush_node` (in checkpoint jobs: what the parent
     /// environment marks clean when the job is done).
     flushed: Option<Vec<Flushed>>,
+    /// Subtrees of dropped trees still on disk, not released yet: reading
+    /// them to release their nodes takes I/O, which the next checkpoint job
+    /// does (off the engine thread). Their bytes count as live until then.
+    releasing: Vec<DiskLoc>,
+    /// Nodes released by a checkpoint job (the parent environment does not
+    /// count them as live any more when the job is done).
+    released: Vec<DiskLoc>,
+    /// Node frames read from segments (`segment_reads`).
+    reads: u64,
 }
 
 /// A node a checkpoint job wrote: its slot and stamp in the parent
@@ -189,6 +198,7 @@ pub struct CheckpointDone {
     segs: SegmentStore,
     manifest: Manifest,
     flushed: Vec<Flushed>,
+    released: Vec<DiskLoc>,
     deleted: Vec<u32>,
     seq: u64,
     gsn: Gsn,
@@ -209,6 +219,7 @@ impl CheckpointJob {
             segs: env.segs,
             manifest: env.manifest.expect("checkpoint job without manifest"),
             flushed: env.flushed.unwrap_or_default(),
+            released: env.released,
             deleted,
             seq: env.checkpoint_seq,
             gsn: env.checkpoint_gsn,
@@ -382,6 +393,9 @@ impl Env {
             manifest: Some(manifest),
             stamp: 0,
             flushed: None,
+            releasing: Vec::new(),
+            released: Vec::new(),
+            reads: 0,
         };
         let recovered = match rec {
             None => None,
@@ -606,6 +620,7 @@ impl Env {
                 Ok(id)
             }
             NodePtr::Disk(loc) => {
+                self.reads += 1;
                 let bytes = self.segs.read(loc)?;
                 let node = Node::decode(&bytes)?;
                 let id = self.alloc_slot(node, Some(loc), parent, tree);
@@ -1504,6 +1519,9 @@ impl Env {
             manifest: self.manifest.take(),
             stamp: self.stamp,
             flushed: Some(Vec::new()),
+            releasing: std::mem::take(&mut self.releasing),
+            released: Vec::new(),
+            reads: 0,
         };
         Ok(CheckpointJob { env, gsn })
     }
@@ -1530,6 +1548,9 @@ impl Env {
             let bytes = slot.bytes;
             self.dirty_bytes -= bytes;
             self.lower_min_seg(f.slot, f.min_seg);
+        }
+        for loc in done.released {
+            self.dec_live(loc);
         }
         // dead in the committed checkpoint, hence here too: nothing this
         // environment references on disk is outside it
@@ -1573,6 +1594,10 @@ impl Env {
     /// checkpoint record (the commit point); then delete sealed segments
     /// without live nodes. Returns those segments.
     fn write_checkpoint(&mut self, gsn: Gsn, app: &[u8]) -> Result<Vec<u32>> {
+        // dropped trees' nodes on disk are dead in this checkpoint
+        for loc in std::mem::take(&mut self.releasing) {
+            self.release(NodePtr::Disk(loc))?;
+        }
         let tree_ids = self.tree_ids();
         let mut records = Vec::with_capacity(tree_ids.len());
         for tid in tree_ids {
@@ -1682,8 +1707,9 @@ impl Env {
         Ok(Env {
             dir: self.dir.clone(),
             opts: self.opts.clone(),
-            // (only segments holding nodes of this version: others may be
-            // gone, deleted by a checkpoint job in progress)
+            // (segments holding nodes: others may be gone, deleted by a
+            // checkpoint job in progress, also those holding only nodes of
+            // dropped trees still to release, see `fork`)
             segs: self.segs.fork(self.seg_live.iter().filter(|(_, (_, live))| *live > 0).map(|(id, _)| *id))?,
             slots: self.slots.clone(),
             free_slots: self.free_slots.clone(),
@@ -1699,6 +1725,9 @@ impl Env {
             manifest: None,
             stamp: self.stamp,
             flushed: None,
+            releasing: Vec::new(),
+            released: Vec::new(),
+            reads: 0,
         })
     }
 
@@ -1762,19 +1791,43 @@ impl Env {
         Ok(id)
     }
 
-    /// Drop a tree, releasing its nodes.
+    /// Drop a tree. Its loaded nodes are freed now; its nodes on disk are
+    /// released by the next checkpoint (which reads them off the engine
+    /// thread), and count as live until then.
     pub fn drop_tree(&mut self, tree: TreeId) -> Result<()> {
         let Some(t) = self.trees.remove(&tree) else { return Ok(()) };
         if let Some(ptr) = t.root {
-            self.release(ptr)?;
+            self.release_loaded(ptr);
         }
         Ok(())
     }
 
+    /// Free the loaded nodes of a dropped subtree, leaving its parts on disk
+    /// to the next checkpoint.
+    fn release_loaded(&mut self, ptr: NodePtr) {
+        match ptr {
+            NodePtr::Disk(loc) => self.releasing.push(loc),
+            NodePtr::Mem(id) => {
+                let children: Vec<NodePtr> = match self.node(id) {
+                    Node::Internal(ch) => ch.iter().map(|c| c.ptr).collect(),
+                    Node::Leaf(_) => Vec::new(),
+                };
+                for c in children {
+                    self.release_loaded(c);
+                }
+                self.slot_mut(id).loaded_children = 0;
+                self.slot_mut(id).parent = NONE;
+                self.free_slot(id);
+            }
+        }
+    }
+
+    /// Release a dropped subtree: its nodes no longer count as live.
     fn release(&mut self, ptr: NodePtr) -> Result<()> {
         let (children, disk, slot_id) = match ptr {
             NodePtr::Disk(loc) => {
                 // only internal nodes need reading to find their children
+                self.reads += 1;
                 let bytes = self.segs.read(loc)?;
                 let node = Node::decode(&bytes)?;
                 let ch = match node {
@@ -1797,6 +1850,7 @@ impl Env {
         }
         if let Some(loc) = disk {
             self.dec_live(loc);
+            self.released.push(loc);
         }
         if let Some(id) = slot_id {
             self.slot_mut(id).loaded_children = 0;
@@ -1880,6 +1934,11 @@ impl Env {
         s.segments = self.seg_live.iter().map(|(id, (t, l))| (*id, *t, *l)).collect();
         s.checkpoint_gsn = self.checkpoint_gsn;
         s
+    }
+
+    /// Node frames this environment has read from segments.
+    pub fn segment_reads(&self) -> u64 {
+        self.reads
     }
 
     pub fn dirty_bytes(&self) -> usize {

@@ -344,7 +344,7 @@ fn verify_all(env: &mut Env, rng: &mut Rng, model: &Model, frontier: Gsn, now: G
     for (id, m) in model {
         verify_tree(env, rng, *id, m, frontier, now);
     }
-    check_structure(env);
+    check_structure(env, true);
 }
 
 /// Point lookups of present and absent keys, now and at a retained time.
@@ -435,8 +435,9 @@ fn walk(env: &Env, w: &mut Walk, ptr: NodePtr, parent: u32, tree: TreeId, lo: Op
     (min_seg, count)
 }
 
-/// Structural invariants and the accounting of memory and segment liveness.
-fn check_structure(env: &mut Env) {
+/// Structural invariants and the accounting of memory and (`segments`)
+/// segment liveness.
+fn check_structure(env: &mut Env, segments: bool) {
     let mut w = Walk { live: BTreeMap::new(), slots: 0 };
     for tid in env.tree_ids() {
         let t = &env.trees[&tid];
@@ -449,11 +450,19 @@ fn check_structure(env: &mut Env) {
             assert_eq!(t.summary.count, 0);
         }
     }
+    // dropped trees' nodes on disk count as live until a checkpoint
+    // releases them
+    for loc in env.releasing.clone() {
+        walk(env, &mut w, NodePtr::Disk(loc), NONE, 0, None, None);
+    }
     let occupied = env.slots.iter().flatten().count();
     assert_eq!(w.slots, occupied, "in-memory nodes unreachable from any root");
     let mem: usize = env.slots.iter().flatten().map(|s| s.bytes).sum();
     assert_eq!(env.mem_bytes, mem, "mem_bytes");
     let _ = env.dirty_bytes(); // debug-asserts the dirty byte count
+    if !segments {
+        return;
+    }
     for (seg, (total, live)) in &env.seg_live {
         assert_eq!(*live, w.live.get(seg).copied().unwrap_or(0), "live bytes of segment {seg}");
         assert!(live <= total, "segment {seg}: live {live} > total {total}");
@@ -680,7 +689,16 @@ impl Harness {
         self.event("check fork");
         let i = self.rng.index(self.forks.len());
         let (mut f, mut model, mut frontier, now) = self.forks.remove(i);
-        verify_all(&mut f, &mut self.rng, &model, frontier, now);
+        // (not its segment accounting, which no checkpoint uses: it counts the
+        // nodes of trees dropped before it was taken as live)
+        let verify = |f: &mut Env, rng: &mut Rng, model: &Model, frontier: Gsn, now: Gsn| {
+            assert_eq!(f.tree_ids(), model.keys().copied().collect::<Vec<_>>(), "tree set of a fork");
+            for (id, m) in model {
+                verify_tree(f, rng, *id, m, frontier, now);
+            }
+            check_structure(f, false);
+        };
+        verify(&mut f, &mut self.rng, &model, frontier, now);
         let ids: Vec<TreeId> = model.keys().copied().collect();
         if !ids.is_empty() {
             for k in 0..self.rng.range(1, 4) {
@@ -688,7 +706,7 @@ impl Harness {
                 let ups = gen_batch(&mut self.rng, &model[&id]);
                 apply_op(&mut f, &mut model, &mut frontier, &Op::Apply { tree: id, ups, gsn: now + 1 + k as u64 });
             }
-            verify_all(&mut f, &mut self.rng, &model, frontier, now + 3);
+            verify(&mut f, &mut self.rng, &model, frontier, now + 3);
         }
         drop(f);
         self.verify();
@@ -1117,6 +1135,47 @@ proptest! {
     fn storage_matches_model_long(setup in arb_setup(), actions in prop::collection::vec(arb_action(), 1..2500)) {
         run(&setup, &actions, "storage-model-long");
     }
+}
+
+/// Dropping a tree that is mostly on disk reads nothing on the calling
+/// (engine) thread: the next checkpoint job reads its nodes to release them
+/// (it used to read every node of the tree, leaves included, right away).
+#[test]
+fn dropped_trees_are_released_by_the_next_checkpoint() {
+    let tmp = TempDir::new("storage-drop");
+    let opts = EnvOptions { cache_bytes: 64 << 10, leaf_bytes: 2048, internal_bytes: 2048, segment_bytes: 1 << 20 };
+    let (mut env, _) = Env::open(tmp.path(), opts).unwrap();
+    let keep = env.create_tree(Arc::new(CountSummarizer));
+    let t = env.create_tree(Arc::new(CountSummarizer));
+    for (tree, n) in [(keep, 1_000u32), (t, 50_000)] {
+        let mut ups: Vec<(Vec<u8>, i64)> = (0..n).map(|i| (format!("{i:08}-{}", "p".repeat(40)).into_bytes(), 1)).collect();
+        env.apply(tree, &mut ups, 1).unwrap();
+    }
+    env.checkpoint(1, b"").unwrap();
+    // (a read evicts down to the small cache: the tree is on disk)
+    env.get(keep, b"0").unwrap();
+    assert!(env.resident_bytes() < 128 << 10);
+    let live = |env: &Env| env.stats().segments.iter().map(|s| s.2).sum::<u64>();
+    let before = live(&env);
+    let reads = env.segment_reads();
+    env.drop_tree(t).unwrap();
+    assert_eq!(env.segment_reads(), reads, "dropping read nodes");
+    // (its few loaded nodes are released at once)
+    assert!(live(&env) * 10 > before * 9, "released before the checkpoint: {} of {before} live", live(&env));
+    let job = env.begin_checkpoint(2).unwrap();
+    let done = job.run(b"").unwrap();
+    env.finish_checkpoint(done).unwrap();
+    assert_eq!(env.segment_reads(), reads, "the checkpoint job read through the environment");
+    assert!(live(&env) * 20 < before, "live bytes {} of {before} after releasing", live(&env));
+    check_structure(&mut env, true);
+    check_live_accounting(&mut env);
+    drop(env);
+    let (mut env, rec) = Env::open(tmp.path(), EnvOptions::default()).unwrap();
+    assert_eq!(rec.unwrap().gsn, 2);
+    assert_eq!(env.unattached_trees(), vec![keep]);
+    env.attach_tree(keep, Arc::new(CountSummarizer)).unwrap();
+    assert_eq!(env.tree_count(keep), 1_000);
+    check_live_accounting(&mut env);
 }
 
 /// Retracted entries disappear once the frontier passes the retraction (and

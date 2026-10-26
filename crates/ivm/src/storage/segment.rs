@@ -123,11 +123,14 @@ impl SegmentStore {
 
     /// Read access for a fork of the environment: the files of segments
     /// `ids` stay open in it, so it can read its nodes after a checkpoint
-    /// of the parent deleted their segments.
+    /// of the parent deleted their segments. (Those already gone held only
+    /// nodes of dropped trees, which a checkpoint job released.)
     pub fn fork(&self, ids: impl IntoIterator<Item = u32>) -> Result<SegmentStore> {
         let mut files = FxHashMap::default();
         for id in ids {
-            files.insert(id, self.reader.file(id)?);
+            if let Ok(f) = self.reader.file(id) {
+                files.insert(id, f);
+            }
         }
         let reader = Arc::new(SegmentReader { dir: self.reader.dir.clone(), files: Mutex::new(files) });
         Ok(SegmentStore { reader, writer: None, active_id: self.active_id })

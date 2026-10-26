@@ -260,7 +260,8 @@ different threads:
    environment lacks until the job is finished (a second checkpoint cannot
    begin meanwhile). The environment goes on: nodes it modifies are copied
    from the frozen ones.
-2. `CheckpointJob::run(app)` writes every frozen dirty node, depth-first so
+2. `CheckpointJob::run(app)` releases the dropped trees' nodes on disk
+   (below), writes every frozen dirty node, depth-first so
    that each parent is written after its children and records their new
    locations, and computes every tree's `min_seg`; `fsync`s the active
    segment and any segments rolled over since the last sync; appends a
@@ -271,7 +272,8 @@ different threads:
    point); then deletes sealed segments without live bytes in the committed
    state.
 3. `Env::finish_checkpoint` takes the append side and manifest back, adds
-   the written bytes to their segments' totals, and marks each written node
+   the written bytes to their segments' totals, subtracts the released ones
+   from the live bytes, and marks each written node
    clean, with its new location, if its slot still holds it unchanged (same
    stamp); its new `min_seg` is recorded in its parent's child entry and
    lowered up the ancestors. A written node that was modified (or freed)
@@ -311,6 +313,10 @@ dirty, so that the next checkpoint rewrites them into the active segment.
 Once a segment has no live bytes it is deleted at the end of a checkpoint.
 The active segment itself is never a victim.
 
-Dropping a tree (`drop_tree`) releases all of its nodes; it reads and
-decodes every node that is not in memory, leaves included, so dropping a
-large tree that is mostly on disk reads all of it.
+Dropping a tree (`drop_tree`) frees its loaded nodes at once and queues
+its subtrees that are on disk; the next checkpoint job releases those
+(reading every on-disk node to find its children, leaves included) off the
+engine thread, before it computes the segment accounting it commits — so the
+nodes of a dropped tree count as live until the next checkpoint, and a
+crash before it drops the tree again on replay. `Env::segment_reads` counts
+the node frames an environment has read.
