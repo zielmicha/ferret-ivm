@@ -124,14 +124,16 @@ pub(crate) struct Parked {
 }
 
 /// What a parked read waits for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Wait {
     /// The engine to process this GSN.
     Gsn(Gsn),
-    /// Every source frontier to pass the read's LSN.
-    Lsn,
-    /// The initial snapshots of the tables it reads (rechecked on wake).
-    Snapshot,
+    /// Every source frontier to pass this LSN.
+    Lsn(u64),
+    /// The initial snapshots of these tables (those it reads that were
+    /// loading), or a catalog change after `catalog` (`Engine::catalog_epoch`),
+    /// which may change what it reads.
+    Snapshot { tables: Vec<ObjectId>, catalog: u64 },
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -197,9 +199,12 @@ pub struct Engine {
     records_since_checkpoint: u64,
     pub(crate) replaying: bool,
     /// Bumped by source progress and DDL: parked reads waiting for initial
-    /// snapshots are re-run when it moves.
+    /// snapshots are re-checked when it moves.
     pub(crate) snap_epoch: u64,
     pub(crate) snap_epoch_seen: u64,
+    /// Bumped by catalog changes (DDL, upstream schema changes): reads
+    /// waiting for initial snapshots are re-run (re-planned) when it moves.
+    pub(crate) catalog_epoch: u64,
     /// (epoch, replicated tables still loading their initial snapshot)
     pub(crate) loading: (u64, std::collections::HashSet<ObjectId>),
     /// Per-source progress state (opaque JSON owned by the source).
@@ -224,15 +229,19 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Record a source's LSN frontier; wakes reads waiting for it.
+    /// Record a source's LSN frontier; wakes reads waiting for it, when it
+    /// passes the smallest LSN one waits for.
     pub fn advance_frontier(&self, source: u64, lsn: u64) {
         let mut m = self.shared.source_lsn.lock();
-        let e = m.entry(source).or_insert(0);
-        if lsn > *e {
-            *e = lsn;
+        let before = m.get(&source).copied();
+        if before.is_none_or(|b| lsn > b) {
+            m.insert(source, lsn);
             drop(m);
             if self.shared.lsn_waiters.load(Ordering::Acquire) {
-                let _ = self.tx.send(EngineMsg::Wake);
+                let wanted = self.shared.lsn_wanted.load(Ordering::Acquire);
+                if lsn >= wanted && before.is_none_or(|b| b < wanted) {
+                    let _ = self.tx.send(EngineMsg::Wake);
+                }
             }
         }
     }
@@ -462,6 +471,7 @@ impl Engine {
             replaying: true,
             snap_epoch: 0,
             snap_epoch_seen: 0,
+            catalog_epoch: 0,
             loading: (0, std::collections::HashSet::new()),
             source_states: HashMap::new(),
             source_lsns: HashMap::new(),
@@ -783,6 +793,7 @@ impl Engine {
                 let res = self.apply_ddl(gsn, &sql, &extra);
                 self.processed = gsn;
                 self.snap_epoch += 1;
+                self.catalog_epoch += 1;
                 if res.is_ok() {
                     self.catalog.history.push((gsn, sql.clone()));
                     // (every checkpoint saves it; trimmed in steps)
@@ -820,6 +831,7 @@ impl Engine {
                     *state = crate::source::postgres::snapshot_again(state, table);
                 }
                 self.snap_epoch += 1;
+                self.catalog_epoch += 1;
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }

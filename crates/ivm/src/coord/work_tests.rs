@@ -240,3 +240,87 @@ fn view_replacement_reads_only_for_subscribers() {
     assert_eq!(diff, (0..10).map(|i| (vec![int(i), int(i)], -1)).collect::<Vec<_>>());
     assert_eq!(t.rows("d"), vec![vec![int(2990)]]);
 }
+
+/// A fresh read of `query` at `as_of`, parked or answered.
+fn read(t: &mut T, h: &EngineHandle, query: &str, as_of: crate::sql::parser::AsOf) -> Receiver<Result<ExecResult>> {
+    let (reply, rx) = bounded(1);
+    let q = crate::sql::parser::parse_single_query(query).unwrap();
+    let stmt = crate::sql::parser::Statement::Select { query: Box::new(q), as_of, text: query.to_string() };
+    if let Some(r) = t.e.execute(stmt, vec![], SessionVars::default(), String::new(), reply.clone(), h).unwrap() {
+        reply.send(Ok(r)).unwrap();
+    }
+    rx
+}
+
+/// A source whose upstream is never contacted (no threads here), with one
+/// replicated table `st`.
+fn source(t: &mut T) -> (EngineHandle, Receiver<EngineMsg>, ObjectId) {
+    let table = crate::coord::ddl::DiscoveredTable {
+        schema: "public".into(),
+        name: "st".into(),
+        columns: vec![crate::types::Column::new("id", crate::types::ColumnType::new(crate::types::SqlType::Int8))],
+        pk: vec![0],
+        replica_identity_full: false,
+    };
+    t.gsn += 1;
+    let sql = "CREATE SOURCE src FROM POSTGRES CONNECTION 'host=/nonexistent' PUBLICATION 'p'";
+    t.e.apply_ddl(t.gsn, sql, &serde_json::to_string(&vec![table]).unwrap()).unwrap();
+    t.e.processed = t.gsn;
+    let (tx, rx) = unbounded();
+    let h = EngineHandle { tx, seq: t.e.seq.clone(), shared: t.e.shared.clone() };
+    (h, rx, t.id("src"))
+}
+
+/// A read waiting for an LSN runs once every source's frontier passed it;
+/// sources wake the engine when their frontier passes the smallest LSN
+/// waited for, not at every advance.
+#[test]
+fn lsn_reads_are_woken_when_the_frontier_passes() {
+    let mut t = T::new("work-lsn");
+    let (h, wakes, src) = source(&mut t);
+    let rx = read(&mut t, &h, "SELECT 1", crate::sql::parser::AsOf::AtLeastLsn("0/1000".into()));
+    assert_eq!(t.e.parked.len(), 1);
+    for lsn in (0x100..0x1000).step_by(0x100) {
+        h.advance_frontier(src, lsn);
+    }
+    assert_eq!(wakes.try_iter().count(), 0, "advances below the LSN waited for");
+    t.e.wake_parked(&h);
+    assert_eq!((t.e.parked.len(), t.e.deferred.len()), (1, 0));
+    h.advance_frontier(src, 0x1000);
+    h.advance_frontier(src, 0x1100);
+    assert_eq!(wakes.try_iter().count(), 1);
+    t.e.wake_parked(&h);
+    assert_eq!((t.e.parked.len(), t.e.deferred.len()), (0, 1));
+    assert!(!t.e.shared.lsn_waiters.load(Ordering::Acquire));
+    drop(rx);
+}
+
+/// A read waiting for the initial snapshot of a table is run again (and
+/// planned again) when that table is loaded or the catalog changes, not at
+/// every progress record of the source.
+#[test]
+fn snapshot_reads_wait_for_their_tables() {
+    let mut t = T::new("work-snapshot");
+    let (h, _wakes, src) = source(&mut t);
+    let st = t.id("st");
+    let state = |done: bool| {
+        let mut s = crate::source::postgres::SourceState::default();
+        s.tables.insert(st, crate::source::postgres::SnapState { done, ..Default::default() });
+        serde_json::to_string(&s).unwrap()
+    };
+    t.e.source_states.insert(src, state(false));
+    t.e.snap_epoch += 1;
+    let rx = read(&mut t, &h, "SELECT count(*) FROM st", crate::sql::parser::AsOf::Fresh);
+    assert_eq!(t.e.parked.len(), 1);
+    for _ in 0..5 {
+        t.gsn += 1;
+        t.e.apply_record(t.gsn, LogRecord::Progress { source: src, lsn: 0, state: state(false) }).unwrap();
+        t.e.wake_parked(&h);
+        assert_eq!((t.e.parked.len(), t.e.deferred.len()), (1, 0), "re-run while its table loads");
+    }
+    t.gsn += 1;
+    t.e.apply_record(t.gsn, LogRecord::Progress { source: src, lsn: 0, state: state(true) }).unwrap();
+    t.e.wake_parked(&h);
+    assert_eq!((t.e.parked.len(), t.e.deferred.len()), (0, 1));
+    drop(rx);
+}

@@ -1674,8 +1674,8 @@ impl Engine {
             .map(|p| {
                 let (wait, gsn) = match p.wait {
                     Wait::Gsn(g) => ("gsn", Some(g)),
-                    Wait::Lsn => ("lsn", None),
-                    Wait::Snapshot => ("snapshot", None),
+                    Wait::Lsn(_) => ("lsn", None),
+                    Wait::Snapshot { .. } => ("snapshot", None),
                 };
                 let sql = match &p.req {
                     Request::Execute { stmt, .. } => match &**stmt {

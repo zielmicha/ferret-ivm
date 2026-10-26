@@ -84,6 +84,7 @@ snapshot requests queued at the engine.
 | `processed_gsn` | last GSN applied by the engine |
 | `source_lsn` | per-source LSN frontier (mutex-protected map) |
 | `lsn_waiters` | some read is waiting for an LSN frontier |
+| `lsn_wanted` | the smallest LSN such a read waits for: a source wakes the engine when its frontier passes it |
 | `want_keepalive` | ask sources to request a keepalive (to move their frontier) |
 | `source_gauges` | per-source upstream position and ingest counters (web UI) |
 | `slot_drops` | replication slots of dropped sources still to be dropped (saved in checkpoints) |
@@ -288,8 +289,8 @@ and a wait condition:
 | Condition | Woken when |
 |---|---|
 | `Gsn(g)` | the engine has applied `g` (checked after every batch) |
-| `Lsn` | every source of the catalog has a frontier ≥ the read's LSN (`lsn_reached`; checked on `Wake` messages, which sources send when a frontier moves while `lsn_waiters` is set, after every batch and on the 200 ms timeout). When the last source is dropped, the read is re-run and fails |
-| `Snapshot` | something changed that could finish a snapshot (source progress, a schema change or DDL); the read is re-run and parks again if a table it reads, directly or through views, is still loading |
+| `Lsn(l)` | every source of the catalog has a frontier ≥ `l` (the frontier all sources have reached is computed once per check, for every waiting read); checked on `Wake` messages, which a source sends when its frontier passes `lsn_wanted` (not at every advance), after every batch and on the 200 ms timeout. When the last source is dropped, the read is re-run and fails |
+| `Snapshot` | the tables it reads, directly or through views, whose initial snapshot was loading have all finished it, or the catalog changed (DDL or an upstream schema change: what the read reads may have changed); the read is re-run (planned again) and parks again if a table it reads is still loading. Source progress that finishes none of its tables does not re-run it |
 
 While an LSN read waits, `want_keepalive` makes the sources request a
 keepalive from the upstream, so that the frontier advances to the server's
