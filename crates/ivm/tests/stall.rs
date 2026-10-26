@@ -1,5 +1,6 @@
-//! Long operations do not stop the engine: views are hydrated off the
-//! engine thread while records go on being applied and requests answered.
+//! Long operations do not stop the engine: views are hydrated, and
+//! checkpoints written, off the engine thread while records go on being
+//! applied and requests answered; DML statements share log appends.
 //! Measured in counts of things that happened meanwhile (records applied,
 //! statements answered), not in wall-clock time.
 
@@ -273,6 +274,55 @@ fn subscriptions_to_queries_add_up_while_they_hydrate() {
     got.sort();
     assert!(i > 0, "no commit while the subscription hydrated");
     assert_eq!(got, rows(&h, q));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// While a large checkpoint is written, single-row commits are applied and
+/// answered: some with a GSN after the checkpoint's are answered before the
+/// checkpoint is. (The checkpoint used to be written on the engine thread,
+/// which applied nothing meanwhile.)
+#[test]
+fn commits_are_applied_while_a_checkpoint_is_written() {
+    let dir = tmpdir("checkpoint-commits");
+    // (no checkpoint before the one asked for: it writes everything loaded)
+    let cfg = coord::Config {
+        data_dir: dir.clone(),
+        sync: false,
+        tick: None,
+        checkpoint_interval: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let running = coord::start(cfg).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE wide (id int PRIMARY KEY, pad text)");
+    for lo in (0..600_000).step_by(100_000) {
+        exec(&h, &format!("INSERT INTO wide SELECT i, repeat('x', 200) || i FROM generate_series({lo}, {}) i", lo + 99_999));
+    }
+    exec(&h, "CREATE TABLE small (id int PRIMARY KEY, v int)");
+    // (the inserts are the only records: their GSNs follow this one)
+    let g0 = gsn(&h);
+    let h2 = h.clone();
+    let ck = std::thread::spawn(move || h2.checkpoint().unwrap());
+    let mut during = Vec::new();
+    let mut i = 0;
+    while !ck.is_finished() {
+        exec(&h, &format!("INSERT INTO small VALUES ({i}, {i})"));
+        i += 1;
+        if !ck.is_finished() {
+            during.push(g0 + i);
+        }
+    }
+    let c = ck.join().unwrap();
+    assert_eq!(gsn(&h), g0 + i);
+    let after = during.iter().filter(|g| **g > c).count();
+    // (over a thousand here; a few race with the reply of one written inline)
+    assert!(after >= 100, "{after} commits after the checkpoint's GSN {c} answered while it was written ({} in all)", during.len());
+    // the next one (with nothing written meanwhile) has everything
+    assert!(h.checkpoint().unwrap() >= *during.last().unwrap());
+    running.shutdown();
+    let running = start(&dir);
+    assert_eq!(rows(&running.handle, "SELECT count(*) FROM small"), vec![i.to_string()]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -63,8 +63,9 @@ impl Engine {
             Statement::Show(k) => self.show(k).map(Some),
             Statement::Explain { kind, target } => self.explain(kind, target, params).map(Some),
             Statement::Checkpoint => {
-                self.checkpoint()?;
-                Ok(Some(ExecResult::Command { tag: "CHECKPOINT".into() }))
+                // (answered once the next checkpoint is committed)
+                self.request_checkpoint(super::checkpoint::Waiter::Statement(reply));
+                Ok(None)
             }
             Statement::Empty => Ok(Some(ExecResult::Command { tag: String::new() })),
             Statement::Sql(s) => match *s {

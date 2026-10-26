@@ -5,6 +5,7 @@ mechanism: *read the state as of GSN g, replay the log from g + 1*. This
 chapter describes the recovery protocol, how checkpointed indexes are found
 again, how sources resume, and the DBLog snapshot algorithm as implemented.
 Code: `crates/ivm/src/coord/mod.rs` (`start`, `recover`, `checkpoint`),
+`crates/ivm/src/coord/checkpoint.rs`,
 `crates/ivm/src/storage/mod.rs` (`Env::open`, `Env::checkpoint`),
 `crates/ivm/src/log.rs`, `crates/ivm/src/source/postgres.rs`.
 
@@ -157,8 +158,11 @@ fingerprint mismatch only costs a rebuild.
 
 ## Checkpoints
 
-`Engine::checkpoint` (every `--checkpoint-secs` if anything changed, when
-dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
+A checkpoint is begun every `--checkpoint-secs` if anything changed, when
+dirty memory exceeds half the cache, and when one is asked for (`CHECKPOINT`,
+`EngineHandle::checkpoint`, answered once one begun after the request is
+committed); it is written in the background (`coord/checkpoint.rs`), one at
+a time. On the engine thread, between two records:
 
 1. build `AppState`: the catalog (with its DDL history), the fingerprint →
    tree id and fingerprint → `since` maps of all hydrated arrangements, each
@@ -166,16 +170,34 @@ dirty memory exceeds half the cache, on `CHECKPOINT`, and on shutdown):
    the per-group error state of operators, each source's opaque state (JSON)
    and last logged LSN, the request counter, the logical clock and its ticks
    in the retention window (at most the last 100,000), and the pending slot
-   drops; serialise it as JSON
-   ([On-disk format](../on-disk-format.md#checkpoint-application-state-appstate));
-2. `Env::checkpoint(processed_gsn, json)`: write dirty nodes, `fsync`, append
-   the manifest record (the commit point), delete dead segments
-   ([Storage](storage.md#segments-and-checkpoints));
-3. `Env::gc(1000)`: relocate live nodes of the oldest sparse segment;
-4. send `Truncate(processed − retention)` to the sequencer, which deletes
-   log segments whose records all lie at or before that GSN.
+   drops;
+2. `Env::begin_checkpoint(processed_gsn)`: freeze a version of the dirty
+   nodes ([Storage](storage.md#segments-and-checkpoints)).
 
-The engine thread does nothing else while a checkpoint runs.
+On a thread of its own (`ivm-checkpoint`), while the engine goes on applying
+records and answering requests:
+
+3. serialise `AppState` as JSON
+   ([On-disk format](../on-disk-format.md#checkpoint-application-state-appstate));
+4. `CheckpointJob::run`: write the frozen dirty nodes, `fsync`, append the
+   manifest record (the commit point), delete dead segments.
+
+Back on the engine thread, once it is written (the thread sends `Wake`):
+
+5. `Env::finish_checkpoint`: mark the written nodes that did not change
+   meanwhile clean;
+6. `Env::gc(1000)`: relocate live nodes of the oldest sparse segment;
+7. send `Truncate(checkpoint GSN − retention)` to the sequencer, which
+   deletes log segments whose records all lie at or before that GSN.
+
+The engine thread is held up only by building the application state and
+freezing the dirty nodes (one reference-count increment per dirty node);
+nodes it modifies while the checkpoint is written are copied first (once
+each). A checkpoint that fails (an I/O error) stops the engine. At shutdown
+the engine waits for the checkpoint being written and then takes the final
+one on its own thread; a simulated crash only waits for it to be written,
+so that no writer outlives the engine. Recovery is unchanged: the manifest
+append is the commit point, and the log is truncated only after it.
 
 ## Source resumption
 

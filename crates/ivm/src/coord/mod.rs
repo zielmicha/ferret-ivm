@@ -4,6 +4,7 @@
 pub mod api;
 pub mod ddl;
 mod dml;
+mod checkpoint;
 mod hydrate;
 pub mod inspect;
 mod read;
@@ -197,6 +198,10 @@ pub struct Engine {
     /// Durable records not applied yet: those from a DDL or schema record
     /// on wait while a hydration is in progress.
     held: VecDeque<(Gsn, LogRecord)>,
+    /// The checkpoint being written in the background (`checkpoint.rs`).
+    checkpointing: Option<checkpoint::InFlight>,
+    /// Requests for a checkpoint, answered when the next one is committed.
+    checkpoint_waiters: Vec<checkpoint::Waiter>,
 }
 
 /// Handle used by sessions and sources.
@@ -454,6 +459,8 @@ impl Engine {
             ticks: VecDeque::new(),
             hydration: None,
             held: VecDeque::new(),
+            checkpointing: None,
+            checkpoint_waiters: Vec::new(),
         }
     }
 
@@ -611,6 +618,7 @@ impl Engine {
                 }
             }
             self.poll_hydration(&handle)?;
+            self.poll_checkpoint(false)?;
             self.maybe_checkpoint()?;
             self.prune_subscriptions();
         }
@@ -626,6 +634,9 @@ impl Engine {
         let _ = self.seq.send(SeqMsg::Shutdown);
         if !self.shared.crash.load(Ordering::Acquire) {
             self.checkpoint()?;
+        } else {
+            // (no writer may outlive the engine: a restart opens the store)
+            self.abandon_checkpoint();
         }
         // give sources and sinks a moment to finish; one stuck in a
         // connection attempt is left behind
@@ -718,10 +729,7 @@ impl Engine {
                     self.run_execute(req, handle);
                 }
             }
-            Request::Checkpoint { reply } => {
-                let r = self.checkpoint().map(|_| self.processed);
-                let _ = reply.send(r);
-            }
+            Request::Checkpoint { reply } => self.request_checkpoint(checkpoint::Waiter::Request(reply)),
             Request::Log { rec } => {
                 let _ = self.seq.send(SeqMsg::Append { rec, ack: None });
             }
@@ -920,19 +928,43 @@ impl Engine {
         }
     }
 
+    /// Begin a checkpoint in the background when one is due or asked for
+    /// (`checkpoint.rs`).
     fn maybe_checkpoint(&mut self) -> Result<()> {
-        if self.records_since_checkpoint == 0 {
+        if self.checkpointing.is_some() {
+            return Ok(());
+        }
+        let asked = !self.checkpoint_waiters.is_empty();
+        if self.records_since_checkpoint == 0 && !asked {
             return Ok(());
         }
         let dirty = self.env.dirty_bytes();
-        if self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.cfg.cache_bytes / 2 {
-            self.checkpoint()?;
+        if asked || self.last_checkpoint.elapsed() >= self.cfg.checkpoint_interval || dirty > self.cfg.cache_bytes / 2 {
+            self.begin_checkpoint()?;
         }
         Ok(())
     }
 
+    /// Take a checkpoint now, on the engine thread, after the one in
+    /// progress (at shutdown, and in an engine without threads).
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
-        let app = AppState {
+        self.poll_checkpoint(true)?;
+        let bytes = serde_json::to_vec(&self.app_state()).map_err(|e| SqlError::internal(e.to_string()))?;
+        self.env.checkpoint(self.processed, &bytes)?;
+        self.after_checkpoint(self.processed)
+    }
+
+    /// GC and log truncation after a checkpoint at `gsn` was committed.
+    fn after_checkpoint(&mut self, gsn: Gsn) -> Result<()> {
+        self.env.gc(1000)?;
+        let keep_from = gsn.saturating_sub(self.cfg.retention_gsns);
+        let _ = self.seq.send(SeqMsg::Truncate(keep_from));
+        Ok(())
+    }
+
+    /// The application state a checkpoint saves with the trees.
+    fn app_state(&self) -> AppState {
+        AppState {
             catalog: self.catalog.clone(),
             trees: self.graph.arrangement_trees().into_iter().collect(),
             // (not of a view still being hydrated: recovery rebuilds it and
@@ -952,15 +984,7 @@ impl Engine {
             arr_since: self.graph.arrangement_since().into_iter().collect(),
             ticks: self.ticks.iter().skip(self.ticks.len().saturating_sub(MAX_SAVED_TICKS)).copied().collect(),
             slot_drops: self.shared.slot_drops.lock().iter().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&app).map_err(|e| SqlError::internal(e.to_string()))?;
-        self.env.checkpoint(self.processed, &bytes)?;
-        self.env.gc(1000)?;
-        let keep_from = self.processed.saturating_sub(self.cfg.retention_gsns);
-        let _ = self.seq.send(SeqMsg::Truncate(keep_from));
-        self.last_checkpoint = Instant::now();
-        self.records_since_checkpoint = 0;
-        Ok(())
+        }
     }
 
     fn start_sources(&mut self, handle: &EngineHandle) -> Result<()> {

@@ -55,7 +55,8 @@ Where the implementation differs from the design:
 | `ivm-listener` | the listening socket | accepts connections (`server::serve_listener`) and starts a session thread for each |
 | `ivm-signals` | | turns the first `SIGINT`/`SIGTERM` into a shutdown request; a second one exits the process at once (status 1) |
 | `ivm-sequencer` | the input-log writer | assigns GSNs, appends and `fsync`s records in batches, generates clock ticks, acknowledges submitters, forwards durable records to the engine |
-| `ivm-engine` (64 MiB stack) | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, takes checkpoints, builds the web UI's snapshots |
+| `ivm-engine` (64 MiB stack) | storage (`Env`), dataflow (`Graph`), catalog, runtime state | applies durable records in GSN order, answers queries, parks waiting reads, delivers changes to subscriptions and sinks, begins and finishes checkpoints, builds the web UI's snapshots |
+| `ivm-checkpoint` (while a checkpoint is written) | a frozen version of the dirty nodes, the store's append side and manifest | serializes the application state, writes the nodes, `fsync`s and appends the manifest record ([Recovery](recovery.md#checkpoints)) |
 | `ivm-session-<n>` (one per client, 16 MiB stack) | the client connection | wire protocol, session settings, source discovery; forwards statements to the engine and streams results |
 | `ivm-source-<name>` (one per source) | replication and snapshot connections | turns `pgoutput` messages and snapshot chunks into log records, acknowledges the slot |
 | `ivm-sink-<name>` (one per sink) | the target connection | writes changes to PostgreSQL |
@@ -219,17 +220,18 @@ handles:
 | `Durable(batch)` | apply each record in GSN order (`apply_record`), publish `processed_gsn`, re-check parked reads. While a hydration is in progress, a `Ddl` or `Schema` record and the records after it are held until it is done; `Commit` and `Tick` records are forwarded to it before they are applied. A record that fails to apply is logged (`failed to apply gsn ...`); an internal (`XX...`) or I/O (`58...`) error stops the engine thread (`Shared::failed`, and the process ends with status 1); any other error (data errors are error records, so this is a bug) leaves the record possibly half-applied and not applied again: `processed` moves past it and its DML statement fails, so that neither the client, the DML queued behind it nor fresh reads wait forever |
 | `Request(Execute)` | run a statement: DDL and DML are validated and submitted; reads are executed or parked; `SUBSCRIBE` is registered; `SHOW`, `EXPLAIN`, `CHECKPOINT` answered directly |
 | `Request(Describe)` | result columns and parameter types of a prepared statement |
-| `Request(Checkpoint)` | take a checkpoint |
+| `Request(Checkpoint)` | ask for a checkpoint: answered with its GSN once one begun after the request is committed |
 | `Request(Inspect)` | build a snapshot for the web UI (`coord/inspect.rs`) between two records, so that it is consistent at one GSN, and hand it to the requester's callback |
 | `Wake` | a source frontier moved, or a statement was cancelled or its client went away: re-check parked reads |
-| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint (not after a simulated crash), wait up to 5 s for sources and sinks, exit |
+| `Shutdown` | ask sources to stop, send every sink the last applied GSN as its progress and ask it to stop, stop the sequencer, take a final checkpoint after the one being written, if any (not after a simulated crash, which only waits for that one to be written), wait up to 5 s for sources and sinks, exit |
 
 After every message it runs deferred requests (queued DML, woken reads),
 finishes the hydration in progress if it has caught up (then applies the
-records held behind it), takes a checkpoint if one is due, and removes
-cancelled subscriptions. The hydration thread sends `Wake` when it has
+records held behind it), finishes the checkpoint being written if it is
+done, begins one if one is due or asked for, and removes cancelled
+subscriptions. The hydration thread sends `Wake` when it has
 hydrated its fragment and whenever it has applied every record forwarded so
-far.
+far; the checkpoint thread when it has written its checkpoint.
 
 `apply_record` dispatches on the record kind:
 
