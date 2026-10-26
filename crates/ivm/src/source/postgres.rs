@@ -249,21 +249,32 @@ impl SourceState {
         serde_json::to_string(self).unwrap()
     }
 
-    /// Apply the change a `ProgressDelta` record carries. One that does not
-    /// parse empties the state, as a full state that does not parse would.
-    pub fn apply(&mut self, delta: &str) {
+    /// Apply the change a `ProgressDelta` record carries; returns the
+    /// tables whose entries it replaced (None: all of the state). One that
+    /// does not parse empties the state, as a full state that does not
+    /// parse would.
+    pub fn apply(&mut self, delta: &str) -> Option<Vec<ObjectId>> {
         match serde_json::from_str::<StateDelta>(delta) {
             Ok(d) => {
                 if let Some(created) = d.slot_created {
                     self.slot_created = created;
                 }
+                let changed = d.tables.keys().copied().collect();
                 self.tables.extend(d.tables);
+                Some(changed)
             }
             Err(e) => {
                 log::error!("a source's progress record does not parse ({e}): its slot is created and its tables copied again");
                 *self = SourceState::default();
+                None
             }
         }
+    }
+
+    /// The state without its tables' entries (which the metadata tree
+    /// keeps one by one).
+    pub fn head(&self) -> SourceState {
+        SourceState { slot_created: self.slot_created, tables: BTreeMap::new() }
     }
 
     /// The snapshot of `table` is to be done again (as the source does on a

@@ -48,7 +48,8 @@ const T_OBJECT: u8 = 1;
 const T_CATALOG: u8 = 2;
 /// `u64 BE gsn` → the statement (UTF-8)
 const T_HISTORY: u8 = 3;
-/// `u64 BE source` → its `SourceState` (JSON)
+/// `u64 BE source` → its `SourceState` (JSON; written without the tables'
+/// entries, which are tag 12's, but read with them too)
 const T_SOURCE_STATE: u8 = 4;
 /// `u64 BE source` → resume LSN (`uvarint`)
 const T_SOURCE_LSN: u8 = 5;
@@ -64,6 +65,9 @@ const T_TICK: u8 = 9;
 const T_SLOT_DROP: u8 = 10;
 /// `bytes fingerprint`: the operator's groups in error are complete
 const T_GROUPS_KNOWN: u8 = 11;
+/// `u64 BE source`, `u64 BE table` → the table's `SnapState` in the
+/// source's state (JSON)
+const T_SOURCE_TABLE: u8 = 12;
 
 const F_NEXT_ID: u8 = 1;
 const F_INSTANCE_ID: u8 = 2;
@@ -116,6 +120,11 @@ pub(crate) struct Meta {
     ticks: (Gsn, Gsn),
     /// The tree does not hold the catalog's objects yet: write them all.
     all_objects: bool,
+    /// The arrangement and source-state records are to be brought up to
+    /// date as a whole (a new tree, or the first write after recovery);
+    /// afterwards only those that changed are visited.
+    all_arrangements: bool,
+    all_sources: bool,
 }
 
 fn u64_key(tag: u8, v: u64) -> Vec<u8> {
@@ -168,8 +177,21 @@ fn retract_range(env: &mut Env, tree: TreeId, lo: &[u8], hi: &[u8], ups: &mut Ve
 impl Meta {
     /// Bring the records of `tag` kept whole to `desired` (key → entry).
     fn sync_keyed(&mut self, tag: u8, desired: BTreeMap<Vec<u8>, Vec<u8>>, ups: &mut Vec<(Vec<u8>, i64)>) {
-        let stale: Vec<Vec<u8>> =
-            self.keyed.range(vec![tag]..vec![tag + 1]).filter(|(k, e)| desired.get(*k) != Some(*e)).map(|(k, _)| k.clone()).collect();
+        self.sync_prefix(&[tag], desired, ups)
+    }
+
+    /// Bring the records kept whole whose keys start with `prefix` to
+    /// `desired` (key → entry).
+    fn sync_prefix(&mut self, prefix: &[u8], desired: BTreeMap<Vec<u8>, Vec<u8>>, ups: &mut Vec<(Vec<u8>, i64)>) {
+        let stale: Vec<Vec<u8>> = self
+            .keyed
+            .range(prefix.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .inspect(|_| crate::dataflow::bookkept(1))
+            .filter(|(k, e)| desired.get(*k) != Some(*e))
+            .map(|(k, _)| k.clone())
+            .collect();
+        crate::dataflow::bookkept(desired.len() as u64);
         for k in stale {
             ups.push((self.keyed.remove(&k).expect("stale entry"), -1));
         }
@@ -180,6 +202,59 @@ impl Meta {
             }
         }
     }
+
+    /// Bring the record kept whole under `key` to `entry` (None: none).
+    fn sync_one(&mut self, key: Vec<u8>, entry: Option<Vec<u8>>, ups: &mut Vec<(Vec<u8>, i64)>) {
+        crate::dataflow::bookkept(1);
+        if self.keyed.get(&key) == entry.as_ref() {
+            return;
+        }
+        if let Some(old) = self.keyed.remove(&key) {
+            ups.push((old, -1));
+        }
+        if let Some(e) = entry {
+            ups.push((e.clone(), 1));
+            self.keyed.insert(key, e);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Meta {
+    /// The arrangement records the tree holds: (fingerprint, tree).
+    pub(crate) fn arrangement_records(&self) -> Vec<(Vec<u8>, TreeId)> {
+        self.keyed
+            .iter()
+            .filter(|(k, _)| k[0] == T_ARRANGEMENT)
+            .map(|(k, e)| {
+                let b = &mut &k[1..];
+                let fp = get_bytes(b).unwrap().to_vec();
+                (fp, get_uvarint(&mut &e[k.len()..]).unwrap())
+            })
+            .collect()
+    }
+}
+
+/// The key of a source table's entry (tag 12).
+fn source_table_key(source: ObjectId, table: ObjectId) -> Vec<u8> {
+    let mut k = u64_key(T_SOURCE_TABLE, source);
+    k.extend_from_slice(&table.to_be_bytes());
+    k
+}
+
+/// The key of an arrangement's record (tag 6).
+fn arrangement_key(fp: &[u8]) -> Vec<u8> {
+    let mut k = vec![T_ARRANGEMENT];
+    put_bytes(&mut k, fp);
+    k
+}
+
+/// An arrangement's record: its tree and `since`.
+fn arrangement_entry(fp: &[u8], tree: TreeId, since: Gsn) -> Vec<u8> {
+    entry(arrangement_key(fp), |e| {
+        put_uvarint(e, tree);
+        put_uvarint(e, since);
+    })
 }
 
 impl Engine {
@@ -189,7 +264,7 @@ impl Engine {
             Some(t) => t,
             None => {
                 let t = self.env.create_tree(Arc::new(CountSummarizer));
-                self.meta = Meta { tree: Some(t), all_objects: true, ..Default::default() };
+                self.meta = Meta { tree: Some(t), all_objects: true, all_arrangements: true, all_sources: true, ..Default::default() };
                 t
             }
         }
@@ -249,32 +324,66 @@ impl Engine {
             retract_range(&mut self.env, tree, &u64_key(T_TICK, first), &u64_key(T_TICK, front), &mut ups)?;
         }
         self.meta.ticks = (self.ticks.front().map(|t| t.0).unwrap_or(0), self.ticks.back().map(|t| t.0).unwrap_or(0));
-        // sources
+        // sources: their states' heads, and the entries of their tables
+        // that changed (`Engine::source_changed`)
         let keyed = |tag: u8, id: u64, value: &dyn Fn(&mut Vec<u8>)| {
             let k = u64_key(tag, id);
             (k.clone(), entry(k, value))
         };
-        let states = self.source_states.iter().map(|(id, s)| keyed(T_SOURCE_STATE, *id, &|e| e.extend_from_slice(s.to_json().as_bytes()))).collect();
-        self.meta.sync_keyed(T_SOURCE_STATE, states, &mut ups);
+        let changed = std::mem::take(&mut self.source_changes);
+        if std::mem::take(&mut self.meta.all_sources) {
+            let heads = self.source_states.iter().map(|(id, s)| keyed(T_SOURCE_STATE, *id, &|e| e.extend_from_slice(s.head().to_json().as_bytes()))).collect();
+            self.meta.sync_keyed(T_SOURCE_STATE, heads, &mut ups);
+            let mut tables = BTreeMap::new();
+            for (src, st) in &self.source_states {
+                for (t, snap) in &st.tables {
+                    let k = source_table_key(*src, *t);
+                    tables.insert(k.clone(), entry(k, |e| e.extend_from_slice(serde_json::to_string(snap).unwrap().as_bytes())));
+                }
+            }
+            self.meta.sync_keyed(T_SOURCE_TABLE, tables, &mut ups);
+        } else {
+            for (src, tables) in changed {
+                let st = self.source_states.get(&src);
+                let head = st.map(|s| entry(u64_key(T_SOURCE_STATE, src), |e| e.extend_from_slice(s.head().to_json().as_bytes())));
+                self.meta.sync_one(u64_key(T_SOURCE_STATE, src), head, &mut ups);
+                let table_entry = |t: ObjectId| {
+                    let snap = st.and_then(|s| s.tables.get(&t))?;
+                    Some(entry(source_table_key(src, t), |e| e.extend_from_slice(serde_json::to_string(snap).unwrap().as_bytes())))
+                };
+                match tables {
+                    Some(ts) => {
+                        for t in ts {
+                            let e = table_entry(t);
+                            self.meta.sync_one(source_table_key(src, t), e, &mut ups);
+                        }
+                    }
+                    None => {
+                        let desired = st.into_iter().flat_map(|s| s.tables.keys()).map(|t| (source_table_key(src, *t), table_entry(*t).unwrap())).collect();
+                        self.meta.sync_prefix(&u64_key(T_SOURCE_TABLE, src), desired, &mut ups);
+                    }
+                }
+            }
+        }
         let lsns = self.source_lsns.iter().map(|(id, l)| keyed(T_SOURCE_LSN, *id, &|e| put_uvarint(e, *l))).collect();
         self.meta.sync_keyed(T_SOURCE_LSN, lsns, &mut ups);
-        // arrangements
-        let since = self.graph.arrangement_since();
-        let arrs = self
-            .graph
-            .arrangement_trees()
-            .into_iter()
-            .map(|(fp, t)| {
-                let mut k = vec![T_ARRANGEMENT];
-                put_bytes(&mut k, &fp);
-                let s = since.get(&fp).copied().unwrap_or(0);
-                (k.clone(), entry(k, |e| {
-                    put_uvarint(e, t);
-                    put_uvarint(e, s);
-                }))
-            })
-            .collect();
-        self.meta.sync_keyed(T_ARRANGEMENT, arrs, &mut ups);
+        // arrangements: those that changed (all of them at first)
+        let changes = self.graph.take_arrangement_changes();
+        if std::mem::take(&mut self.meta.all_arrangements) {
+            let since = self.graph.arrangement_since();
+            let arrs = self
+                .graph
+                .arrangement_trees()
+                .into_iter()
+                .map(|(fp, t)| (arrangement_key(&fp), arrangement_entry(&fp, t, since.get(&fp).copied().unwrap_or(0))))
+                .collect();
+            self.meta.sync_keyed(T_ARRANGEMENT, arrs, &mut ups);
+        } else {
+            for (fp, rec) in changes {
+                let e = rec.map(|(t, since)| arrangement_entry(&fp, t, since));
+                self.meta.sync_one(arrangement_key(&fp), e, &mut ups);
+            }
+        }
         // pending slot drops (also removed by their threads)
         let drops = self
             .shared
@@ -343,6 +452,7 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
     let mut node_errors: BTreeMap<Vec<u8>, ErrDelta> = BTreeMap::new();
     let mut group_errors: BTreeMap<Vec<u8>, Vec<(Vec<u8>, ErrRecord)>> = BTreeMap::new();
     let mut known = Vec::new();
+    let mut sources: BTreeMap<ObjectId, crate::source::postgres::SourceState> = BTreeMap::new();
     for (e, w) in entries {
         let bad = |what: &str| SqlError::corrupt(format!("bad metadata entry ({what}): {e:02x?}"));
         let tag = e[0];
@@ -382,9 +492,20 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
             }
             T_SOURCE_STATE => {
                 let id = be64(&mut b)?;
-                st.source_states.push((id, String::from_utf8(b.to_vec()).map_err(|_| bad("source state"))?));
+                let json = std::str::from_utf8(b).map_err(|_| bad("source state"))?;
+                let state = sources.entry(id).or_default();
+                let tables = std::mem::take(&mut state.tables);
+                *state = crate::source::postgres::SourceState::parse(json);
+                state.tables.extend(tables);
                 b = &[];
                 Some(9)
+            }
+            T_SOURCE_TABLE => {
+                let (src, table) = (be64(&mut b)?, be64(&mut b)?);
+                let snap: crate::source::postgres::SnapState = serde_json::from_slice(b).map_err(|err| bad(&format!("source table {table}: {err}")))?;
+                sources.entry(src).or_default().tables.insert(table, snap);
+                b = &[];
+                Some(17)
             }
             T_SOURCE_LSN => {
                 let id = be64(&mut b)?;
@@ -437,6 +558,9 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
         }
     }
     st.catalog.next_id = next_id.ok_or_else(|| SqlError::corrupt("the metadata tree has no next object id"))?;
+    st.source_states = sources.into_iter().map(|(id, s)| (id, s.to_json())).collect();
+    // (the first write after recovery brings these up to date as a whole)
+    (meta.all_arrangements, meta.all_sources) = (true, true);
     st.clock = st.ticks.last().map(|t| t.1).unwrap_or(0);
     st.errors = ErrorState { nodes: node_errors.into_iter().collect(), operators: group_errors.into_iter().collect(), known };
     meta.history = (st.catalog.history.first().map(|h| h.0).unwrap_or(0), st.catalog.history.last().map(|h| h.0).unwrap_or(0));

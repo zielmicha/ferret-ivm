@@ -214,8 +214,13 @@ pub struct Engine {
     /// Bumped by catalog changes (DDL, upstream schema changes): reads
     /// waiting for initial snapshots are re-run (re-planned) when it moves.
     pub(crate) catalog_epoch: u64,
-    /// (epoch, replicated tables still loading their initial snapshot)
-    pub(crate) loading: (u64, std::collections::HashSet<ObjectId>),
+    /// Replicated tables still loading their initial snapshot (or a
+    /// re-snapshot), kept as their sources' states and the catalog change
+    /// (`source_changed`, `table_loading_changed`).
+    pub(crate) loading: std::collections::HashSet<ObjectId>,
+    /// Per source, what of its state changed since the metadata tree was
+    /// last written: some tables' entries, or (None) all of it.
+    pub(crate) source_changes: BTreeMap<ObjectId, Option<std::collections::BTreeSet<ObjectId>>>,
     /// Per-source progress state (snapshot bookkeeping owned by the
     /// source), as its `Progress` and `ProgressDelta` records leave it.
     pub source_states: HashMap<ObjectId, crate::source::postgres::SourceState>,
@@ -590,7 +595,8 @@ impl Engine {
             snap_epoch: 0,
             snap_epoch_seen: 0,
             catalog_epoch: 0,
-            loading: (0, std::collections::HashSet::new()),
+            loading: std::collections::HashSet::new(),
+            source_changes: BTreeMap::new(),
             source_states: HashMap::new(),
             source_lsns: HashMap::new(),
             handle: None,
@@ -630,6 +636,16 @@ impl Engine {
             self.ticks = app.ticks.into_iter().collect();
         }
         self.source_states = app.source_states.iter().map(|(id, s)| (*id, crate::source::postgres::SourceState::parse(s))).collect();
+        let replicated: Vec<ObjectId> = self
+            .catalog
+            .objects
+            .values()
+            .filter(|o| matches!(&o.kind, ObjectKind::Table(t) if t.source.is_some()))
+            .map(|o| o.id)
+            .collect();
+        for t in replicated {
+            self.table_loading_changed(t);
+        }
         self.source_lsns = app.source_lsns.into_iter().collect();
         self.shared.slot_drops.lock().extend(app.slot_drops);
         let objects: Vec<_> = self.catalog.objects.values().cloned().collect();
@@ -1024,15 +1040,15 @@ impl Engine {
                 self.processed = gsn;
                 if self.catalog.get(source).is_some() {
                     self.source_states.insert(source, crate::source::postgres::SourceState::parse(&state));
+                    self.source_changed(source, None);
                 }
-                self.snap_epoch += 1;
             }
             LogRecord::ProgressDelta { source, lsn: _, delta } => {
                 self.processed = gsn;
                 if self.catalog.get(source).is_some() {
-                    self.source_states.entry(source).or_default().apply(&delta);
+                    let changed = self.source_states.entry(source).or_default().apply(&delta);
+                    self.source_changed(source, changed.as_deref());
                 }
-                self.snap_epoch += 1;
             }
             LogRecord::Schema { source, table, columns, pk } => {
                 let r = self.apply_schema_change(gsn, table, columns, pk);
@@ -1048,6 +1064,7 @@ impl Engine {
                 // record).
                 if let Some(state) = self.source_states.get_mut(&source) {
                     state.snapshot_again(table);
+                    self.source_changed(source, Some(&[table]));
                 }
                 self.snap_epoch += 1;
                 self.catalog_epoch += 1;
@@ -1152,6 +1169,53 @@ impl Engine {
     /// behind the first that still has to wait).
     fn drain_dml_queue(&mut self) {
         self.deferred.extend(self.dml_queue.drain(..));
+    }
+
+    /// The state of `source` changed: the entries of `tables`, or (None)
+    /// all of it. It is written into the metadata tree with the next
+    /// `persist_meta`, and the loading tables follow it — the work is that
+    /// of the change, not of the source's or the catalog's tables.
+    pub(crate) fn source_changed(&mut self, source: ObjectId, tables: Option<&[ObjectId]>) {
+        match tables {
+            Some(ts) => {
+                // (on top of a change of all of it, nothing to add)
+                if let Some(set) = self.source_changes.entry(source).or_insert_with(|| Some(Default::default())) {
+                    set.extend(ts.iter().copied());
+                }
+                for t in ts {
+                    self.table_loading_changed(*t);
+                }
+            }
+            None => {
+                self.source_changes.insert(source, None);
+                let tables: Vec<ObjectId> = self
+                    .catalog
+                    .objects
+                    .values()
+                    .filter(|o| matches!(&o.kind, ObjectKind::Table(t) if t.source == Some(source)))
+                    .map(|o| o.id)
+                    .collect();
+                for t in tables {
+                    self.table_loading_changed(t);
+                }
+            }
+        }
+    }
+
+    /// Whether replicated table `table` is loading may have changed (its
+    /// source's state, or the table itself, changed): reads parked for
+    /// loading tables are re-checked when the set does.
+    pub(crate) fn table_loading_changed(&mut self, table: ObjectId) {
+        let loading = match self.catalog.get(table).map(|o| &o.kind) {
+            Some(ObjectKind::Table(t)) => {
+                t.source.is_some_and(|src| !self.source_states.get(&src).and_then(|s| s.tables.get(&table)).is_some_and(|s| s.done))
+            }
+            _ => false,
+        };
+        let changed = if loading { self.loading.insert(table) } else { self.loading.remove(&table) };
+        if changed {
+            self.snap_epoch += 1;
+        }
     }
 
     /// The logical clock as of `gsn` (what now() returns in a read at `gsn`).

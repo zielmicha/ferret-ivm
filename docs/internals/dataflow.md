@@ -673,7 +673,15 @@ re-planning of the views reading the replaced view), upstream schema changes
 and `SUBSCRIBE (query)` hydrate their new nodes and arrangements without
 stopping the engine (`coord/hydrate.rs`). A DDL or schema record collects
 what has to follow the hydration of what it built (`hydrate::Then`) and
-starts the hydration once it has been applied. At the GSN *g* the statement is
+starts the hydration once it has been applied. A small one — reading no
+more than the read budget of 50,000 entries, as estimated from the
+arrangements the pending fragment reads (`Graph::pending_input_entries`,
+which counts every input whole) and, for a replacement with consumers, the
+old version — is hydrated inline, as replay does: forking the storage and
+the graph would cost more than reading what it reads. (The graph keeps
+its pending nodes and arrangements as they change, so finding and
+hydrating them visits nothing else.) A table rebuilt after a schema change
+always goes off the engine thread. At the GSN *g* the statement is
 applied at (its DDL record, or the last applied record for `SUBSCRIBE`), the
 engine takes a fork of the storage — every tree as of *g*
 ([Storage](storage.md#forks)) — and a copy of the part of the graph the new

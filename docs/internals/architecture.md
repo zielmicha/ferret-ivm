@@ -315,7 +315,7 @@ checkpoint.
 | `Commit`, `CommitParts` | feed the changes to the dataflow by table (`Graph::step_feed`; changes to tables that no longer exist are skipped; a `CommitParts` record's are read from its parts file and fed one part at a time), then step the GSN (`Graph::step_finish`) and deliver outputs; for local DML reply to the client; for sources that still exist update the per-source last LSN |
 | `Ddl` | apply the statement to the catalog and dataflow; on success append it to the catalog history (which keeps the most recent 10,000 statements, trimmed back to 10,000 once it exceeds 11,000); write the catalog's changes into the metadata tree at the record's GSN (`persist_meta`); reply |
 | `Progress` | store the source's state (snapshot progress), if the source still exists |
-| `ProgressDelta` | apply the change to the source's stored state (the listed tables' entries replace theirs), if the source still exists |
+| `ProgressDelta` | apply the change to the source's stored state (the listed tables' entries replace theirs), if the source still exists; the tables whose initial snapshot is loading, and the metadata tree's records of the state (at the next `persist_meta`), follow the listed tables only (`source_changed`) |
 | `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
@@ -453,7 +453,7 @@ and a wait condition:
 |---|---|
 | `Gsn(g)` | the engine has applied `g` (checked after every batch) |
 | `Lsn(l)` | every source of the catalog has a frontier ≥ `l` (the frontier all sources have reached is computed once per check, for every waiting read); checked on `Wake` messages, which a source sends when its frontier passes `lsn_wanted` (not at every advance), after every batch and on the 200 ms timeout. When the last source is dropped, the read is re-run and fails |
-| `Snapshot` | the tables it reads, directly or through views, whose initial snapshot was loading have all finished it, or the catalog changed (DDL or an upstream schema change: what the read reads may have changed); the read is re-run (planned again) and parks again if a table it reads is still loading. Source progress that finishes none of its tables does not re-run it |
+| `Snapshot` | the tables it reads, directly or through views, whose initial snapshot was loading have all finished it, or the catalog changed (DDL or an upstream schema change: what the read reads may have changed); the read is re-run (planned again) and parks again if a table it reads is still loading. The loading tables are kept as source states and the catalog change, table by table (`Engine::loading`, `table_loading_changed`); source progress that finishes none of them does not re-check the reads |
 | `Hydration` | the hydration in progress is done; a statement (read, DML or `SUBSCRIBE`) that read a view still being hydrated is re-run |
 
 While an LSN read waits, `want_keepalive` makes the sources request a

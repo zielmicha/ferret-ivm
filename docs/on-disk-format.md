@@ -720,7 +720,7 @@ weight is its count.
 | 1 | catalog object | `u64 BE id`, then the [`CatalogObject`](#catalog-objects) as JSON (to the end of the entry) | 1 |
 | 2 | catalog scalar | `u8 field`, then its value: field 1, the next object id (`uvarint`); field 2, the instance id (`str`; no record while there is none) | 1 |
 | 3 | DDL history | `u64 BE gsn`, then the statement (UTF-8, to the end of the entry) | 1 |
-| 4 | source state | `u64 BE source`, then its `SourceState` JSON (to the end of the entry), as in [`Progress` records](#logrecord) | 1 |
+| 4 | source state | `u64 BE source`, then its `SourceState` JSON (to the end of the entry), as in [`Progress` records](#logrecord), written without its tables' entries (tag 12 holds them; one written by earlier versions with them is read with them) | 1 |
 | 5 | source resume LSN | `u64 BE source`, `uvarint lsn` | 1 |
 | 6 | arrangement | `bytes fingerprint`, `uvarint tree`, `uvarint since` | 1 |
 | 7 | node error record | `bytes node fingerprint`, `str sqlstate`, `str message` | its count |
@@ -728,10 +728,11 @@ weight is its count.
 | 9 | clock tick | `u64 BE gsn`, `ivarint clock` | 1 |
 | 10 | pending slot drop | `str conninfo`, `str slot` | 1 |
 | 11 | groups in error known | `bytes node fingerprint` | 1 |
+| 12 | source table state | `u64 BE source`, `u64 BE table`, then the table's `SnapState` JSON (to the end of the entry): its entry in the source's `SourceState` | 1 |
 
 The *key* of a record kept by key is its entry up to its value: tag and
 id for tags 1, 3, 4, 5 and 9, tag and field for 2, tag and fingerprint for
-6, the whole entry for 10. Fixed-width big-endian ids and length-prefixed
+6, tag, source and table for 12, the whole entry for 10. Fixed-width big-endian ids and length-prefixed
 fields make keys prefix-free, so the entries of one key are found by a
 prefix scan.
 
@@ -740,7 +741,7 @@ prefix scan.
 | catalog objects | every object of the catalog, by id |
 | DDL history | `ivm.catalog_history`: the successfully applied DDL statements, by GSN, the most recent 10,000; when a statement makes the history longer than 11,000, the oldest are retracted down to 10,000. Trimming happens when a statement is applied, so replay trims identically |
 | catalog scalars | the next object id; the instance id: 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted |
-| source states, resume LSNs | per source: its `SourceState`; the end LSN of its last logged commit, from which it resumes streaming |
+| source states, resume LSNs | per source: its `SourceState` (its tables' entries one record each, so that progress logged for one table changes one record); the end LSN of its last logged commit, from which it resumes streaming |
 | arrangements | every hydrated arrangement (also private state arrangements, such as a temporal filter's events): its [structural fingerprint](#structural-fingerprints), its tree, and the GSN from which its history is complete (when it was hydrated, or created with its table): `AS OF` reads of earlier GSNs do not use it |
 | node error records | the error records in the contents of every arranged node, by node fingerprint, so that views created later over the node start with them (an arrangement holds rows only); a materialized view's error records are those of its root node |
 | group errors | for every `Reduce`, `Recursive` and `Window` node, the groups (a window's partitions) in error with their error record, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (of a window's partition columns; empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers |
@@ -752,16 +753,22 @@ prefix scan.
 record, at its GSN (catalog objects and history entries are thus stamped
 with the GSN of their change), and at every checkpoint, at the checkpoint's
 GSN, before its nodes are written. Each time only what changed since the
-previous time is written: the catalog objects inserted, replaced or removed
-(the stored entries of each are retracted, whatever their bytes); history
-entries and ticks after the last ones written, and those trimmed or behind
-the frontier (retracted by a range scan); the records kept by key whose
-entry differs from the one the tree holds; and the changes to the error
-state (`Graph::take_error_changes`: a node's error records are added when
-it is first seen with an arrangement and retracted when it loses its last
-one or leaves the graph; an operator's group errors when it is first seen
-and when it leaves, its record of being known when it becomes known and when
-it leaves).
+previous time is written, and only what may have changed is looked at:
+the catalog objects inserted, replaced or removed (the stored entries of
+each are retracted, whatever their bytes); history entries and ticks after
+the last ones written, and those trimmed or behind the frontier (retracted
+by a range scan); the arrangements created, hydrated or freed since
+(`Graph::take_arrangement_changes`) and the source states' heads and table
+entries changed since (`Engine::source_changed`), whose entries are
+replaced where they differ from the ones the tree holds — all of them at
+the first write into a new tree or after recovery; the other records kept
+by key whose entry differs; and the changes to the error state
+(`Graph::take_error_changes`, which visits only the nodes whose
+arrangements changed or that keep groups in error and ran: a node's error
+records are added when it is first seen with an arrangement and retracted
+when it loses its last one or leaves the graph; an operator's group errors
+when it is first seen and when it leaves, its record of being known when
+it becomes known and when it leaves).
 
 **Reading** (recovery, `meta::load`): every entry with a non-zero weight.
 An entry with an unknown tag or trailing bytes, a record kept by key whose
@@ -861,7 +868,7 @@ it.
 | `catalog.instance_id` | 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted; `null` before that (and if absent) |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view with a dataflow: its error records `[[sqlstate, message], count]` |
-| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records), after the `Progress` and `ProgressDelta` records up to the checkpoint |
+| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records), after the `Progress` records up to the checkpoint |
 | `source_lsns` | per source: the end LSN of its last logged commit (resume point); `[]` if absent |
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
@@ -1318,7 +1325,7 @@ Consequences of code changes for an existing data directory:
 |---|---|
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag fails to replay a log holding it (versions before `CommitParts` truncated the newest log segment at the first such record, losing it and everything after it: a log with `CommitParts` records, tag 6, `ProgressDelta` records, tag 7, or `UpsertIfPresent` changes, kind 6, cannot be opened by them) |
 | `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType`, `SourceState` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`, `SourceState` also in `Progress` records: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
-| metadata record layouts (tags 1–11), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tag 11 was added within format 2 (a directory without it recomputes its window operators' partitions in error once, at the first start) |
+| metadata record layouts (tags 1–12), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tags 11 and 12 were added within format 2 (a directory without tag 11 recomputes its window operators' partitions in error once, at the first start; one written without tag 12 keeps its source states' tables in tag 4, which the first write splits out) |
 | format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate`, `index_order`, `scanned` and `reread` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tags 8–10 (float sums as normalized dyadic rationals, `min`/`max` prefixes) are written instead of format 1's tag 5 and wide values under tags 6 and 7, which are still read (as described [above](#summary)) |

@@ -410,9 +410,7 @@ pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: NodeId, gs
             return Err(e);
         }
     }
-    let ev = g.arrs[p.events].as_mut().unwrap();
-    ev.hydrated = true;
-    ev.since = gsn;
+    g.set_arr_hydrated(p.events, true, gsn);
     Ok(())
 }
 

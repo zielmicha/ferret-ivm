@@ -218,9 +218,11 @@ pub struct Graph {
     arr_seq: u64,
     node_by_fp: FxHashMap<Vec<u8>, NodeId>,
     arr_by_fp: FxHashMap<Vec<u8>, ArrId>,
-    /// Live nodes in sequence order.
-    topo: Vec<NodeId>,
-    topo_dirty: bool,
+    /// Live nodes and arrangements by sequence number (creation order,
+    /// which is topological for nodes): what was created since a mark is a
+    /// range of them (`gc_since`).
+    nodes_by_seq: BTreeMap<u64, NodeId>,
+    arrs_by_seq: BTreeMap<u64, ArrId>,
     /// Temporal filter nodes: they run whenever the clock moves.
     temporal: std::collections::BTreeSet<NodeId>,
     /// Trees from the checkpoint to attach instead of creating new ones.
@@ -259,6 +261,21 @@ pub struct Graph {
     pub group_caches: Arc<crate::memory::CacheMeter>,
     /// Per node, the index by all columns its spilled outputs are kept in.
     spill_layouts: parking_lot::Mutex<FxHashMap<NodeId, Arc<Layout>>>,
+    /// Nodes and arrangements not hydrated yet (`pending`): kept as they
+    /// change, so that what a statement adds costs no scan of the graph.
+    pending_nodes: std::collections::BTreeSet<NodeId>,
+    pending_arrs: std::collections::BTreeSet<ArrId>,
+    /// Fingerprints of the arrangements whose durable record (hydrated,
+    /// tree, `since`, existence) may have changed since
+    /// `take_arrangement_changes`.
+    arr_changes: rustc_hash::FxHashSet<Vec<u8>>,
+    /// Nodes whose mirrored error state may have changed since
+    /// `take_error_changes`: their arrangements changed, or they keep
+    /// groups in error and ran.
+    err_dirty: rustc_hash::FxHashSet<NodeId>,
+    /// Window operators whose partitions in error may not be known yet
+    /// (`hydrate` computes them).
+    unknown_windows: Vec<NodeId>,
 }
 
 /// Error state that must survive restarts, by node fingerprint: the error
@@ -515,10 +532,9 @@ impl Graph {
             hydrated: false,
         });
         self.node_by_fp.insert(fp, id);
-        // the newest node comes last in sequence order
-        if !self.topo_dirty {
-            self.topo.push(id);
-        }
+        self.nodes_by_seq.insert(seq, id);
+        self.pending_nodes.insert(id);
+        self.err_dirty.insert(id);
         id
     }
 
@@ -535,6 +551,9 @@ impl Graph {
         }
         if matches!(kind, NodeKind::Temporal(_)) {
             self.temporal.insert(id);
+        }
+        if matches!(kind, NodeKind::Window(_)) {
+            self.unknown_windows.push(id);
         }
         self.node_mut(id).kind = kind;
     }
@@ -634,9 +653,41 @@ impl Graph {
         };
         let seq = self.arr_seq;
         self.arr_seq += 1;
+        if !hydrated {
+            self.pending_arrs.insert(id);
+        }
+        self.arrs_by_seq.insert(seq, id);
+        self.arr_changes.insert(fp.clone());
+        self.err_dirty.insert(node);
         self.arrs[id] = Some(Arrangement { id, seq, node, layout, tree, refs: 0, fp: fp.clone(), hydrated, since });
         self.arr_by_fp.insert(fp, id);
         id
+    }
+
+    /// Mark arrangement `id` hydrated (or not), its history starting at
+    /// `since`.
+    pub fn set_arr_hydrated(&mut self, id: ArrId, hydrated: bool, since: Gsn) {
+        let a = self.arrs[id].as_mut().expect("dangling arrangement");
+        (a.hydrated, a.since) = (hydrated, since);
+        let (fp, node) = (a.fp.clone(), a.node);
+        if hydrated {
+            self.pending_arrs.remove(&id);
+        } else {
+            self.pending_arrs.insert(id);
+        }
+        self.arr_changes.insert(fp);
+        self.err_dirty.insert(node);
+    }
+
+    /// Mark node `id` hydrated (or not).
+    pub fn set_node_hydrated(&mut self, id: NodeId, hydrated: bool) {
+        self.node_mut(id).hydrated = hydrated;
+        if hydrated {
+            self.pending_nodes.remove(&id);
+        } else {
+            self.pending_nodes.insert(id);
+        }
+        self.err_dirty.insert(id);
     }
 
     /// Nodes created so far (a mark for `gc_since`).
@@ -653,9 +704,8 @@ impl Graph {
     /// ended up unreferenced (planning leftovers).
     pub fn gc_since(&mut self, env: &mut Env, node_mark: usize, arr_mark: usize) -> Result<()> {
         // newest first: consumers before their inputs
-        let mut new: Vec<(u64, NodeId)> =
-            self.live_nodes().filter(|n| n.seq >= node_mark as u64).map(|n| (n.seq, n.id)).collect();
-        new.sort_unstable_by(|a, b| b.cmp(a));
+        let new: Vec<(u64, NodeId)> = self.nodes_by_seq.range(node_mark as u64..).rev().map(|(s, n)| (*s, *n)).collect();
+        bookkept(new.len() as u64);
         for (seq, id) in new {
             // (releasing a node may have freed one of its inputs already)
             if let Some(n) = &self.nodes[id]
@@ -666,8 +716,7 @@ impl Graph {
                 self.release_node(env, id)?;
             }
         }
-        let new: Vec<(u64, ArrId)> =
-            self.live_arrangements().filter(|a| a.seq >= arr_mark as u64).map(|a| (a.seq, a.id)).collect();
+        let new: Vec<(u64, ArrId)> = self.arrs_by_seq.range(arr_mark as u64..).map(|(s, a)| (*s, *a)).collect();
         for (seq, id) in new {
             if let Some(a) = &self.arrs[id]
                 && a.seq == seq
@@ -742,6 +791,10 @@ impl Graph {
             let a = self.arrs[id].take().unwrap();
             self.free_arrs.push(id);
             self.arr_by_fp.remove(&a.fp);
+            self.arrs_by_seq.remove(&a.seq);
+            self.pending_arrs.remove(&id);
+            self.err_dirty.insert(a.node);
+            self.arr_changes.insert(a.fp.clone());
             env.drop_tree(a.tree)?;
             if let Some(n) = self.nodes[a.node].as_mut() {
                 n.arrangements.retain(|x| *x != id);
@@ -760,13 +813,14 @@ impl Graph {
         let node = self.nodes[id].take().unwrap();
         self.free_nodes.push(id);
         self.node_by_fp.remove(&node.fp);
+        self.nodes_by_seq.remove(&node.seq);
+        self.pending_nodes.remove(&id);
         let errs = self.node_errors.remove(&id);
         self.forget_mirrored_errors(id, &node, errs);
         self.spill_layouts.get_mut().remove(&id);
         self.counters.remove(&id);
         self.stats.remove(&id);
         self.temporal.remove(&id);
-        self.topo_dirty = true;
         // arrangements used by this operator
         for a in operator_arrangements(&node.kind) {
             self.release_arr(env, a)?;
@@ -780,18 +834,6 @@ impl Graph {
             self.release_node(env, i)?;
         }
         Ok(())
-    }
-
-    /// Topological order of live nodes.
-    pub fn topo(&mut self) -> &[NodeId] {
-        if self.topo_dirty {
-            // nodes are created after their inputs, so creation order is topological
-            let mut live: Vec<(u64, NodeId)> = self.live_nodes().map(|n| (n.seq, n.id)).collect();
-            live.sort_unstable();
-            self.topo = live.into_iter().map(|(_, id)| id).collect();
-            self.topo_dirty = false;
-        }
-        &self.topo
     }
 
     // ------------------------------------------------------------------ reads
@@ -1033,7 +1075,10 @@ impl Graph {
     /// when it loses its last arrangement or leaves the graph.
     pub fn take_error_changes(&mut self) -> Vec<(ErrorKey, i64)> {
         let mut out = std::mem::take(&mut self.err_changes);
-        for n in self.nodes.iter().flatten() {
+        // (only the nodes whose state may have changed: see `err_dirty`)
+        for id in std::mem::take(&mut self.err_dirty) {
+            bookkept(1);
+            let Some(n) = self.nodes.get(id).and_then(|n| n.as_ref()) else { continue };
             let arranged = n.arrangements.iter().any(|a| self.arr(*a).hydrated);
             if arranged != self.errs_mirrored.contains(&n.id) {
                 let sign = if arranged { 1 } else { -1 };
@@ -1093,11 +1138,12 @@ impl Graph {
             }
         }
         for (fp, groups) in st.operators {
-            match self.node_by_fp.get(&fp).and_then(|&id| operator_errors(&self.node(id).kind)) {
-                Some(errs) => {
+            match self.node_by_fp.get(&fp).and_then(|&id| operator_errors(&self.node(id).kind).map(|e| (id, e.clone()))) {
+                Some((id, errs)) => {
                     let mut errs = errs.lock();
                     errs.groups = groups.into_iter().collect();
                     errs.changes = mirrored.then(BTreeMap::new);
+                    self.err_dirty.insert(id);
                 }
                 None if mirrored => {
                     for (g, e) in groups {
@@ -1313,6 +1359,10 @@ impl Graph {
                 let targets = self.delta_targets(id, None);
                 let rows = if self.is_read(id, observed) { delta::DeltaBuf::new(gsn, targets) } else { delta::DeltaBuf::direct(gsn, targets) };
                 let out = ops::step_node(self, env, node, &ins, gsn, deltas, rows)?;
+                // (its groups in error may have changed)
+                if operator_errors(&self.node(id).kind).is_some() {
+                    self.err_dirty.insert(id);
+                }
                 if !out.is_empty() {
                     self.add_errors(id, &out.errs);
                     if let Err(e) = out.apply(env, gsn) {
@@ -1408,8 +1458,19 @@ impl Graph {
     /// arrangements a batch at a time, and each arrangement is built by an
     /// external sort (`TreeBuilder`).
     pub fn hydrate(&mut self, env: &mut Env, gsn: Gsn) -> Result<()> {
-        let order: Vec<NodeId> = self.topo().to_vec();
-        for id in order {
+        // the pending nodes and those with pending arrangements, in sequence
+        // (topological) order: what the graph holds besides is not visited
+        let mut order: Vec<(u64, NodeId)> = self
+            .pending_nodes
+            .iter()
+            .copied()
+            .chain(self.pending_arrs.iter().map(|a| self.arr(*a).node))
+            .map(|id| (self.node(id).seq, id))
+            .collect();
+        order.sort_unstable();
+        order.dedup();
+        bookkept(order.len() as u64);
+        for (_, id) in order {
             let needs_node = !self.node(id).hydrated;
             if needs_node {
                 // stateful operators initialize their own arrangements here
@@ -1441,27 +1502,33 @@ impl Graph {
                 };
                 delta::finish_all(env, builders)?;
                 for a in pending_arrs {
-                    let a = self.arrs[a].as_mut().unwrap();
-                    a.hydrated = true;
-                    a.since = gsn;
+                    self.set_arr_hydrated(a, true, gsn);
                 }
                 // the arrangement holds the rows; the errors are kept here
                 self.set_errors(id, &errs);
             }
-            self.node_mut(id).hydrated = true;
+            self.set_node_hydrated(id, true);
         }
         // Window operators whose partitions in error are not known (neither
         // computed above nor restored from a checkpoint: a new operator that
         // had no snapshot to take, or a checkpoint of an older version)
         // compute them now, so that their steps can change partitions in
         // part.
-        let unknown: Vec<window::WindowPlan> = self
-            .live_nodes()
-            .filter_map(|n| match &n.kind {
-                NodeKind::Window(p) if n.hydrated && !p.errors.lock().known() => Some(p.clone()),
-                _ => None,
-            })
-            .collect();
+        let mut unknown: Vec<window::WindowPlan> = Vec::new();
+        for id in std::mem::take(&mut self.unknown_windows) {
+            let Some(n) = self.nodes.get(id).and_then(|n| n.as_ref()) else { continue };
+            match &n.kind {
+                NodeKind::Window(p) if !p.errors.lock().known() => {
+                    if n.hydrated {
+                        unknown.push(p.clone());
+                    } else {
+                        // (not hydrated in this graph: a fork does it)
+                        self.unknown_windows.push(id);
+                    }
+                }
+                _ => {}
+            }
+        }
         for p in unknown {
             // (only the state is wanted: the rows are dropped as they come)
             let mut drop_rows = |_: &mut Env, _: Delta| Ok(());
@@ -1476,9 +1543,69 @@ impl Graph {
 
     /// Nodes and arrangements not hydrated yet: what `hydrate` would compute.
     pub fn pending(&self) -> (Vec<NodeId>, Vec<ArrId>) {
-        let nodes = self.live_nodes().filter(|n| !n.hydrated).map(|n| n.id).collect();
-        let arrs = self.live_arrangements().filter(|a| !a.hydrated).map(|a| a.id).collect();
-        (nodes, arrs)
+        (self.pending_nodes.iter().copied().collect(), self.pending_arrs.iter().copied().collect())
+    }
+
+    /// Forget what window operator `id` knows of its partitions in error,
+    /// as a checkpoint of an older version leaves it (tests).
+    #[cfg(test)]
+    pub(crate) fn forget_window_errors(&mut self, id: NodeId) {
+        if let NodeKind::Window(p) = &self.node(id).kind {
+            *p.errors.lock() = Default::default();
+            self.unknown_windows.push(id);
+        }
+    }
+
+    /// An estimate of the entries that hydrating the pending nodes and
+    /// arrangements reads: those of the hydrated arrangements they read
+    /// (directly, through nodes without an arrangement, or as an operator's
+    /// lookup arrangement). It counts every input whole, so it is high for a
+    /// join that hydrates by lookups.
+    pub fn pending_input_entries(&self, env: &Env) -> u64 {
+        let mut seen: FxHashSet<NodeId> = FxHashSet::default();
+        let mut stack: Vec<NodeId> = self.pending_nodes.iter().copied().collect();
+        let mut entries = 0u64;
+        let arr_entries = |a: ArrId, entries: &mut u64| *entries += env.tree_count(self.arr(a).tree).unsigned_abs();
+        // a pending arrangement of a hydrated node reads that node's contents
+        for &a in &self.pending_arrs {
+            let n = self.arr(a).node;
+            if self.node(n).hydrated {
+                match self.any_arrangement(n) {
+                    Some(h) => arr_entries(h, &mut entries),
+                    None => stack.push(n),
+                }
+            }
+        }
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            bookkept(1);
+            let n = self.node(id);
+            for &a in &operator_arrangements(&n.kind) {
+                if self.arr(a).hydrated {
+                    arr_entries(a, &mut entries);
+                }
+            }
+            for &i in &n.inputs {
+                let input = self.node(i);
+                if input.hydrated
+                    && let Some(a) = self.any_arrangement(i)
+                {
+                    if seen.insert(i) {
+                        arr_entries(a, &mut entries);
+                    }
+                } else {
+                    stack.push(i);
+                }
+            }
+        }
+        entries
+    }
+
+    /// Is anything waiting to be hydrated?
+    pub fn has_pending(&self) -> bool {
+        !self.pending_nodes.is_empty() || !self.pending_arrs.is_empty()
     }
 
     /// A copy of nodes `roots` and what they read, transitively — their
@@ -1500,7 +1627,6 @@ impl Graph {
             node_seq: self.node_seq,
             arr_seq: self.arr_seq,
             temporal: self.temporal.iter().copied().filter(|n| keep_nodes.contains(n)).collect(),
-            topo_dirty: true,
             group_caches: self.group_caches.clone(),
             ..Graph::default()
         };
@@ -1536,6 +1662,11 @@ impl Graph {
         g.arrs = self.arrs.iter().map(|a| a.as_ref().filter(|a| keep_nodes.contains(&a.node)).cloned()).collect();
         g.node_by_fp = g.live_nodes().map(|n| (n.fp.clone(), n.id)).collect();
         g.arr_by_fp = g.live_arrangements().map(|a| (a.fp.clone(), a.id)).collect();
+        g.nodes_by_seq = g.live_nodes().map(|n| (n.seq, n.id)).collect();
+        g.arrs_by_seq = g.live_arrangements().map(|a| (a.seq, a.id)).collect();
+        g.pending_nodes = self.pending_nodes.iter().copied().filter(|n| keep_nodes.contains(n)).collect();
+        g.pending_arrs = self.pending_arrs.iter().copied().filter(|a| g.arrs[*a].is_some()).collect();
+        g.unknown_windows = self.unknown_windows.iter().copied().filter(|n| keep_nodes.contains(n)).collect();
         g.node_errors = self.node_errors.iter().filter(|(id, _)| keep_nodes.contains(id)).map(|(k, v)| (*k, v.clone())).collect();
         g
     }
@@ -1564,10 +1695,14 @@ impl Graph {
             if self.nodes[id].is_some() && !keep.contains(&id) {
                 let n = self.nodes[id].take().unwrap();
                 self.node_by_fp.remove(&n.fp);
+                self.nodes_by_seq.remove(&n.seq);
                 self.node_errors.remove(&id);
+                self.pending_nodes.remove(&id);
                 for a in n.arrangements {
                     if let Some(arr) = self.arrs[a].take() {
                         self.arr_by_fp.remove(&arr.fp);
+                        self.arrs_by_seq.remove(&arr.seq);
+                        self.pending_arrs.remove(&a);
                     }
                 }
             }
@@ -1576,7 +1711,6 @@ impl Graph {
         for n in self.nodes.iter_mut().flatten() {
             n.consumers.retain(|c| keep.contains(c));
         }
-        self.topo_dirty = true;
     }
 
     /// Drop the arrangements that no operator reads, except `keep` (in a
@@ -1594,6 +1728,8 @@ impl Graph {
             if self.arrs[a].is_some() && !used.contains(&a) {
                 let arr = self.arrs[a].take().unwrap();
                 self.arr_by_fp.remove(&arr.fp);
+                self.arrs_by_seq.remove(&arr.seq);
+                self.pending_arrs.remove(&a);
                 if let Some(n) = self.nodes[arr.node].as_mut() {
                     n.arrangements.retain(|x| *x != a);
                 }
@@ -1612,9 +1748,7 @@ impl Graph {
                 continue;
             }
             let (hydrated, since) = (theirs.hydrated, theirs.since);
-            let mine = self.arrs[a].as_mut().unwrap();
-            mine.hydrated = hydrated;
-            mine.since = since;
+            self.set_arr_hydrated(a, hydrated, since);
         }
         for &id in nodes {
             let (Some(Some(mine)), Some(Some(theirs))) = (self.nodes.get(id), from.nodes.get(id)) else { continue };
@@ -1626,8 +1760,28 @@ impl Graph {
             }
             let errs = from.errors_of(id);
             self.set_errors(id, &errs);
-            self.node_mut(id).hydrated = theirs.hydrated;
+            self.set_node_hydrated(id, theirs.hydrated);
+            // (whether its partitions in error are known came along)
+            if matches!(self.node(id).kind, NodeKind::Window(_)) {
+                self.unknown_windows.push(id);
+            }
         }
+    }
+
+    /// The durable records of the arrangements that may have changed since
+    /// the last call: by fingerprint, the tree and `since` of the hydrated
+    /// arrangement with it, or None if there is none (any more).
+    pub fn take_arrangement_changes(&mut self) -> Vec<(Vec<u8>, Option<(TreeId, Gsn)>)> {
+        let mut out: Vec<(Vec<u8>, Option<(TreeId, Gsn)>)> = std::mem::take(&mut self.arr_changes)
+            .into_iter()
+            .map(|fp| {
+                bookkept(1);
+                let rec = self.arr_by_fp.get(&fp).map(|a| self.arr(*a)).filter(|a| a.hydrated).map(|a| (a.tree, a.since));
+                (fp, rec)
+            })
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// Arrangement fingerprint -> tree for checkpoints.
@@ -1796,6 +1950,19 @@ thread_local! {
     /// Work done on this thread: index entries operators visited and nodes
     /// a step considered (see `visited`).
     pub(crate) static WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Graph nodes, arrangements and metadata records visited by the
+    /// bookkeeping around statements (see `bookkept`).
+    pub(crate) static BOOKKEEPING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` graph nodes, arrangements or metadata records that the
+/// bookkeeping of a statement visits (hydration, error and arrangement
+/// changes, the metadata tree, what lowering left unreferenced): tests
+/// check that it does not grow with the catalog. Nothing outside tests.
+#[inline]
+pub(crate) fn bookkept(_n: u64) {
+    #[cfg(test)]
+    BOOKKEEPING.with(|b| b.set(b.get() + _n));
 }
 
 /// Count index entries an operator visits: tests check that the work of a

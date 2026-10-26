@@ -183,10 +183,8 @@ fn fill_rebuilt(graph: &mut Graph, env: &mut Env, c: &Conversion, gsn: Gsn) -> R
             return Err(e);
         }
     }
-    let a = graph.arrs[primary].as_mut().unwrap();
-    a.hydrated = true;
-    a.since = gsn;
-    graph.node_mut(c.new_node).hydrated = true;
+    graph.set_arr_hydrated(primary, true, gsn);
+    graph.set_node_hydrated(c.new_node, true);
     Ok(())
 }
 
@@ -385,8 +383,21 @@ impl Engine {
                 _ => None,
             })
             .collect();
+        // (a small fragment is hydrated inline: forking for it would cost
+        // more than reading what it reads)
+        let small = || {
+            let replaced: u64 = then
+                .iter()
+                .filter_map(|t| match t {
+                    Then::Replaced(r) if r.consumers => Some(self.env.tree_count(self.graph.arr(r.old.arr).tree).unsigned_abs()),
+                    _ => None,
+                })
+                .sum();
+            !then.iter().any(|t| matches!(t, Then::Rebuilt(_)))
+                && self.graph.pending_input_entries(&self.env) + replaced <= super::reader::INLINE_READ_ENTRIES
+        };
         let wake = match &self.handle {
-            Some(h) if !self.replaying && !(nodes.is_empty() && arrs.is_empty()) => h.tx.clone(),
+            Some(h) if !self.replaying && !(nodes.is_empty() && arrs.is_empty()) && !small() => h.tx.clone(),
             _ => {
                 for c in &conversions {
                     fill_rebuilt(&mut self.graph, &mut self.env, c, gsn)?;

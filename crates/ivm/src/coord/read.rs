@@ -282,23 +282,9 @@ impl Engine {
     }
 
     /// Replicated tables whose initial snapshot is still loading (their
-    /// contents are no state the upstream ever had); cached per epoch.
-    fn loading_tables(&mut self) -> &std::collections::HashSet<ObjectId> {
-        if self.loading.0 != self.snap_epoch || self.snap_epoch == 0 {
-            let mut set = std::collections::HashSet::new();
-            for o in self.catalog.objects.values() {
-                if let ObjectKind::Table(t) = &o.kind
-                    && let Some(src) = t.source
-                {
-                    let st = self.source_states.get(&src);
-                    if !st.and_then(|st| st.tables.get(&o.id)).is_some_and(|s| s.done) {
-                        set.insert(o.id);
-                    }
-                }
-            }
-            self.loading = (self.snap_epoch, set);
-        }
-        &self.loading.1
+    /// contents are no state the upstream ever had).
+    fn loading_tables(&self) -> &std::collections::HashSet<ObjectId> {
+        &self.loading
     }
 
     /// The tables the plan reads (directly or through views) whose initial
@@ -326,7 +312,7 @@ impl Engine {
             }
             match self.catalog.get(id).map(|o| &o.kind) {
                 Some(ObjectKind::Table(_)) => {
-                    if self.loading.1.contains(&id) {
+                    if self.loading.contains(&id) {
                         loading.push(id);
                     }
                 }
@@ -510,9 +496,6 @@ impl Engine {
         let lsn_waiting = self.parked.iter().any(|p| matches!(p.wait, Wait::Lsn(_)));
         // (the sources' common frontier, once for all reads)
         let mut floor = if lsn_waiting { self.lsn_floor() } else { None };
-        if snapshots_changed && self.parked.iter().any(|p| matches!(p.wait, Wait::Snapshot { .. })) {
-            self.loading_tables();
-        }
         let mut still = Vec::new();
         for p in std::mem::take(&mut self.parked) {
             if let Some(e) = interruption(&p.req, true) {
@@ -529,7 +512,7 @@ impl Engine {
                 // tables it waited for are loaded: it parks again if a table
                 // it reads is still loading
                 Wait::Snapshot { tables, catalog } => {
-                    snapshots_changed && (*catalog != self.catalog_epoch || !tables.iter().any(|t| self.loading.1.contains(t)))
+                    snapshots_changed && (*catalog != self.catalog_epoch || !tables.iter().any(|t| self.loading.contains(t)))
                 }
                 Wait::Gsn(g) => self.processed >= *g,
                 Wait::Hydration(done) => self.hydrations_done > *done,

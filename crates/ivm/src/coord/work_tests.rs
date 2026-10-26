@@ -116,6 +116,51 @@ fn steps_consider_only_nodes_that_can_change() {
     assert_eq!(nodes, 0);
 }
 
+/// The bookkeeping of a DDL statement visits what the statement changes,
+/// not the graph or the catalog: the metadata tree's records (only the
+/// changed objects and arrangements), the mirrored error state (only the
+/// nodes whose arrangements changed), what is hydrated (only what is
+/// pending), what lowering left unreferenced, relations looked up by name.
+/// Creating a table and a view costs the same with 400 objects as with 40.
+/// (Each DDL record rewrote every arrangement's record and checked every
+/// node's error state, hydration visited every node, lookups by name
+/// scanned the catalog, and a small view was hydrated on a fork of the
+/// whole storage: creating 3,000 tables and views took 24 s, 0.8 s now.)
+#[test]
+fn ddl_work_does_not_grow_with_the_catalog() {
+    use crate::dataflow::BOOKKEEPING;
+    let mut t = T::new("work-ddl");
+    let ddl = |t: &mut T, sql: String| {
+        t.gsn += 1;
+        t.e.apply_record(t.gsn, LogRecord::Ddl { req: 0, sql, extra: String::new() }).unwrap();
+    };
+    let cost = |t: &mut T, i: usize| {
+        BOOKKEEPING.with(|b| b.set(0));
+        ddl(t, format!("CREATE TABLE t{i} (id bigint PRIMARY KEY, g bigint, v bigint)"));
+        ddl(t, format!("CREATE MATERIALIZED VIEW v{i} AS SELECT g, sum(v) AS s FROM t{i} WHERE v > 0 GROUP BY g"));
+        BOOKKEEPING.with(|b| b.get())
+    };
+    let mut costs = Vec::new();
+    for i in 0..200 {
+        let c = cost(&mut t, i);
+        if i == 20 || i == 199 {
+            costs.push(c);
+        }
+    }
+    assert!(costs[1] <= costs[0] + 4, "a table and a view cost {} with 40 objects, {} with 400", costs[0], costs[1]);
+    assert!(costs[0] < 100, "{costs:?}");
+    // the metadata tree holds every arrangement's record all the same, also
+    // after views are dropped
+    for i in 0..100 {
+        ddl(&mut t, format!("DROP MATERIALIZED VIEW v{i}"));
+    }
+    let mut want: Vec<(Vec<u8>, TreeId)> = t.e.graph.arrangement_trees().into_iter().collect();
+    let mut have = t.e.meta.arrangement_records();
+    want.sort();
+    have.sort();
+    assert_eq!(have, want);
+}
+
 /// A subscription to a query frees the slots of its nodes and arrangements
 /// (and their statistics) when it ends, and the next one reuses them.
 #[test]
@@ -307,6 +352,60 @@ fn source(t: &mut T) -> (EngineHandle, Receiver<EngineMsg>, ObjectId) {
     (h, rx, t.id("src"))
 }
 
+/// A source's progress records change its state table by table
+/// (`ProgressDelta`), and so do the metadata tree's records of it, one per
+/// table: logging that one table of a thousand is copied writes one record
+/// and keeps the loading tables without looking at the others, and the
+/// whole state comes back after a restart. (The state was written whole,
+/// as one JSON value, at every metadata write, and the loading tables were
+/// recomputed from the catalog at the next read after any progress.)
+#[test]
+fn source_progress_costs_what_it_changes() {
+    use crate::dataflow::BOOKKEEPING;
+    let mut t = T::new("work-source-state");
+    let n = 1000;
+    let tables: Vec<crate::coord::ddl::DiscoveredTable> = (0..n)
+        .map(|i| crate::coord::ddl::DiscoveredTable {
+            schema: "public".into(),
+            name: format!("s{i}"),
+            columns: vec![crate::types::Column::new("id", crate::types::ColumnType::new(crate::types::SqlType::Int8))],
+            pk: vec![0],
+            replica_identity_full: false,
+        })
+        .collect();
+    t.gsn += 1;
+    let sql = "CREATE SOURCE src FROM POSTGRES CONNECTION 'host=/nonexistent' PUBLICATION 'p'".to_string();
+    t.e.apply_record(t.gsn, LogRecord::Ddl { req: 0, sql, extra: serde_json::to_string(&tables).unwrap() }).unwrap();
+    let src = t.id("src");
+    assert_eq!(t.e.loading.len(), n);
+    let ids: Vec<ObjectId> = (0..n).map(|i| t.id(&format!("s{i}"))).collect();
+    let progress = |t: &mut T, table: ObjectId, done: bool| {
+        let snap = crate::source::postgres::SnapState { done, ..Default::default() };
+        let delta = serde_json::json!({ "tables": { table.to_string(): snap } }).to_string();
+        t.gsn += 1;
+        t.e.apply_record(t.gsn, LogRecord::ProgressDelta { source: src, lsn: 0, delta }).unwrap();
+    };
+    for (i, id) in ids.iter().enumerate() {
+        progress(&mut t, *id, i % 2 == 0);
+    }
+    t.e.persist_meta(t.gsn).unwrap();
+    let epoch = t.e.snap_epoch;
+    BOOKKEEPING.with(|b| b.set(0));
+    progress(&mut t, ids[1], true);
+    t.e.persist_meta(t.gsn).unwrap();
+    let cost = BOOKKEEPING.with(|b| b.get());
+    assert!(cost < 20, "{cost} records for one table's progress");
+    assert_eq!(t.e.loading.len(), n / 2 - 1);
+    assert_eq!(t.e.snap_epoch, epoch + 1, "the loading tables changed once");
+    // progress that finishes nothing does not move the epoch
+    progress(&mut t, ids[3], false);
+    assert_eq!(t.e.snap_epoch, epoch + 1);
+    let state = t.e.source_states[&src].to_json();
+    let t = t.restart();
+    assert_eq!(t.e.source_states[&src].to_json(), state);
+    assert_eq!(t.e.loading.len(), n / 2 - 1);
+}
+
 /// A read waiting for an LSN runs once every source's frontier passed it;
 /// sources wake the engine when their frontier passes the smallest LSN
 /// waited for, not at every advance.
@@ -345,7 +444,7 @@ fn snapshot_reads_wait_for_their_tables() {
         serde_json::to_string(&s).unwrap()
     };
     t.e.source_states.insert(src, crate::source::postgres::SourceState::parse(&state(false)));
-    t.e.snap_epoch += 1;
+    t.e.source_changed(src, None);
     let rx = read(&mut t, &h, "SELECT count(*) FROM st", crate::sql::parser::AsOf::Fresh);
     assert_eq!(t.e.parked.len(), 1);
     for _ in 0..5 {
@@ -388,12 +487,17 @@ fn windows_read_only_what_a_change_reaches() {
         if name == "running" {
             // a window operator whose state is unknown (as recovered from an
             // older checkpoint) learns it when the graph is hydrated
-            let p = t.e.graph.live_nodes().find_map(|n| match &n.kind {
-                crate::dataflow::NodeKind::Window(p) => Some(p.clone()),
-                _ => None,
-            });
-            let errors = p.unwrap().errors;
-            *errors.lock() = Default::default();
+            let (id, p) = t
+                .e
+                .graph
+                .live_nodes()
+                .find_map(|n| match &n.kind {
+                    crate::dataflow::NodeKind::Window(p) => Some((n.id, p.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            let errors = p.errors;
+            t.e.graph.forget_window_errors(id);
             t.e.graph.hydrate(&mut t.e.env, t.gsn).unwrap();
             assert!(errors.lock().known());
         }

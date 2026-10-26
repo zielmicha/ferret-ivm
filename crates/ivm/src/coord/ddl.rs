@@ -463,6 +463,7 @@ impl Engine {
                 created_gsn: gsn,
                 create_sql: format!("-- table {}.{} replicated by source {}", t.schema, t.name, source),
             });
+            self.table_loading_changed(id);
         }
         Ok(())
     }
@@ -473,7 +474,7 @@ impl Engine {
         self.table_rt(id, def, false)?;
         let node = self.rt.tables[&id];
         let NodeKind::Table { primary, .. } = self.graph.node(node).kind else { unreachable!() };
-        self.graph.arrs[primary].as_mut().unwrap().since = gsn;
+        self.graph.set_arr_hydrated(primary, true, gsn);
         Ok(())
     }
 
@@ -491,9 +492,10 @@ impl Engine {
                 )));
             }
         } else {
-            self.graph.arrs[primary].as_mut().unwrap().hydrated = true;
+            let since = self.graph.arr(primary).since;
+            self.graph.set_arr_hydrated(primary, true, since);
         }
-        self.graph.node_mut(node).hydrated = true;
+        self.graph.set_node_hydrated(node, true);
         Ok(())
     }
 
@@ -1094,6 +1096,7 @@ impl Engine {
                 if let Some(n) = self.rt.tables.remove(&id) {
                     self.graph.release_node(&mut self.env, n)?;
                 }
+                self.table_loading_changed(id);
             }
             ObjectKind::MaterializedView(_) => {
                 if let Some(v) = self.rt.views.remove(&id) {
@@ -1116,6 +1119,7 @@ impl Engine {
                 // succeeded before the restart (it is retried after it)
                 crate::source::drop_slot_async(&self.shared, def.conninfo.clone(), def.slot.clone(), !self.replaying);
                 self.source_states.remove(&id);
+                self.source_changed(id, None);
                 // a dropped source no longer holds back reads waiting for an LSN
                 self.source_lsns.remove(&id);
                 self.shared.source_lsn.lock().remove(&id);

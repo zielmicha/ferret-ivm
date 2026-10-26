@@ -103,11 +103,56 @@ pub struct Catalog {
     /// Objects inserted or removed since the last `take_changed`.
     #[serde(skip)]
     changed: BTreeSet<ObjectId>,
+    /// The objects by name, built when first needed and then kept by
+    /// `insert` and `remove`: a lookup by name costs no scan of the catalog.
+    #[serde(skip)]
+    names: std::sync::OnceLock<NameIndex>,
+}
+
+/// The catalog's objects by name, and its replicated tables by upstream
+/// name.
+#[derive(Clone, Debug, Default)]
+struct NameIndex {
+    names: std::collections::HashMap<String, BTreeSet<ObjectId>>,
+    upstream: std::collections::HashMap<(String, String), BTreeSet<ObjectId>>,
+    /// Upstream schemas, with the number of tables from each.
+    schemas: std::collections::HashMap<String, usize>,
+}
+
+impl NameIndex {
+    fn add(&mut self, o: &CatalogObject) {
+        self.names.entry(o.name.clone()).or_default().insert(o.id);
+        if let ObjectKind::Table(TableDef { upstream: Some(u), .. }) = &o.kind {
+            self.upstream.entry(u.clone()).or_default().insert(o.id);
+            *self.schemas.entry(u.0.clone()).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, o: &CatalogObject) {
+        fn drop_id<K: std::hash::Hash + Eq>(m: &mut std::collections::HashMap<K, BTreeSet<ObjectId>>, k: &K, id: ObjectId) {
+            if let Some(ids) = m.get_mut(k) {
+                ids.remove(&id);
+                if ids.is_empty() {
+                    m.remove(k);
+                }
+            }
+        }
+        drop_id(&mut self.names, &o.name, o.id);
+        if let ObjectKind::Table(TableDef { upstream: Some(u), .. }) = &o.kind {
+            drop_id(&mut self.upstream, u, o.id);
+            if let Some(n) = self.schemas.get_mut(&u.0) {
+                *n -= 1;
+                if *n == 0 {
+                    self.schemas.remove(&u.0);
+                }
+            }
+        }
+    }
 }
 
 impl Catalog {
     pub fn new() -> Catalog {
-        Catalog { objects: BTreeMap::new(), next_id: 1000, history: Vec::new(), instance_id: None, changed: BTreeSet::new() }
+        Catalog { objects: BTreeMap::new(), next_id: 1000, history: Vec::new(), instance_id: None, changed: BTreeSet::new(), names: Default::default() }
     }
 
     pub fn alloc_id(&mut self) -> ObjectId {
@@ -116,8 +161,27 @@ impl Catalog {
         id
     }
 
+    fn names(&self) -> &NameIndex {
+        self.names.get_or_init(|| {
+            crate::dataflow::bookkept(self.objects.len() as u64);
+            let mut ix = NameIndex::default();
+            for o in self.objects.values() {
+                ix.add(o);
+            }
+            ix
+        })
+    }
+
+    /// The object of a name (the oldest, should several have it).
     pub fn by_name(&self, name: &str) -> Option<&CatalogObject> {
-        self.objects.values().find(|o| o.name == name)
+        self.names().names.get(name).and_then(|ids| ids.first()).and_then(|id| self.objects.get(id))
+    }
+
+    /// Keep the name index (if built) as `id` leaves the catalog or changes.
+    fn unname(&mut self, id: ObjectId) {
+        if let (Some(ix), Some(o)) = (self.names.get_mut(), self.objects.get(&id)) {
+            ix.remove(o);
+        }
     }
 
     pub fn get(&self, id: ObjectId) -> Option<&CatalogObject> {
@@ -126,11 +190,16 @@ impl Catalog {
 
     pub fn insert(&mut self, obj: CatalogObject) {
         self.changed.insert(obj.id);
+        self.unname(obj.id);
+        if let Some(ix) = self.names.get_mut() {
+            ix.add(&obj);
+        }
         self.objects.insert(obj.id, obj);
     }
 
     pub fn remove(&mut self, id: ObjectId) -> Option<CatalogObject> {
         self.changed.insert(id);
+        self.unname(id);
         self.objects.remove(&id)
     }
 
@@ -250,16 +319,22 @@ impl BindCatalog for Catalog {
         if let Some((columns, rows)) = crate::sysrel::system_relation(self, schema, name) {
             return Some(CatalogRelation::Constant { name: name.to_string(), columns, rows });
         }
+        let ix = self.names();
         if let Some(s) = schema
             && s != "public"
-            && !self.objects.values().any(|o| matches!(&o.kind, ObjectKind::Table(t) if t.upstream.as_ref().is_some_and(|(us, _)| us == s)))
+            && !ix.schemas.contains_key(s)
         {
             return None;
         }
-        let o = self.objects.values().find(|o| {
-            o.name == name
-                || matches!(&o.kind, ObjectKind::Table(t) if schema.is_some() && t.upstream.as_ref().is_some_and(|(us, un)| Some(us.as_str()) == schema && un == name))
-        })?;
+        // the oldest object of the name, or replicated table of the
+        // upstream name (when a schema is given)
+        let named = ix.names.get(name).and_then(|ids| ids.first());
+        let upstream = schema.and_then(|s| ix.upstream.get(&(s.to_string(), name.to_string()))).and_then(|ids| ids.first());
+        let id = match (named, upstream) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        let o = self.objects.get(id)?;
         match &o.kind {
             ObjectKind::Table(t) => Some(CatalogRelation::Table {
                 id: o.id,
