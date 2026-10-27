@@ -16,7 +16,7 @@ use crate::expr::func::func_def;
 use crate::expr::Expr;
 use crate::sql::plan::{JoinKind, Rel, SetOpKind, SortKey};
 use crate::sql::BoundQuery;
-use crate::storage::{AggKind, Env, ReadAt, Summary};
+use crate::storage::{AggKind, Env, Summary};
 use crate::types::encoding::{self, SortSpec};
 use crate::types::{Datum, Row, SqlType};
 use rustc_hash::FxHashMap;
@@ -32,7 +32,6 @@ pub type RowSink<'s> = dyn FnMut(Row, i64) -> Result<bool> + 's;
 pub struct ExecCtx<'a> {
     pub g: &'a Graph,
     pub env: &'a mut Env,
-    pub at: ReadAt,
     pub objects: &'a dyn Fn(u64) -> Option<NodeId>,
     pub rec: FxHashMap<u64, Rows>,
     /// Arrangement entries the scans of base relations visited.
@@ -228,23 +227,13 @@ impl<'a> ExecCtx<'a> {
     }
 
     fn read_node(&mut self, node: NodeId) -> Result<Rows> {
-        match self.g.arrangement_at(node, self.at) {
+        match self.g.any_arrangement(node) {
             Some(a) => {
-                let mut rows = self.g.scan_arr(self.env, a, self.at)?;
+                let mut rows = self.g.scan_arr(self.env, a)?;
                 rows.retain(|(_, w)| *w > 0);
                 Ok(rows)
             }
             None => {
-                if let (ReadAt::AsOf(t), Some(a)) = (self.at, self.g.any_arrangement(node)) {
-                    // (re)built later: its history before then is not kept
-                    return Err(SqlError::new(
-                        codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        format!("AS OF {t} is before the history of a relation it reads, which starts at {}", self.g.arr(a).since),
-                    ));
-                }
-                if self.at != ReadAt::Latest {
-                    return Err(SqlError::unsupported("time travel requires an arranged relation"));
-                }
                 let mut rows = self.g.snapshot(self.env, node)?.data;
                 rows.retain(|(_, w)| *w > 0);
                 Ok(rows)
@@ -288,8 +277,7 @@ impl<'a> ExecCtx<'a> {
         let mut best: Option<IndexRange<'_>> = None;
         for &a in &self.g.node(node).arrangements {
             let arr = self.g.arr(a);
-            // (an index built after the read's GSN lacks its history)
-            if !arr.covers(self.at) {
+            if !arr.hydrated {
                 continue;
             }
             let usable = |c: usize, t: &SqlType, d: &Datum| schema[c].ty == *t && literal_matches(d, t);
@@ -369,8 +357,7 @@ impl<'a> ExecCtx<'a> {
         let Some(node) = (self.objects)(b.id) else { return Ok(None) };
         let (arr, lo_key, hi_key) = match self.index_range(node, &b.preds) {
             Some((a, lo, hi, _)) => (a, lo, hi),
-            // (the general path reports reads before an arrangement's history)
-            None => match self.g.arrangement_at(node, self.at) {
+            None => match self.g.any_arrangement(node) {
                 Some(a) => (a, Vec::new(), None),
                 None => return Ok(None),
             },
@@ -392,12 +379,12 @@ impl<'a> ExecCtx<'a> {
             Some(h) => Bound::Excluded(h),
             None => Bound::Unbounded,
         };
-        let (at, preds, cols) = (self.at, &b.preds, &b.cols);
+        let (preds, cols) = (&b.preds, &b.cols);
         let distinct = cols.as_ref().is_some_and(|c| c.iter().enumerate().all(|(i, x)| !c[..i].contains(x)));
         let (mut visited, mut done) = (0u64, true);
         self.env.for_each(a.tree, Bound::Included(lo), hi, &mut |k, h| {
             visited += 1;
-            let w = h.weight(at);
+            let w = h.total();
             if w <= 0 {
                 return Ok(true);
             }
@@ -607,7 +594,7 @@ impl<'a> ExecCtx<'a> {
             Some((a, lo, hi, fixed)) if in_order(a, fixed) => (a, lo, hi),
             Some((_, _, _, fixed)) if fixed > 0 => return None,
             _ => {
-                let a = self.g.node(node).arrangements.iter().copied().find(|a| self.g.arr(*a).covers(self.at) && in_order(*a, 0))?;
+                let a = self.g.node(node).arrangements.iter().copied().find(|a| self.g.arr(*a).hydrated && in_order(*a, 0))?;
                 (a, Vec::new(), None)
             }
         };
@@ -782,8 +769,7 @@ impl<'a> ExecCtx<'a> {
         let mut best: Option<(usize, Vec<usize>)> = None;
         for &a in &self.g.node(node).arrangements {
             let arr = self.g.arr(a);
-            // (an index built after the read's GSN lacks its history)
-            if !arr.covers(self.at) {
+            if !arr.hydrated {
                 continue;
             }
             let mut used = Vec::new();
@@ -803,7 +789,7 @@ impl<'a> ExecCtx<'a> {
         if (l.len() as i64).saturating_mul(64) >= self.env.tree_count(a.tree) {
             return Ok(None);
         }
-        let (layout, tree, at) = (a.layout.clone(), a.tree, self.at);
+        let (layout, tree) = (a.layout.clone(), a.tree);
         let plan = b.cols.as_ref().and_then(|cols| {
             let needed: Vec<usize> = cols.iter().copied().chain(b.preds.iter().flat_map(|p| p.column_set())).collect();
             layout.decode_plan(&needed)
@@ -823,7 +809,7 @@ impl<'a> ExecCtx<'a> {
             if kv.len() == used.len() {
                 let mut cands = Vec::new();
                 self.env.for_each_prefix(tree, &layout.encode_prefix(&kv), &mut |k, h| {
-                    let w = h.weight(at);
+                    let w = h.total();
                     if w > 0 {
                         cands.push((layout.decode_row_with(k, plan.as_ref())?, w));
                     }
@@ -1033,7 +1019,7 @@ fn literal_matches(d: &Datum, t: &SqlType) -> bool {
 pub fn eval_recursive(g: &Graph, env: &mut Env, p: &RecursivePlan) -> Result<Rows> {
     let sources = p.sources.clone();
     let objects = move |oid: u64| sources.iter().find(|(o, _)| *o == oid).map(|(_, n)| *n);
-    let mut ctx = ExecCtx { g, env, at: ReadAt::Latest, objects: &objects, rec: FxHashMap::default(), visited: 0 };
+    let mut ctx = ExecCtx { g, env, objects: &objects, rec: FxHashMap::default(), visited: 0 };
     let mut rows = ctx.recursive(p.rec_id, &p.base, &p.step, p.distinct)?;
     consolidate(&mut rows);
     Ok(rows)

@@ -40,8 +40,6 @@ pub struct Config {
     pub checkpoint_interval: Duration,
     /// fsync the input log on every commit batch.
     pub sync: bool,
-    /// GSNs of history kept readable with AS OF.
-    pub retention_gsns: u64,
     /// Interval of logged clock ticks (the time now() refers to).
     pub tick: Option<Duration>,
     /// Bounds of the sinks' messages and memory.
@@ -55,7 +53,6 @@ impl Default for Config {
             memory_bytes: crate::memory::DEFAULT_TOTAL,
             checkpoint_interval: Duration::from_secs(10),
             sync: true,
-            retention_gsns: 1000,
             tick: Some(Duration::from_secs(1)),
             sink_limits: Default::default(),
         }
@@ -244,8 +241,8 @@ pub struct Engine {
     pub(crate) sink_handles: HashMap<ObjectId, crate::sink::SinkHandle>,
     /// Logical clock: the latest logged tick (timestamptz microseconds).
     pub clock: i64,
-    /// Recent (gsn, clock) ticks, for now() in reads as of a past GSN.
-    pub ticks: VecDeque<(Gsn, i64)>,
+    /// GSN of the tick that set the clock (0: none yet).
+    pub clock_gsn: Gsn,
     /// The hydration in progress off the engine thread (`hydrate.rs`).
     pub(crate) hydration: Option<hydrate::Hydration>,
     /// What waits for the hydration to begin after it (statements applied
@@ -616,7 +613,7 @@ impl Engine {
             source_handles: HashMap::new(),
             sink_handles: HashMap::new(),
             clock: 0,
-            ticks: VecDeque::new(),
+            clock_gsn: 0,
             hydration: None,
             hydration_next: Vec::new(),
             hydrations_done: 0,
@@ -640,14 +637,10 @@ impl Engine {
         self.next_req = app.next_req;
         self.processed = rec.gsn;
         self.graph.recovery = app.trees.into_iter().collect();
-        self.graph.recovery_since = app.arr_since.into_iter().collect();
         self.clock = app.clock;
         self.graph.restore_clock(app.clock);
-        if app.ticks.is_empty() {
-            self.ticks.push_back((rec.gsn, app.clock));
-        } else {
-            self.ticks = app.ticks.into_iter().collect();
-        }
+        // (a format-1 checkpoint may have the clock without its ticks)
+        self.clock_gsn = app.ticks.last().map_or(if app.clock != 0 { rec.gsn } else { 0 }, |t| t.0);
         self.source_states = app.source_states.iter().map(|(id, s)| (*id, crate::source::postgres::SourceState::parse(s))).collect();
         let replicated: Vec<ObjectId> = self
             .catalog
@@ -702,8 +695,7 @@ impl Engine {
             self.env.drop_tree(t)?;
         }
         self.graph.recovery.clear();
-        self.graph.recovery_since.clear();
-        self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns));
+        self.env.set_frontier(self.processed);
         Ok(())
     }
 
@@ -1091,11 +1083,7 @@ impl Engine {
                 // monotonic even if the wall clock steps back
                 self.clock = self.clock.max(micros - 946_684_800_000_000);
                 self.graph.now = self.clock;
-                self.ticks.push_back((gsn, self.clock));
-                let frontier = self.env.frontier();
-                while self.ticks.len() > 1 && self.ticks[1].0 <= frontier {
-                    self.ticks.pop_front();
-                }
+                self.clock_gsn = gsn;
                 self.forward_begin()?;
                 self.forward_step(gsn);
                 // temporal filters release the events that became due
@@ -1108,7 +1096,7 @@ impl Engine {
                 self.deliver(gsn, outputs)?;
             }
         }
-        self.env.set_frontier(self.processed.saturating_sub(self.cfg.retention_gsns.max(1)));
+        self.env.set_frontier(self.processed);
         self.records_since_checkpoint += 1;
         self.changes_since_checkpoint += changed as u64;
         Ok(())
@@ -1230,12 +1218,6 @@ impl Engine {
         if changed {
             self.snap_epoch += 1;
         }
-    }
-
-    /// The logical clock as of `gsn` (what now() returns in a read at `gsn`).
-    pub(crate) fn clock_at(&self, gsn: Gsn) -> i64 {
-        let i = self.ticks.partition_point(|(g, _)| *g <= gsn);
-        if i == 0 { self.ticks.front().map(|t| t.1).unwrap_or(self.clock) } else { self.ticks[i - 1].1 }
     }
 
     /// The index of subscriptions and sinks by node (rebuilt after they
@@ -1853,14 +1835,13 @@ mod tests {
     }
 
     /// A checkpoint lets the sequencer delete the input log up to its own
-    /// GSN, whatever the retention: only recovery reads the log, from the
-    /// checkpoint on (the log used to be kept for the retention window too).
+    /// GSN: only recovery reads the log, from the checkpoint on.
     #[test]
     fn checkpoints_truncate_the_log_to_their_gsn() {
         let tmp = crate::testkit::TempDir::new("coord-truncate");
         let (env, _) = Env::open(&tmp.path().join("store"), EnvOptions::default()).unwrap();
         let (seq, rx) = unbounded();
-        let cfg = Config { data_dir: tmp.path().to_path_buf(), retention_gsns: 1000, ..Default::default() };
+        let cfg = Config { data_dir: tmp.path().to_path_buf(), ..Default::default() };
         let mut e = Engine::new(cfg, env, seq, Arc::new(Shared::default()));
         e.replaying = false;
         for gsn in 1..=5 {
@@ -1871,16 +1852,13 @@ mod tests {
         assert_eq!(truncated, [5]);
     }
 
-    /// The metadata tree is maintained like any other: error records that
-    /// go away leave retracted entries in leaves that nothing writes again,
-    /// which the checkpoints' maintenance passes compact away once the
-    /// retention frontier passes them.
+    /// Metadata records that go away (here 20,000 error records) leave no
+    /// entries behind in the metadata tree: it holds what is live only.
     #[test]
-    fn the_metadata_tree_is_compacted_by_maintenance() {
+    fn the_metadata_tree_holds_live_records_only() {
         use crate::types::Datum;
-        let tmp = crate::testkit::TempDir::new("coord-meta-maintenance");
+        let tmp = crate::testkit::TempDir::new("coord-meta-live");
         let mut e = engine(tmp.path());
-        e.cfg.retention_gsns = 1;
         let ddl = |sql: &str| LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() };
         e.apply_record(1, ddl("CREATE TABLE t (id int PRIMARY KEY, v text)")).unwrap();
         e.apply_record(2, ddl("CREATE MATERIALIZED VIEW m AS SELECT id, v::int AS n FROM t")).unwrap();
@@ -1890,8 +1868,6 @@ mod tests {
             .map(|i| (t, TableChange::Upsert { row: vec![Datum::Int4(i), Datum::Text(format!("x{i}").into())], unchanged: vec![] }))
             .collect();
         e.apply_record(3, LogRecord::Commit { source: 1, lsn: 0, changes: rows }).unwrap();
-        e.checkpoint().unwrap();
-        e.apply_record(4, LogRecord::Commit { source: 1, lsn: 0, changes: vec![(t, TableChange::Truncate)] }).unwrap();
         e.checkpoint().unwrap();
         let meta_entries = |e: &mut Engine| {
             let tree = e.meta.tree.unwrap();
@@ -1906,12 +1882,11 @@ mod tests {
             (entries, live)
         };
         let (entries, live) = meta_entries(&mut e);
-        assert!(entries > 20_000 && live < 100, "{entries} entries, {live} live");
-        // the frontier passes the retractions
-        e.apply_record(5, LogRecord::Tick { micros: 1_767_225_600_000_000 }).unwrap();
+        assert!(entries == live && live > 20_000, "{entries} entries, {live} live");
+        e.apply_record(4, LogRecord::Commit { source: 1, lsn: 0, changes: vec![(t, TableChange::Truncate)] }).unwrap();
         e.checkpoint().unwrap();
         let (entries, live) = meta_entries(&mut e);
-        assert!(entries < 2 * live + 100, "{entries} entries left for {live} live ones");
+        assert!(entries == live && live < 100, "{entries} entries, {live} live");
     }
 
     /// A query's result rows and the arrangement entries its scans visited.
@@ -1920,7 +1895,7 @@ mod tests {
         let bq = crate::sql::plan_query(&e.catalog, &q, vec![]).unwrap();
         let mut rows = Vec::new();
         let visited = e
-            .read_query(&bq, crate::storage::ReadAt::Latest, &mut |r| {
+            .read_query(&bq, &mut |r| {
                 rows.push(r.iter().map(crate::types::text::format_datum).collect::<Vec<_>>().join("|"));
                 Ok(true)
             })

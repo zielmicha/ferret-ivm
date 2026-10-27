@@ -410,7 +410,7 @@ pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: NodeId, gs
             return Err(e);
         }
     }
-    g.set_arr_hydrated(p.events, true, gsn);
+    g.set_arr_hydrated(p.events, true);
     Ok(())
 }
 

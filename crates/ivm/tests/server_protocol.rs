@@ -685,14 +685,21 @@ fn until_parked(running: &Running, n: usize) {
     }
 }
 
-/// A read waiting in the engine (here for a GSN that never comes) ends
-/// with 57014 on a CancelRequest, and is dropped when its client
-/// disconnects; it used to wait forever (only SUBSCRIBE was cancellable).
+/// A read waiting in the engine (here for an LSN that no source reaches:
+/// the only one connects nowhere) ends with 57014 on a CancelRequest, and
+/// is dropped when its client disconnects; it used to wait forever (only
+/// SUBSCRIBE was cancellable).
 #[test]
 fn waiting_reads_are_cancelled_and_dropped() {
     let (running, port) = start("cancel-parked");
+    // (created through the engine, with the upstream tables it discovered
+    // given: none)
+    let sql = "CREATE SOURCE s FROM POSTGRES CONNECTION 'host=127.0.0.1 port=1 connect_timeout=1' PUBLICATION 'p'";
+    let stmt = ivm::sql::parse_statement(sql).unwrap();
+    running.engine.handle.execute(stmt, vec![], ivm::coord::api::SessionVars::default(), "[]".into()).unwrap();
+    let read = "SELECT 1 AS OF AT LEAST LSN '0/16B3748'";
     let (mut c, pid, secret) = connect_with_key(port);
-    let mut b = b"SELECT 1 AS OF 1000000".to_vec();
+    let mut b = read.as_bytes().to_vec();
     b.push(0);
     // simple query
     c.send(b'Q', &b);
@@ -706,7 +713,7 @@ fn waiting_reads_are_cancelled_and_dropped() {
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(first_values(&c.query("SELECT 7")), ["7"]);
     // extended protocol
-    c.parse("", "SELECT 1 AS OF 1000000", &[]);
+    c.parse("", read, &[]);
     c.bind("", "", &[], 0);
     c.execute("", 0);
     c.send(b'S', &[]);

@@ -188,14 +188,14 @@ impl<'s, 'a> SnapOut<'s, 'a> {
 /// arrangement is streamed from its inputs' (recomputed for each reader).
 pub fn snapshot_stream(g: &Graph, env: &mut Env, id: NodeId, sink: &mut RowSink) -> Result<ErrDelta> {
     if let Some(a) = g.any_arrangement(id) {
-        g.scan_stream(env, a, ReadAt::Latest, sink)?;
+        g.scan_stream(env, a, sink)?;
         return Ok(g.errors_of(id));
     }
     let node = g.node(id);
     let mut out = SnapOut::new(sink);
     match &node.kind {
         NodeKind::Table { primary, .. } => {
-            g.scan_stream(env, *primary, ReadAt::Latest, out.sink)?;
+            g.scan_stream(env, *primary, out.sink)?;
         }
         NodeKind::Constant { rows } => {
             for r in rows {
@@ -345,7 +345,7 @@ pub fn table_step(
     // retract every stored row (the changes before were emitted, so this
     // includes them)
     let truncate = |env: &mut Env, emit: &mut RowSink| {
-        g.scan_stream(env, *primary, ReadAt::Latest, &mut |env, mut rows| {
+        g.scan_stream(env, *primary, &mut |env, mut rows| {
             for (_, w) in rows.iter_mut() {
                 *w = -*w;
             }
@@ -1224,7 +1224,7 @@ fn recursive_snapshot(g: &Graph, env: &mut Env, p: &RecursivePlan, out: &mut Sna
 
 fn recursive_step(g: &Graph, env: &mut Env, node: &Node, p: &RecursivePlan, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let _ = (node, gsn);
-    g.scan_stream(env, p.out_arr, ReadAt::Latest, &mut |env, old| {
+    g.scan_stream(env, p.out_arr, &mut |env, old| {
         for (r, w) in old {
             out.push(env, r, -w)?;
         }

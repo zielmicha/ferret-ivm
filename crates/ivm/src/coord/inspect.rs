@@ -12,7 +12,7 @@ use crate::dataflow::mfp::MfpStep;
 use crate::dataflow::{operator_arrangements, Arrangement, Node, NodeCounters, NodeKind};
 use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, Statement};
 use crate::sql_bail;
-use crate::storage::{ReadAt, TreeResidency};
+use crate::storage::TreeResidency;
 use crate::types::text::format_datum;
 use crate::types::{ColumnType, Datum, Row};
 use rustc_hash::FxHashSet;
@@ -72,7 +72,6 @@ pub enum InspectReply {
 pub struct EngineStats {
     pub processed_gsn: Gsn,
     pub durable_gsn: Gsn,
-    pub retention_frontier: Gsn,
     pub checkpoint_gsn: Gsn,
     pub records_since_checkpoint: u64,
     /// Wall clock (Unix ms) of the last checkpoint, or of the engine start.
@@ -124,7 +123,6 @@ pub struct ConfigInfo {
     pub data_dir: String,
     pub memory_bytes: usize,
     pub checkpoint_interval_secs: f64,
-    pub retention_gsns: u64,
     pub sync: bool,
     pub tick_ms: Option<u64>,
 }
@@ -690,7 +688,6 @@ impl Engine {
         EngineStats {
             processed_gsn: self.processed,
             durable_gsn: self.shared.durable(),
-            retention_frontier: self.env.frontier(),
             checkpoint_gsn: self.env.checkpoint_gsn(),
             records_since_checkpoint: self.records_since_checkpoint,
             last_checkpoint_ms: unix_ms(SystemTime::now()) - since.as_secs_f64() * 1000.0,
@@ -740,7 +737,6 @@ impl Engine {
                 data_dir: self.cfg.data_dir.display().to_string(),
                 memory_bytes: self.cfg.memory_bytes,
                 checkpoint_interval_secs: self.cfg.checkpoint_interval.as_secs_f64(),
-                retention_gsns: self.cfg.retention_gsns,
                 sync: self.cfg.sync,
                 tick_ms: self.cfg.tick.map(|d| d.as_millis() as u64),
             },
@@ -1317,7 +1313,7 @@ impl Engine {
                 }
             };
             out.scanned += 1;
-            let w = h.weight(ReadAt::Latest);
+            let w = h.total();
             if w == 0 {
                 continue;
             }
@@ -1702,7 +1698,6 @@ impl Engine {
                     Request::Execute { stmt, .. } => match &**stmt {
                         Statement::Select { query, as_of, .. } => {
                             let suffix = match as_of {
-                                AsOf::Gsn(g) => format!(" AS OF {g}"),
                                 AsOf::AtLeastLsn(l) => format!(" AS OF AT LEAST LSN '{l}'"),
                                 _ => String::new(),
                             };

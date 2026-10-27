@@ -26,7 +26,7 @@ fn tmpdir(name: &str) -> PathBuf {
 }
 
 fn start(dir: &Path) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, retention_gsns: 100_000, ..Default::default() };
+    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
     coord::start(cfg).expect("engine starts")
 }
 

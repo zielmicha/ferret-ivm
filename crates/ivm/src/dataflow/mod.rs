@@ -25,7 +25,7 @@ pub mod window;
 use crate::error::{Result, SqlError};
 use crate::expr::Expr;
 use crate::sql::plan::SetOpKind;
-use crate::storage::{AggKind, Env, Gsn, ReadAt, TreeId};
+use crate::storage::{AggKind, Env, Gsn, TreeId};
 use crate::types::encoding::SortSpec;
 use crate::types::{ColumnType, Row};
 use layout::{Layout, LayoutSummarizer};
@@ -183,30 +183,15 @@ pub struct Arrangement {
     pub refs: usize,
     pub fp: Vec<u8>,
     pub hydrated: bool,
-    /// GSN from which the arrangement's history is complete (it was
-    /// hydrated then): reads as of earlier GSNs must not use it.
-    pub since: Gsn,
-}
-
-impl Arrangement {
-    /// Can a read at `at` use this arrangement?
-    pub fn covers(&self, at: ReadAt) -> bool {
-        self.hydrated
-            && match at {
-                ReadAt::Latest => true,
-                ReadAt::AsOf(t) => self.since <= t,
-                ReadAt::Before(t) => self.since < t,
-            }
-    }
 }
 
 /// Recovered arrangement trees, by fingerprint.
 pub type RecoveryMap = FxHashMap<Vec<u8>, TreeId>;
 
 /// An arrangement's durable record as `Graph::take_arrangement_changes`
-/// returns it: its fingerprint, and the tree and `since` of the hydrated
-/// arrangement with it (None: there is none).
-pub type ArrangementChange = (Vec<u8>, Option<(TreeId, Gsn)>);
+/// returns it: its fingerprint, and the tree of the hydrated arrangement
+/// with it (None: there is none).
+pub type ArrangementChange = (Vec<u8>, Option<TreeId>);
 
 /// Nodes and arrangements live in slots indexed by their ids; the slots of
 /// freed ones are reused (a subscription to a query would otherwise leave
@@ -232,8 +217,6 @@ pub struct Graph {
     temporal: std::collections::BTreeSet<NodeId>,
     /// Trees from the checkpoint to attach instead of creating new ones.
     pub recovery: RecoveryMap,
-    /// `since` of the recovered trees, by fingerprint.
-    pub recovery_since: FxHashMap<Vec<u8>, Gsn>,
     /// Per-node delta-rate statistics (rows per tick, EWMA) for the planner.
     pub stats: FxHashMap<NodeId, NodeStats>,
     /// Per-node activity counters for introspection (one update per node
@@ -271,7 +254,7 @@ pub struct Graph {
     pending_nodes: std::collections::BTreeSet<NodeId>,
     pending_arrs: std::collections::BTreeSet<ArrId>,
     /// Fingerprints of the arrangements whose durable record (hydrated,
-    /// tree, `since`, existence) may have changed since
+    /// tree, existence) may have changed since
     /// `take_arrangement_changes`.
     arr_changes: rustc_hash::FxHashSet<Vec<u8>>,
     /// Nodes whose mirrored error state may have changed since
@@ -640,15 +623,14 @@ impl Graph {
             }
             _ => (env.create_tree(summarizer), false),
         };
-        let since = self.recovery_since.get(&afp).copied().unwrap_or(0);
-        let arr = self.insert_arr(id, layout, tree, afp, hydrated, since);
+        let arr = self.insert_arr(id, layout, tree, afp, hydrated);
         patch(&mut kind, arr);
         self.link(id, kind);
         id
     }
 
     /// Store a new (unreferenced) arrangement in a free slot.
-    fn insert_arr(&mut self, node: NodeId, layout: Arc<Layout>, tree: TreeId, fp: Vec<u8>, hydrated: bool, since: Gsn) -> ArrId {
+    fn insert_arr(&mut self, node: NodeId, layout: Arc<Layout>, tree: TreeId, fp: Vec<u8>, hydrated: bool) -> ArrId {
         let id = match self.free_arrs.pop() {
             Some(id) => id,
             None => {
@@ -664,16 +646,15 @@ impl Graph {
         self.arrs_by_seq.insert(seq, id);
         self.arr_changes.insert(fp.clone());
         self.err_dirty.insert(node);
-        self.arrs[id] = Some(Arrangement { id, seq, node, layout, tree, refs: 0, fp: fp.clone(), hydrated, since });
+        self.arrs[id] = Some(Arrangement { id, seq, node, layout, tree, refs: 0, fp: fp.clone(), hydrated });
         self.arr_by_fp.insert(fp, id);
         id
     }
 
-    /// Mark arrangement `id` hydrated (or not), its history starting at
-    /// `since`.
-    pub fn set_arr_hydrated(&mut self, id: ArrId, hydrated: bool, since: Gsn) {
+    /// Mark arrangement `id` hydrated (or not).
+    pub fn set_arr_hydrated(&mut self, id: ArrId, hydrated: bool) {
         let a = self.arrs[id].as_mut().expect("dangling arrangement");
-        (a.hydrated, a.since) = (hydrated, since);
+        a.hydrated = hydrated;
         let (fp, node) = (a.fp.clone(), a.node);
         if hydrated {
             self.pending_arrs.remove(&id);
@@ -774,8 +755,7 @@ impl Graph {
             }
             _ => (env.create_tree(summarizer), false),
         };
-        let since = self.recovery_since.get(&full_fp).copied().unwrap_or(0);
-        let id = self.insert_arr(node, layout, tree, full_fp, hydrated, since);
+        let id = self.insert_arr(node, layout, tree, full_fp, hydrated);
         self.node_mut(node).arrangements.push(id);
         id
     }
@@ -843,14 +823,14 @@ impl Graph {
 
     // ------------------------------------------------------------------ reads
 
-    /// Rows of an arrangement with weights as of `at` (decoded).
-    pub fn scan_arr(&self, env: &mut Env, arr: ArrId, at: ReadAt) -> Result<Delta> {
+    /// Rows of an arrangement with their weights (decoded).
+    pub fn scan_arr(&self, env: &mut Env, arr: ArrId) -> Result<Delta> {
         let a = self.arr(arr);
         let layout = &a.layout;
         let mut out = Vec::with_capacity(env.tree_count(a.tree).clamp(0, 1 << 24) as usize);
         env.for_each(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
             visited(1);
-            let w = h.weight(at);
+            let w = h.total();
             if w != 0 {
                 out.push((layout.decode_row(k)?, w));
             }
@@ -859,9 +839,9 @@ impl Graph {
         Ok(out)
     }
 
-    /// Rows of an arrangement with weights as of `at`, handed to `sink` in
+    /// Rows of an arrangement with their weights, handed to `sink` in
     /// batches of at most `ops::BATCH_ROWS` rows and about 1 MiB of entries.
-    pub fn scan_stream(&self, env: &mut Env, arr: ArrId, at: ReadAt, sink: &mut ops::RowSink) -> Result<()> {
+    pub fn scan_stream(&self, env: &mut Env, arr: ArrId, sink: &mut ops::RowSink) -> Result<()> {
         let a = self.arr(arr);
         let layout = &a.layout;
         let mut from: Option<Vec<u8>> = None;
@@ -875,7 +855,7 @@ impl Graph {
             let mut last = None;
             env.for_each(a.tree, lo, std::ops::Bound::Unbounded, &mut |k, h| {
                 visited(1);
-                let w = h.weight(at);
+                let w = h.total();
                 if w != 0 {
                     batch.push((layout.decode_row(k)?, w));
                     bytes += k.len();
@@ -966,7 +946,7 @@ impl Graph {
     /// at a time.
     fn scan_diff(&self, env: &mut Env, old: ArrId, new: ArrId, out: &mut dyn FnMut(&mut Env, Row, i64) -> Result<()>) -> Result<()> {
         for (arr, sign) in [(new, 1), (old, -1)] {
-            self.scan_stream(env, arr, ReadAt::Latest, &mut |env, batch| {
+            self.scan_stream(env, arr, &mut |env, batch| {
                 for (r, w) in batch {
                     out(env, r, sign * w)?;
                 }
@@ -977,13 +957,13 @@ impl Graph {
     }
 
     /// Rows matching a key prefix.
-    pub fn lookup(&self, env: &mut Env, arr: ArrId, key: &[crate::types::Datum], at: ReadAt) -> Result<Delta> {
+    pub fn lookup(&self, env: &mut Env, arr: ArrId, key: &[crate::types::Datum]) -> Result<Delta> {
         let a = self.arr(arr);
         let prefix = a.layout.encode_prefix(key);
         let layout = &a.layout;
         let mut out = Vec::new();
         env.for_each_prefix(a.tree, &prefix, &mut |k, h| {
-            let w = h.weight(at);
+            let w = h.total();
             if w != 0 {
                 out.push((layout.decode_row(k)?, w));
             }
@@ -1507,7 +1487,7 @@ impl Graph {
                 };
                 delta::finish_all(env, builders)?;
                 for a in pending_arrs {
-                    self.set_arr_hydrated(a, true, gsn);
+                    self.set_arr_hydrated(a, true);
                 }
                 // the arrangement holds the rows; the errors are kept here
                 self.set_errors(id, &errs);
@@ -1744,16 +1724,15 @@ impl Graph {
 
     /// Take over what fork `from` hydrated of `nodes` and `arrs` (the pending
     /// ones when it was taken; their trees are adopted by the storage
-    /// separately): hydration flags, `since`, error records and operator
-    /// error state. Those freed here in the meantime are skipped.
+    /// separately): hydration flags, error records and operator error
+    /// state. Those freed here in the meantime are skipped.
     pub fn adopt_hydrated(&mut self, from: &Graph, nodes: &[NodeId], arrs: &[ArrId]) {
         for &a in arrs {
             let (Some(Some(mine)), Some(Some(theirs))) = (self.arrs.get(a), from.arrs.get(a)) else { continue };
             if mine.fp != theirs.fp {
                 continue;
             }
-            let (hydrated, since) = (theirs.hydrated, theirs.since);
-            self.set_arr_hydrated(a, hydrated, since);
+            self.set_arr_hydrated(a, theirs.hydrated);
         }
         for &id in nodes {
             let (Some(Some(mine)), Some(Some(theirs))) = (self.nodes.get(id), from.nodes.get(id)) else { continue };
@@ -1774,14 +1753,14 @@ impl Graph {
     }
 
     /// The durable records of the arrangements that may have changed since
-    /// the last call: by fingerprint, the tree and `since` of the hydrated
-    /// arrangement with it, or None if there is none (any more).
+    /// the last call: by fingerprint, the tree of the hydrated arrangement
+    /// with it, or None if there is none (any more).
     pub fn take_arrangement_changes(&mut self) -> Vec<ArrangementChange> {
         let mut out: Vec<ArrangementChange> = std::mem::take(&mut self.arr_changes)
             .into_iter()
             .map(|fp| {
                 bookkept(1);
-                let rec = self.arr_by_fp.get(&fp).map(|a| self.arr(*a)).filter(|a| a.hydrated).map(|a| (a.tree, a.since));
+                let rec = self.arr_by_fp.get(&fp).map(|a| self.arr(*a)).filter(|a| a.hydrated).map(|a| a.tree);
                 (fp, rec)
             })
             .collect();
@@ -1792,16 +1771,6 @@ impl Graph {
     /// Arrangement fingerprint -> tree for checkpoints.
     pub fn arrangement_trees(&self) -> BTreeMap<Vec<u8>, TreeId> {
         self.live_arrangements().filter(|a| a.hydrated).map(|a| (a.fp.clone(), a.tree)).collect()
-    }
-
-    /// Arrangement fingerprint -> `since` for checkpoints.
-    pub fn arrangement_since(&self) -> BTreeMap<Vec<u8>, Gsn> {
-        self.live_arrangements().filter(|a| a.hydrated).map(|a| (a.fp.clone(), a.since)).collect()
-    }
-
-    /// The first of a node's arrangements holding its history as of `at`.
-    pub fn arrangement_at(&self, node: NodeId, at: ReadAt) -> Option<ArrId> {
-        self.node(node).arrangements.iter().copied().find(|a| self.arr(*a).covers(at))
     }
 }
 

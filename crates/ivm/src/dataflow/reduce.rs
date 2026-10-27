@@ -368,7 +368,7 @@ pub fn is_data_error(e: &SqlError) -> bool {
 }
 
 fn old_row(g: &Graph, env: &mut Env, p: &ReducePlan, gvals: &[Datum]) -> Result<Option<Row>> {
-    let rows = g.lookup(env, p.out_arr, gvals, ReadAt::Latest)?;
+    let rows = g.lookup(env, p.out_arr, gvals)?;
     Ok(rows.into_iter().find(|(_, w)| *w > 0).map(|(r, _)| r))
 }
 

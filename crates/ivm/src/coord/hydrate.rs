@@ -183,7 +183,7 @@ fn fill_rebuilt(graph: &mut Graph, env: &mut Env, c: &Conversion, gsn: Gsn) -> R
             return Err(e);
         }
     }
-    graph.set_arr_hydrated(primary, true, gsn);
+    graph.set_arr_hydrated(primary, true);
     graph.set_node_hydrated(c.new_node, true);
     Ok(())
 }

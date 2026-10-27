@@ -215,13 +215,12 @@ fn indexes_follow_upstream_schema_changes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// now() in a read AS OF an earlier GSN is the logical clock of that GSN,
-/// also after a restart: the checkpoint keeps the clock ticks of the
-/// retention window (a restart used to answer every earlier GSN with the
-/// checkpoint's clock).
+/// now() in a read is the logical clock: the last logged tick, also after
+/// a restart, from the checkpoint (which keeps that tick) or from the log
+/// replayed after it.
 #[test]
-fn now_as_of_earlier_gsns_after_a_restart() {
-    let dir = tmpdir("now-as-of");
+fn now_is_the_last_tick_after_a_restart() {
+    let dir = tmpdir("now-restart");
     let e = Engine::start(&dir);
     let tick = |e: &Engine, secs: i64| {
         let base = 1_767_225_600_000_000i64; // 2026-01-01T00:00:00Z in Unix microseconds
@@ -230,21 +229,18 @@ fn now_as_of_earlier_gsns_after_a_restart() {
     e.exec("CREATE TABLE t (id int PRIMARY KEY)");
     tick(&e, 10);
     e.exec("INSERT INTO t VALUES (1)");
-    let g1: u64 = e.rows("SHOW GSN")[0].parse().unwrap();
     tick(&e, 20);
-    e.exec("INSERT INTO t VALUES (2)");
-    let g2: u64 = e.rows("SHOW GSN")[0].parse().unwrap();
-    tick(&e, 30);
-    let reads = |e: &Engine| {
-        [g1, g2].map(|g| e.rows(&format!("SELECT now(), count(*) FROM t AS OF {g}"))[0].clone())
-    };
-    let want = ["2026-01-01 00:00:10+00|1", "2026-01-01 00:00:20+00|2"];
-    assert_eq!(reads(&e), want);
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:20+00|1"]);
     e.exec("CHECKPOINT");
     e.shutdown();
     let e = Engine::start(&dir);
-    assert_eq!(reads(&e), want);
-    assert_eq!(e.rows("SELECT now()"), ["2026-01-01 00:00:30+00"]);
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:20+00|1"]);
+    tick(&e, 30);
+    e.exec("INSERT INTO t VALUES (2)");
+    // (replayed from the log after the restart's checkpoint)
+    e.running.crash();
+    let e = Engine::start(&dir);
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:30+00|2"]);
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -433,13 +429,11 @@ fn check_format1(e: &Engine, app: &serde_json::Value) {
     let drops: Vec<(String, String)> = e.h.shared.slot_drops.lock().iter().map(|d| (d.conninfo.clone(), d.slot.clone())).collect();
     assert_eq!(drops, [(s(&app["slot_drops"][0]["conninfo"]), "fixture_src2".to_string())]);
     assert_eq!(e.rows("SELECT * FROM up ORDER BY id"), ["1|a", "2|b", "3|c"]);
-    // the clock as of earlier GSNs (as the format-1 engine answered), and
-    // histories: ti's starts at its creation (GSN 9), so the read as of
-    // GSN 8 does not use it
-    assert_eq!(e.rows("SELECT now(), count(*) FROM t AS OF 21"), ["2026-10-25 23:18:50.490978+00|4"]);
-    assert_eq!(e.rows("SELECT now()"), ["2026-10-25 23:18:55.673051+00"]);
-    assert_eq!(e.rows("SELECT v FROM t WHERE id = 2 AS OF 21"), ["20"]);
-    assert_eq!(e.rows("SELECT id FROM t WHERE v = '20' AS OF 8"), ["2"]);
+    // the clock (its last tick), and the rows (the index's histories
+    // collapsed to their current weights)
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-10-25 23:18:55.673051+00|4"]);
+    assert_eq!(e.rows("SELECT v FROM t WHERE id = 2"), ["30"]);
+    assert_eq!(e.rows("SELECT id FROM t WHERE v = '20'"), Vec::<String>::new());
     assert_eq!(e.rows("SELECT id FROM t WHERE v = '30'"), ["2"]);
 }
 
@@ -451,8 +445,8 @@ fn checkpoint_state(dir: &Path) -> Vec<u8> {
 /// A data directory of format 1 opens, and is migrated at its first start:
 /// everything it held is kept (catalog, DDL history, error records of views
 /// and aggregation groups, source states and resume LSNs, pending slot
-/// drops, clock ticks, the histories of indexes), and from then on its
-/// checkpoints carry a small header naming the metadata tree.
+/// drops, the clock, the indexes' rows), and from then on its checkpoints
+/// carry a small header naming the metadata tree.
 #[test]
 fn format1_data_directories_are_migrated() {
     let app = format1_state("format1-state");

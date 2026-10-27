@@ -24,7 +24,6 @@ use crate::sql::parser::Statement;
 use crate::sql::plan::Rel;
 use crate::sql::ParamSlot;
 use crate::sql_bail;
-use crate::storage::ReadAt;
 use crate::types::{Datum, Row, SqlType};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast;
@@ -122,7 +121,7 @@ impl Engine {
         }
         let node = self.rt.tables[&table];
         let NodeKind::Table { primary, .. } = self.graph.node(node).kind else { unreachable!() };
-        let rows = self.graph.lookup(&mut self.env, primary, key, ReadAt::Latest)?;
+        let rows = self.graph.lookup(&mut self.env, primary, key)?;
         Ok(rows.into_iter().find(|(_, w)| *w > 0).map(|(r, _)| r))
     }
 
@@ -337,7 +336,7 @@ impl Engine {
                     if types.len() > target.len() { "target columns" } else { "expressions" }
                 );
             }
-            for (r, w) in self.execute_rel(&bq.into_rel().bind_now(now), ReadAt::Latest)? {
+            for (r, w) in self.execute_rel(&bq.into_rel().bind_now(now))? {
                 for _ in 0..w.max(0) {
                     rows.push(r.iter().cloned().zip(types.iter().cloned()).collect());
                 }
@@ -415,7 +414,7 @@ impl Engine {
         }
         let rel = rel.map(new_exprs);
         let rel = crate::sql::decorrelate::decorrelate(rel)?;
-        self.execute_rel(&rel.bind_now(statement_time()), ReadAt::Latest)
+        self.execute_rel(&rel.bind_now(statement_time()))
     }
 
     fn plan_update(&mut self, upd: &ast::Update, params: Vec<ParamSlot>) -> Result<(Vec<(ObjectId, TableChange)>, String)> {

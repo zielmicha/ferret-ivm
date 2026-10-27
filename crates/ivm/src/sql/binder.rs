@@ -1260,7 +1260,7 @@ impl<'a> Binder<'a> {
         match tf {
             ast::TableFactor::Table { name, alias, args, version, with_ordinality, .. } => {
                 if version.is_some() {
-                    sql_bail!(codes::FEATURE_NOT_SUPPORTED, "table versions are not supported; use AS OF on the query");
+                    sql_bail!(codes::FEATURE_NOT_SUPPORTED, "table versions are not supported: reads see the latest state");
                 }
                 if let Some(args) = args {
                     let (_, fname) = object_name(name)?;
