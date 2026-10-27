@@ -280,12 +280,14 @@ What a run does:
    subqueries, aggregates (`count`, `count(DISTINCT)`, `sum`, `avg`, `min`,
    `max`, `bool_and`, ordered `string_agg`, `array_agg`, `json_agg` and
    `jsonb_agg`, `percentile_cont`/`percentile_disc`, `mode()`, with
-   `FILTER`), `HAVING`, `ROLLUP`, `CUBE` and `GROUPING SETS` with
+   `FILTER`, also over arguments and orders that fail on the rows the
+   filter excludes), `HAVING`, `ROLLUP`, `CUBE` and `GROUPING SETS` with
    `grouping()`, window functions with `ROWS` and `RANGE` frames,
    `DISTINCT` and `DISTINCT ON`, top-k with `LIMIT`/`OFFSET` and `FETCH
    FIRST ... WITH TIES`, set operations with and without `ALL`, derived
-   tables, CTEs and `WITH RECURSIVE`, `VALUES` and set-returning functions
-   (`WITH ORDINALITY`), jsonpath and array expressions. Every order that
+   tables (also 2–8 nested ones that each use a column twice, under a
+   condition on it), CTEs and `WITH RECURSIVE`, `VALUES` and set-returning
+   functions (`WITH ORDINALITY`), jsonpath and array expressions. Every order that
    decides which rows are returned is total, so any correct implementation
    returns the same rows. It keeps the queries PostgreSQL accepts and
    creates each as a materialized view, printing `unsupported: <error> ::
