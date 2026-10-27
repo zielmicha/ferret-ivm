@@ -675,16 +675,36 @@ fn newer_formats_are_refused_untouched() {
 /// reads the deleted rows in three rows.
 const WINDOW_REVISION: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/window-revision");
 
+/// The storage tree of each named object's index (a materialized view's
+/// result), from the web UI's snapshot of the dataflow.
+fn index_trees(e: &Engine) -> std::collections::BTreeMap<String, u64> {
+    match e.h.inspect_wait(InspectQuery::Dataflow, Duration::from_secs(10)).unwrap() {
+        InspectReply::Dataflow(d) => {
+            assert!(!d.truncated);
+            d.objects
+                .iter()
+                .filter_map(|o| Some((o.name.clone(), d.arrangements.iter().find(|a| Some(a.id) == o.arrangement)?.tree)))
+                .collect()
+        }
+        other => panic!("unexpected reply {other:?}"),
+    }
+}
+
 /// Window operators that this version maintains otherwise than the one
 /// that wrote a data directory (`WinSpec::revised`) do not match its
 /// checkpoint: they are rebuilt from their input at the first start, with
-/// the views over them, and follow changes from then on (matched, the
-/// first change would have retracted rows they never held). Those of
-/// functions maintained as before are recovered.
+/// the views over them, in new trees, and follow changes from then on
+/// (matched, the first change would have retracted rows they never held).
+/// Those of functions maintained as before are recovered, in the trees of
+/// the checkpoint.
 #[test]
 fn revised_window_operators_are_rebuilt() {
     let dir = tmpdir("window-revision");
     copy_dir(Path::new(WINDOW_REVISION), &dir);
+    let checkpointed: std::collections::BTreeSet<u64> = {
+        let (env, _) = ivm::storage::Env::open(&dir.join("store"), Default::default()).unwrap();
+        env.tree_ids().into_iter().collect()
+    };
     let queries = [
         ("nv", "SELECT id, g, ntile(a) OVER (PARTITION BY g ORDER BY id) AS n FROM w"),
         ("nc", "SELECT g, n, count(*) AS c FROM (SELECT g, ntile(a) OVER (PARTITION BY g ORDER BY id) AS n FROM w) s GROUP BY g, n"),
@@ -704,12 +724,14 @@ fn revised_window_operators_are_rebuilt() {
     check(&e, "at the first start");
     // (ntile's buckets from each partition's first argument, 3 and 2)
     assert_eq!(e.rows("SELECT n, c FROM nc WHERE g = 1 ORDER BY n"), ["1|22", "2|22"]);
-    // rebuilt: their history starts at the restart; cv's indexes were found
+    // rebuilt in new trees; cv's index, and w's, were found
+    let trees = index_trees(&e);
     for view in ["nv", "nc", "lv"] {
-        let err = e.err(&format!("SELECT count(*) FROM {view} AS OF 6")).message;
-        assert!(err.contains("before the history"), "{view}: {err}");
+        assert!(!checkpointed.contains(&trees[view]), "{view} recovered from the checkpoint (tree {})", trees[view]);
     }
-    assert_eq!(e.rows("SELECT count(*) FROM cv AS OF 6"), ["90"]);
+    for object in ["cv", "w"] {
+        assert!(checkpointed.contains(&trees[object]), "{object} rebuilt (tree {})", trees[object]);
+    }
     for (i, sql) in [
         "UPDATE w SET a = 1 WHERE id = 1",
         "DELETE FROM w WHERE id = 2",

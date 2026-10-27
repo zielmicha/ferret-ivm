@@ -439,7 +439,7 @@ keywords, such as `CREATE MATERIALIZED VIEW` or `DROP TABLE`.
     "counters": {"steps": 114, "in_rows": 11600, "out_rows": 95300, "nanos": 410000000}
   }],
   "arrangements": [{
-    "id": 6, "node": 1, "role": "index", "key": ["#2"], "summaries": [], "refs": 3,
+    "id": 6, "node": 1, "tree": 9, "role": "index", "key": ["#2"], "summaries": [], "refs": 3,
     "records": 272760, "resident_bytes": 6291456, "resident_nodes": 700,
     "hydrated": true, "readers": [4, 7, 25]
   }],
@@ -461,9 +461,12 @@ those the operator owns, `reads` those it reads (often its inputs'),
 tables, materialized views, indexes, sinks and subscriptions whose results
 depend on the operator. An edge `[a, b]` means `a` is an input of `b` (one
 per input; a self-join lists its input twice). `role` is `index` for an index
-of the operator's output and `state` for operator-private state. `records`
-is the weighted entry count (rows counting multiplicity) from the tree's
-summary; `resident_*` is what the buffer pool holds in memory.
+of the operator's output and `state` for operator-private state. `tree` is
+the storage tree holding the arrangement: one that recovery matched by its
+fingerprint keeps its tree from the checkpoint, one rebuilt at start-up has
+a new one. `records` is the weighted entry count (rows counting
+multiplicity) from the tree's summary; `resident_*` is what the buffer pool
+holds in memory.
 
 ### `GET /api/dataflow/node/ID?sample=N`
 

@@ -302,6 +302,10 @@ pub struct NodeInfo {
 pub struct ArrInfo {
     pub id: ArrId,
     pub node: NodeId,
+    /// The storage tree holding its entries: an arrangement that recovery
+    /// matched by fingerprint keeps the tree of the checkpoint, one rebuilt
+    /// by hydration has a new one.
+    pub tree: crate::storage::TreeId,
     /// "index" (of the node's output) or "state" (operator-private).
     pub role: &'static str,
     pub key: Vec<String>,
@@ -1123,6 +1127,7 @@ impl Engine {
         ArrInfo {
             id: a.id,
             node: a.node,
+            tree: a.tree,
             role: if owned_index { "index" } else { "state" },
             key: a
                 .layout
