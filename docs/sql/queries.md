@@ -99,6 +99,14 @@ start/end: UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | UNBOU
   `lead(x [, offset [, default]])`, `first_value(x)`, `last_value(x)`,
   `nth_value(x, n)` (NULL for a NULL `n`), and every
   [aggregate](#aggregate-functions) except with `DISTINCT` or `FILTER`.
+- As in PostgreSQL, `ntile` reads `n` at the partition's first row where it
+  is not NULL: that value is the number of buckets for every row (an `n`
+  that is not positive there fails with `argument of ntile must be greater
+  than zero`, SQLSTATE `22014`; later rows' `n` are ignored), the rows
+  before it are NULL, and the buckets are counted from it. The `offset` of
+  `lag`/`lead` and the `n` of `nth_value` are read at every row. The
+  arguments are computed for every row, also where PostgreSQL does not
+  compute them ([Known problems](../user-guide/troubleshooting.md#known-problems)).
 - Default frame: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 - `ROWS` and `GROUPS` offsets are integer constants. `RANGE` offsets need
   exactly one `ORDER BY` column of a numeric type (offset of the same type)

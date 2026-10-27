@@ -552,22 +552,41 @@ their frames which rows' values the change can change: rows whose frame
 holds a changed row (frames ending after it reach back from it, frames
 starting before it forward from it), the rows after it for `row_number` and
 `rank` when the partition's size changes (for `dense_rank` always; every row
-for `percent_rank`, `cume_dist` and `ntile`), the next row for `lag` (any
-row with an explicit offset), and so on. It reads the run those rows'
-values depend on — their frames, except the parts that summaries or row
-lookups provide; whole peer groups; from the partition's start for
-`dense_rank` — computes their values before and after the GSN, and emits
-the difference. Positions outside the changed rows are the same in both
-versions, so both are computed from one read of the run (an entry's weight
-before the GSN being its current weight minus the step's change to it, the
-input delta overlaid on the input index). The work is proportional to the rows
-that change and the rows their frames reach: appending to a partition with
-a running sum reads a few rows, while a change that changes every row (an
-insert at the start with `row_number`, any change with frames reaching the
-partition's end) reads the partition once. Partitions of at most 32 rows
+for `percent_rank`, `cume_dist` and `ntile`), for `lag` and `lead` the rows
+that read it, up to their offset away (the next row for `lag` without an
+offset; a negative offset reads the other way; an offset that is not a
+constant of the query, `WinSpec::constant_arg`, can differ between rows,
+and any row can read it), and so on.
+`ntile` reads its argument at the partition's first row where it is not
+NULL, as PostgreSQL does: that value is the number of buckets of every row,
+counted from that row, so a change that can change that row's position or
+its argument changes every row. The operator walks the partition from its
+start to find that row before and after the GSN (`ntile_first`); if it is
+not among the first 32 entries in either version, any change is taken to
+change it. The operator reads the run those rows' values depend on — their
+frames, except the parts that summaries or row lookups provide; whole peer
+groups; from the partition's start for `dense_rank` — computes their values
+before and after the GSN, and emits the difference. Positions outside the
+changed rows are the same in both versions, so both are computed from one
+read of the run (an entry's weight before the GSN being its current weight
+minus the step's change to it, the input delta overlaid on the input
+index). The work is proportional to the rows that change and the rows
+their frames reach: appending to a partition with a running sum reads a
+few rows, while a change that changes every row (an insert at the start
+with `row_number`, any change with frames reaching the partition's end)
+reads the partition once. Partitions of at most 32 rows
 are recomputed whole: finding what to read would cost more. So are
 partitions with more than 4,096 changed entries, read before the GSN with
 the overlay of the delta read along, without collecting their changes.
+
+Since the values before a change are computed from the input, not read from
+the operator's output, an output stored by code that computed other values
+would make a change retract rows the operator never emitted. The uses of
+window functions whose values or maintenance changed (`WinSpec::revised`:
+`ntile` whose argument is not a constant, `lag` and `lead` whose offset is
+not a constant of at least 0) therefore change the operator's fingerprint,
+and recovery rebuilds such operators from their input
+([Compatibility](../on-disk-format.md#compatibility)).
 
 An error in a partition (for example `ntile(0)`) becomes an error record,
 and none of its rows is output. The partitions in error are remembered

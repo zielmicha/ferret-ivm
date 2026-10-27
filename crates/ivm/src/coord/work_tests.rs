@@ -563,6 +563,40 @@ fn windows_read_only_what_a_change_reaches() {
     }
 }
 
+/// lag and lead read the row at their offset: with a constant offset (also
+/// a negative one, reading the other way), a change in the middle of a
+/// partition reads the rows up to that offset from it; offsets that differ
+/// between rows can reach any row, and the partition is read once.
+#[test]
+fn lag_and_lead_read_the_rows_their_offsets_reach() {
+    let mut t = T::new("work-lag");
+    let n = 3000;
+    let cases = [
+        // (the row reading the changed one)
+        ("back2", "lag(v, 2)", Some(n / 2 + 2)),
+        ("ahead", "lead(v, 3, 0)", Some(n / 2 - 3)),
+        ("negative", "lead(v, -2)", Some(n / 2 + 2)),
+        ("by_row", "lag(v, (id % 3 - 1)::int)", None),
+    ];
+    for (name, f, want) in cases {
+        t.ddl(&format!("CREATE TABLE {name} (id bigint PRIMARY KEY, g bigint, v bigint)"));
+        t.upsert(name, (0..n).map(|i| vec![int(i), int(1), int(i)]).collect());
+        let q = format!("SELECT id, {f} OVER (PARTITION BY g ORDER BY id) AS x FROM {name}");
+        t.ddl(&format!("CREATE MATERIALIZED VIEW {name}_v AS {q}"));
+        let (entries, _) = t.work(|t| t.upsert(name, vec![vec![int(n / 2), int(1), int(-1)]]));
+        match want {
+            Some(_) => assert!(entries <= 20, "{name}: {entries} entries"),
+            None => assert!(entries > n as u64 && entries <= n as u64 + 50, "{name}: {entries} entries"),
+        }
+        let rows = t.rows(&format!("{name}_v"));
+        if let Some(at) = want {
+            assert_eq!(rows.iter().find(|r| r[0] == int(at)).unwrap()[1], int(-1), "{name}");
+        }
+        t.ddl(&format!("CREATE MATERIALIZED VIEW {name}_fresh AS {q}"));
+        assert_eq!(rows, t.rows(&format!("{name}_fresh")), "{name}");
+    }
+}
+
 /// A window operator's partitions in error, and that they are known (also
 /// without any in error), are kept in the metadata tree: recovery restores
 /// them without reading the operator's input, and a change after it is
@@ -575,8 +609,8 @@ fn window_error_state_is_recovered_without_reading_the_input() {
     let q = "SELECT id, ntile(v::int) OVER (PARTITION BY g ORDER BY id) AS nt, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM w";
     t.ddl(&format!("CREATE MATERIALIZED VIEW wv AS {q}"));
     t.ddl("CREATE MATERIALIZED VIEW ok AS SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM w");
-    // (partition 0 in error: ntile(0))
-    t.upsert("w", vec![vec![int(10), int(0), int(0)]]);
+    // (partition 0 in error: ntile(0) at its first row)
+    t.upsert("w", vec![vec![int(0), int(0), int(0)]]);
     // (whether every window operator's state is known, partitions in error)
     let window_errors = |t: &T| -> (bool, usize) {
         let mut st = (true, 0);
@@ -597,9 +631,45 @@ fn window_error_state_is_recovered_without_reading_the_input() {
     // changed in part (not whole, as without the state known)
     let (entries, _) = t.work(|t| t.upsert("w", vec![vec![int(2999), int(1), int(7)]]));
     assert!(entries <= 40, "{entries} entries");
-    t.upsert("w", vec![vec![int(10), int(0), int(3)]]);
+    t.upsert("w", vec![vec![int(0), int(0), int(3)]]);
     assert_eq!(window_errors(&t), (true, 0));
     // (as a view hydrated now)
     t.ddl(&format!("CREATE MATERIALIZED VIEW fresh AS {q}"));
     assert_eq!(t.rows("wv"), t.rows("fresh"));
+}
+
+/// ntile's number of buckets is the argument of the partition's first row
+/// where it is not NULL: a change that keeps the partition's size, that
+/// row's position and its argument reads a few rows (also a change to a
+/// later row's argument, which is not read, or to the first row's other
+/// columns), while one that changes that argument, or which row it is,
+/// changes every row and reads the partition once.
+#[test]
+fn ntile_reads_its_partition_when_the_number_of_buckets_changes() {
+    let mut t = T::new("work-ntile");
+    let n = 3000;
+    t.ddl("CREATE TABLE nt (id bigint PRIMARY KEY, g bigint, a bigint, v bigint)");
+    let row = |i: i64, a: Option<i64>, v: i64| vec![int(i), int(1), a.map(int).unwrap_or(Datum::Null), int(v)];
+    t.upsert("nt", (0..n).map(|i| row(i, (i >= 5).then_some(4 + i % 3), i)).collect());
+    let q = "SELECT id, v, ntile(a::int) OVER (PARTITION BY g ORDER BY id) AS x FROM nt";
+    t.ddl(&format!("CREATE MATERIALIZED VIEW ntv AS {q}"));
+    for (what, change, few) in [
+        ("another column", row(1500, Some(4), -1), true),
+        ("a later argument", row(2000, Some(0), 2000), true),
+        ("the first row's other column", row(5, Some(6), -5), true),
+        ("the first argument", row(5, Some(3), 5), false),
+        ("which row is first", row(2, Some(2), 2), false),
+    ] {
+        let (entries, _) = t.work(|t| t.upsert("nt", vec![change]));
+        if few {
+            assert!(entries <= 20, "{what}: {entries} entries");
+        } else {
+            assert!(entries > n as u64 && entries <= n as u64 + 50, "{what}: {entries} entries");
+        }
+    }
+    // (as a view hydrated now)
+    t.ddl(&format!("CREATE MATERIALIZED VIEW fresh AS {q}"));
+    assert_eq!(t.rows("ntv"), t.rows("fresh"));
+    let bucket = |t: &mut T, id: i64| t.rows("ntv").into_iter().find(|r| r[0] == int(id)).unwrap()[2].clone();
+    assert_eq!((bucket(&mut t, 1), bucket(&mut t, 2), bucket(&mut t, 2999)), (Datum::Null, Datum::Int4(1), Datum::Int4(2)));
 }

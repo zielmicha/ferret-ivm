@@ -768,20 +768,44 @@ impl Gen<'_> {
             3 => ("count(*)".to_string(), ""),
             4 => (format!("sum({v})"), *self.rng.pick(&["", " ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING", whole])),
             5 => (format!("lag({v})"), ""),
-            6 => (format!("lead({v}, 2)"), ""),
+            6 => (format!("lead({v}, {})", self.window_int_arg(srcs, 1, true)), ""),
             7 => (format!("first_value({v})"), ""),
             8 => (format!("max({v})"), *self.rng.pick(&["", " ROWS BETWEEN 2 PRECEDING AND CURRENT ROW", whole])),
             9 => (format!("min({v})"), *self.rng.pick(&["", " ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING", whole])),
-            10 => (format!("ntile({})", 2 + self.rng.below(3)), ""),
+            // (a first argument below 1 fails, later ones are not read)
+            10 => (format!("ntile({})", self.window_int_arg(srcs, 2, true)), ""),
             11 => (format!("last_value({v})"), whole),
-            12 => (format!("nth_value({v}, 2)"), whole),
-            13 => (format!("lag({v}, 1, 0)"), ""),
+            // (a position below 1 fails at any row)
+            12 => (format!("nth_value({v}, {})", self.window_int_arg(srcs, 1, false)), *self.rng.pick(&["", whole])),
+            13 => {
+                let default = match self.col_of(srcs, |c| c.ty.is_int()) {
+                    Some((c, _)) if self.rng.chance(50) => c,
+                    _ => "0".to_string(),
+                };
+                (format!("lag({v}, {}, {default})", self.window_int_arg(srcs, 1, true)), "")
+            }
             _ => ("percent_rank()".to_string(), ""),
         };
         if self.rng.chance(20) {
             return (format!("{f} OVER w"), format!(" WINDOW w AS ({part}ORDER BY {order}{frame})"));
         }
         (format!("{f} OVER ({part}ORDER BY {order}{frame})"), String::new())
+    }
+
+    /// An `int` argument of a window function: a constant from `lo` to
+    /// `lo + 2`, or a value of an integer column of the sources from `lo` to
+    /// `lo + 4` (from `lo - 2` with `below`), NULL where the column is (and
+    /// in some rows where it is not), so that it differs between the rows of
+    /// a partition. PostgreSQL reads `ntile`'s at the partition's first row
+    /// where it is not NULL, the others at every row.
+    fn window_int_arg(&mut self, srcs: &[Src], lo: i64, below: bool) -> String {
+        let (c, _) = self.col_of(srcs, |c| c.ty.is_int()).unwrap_or_else(|| (format!("{}.id", srcs[0].alias), Ty::Int));
+        match self.rng.below(if below { 4 } else { 3 }) {
+            0 => (lo + self.rng.range(0, 2)).to_string(),
+            1 => format!("({c} % 3 + {})::int", lo + 2),
+            2 => format!("CASE WHEN {c} > {} THEN ({c} % 3 + {})::int END", self.rng.range(-5, 30), lo + 2),
+            _ => format!("({c} % 3 + {lo})::int"),
+        }
     }
 
     fn select_list_subqueries(&mut self, srcs: &[Src], sel: &mut Vec<String>) {

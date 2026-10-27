@@ -679,6 +679,11 @@ fn windows_follow_random_changes() {
         "SELECT id, rank() OVER w AS r, sum(v) OVER (w ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s, max(v) OVER (w ROWS UNBOUNDED PRECEDING) AS m, sum(v) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) AS p FROM t WINDOW w AS (PARTITION BY g ORDER BY v, id)",
         "SELECT id, dense_rank() OVER (ORDER BY v) AS d, sum(v) OVER (ORDER BY v ROWS BETWEEN 3 FOLLOWING AND UNBOUNDED FOLLOWING) AS s FROM t",
         "SELECT id, ntile(v) OVER (PARTITION BY g ORDER BY id) AS nt FROM t",
+        // (ntile's number of buckets from the first row whose argument is not NULL)
+        "SELECT id, ntile(CASE WHEN v > 4 THEN v - 4 END) OVER (PARTITION BY g ORDER BY id) AS a, ntile(CASE WHEN id > 100 THEN v + 1 END) OVER (ORDER BY id) AS b, ntile(v + 1) OVER (PARTITION BY g ORDER BY v DESC) AS c FROM t",
+        "SELECT g, v, ntile(v + 2) OVER (PARTITION BY g ORDER BY v NULLS FIRST) AS n, sum(v) OVER (PARTITION BY g ORDER BY v ROWS 1 PRECEDING) AS s FROM t",
+        // (offsets that differ between rows, negative ones reading the other way)
+        "SELECT id, lag(id, v - 3, -id) OVER (PARTITION BY g ORDER BY id) AS l, lead(v, id % 3 - 1) OVER (PARTITION BY g ORDER BY id) AS ld, lag(v, -2) OVER (PARTITION BY g ORDER BY id) AS lf, lead(id, -1, 0) OVER (PARTITION BY g ORDER BY id) AS lb FROM t",
         "SELECT id, count(*) OVER (PARTITION BY g ORDER BY d RANGE BETWEEN interval '2 days' PRECEDING AND interval '1 day' FOLLOWING) AS c FROM (SELECT id, g, date '2026-01-01' + v AS d FROM t) s",
         "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 40 PRECEDING AND 1 PRECEDING) AS s, lag(v, 2) OVER (PARTITION BY g ORDER BY id) AS l FROM t",
     ];
@@ -707,7 +712,8 @@ fn window_partition_errors_across_restart() {
     exec(&h, &format!("CREATE MATERIALIZED VIEW w AS {q}"));
     let check = |h: &EngineHandle| assert_eq!(rows_of(h, "SELECT * FROM w").map(sorted), rows_of(h, q).map(sorted));
     check(&h);
-    exec(&h, "UPDATE t SET v = 0 WHERE id = 10");
+    // (ntile reads the argument of its partition's first row)
+    exec(&h, "UPDATE t SET v = 0 WHERE id = 2");
     assert_eq!(read_error(&h, "SELECT * FROM w"), Some("22014 argument of ntile must be greater than zero".to_string()));
     exec(&h, "UPDATE t SET v = 3 WHERE id = 12");
     exec(&h, "CHECKPOINT");
@@ -717,7 +723,7 @@ fn window_partition_errors_across_restart() {
     exec(&h, "UPDATE t SET v = 2 WHERE id = 14");
     exec(&h, "UPDATE t SET v = 2 WHERE id = 15");
     assert_eq!(read_error(&h, "SELECT * FROM w"), Some("22014 argument of ntile must be greater than zero".to_string()));
-    exec(&h, "UPDATE t SET v = 1 WHERE id = 10");
+    exec(&h, "UPDATE t SET v = 1 WHERE id = 2");
     check(&h);
     exec(&h, "INSERT INTO t VALUES (201, 1, 4)");
     check(&h);

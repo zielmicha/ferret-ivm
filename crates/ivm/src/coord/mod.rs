@@ -1766,6 +1766,55 @@ mod tests {
         assert_eq!(e.graph.group_caches.used(), a + b);
     }
 
+    /// Window operators whose values are maintained otherwise than by
+    /// earlier versions (`WinSpec::revised`: ntile with an argument that
+    /// can differ between rows, lag and lead with an offset that is not a
+    /// constant of at least 0) get other fingerprints than those versions
+    /// computed, so that recovery rebuilds them instead of matching their
+    /// checkpointed output; all others keep theirs.
+    #[test]
+    fn revised_window_functions_change_the_operator_fingerprint() {
+        use crate::dataflow::{hash128, FpCtx, NodeKind};
+        let tmp = crate::testkit::TempDir::new("coord-window-fp");
+        let mut e = engine(tmp.path());
+        let ddl = |sql: &str| LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() };
+        e.apply_record(1, ddl("CREATE TABLE w (id int PRIMARY KEY, g int, a int)")).unwrap();
+        let w = "OVER (PARTITION BY g ORDER BY id)";
+        let cases = [
+            (format!("ntile(3) {w}, lag(a) {w}, lead(a, 2, 0) {w}, lag(a, 0) {w}, lag(a, NULL) {w}, ntile(NULL) {w}"), false),
+            (format!("ntile(2 + 1) {w}, nth_value(a, a) {w}, first_value(a) {w}, sum(a) {w}"), false),
+            (format!("ntile(a) {w}"), true),
+            (format!("ntile(CASE WHEN id > 3 THEN 2 END) {w}"), true),
+            (format!("lag(a, a) {w}"), true),
+            (format!("lag(a, -1) {w}"), true),
+            (format!("lead(id, (id % 3 - 1)::int, -1) {w}"), true),
+            (format!("lead(a, -2) {w}"), true),
+        ];
+        for (i, (funcs, revised)) in cases.iter().enumerate() {
+            e.apply_record(2 + i as u64, ddl(&format!("CREATE MATERIALIZED VIEW v{i} AS SELECT id, {funcs} FROM w"))).unwrap();
+            let mut n = e.rt.views[&e.catalog.by_name(&format!("v{i}")).unwrap().id].node;
+            let p = loop {
+                match &e.graph.node(n).kind {
+                    NodeKind::Window(p) => break p,
+                    _ => n = e.graph.node(n).inputs[0],
+                }
+            };
+            // as computed before WinSpec::revised
+            let node = e.graph.node(n);
+            let mut fp = b"Window".to_vec();
+            for i in &node.inputs {
+                fp.extend_from_slice(&e.graph.node(*i).fp);
+            }
+            fp.push(0xFF);
+            fp.extend_from_slice(format!("{:?}{:?}", p.partition, p.order).as_bytes());
+            fp.extend_from_slice(FpCtx { g: &e.graph }.arr(p.input_arr));
+            for f in &p.funcs {
+                fp.extend_from_slice(format!("{:?}{:?}{:?}{:?}", f.func, f.args, f.frame, f.range).as_bytes());
+            }
+            assert_eq!(node.fp != hash128(&fp), *revised, "{funcs}");
+        }
+    }
+
     /// A subscription whose query fails to lower releases the operators
     /// built before the failure (create_view_rt did; subscribe left them in
     /// the graph, where they stayed and were maintained for good).
