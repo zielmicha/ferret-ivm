@@ -128,7 +128,7 @@ maintained:
 | window functions | `Window` | recomputation of each changed partition (before and after) | input index keyed by (partition, order) |
 | set-returning functions | `FlatMap` | the function's output | none |
 | `WITH RECURSIVE` | `Recursive` | recomputation of the whole fixpoint from the current inputs, diffed against the previous result | index of the result (and of the inputs) |
-| conditions over `now()` | `TemporalFilter` | bisection of the row's validity interval; due events at each tick | index of pending (time, row) events |
+| conditions over `now()` | `TemporalFilter` | per changed row, the times at which its conditions change (a few evaluations of them, see [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal-filters-are-maintained)); due events at each tick | index of pending (time, row) events |
 | `VALUES` | `Constant` | — | none |
 
 Output of every operator is *consolidated* per GSN: a row inserted and

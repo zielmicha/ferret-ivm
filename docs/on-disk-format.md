@@ -1175,7 +1175,7 @@ operator name (ASCII: Table, Constant, Mfp, Union, Negate, FlatMap, DeltaJoin,
 | `TopK` | `Debug` text of group key, limit, offset and with-ties concatenated; input arrangement fingerprint |
 | `Window` | `Debug` of partition and order; input arrangement fingerprint; per function `Debug` of function, arguments, frame, range offsets |
 | `Recursive` | `Debug` text of the base and step plans (`Rel`), distinct flag byte, per source object: id `u64 LE` + node fingerprint |
-| `TemporalFilter` | per predicate: clock expression, operator byte (`<` 0, `<=` 1, `>` 2, `>=` 3), row expression |
+| `TemporalFilter` | per predicate: clock expression, operator byte (`<` 0, `<=` 1, `>` 2, `>=` 3), row expression, then `0xD0` if the clock expression adds an interval with months to a date or timestamp (added when such predicates became exact: the event indexes of earlier versions, which could end a row's validity at another change of the predicate, are not matched and are rebuilt) |
 
 **Expression fingerprint** (pre-order; each node writes a tag byte and a
 `u32 LE` value, plus extras, then its children's fingerprints):

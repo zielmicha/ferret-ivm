@@ -131,6 +131,58 @@ fn temporal_filters_follow_the_logged_clock() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Adding a month clamps the day to the end of a shorter month: January
+/// 29th to 31st plus a month are all February 28th, at their time of day,
+/// so `now() + interval '1 month'` goes back a day at the midnights
+/// starting them, and a row of February 28th noon enters
+/// `ts > now() + interval '1 month'` on each of those days until noon.
+/// Likewise `now() - interval '1 month'` on March 28th to 31st.
+#[test]
+fn temporal_filters_with_months_follow_the_calendar() {
+    let dir = tmpdir("temporal-months");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    tick(&h, 0);
+    exec(&h, "CREATE TABLE ev (id int PRIMARY KEY, ts timestamptz)");
+    exec(&h, "INSERT INTO ev VALUES (1, '2026-02-28 12:00:00+00'), (2, '2026-02-28 00:00:00+00'), (3, '2026-03-01 00:00:00+00')");
+    let ahead = "SELECT id FROM ev WHERE ts > now() + interval '1 month'";
+    let recent = "SELECT id FROM ev WHERE ts > now() - interval '1 month'";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW ahead AS {ahead}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW recent AS {recent}"));
+    let ids = |h: &EngineHandle, q: &str| {
+        let mut r = rows(h, q);
+        r.sort();
+        r.join(",")
+    };
+    // (day of 2026, hour, ids in `ahead`, ids in `recent`)
+    let steps = [
+        (27, 6, "1,3", "1,2,3"),
+        (27, 13, "3", "1,2,3"),
+        (28, 6, "1,3", "1,2,3"),
+        (29, 18, "3", "1,2,3"),
+        (30, 6, "1,3", "1,2,3"), // January 31st, 06:00
+        (30, 13, "3", "1,2,3"),
+        (31, 6, "", "1,2,3"), // February 1st: plus a month is March 1st
+        (31 + 28 + 27, 6, "", "1,3"), // March 28th
+        (31 + 28 + 27, 13, "", "3"),
+        (31 + 28 + 28, 6, "", "1,3"),
+        (31 + 28 + 28, 13, "", "3"),
+        (31 + 28 + 30, 6, "", "1,3"), // March 31st
+        (31 + 28 + 30, 13, "", "3"),
+        (31 + 28 + 31, 6, "", ""), // April 1st: minus a month is March 1st
+    ];
+    for (day, hour, want_ahead, want_recent) in steps {
+        tick(&h, day * 86_400 + hour * 3600);
+        let at = rows(&h, "SELECT now()").join("");
+        assert_eq!(ids(&h, ahead), want_ahead, "{ahead} at {at}");
+        assert_eq!(ids(&h, recent), want_recent, "{recent} at {at}");
+        assert_eq!(ids(&h, "SELECT id FROM ahead"), want_ahead, "view ahead at {at}");
+        assert_eq!(ids(&h, "SELECT id FROM recent"), want_recent, "view recent at {at}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn temporal_filter_errors() {
     let dir = tmpdir("temporal-errors");
@@ -230,6 +282,105 @@ fn temporal_views_match_recompute_as_time_passes() {
             assert_eq!(got, want, "step {step} (clock {clock}): view tv{i} = {v}");
         }
     }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Temporal filters adding months to the clock, which goes back at the
+/// midnights starting days clamped to the end of a shorter month, equal
+/// their queries at every clock reading of a walk across month ends
+/// (January to April 2026, and February 2024's leap day two years back),
+/// as rows near those ends change, views are created over existing rows,
+/// and the engine restarts.
+#[test]
+fn temporal_views_with_months_match_recompute() {
+    let dir = tmpdir("temporal-months-random");
+    let mut running = start(&dir);
+    let mut h = running.handle.clone();
+    tick(&h, 0);
+    exec(&h, "CREATE TABLE ev (id int PRIMARY KEY, ts timestamptz, d date, lts timestamp)");
+    let views = [
+        "SELECT id FROM ev WHERE ts > now() - interval '1 month'",
+        "SELECT id FROM ev WHERE ts <= now() + interval '1 month'",
+        "SELECT id FROM ev WHERE ts BETWEEN now() - interval '1 month 2 days' AND now() + interval '1 month -3 hours'",
+        "SELECT id FROM ev WHERE d > current_date - interval '1 month'",
+        "SELECT id FROM ev WHERE lts >= localtimestamp + interval '-1 month 6 hours'",
+        "SELECT count(*) AS n FROM ev WHERE ts::date = (now() - interval '1 month')::date",
+        "SELECT id FROM ev WHERE ts > (now() + interval '1 month') - interval '1 month' - interval '29 days'",
+        "SELECT id FROM ev WHERE date_trunc('hour', ts) < date_trunc('minute', now() - interval '2 years')",
+        "SELECT id FROM ev WHERE ts = date_trunc('hour', now() + interval '13 months') - interval '1 year 1 month'",
+    ];
+    // the last three are created over existing rows
+    let early = 6;
+    for (i, v) in views[..early].iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW mv{i} AS {v}"));
+    }
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    // a time near a month's end, as SQL: ten days around the start of one
+    // of February to April 2026 (or two years before, around February
+    // 29th 2024), at an hour, minute or microsecond
+    let near_end = |rng: &mut Rng| {
+        let month = ["2026-02-01", "2026-03-01", "2026-04-01", "2024-03-01"][rng.below(4) as usize];
+        let secs = rng.below(10 * 86_400) as i64 - 6 * 86_400;
+        let secs = match rng.below(3) {
+            0 => secs - secs.rem_euclid(3600),
+            1 => secs - secs.rem_euclid(60),
+            _ => secs,
+        };
+        format!("timestamp '{month}' + {secs} * interval '1 second' + {} * interval '1 microsecond'", rng.below(2))
+    };
+    let row = |rng: &mut Rng, id: u64| {
+        let (a, b, c) = (near_end(rng), near_end(rng), near_end(rng));
+        format!("({id}, ({a}) AT TIME ZONE 'UTC', ({b})::date, {c})")
+    };
+    let rows_now: Vec<String> = (0..60).map(|id| row(&mut rng, id)).collect();
+    exec(&h, &format!("INSERT INTO ev VALUES {}", rows_now.join(", ")));
+    // from January 20th to April 5th 2026
+    let mut clock = 19 * 86_400;
+    let mut step = 0;
+    while clock < 94 * 86_400 {
+        clock += match rng.below(4) {
+            0 => rng.below(60) as i64,
+            1 => rng.below(3600) as i64,
+            _ => rng.below(7 * 3600) as i64,
+        };
+        tick(&h, clock);
+        match rng.below(6) {
+            0 => {
+                let id = rng.below(100);
+                let r = row(&mut rng, id);
+                exec(&h, &format!("DELETE FROM ev WHERE id = {id}"));
+                exec(&h, &format!("INSERT INTO ev VALUES {r}"));
+            }
+            1 => {
+                exec(&h, &format!("DELETE FROM ev WHERE id = {}", rng.below(100)));
+            }
+            _ => {}
+        }
+        if step == 40 {
+            for (i, v) in views.iter().enumerate().skip(early) {
+                exec(&h, &format!("CREATE MATERIALIZED VIEW mv{i} AS {v}"));
+            }
+        }
+        if step == 150 || step == 300 {
+            running.shutdown();
+            running = start(&dir);
+            h = running.handle.clone();
+        }
+        for (i, v) in views.iter().enumerate() {
+            if i >= early && step < 40 {
+                continue;
+            }
+            let mut got = rows(&h, &format!("SELECT * FROM mv{i}"));
+            let mut want = rows(&h, v);
+            got.sort();
+            want.sort();
+            let at = rows(&h, "SELECT now()").join("");
+            assert_eq!(got, want, "step {step} at {at}: view mv{i} = {v}");
+        }
+        step += 1;
+    }
+    assert!(step > 300, "{step} clock readings");
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

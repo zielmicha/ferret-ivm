@@ -597,7 +597,7 @@ again.
 ### TemporalFilter
 
 Rows pass while temporal predicates over the clock hold. For each row the
-operator computes its validity interval `[lo, hi)` (below), emits it if
+operator computes its validity intervals `[lo, hi)` (below), emits it if
 valid now, and stores future `(time, kind, row)` events in a private
 arrangement keyed by (time `bigint`, kind `smallint`) — kind 0 "becomes
 valid", kind 1 "expires". At each step it releases the events that became
@@ -610,16 +610,60 @@ graph rebuilt by recovery starts from the checkpoint's clock
 (`Graph::restore_clock`), up to which the checkpointed filters released
 everything.
 
-Each predicate is `clock_side op row_side`; its value changes where
-`clock_side(t)` reaches the row side's value `x`. The operator first tries
-the time where a shift of the clock reaches `x` — `t0 + (y − clock_side(t0))`
-at `t0 = y`, `y` being `x` or the next value of its type for a strict
-condition — and takes it if the predicate changes exactly there (two
-evaluations); only otherwise does it bisect the predicate over the searched
-range. Shifts of the clock by constant intervals therefore take three
-evaluations of the clock side per predicate instead of about 55, and the
-result is exact whatever the arithmetic (months, time zones, `date_trunc`),
-because it is a verified change of the predicate itself.
+Each predicate is `clock_side op row_side`, its clock side a chain of steps
+applied to the clock reading `t`: casts, `date_trunc`, constants added or
+subtracted. All of them are non-decreasing except adding an interval with
+months to a date or timestamp, which clamps the day to the end of a shorter
+target month: March 29th to 31st minus a month are all February 28th, at
+their time of day, so the sum goes back by up to a day at the midnights
+starting those days, and a predicate can hold, stop holding and hold again.
+The interval's days and time are added after its months
+(`timestamp_pl_interval`), so they are a non-decreasing step of their own.
+
+Without months, the clock side is non-decreasing and the predicate changes
+value once at most, where `clock_side(t)` reaches the row side's value `x`.
+The operator first tries the time where a shift of the clock reaches `x` —
+`t0 + (y − clock_side(t0))` at `t0 = y`, `y` being `x` or the next value of
+its type for a strict condition — and takes it if the predicate changes
+exactly there (two evaluations); only otherwise does it bisect the predicate
+over the searched range. Shifts of the clock by constant intervals
+therefore take three evaluations of the clock side per predicate instead of
+about 55, and the result is exact whatever the arithmetic (time zones,
+`date_trunc`), because it is a verified change of the predicate itself.
+
+With months (`Clock`, `MonthSum`), the clock side is split at its outermost
+addition of months into `outer(inner + n months)`, `outer` being
+non-decreasing (it includes the interval's days and time):
+
+1. A condition that holds until some time is solved as its negation (`<`
+   as `>=`), which holds from some time on. It holds from some month sum `c`
+   on, found like a change above, over sums instead of clock readings
+   (guessed at `x` shifted back through `outer`, else bisected over the
+   sums the clock reaches in the searched range, with a year's margin).
+2. The values `u` of `inner` whose sum reaches `c` follow from the calendar
+   (`month_sum_at_least`): `u + n months` lies in the month `n` months after
+   `u`'s, at `u`'s day (clamped to that month's last day) and time of day.
+   So the values of all months after the source month (`n` months before
+   `c`'s) reach `c`, those of earlier months do not, and those of the source
+   month do from `c`'s day and time on (none if the source month is shorter
+   than `c`'s day); and if `c` is on the last day of a target month shorter
+   than the source month, each later day of the source month, clamped to
+   it, reaches `c` again from `c`'s time of day on. That is one interval of
+   values, or one per such day: up to four.
+3. When `inner` takes those values is found the same way, as the times from
+   which `inner` is at least each bound — recursively if `inner` adds months
+   itself.
+
+A row's validity is the intersection of its predicates' sets, and each of
+its intervals gets its pair of events. The result is exact: every part is
+a change of a non-decreasing function, taken where verified or bisected,
+or calendar arithmetic. Its cost does not depend on how far the changes
+are: only the source month of `c` is looked at, whatever the months in
+between. For `now() - interval '1 month'` and the like, `outer` and
+`inner` are the identity, the guesses hold, and a predicate takes six
+evaluations of trivial expressions (three for the sum, three for the
+time); a row valid over several intervals takes three more per further
+bound.
 See [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal-filters-are-maintained).
 
 ## Hydration
