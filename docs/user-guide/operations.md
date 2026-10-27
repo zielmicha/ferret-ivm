@@ -1,7 +1,7 @@
 # Operations
 
 Running `ivm` in practice: configuration and tuning, the data directory,
-recovery, checkpoints, retention, durability, and cleaning up. The byte-level
+recovery, checkpoints, space reclamation, durability, and cleaning up. The byte-level
 formats are in [On-disk format](../on-disk-format.md); the mechanisms in
 [Recovery and snapshots](../internals/recovery.md).
 
@@ -13,7 +13,6 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 |---|---|---|
 | `--memory-mb` | 2048 | The memory budget: the buffer pool of index nodes, the aggregation group caches, the records waiting to be applied, the changes queued for subscriptions and sinks, the dataflow's transient working memory and the buffer pools of hydrations and large reads together ([Memory](#memory)). The buffer pool gets what the others leave; index nodes beyond its share are evicted (CLOCK) and re-read from segment files on demand — modified (dirty) nodes are written to the segment files first, and are also written once they exceed half of the pool's share, ahead of the next checkpoint (which makes them durable). Working sets that fit run from memory; larger ones degrade gradually — also large transactions and view hydration, which build their results through the pool. `--cache-mb` is an older name of this flag (it used to size the buffer pool alone, counted in serialized bytes: about a quarter of the memory it took). |
 | `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash (dirty memory stays within half of the pool's share either way). A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. Checkpoints are written by a thread of their own: reads and maintenance go on meanwhile (nodes modified meanwhile are copied, once each, and the buffer pool goes on writing dirty nodes early, except those the checkpoint is writing). |
-| `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes and more clock ticks. `0` keeps no history beyond the previous GSN. |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
 | `--no-sync` | off | Skips `fsync` of the input log. Only for tests and benchmarks; see [Durability](#durability-and---no-sync). |
 
@@ -34,14 +33,14 @@ Fixed internal parameters (not configurable):
 | buffer pool | what the above leave of `--memory-mb`, at least a quarter of it |
 | records a source has in flight to the input log before it stops reading the stream until they are durable | 10,000 |
 | initial-snapshot chunk (and piece of a table without a key) | 10,000 rows |
-| maintenance pass budget (compaction, and relocation, each) | 8 MiB plus the bytes checkpoints wrote for updates since the previous pass |
+| maintenance pass budget (relocation and merges) | 8 MiB plus the bytes checkpoints wrote for updates since the previous pass |
 | sort buffer when building or updating an index in bulk (hydration, large changes) | half the working memory, within 1 MiB and 64 MiB |
 | change (delta) of a view or operator kept in memory per GSN, and changes of a table applied at once | half the working memory, within 1 MiB and 256 MiB (larger ones go to temporary trees) |
 | rows per hydration batch | 1,024 (or 1 MiB of index entries) |
 | join rows looked up at once | about half the working memory, within 256 KiB and 8 MiB |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
-| clock ticks kept | those of the retention window |
+| clock ticks kept | the last one |
 | clock ticks that make a checkpoint due without other changes | 3,600 |
 | source reconnect delay | 200 ms, doubling up to 10 s |
 | retry of a table that cannot be copied | 1 s, doubling up to 60 s |
@@ -235,10 +234,9 @@ step of a requested shutdown. It:
 
 1. writes what changed in the catalog and the engine state since the last
    one (DDL history entries, source states and LSNs, index fingerprints →
-   tree ids and the GSN each index's history starts at, error records,
-   clock ticks, pending slot drops) into the metadata tree, a tree like the
-   indexes (DDL statements write their catalog changes into it right
-   away);
+   tree ids, error records, the last clock tick, pending slot drops) into
+   the metadata tree, a tree like the indexes (DDL statements write their
+   catalog changes into it right away);
 2. runs one maintenance pass (below);
 3. writes all dirty nodes bottom-up to the active segment and `fsync`s the
    segment files;
@@ -254,33 +252,25 @@ What a checkpoint writes is what changed since the previous one: its cost
 does not grow with the catalog, its DDL history or the error records that
 stay the same.
 
-Space reclamation: a node rewritten after a checkpoint makes its old copy
-dead, and a deleted or updated row leaves its old version in its index leaf
-until the retention frontier passes it. The maintenance pass removes both,
-visiting only what needs it: it rewrites the index leaves where removing
-versions behind the frontier would free at least a quarter of the leaf
-(including leaves no change reaches again, such as the oldest rows of a
-queue or of a table purged by age), merges leaves and inner nodes left
-nearly empty, and rewrites the live nodes of the sealed segments that are
-less than half live, preferring the emptiest and oldest, so that they can be
-deleted. Its work on nodes not already in memory or modified is bounded per
-pass by the budget in the table above: it keeps pace with the rate at which
-updates create garbage, and the next pass continues what does not fit. A
-segment with no live bytes is deleted at the checkpoint. The active segment
-is never collected, so up to one segment (256 MiB) of dead space can
-accumulate before it is sealed. Dropping an index or view releases its space
-without reading it.
+Space reclamation: the indexes hold the current rows only — a deleted row
+(or the old version of an updated one) leaves its index leaf with the change
+that removes it, and a leaf or inner node a change leaves nearly empty is
+merged with a neighbour — but a node rewritten after a checkpoint makes its
+old copy in a segment file dead. The maintenance pass rewrites the live
+nodes of the sealed segments that are less than half live, preferring the
+emptiest and oldest, so that they can be deleted, and merges those of them
+left nearly empty with a neighbour. Its work on nodes not already in memory
+or modified is bounded per pass by the budget in the table above: it keeps
+pace with the rate at which updates create garbage, and the next pass
+continues what does not fit. A segment with no live bytes is deleted at the
+checkpoint. The active segment is never collected, so up to one segment
+(256 MiB) of dead space can accumulate before it is sealed. Dropping an
+index or view releases its space without reading it. (A data directory
+written by a version that kept each row's history of changes for `AS OF`
+reads keeps the old versions in its leaves on disk until a change or the
+maintenance pass rewrites them; reads skip them.)
 
 `SHOW FRONTIERS` shows `checkpoint_gsn` and the number of segments.
-
-## Retention and time travel
-
-Each index entry keeps a history of (GSN, weight) changes. Changes at or
-before the *retention frontier* (`last applied GSN − --retention-gsns`) are
-merged into one when an index leaf is next rewritten or by the maintenance
-pass of a checkpoint (see above), and `AS OF` reads before the frontier are
-refused. Retention does not keep input-log segments: `AS OF` reads use the
-histories in the indexes. See [Reads](reads.md#time-travel-as-of-gsn).
 
 ## Durability and --no-sync
 

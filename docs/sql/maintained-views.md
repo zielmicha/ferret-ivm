@@ -19,8 +19,9 @@ is a pure function of the input log up to *g*. Several mechanisms rely on it:
   any number of changes.
 - **Sharing**: a sub-plan identical to one of another view reuses that
   view's operators and indexes; it must compute the same thing.
-- **Time travel and repeatable reads**: reading a view `AS OF g` must give
-  the same answer every time.
+- **Incremental maintenance**: a change retracts what a row produced by
+  evaluating the expressions again on the old row; the retraction must
+  cancel what was added then.
 
 A function whose result depends on something other than its arguments
 breaks all of these. Such functions are therefore rejected, and constructs

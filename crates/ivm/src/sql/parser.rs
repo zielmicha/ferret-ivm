@@ -6,18 +6,18 @@ use sqlparser::ast;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-/// Read point for queries.
+/// What a query waits for before it reads the engine's latest state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AsOf {
     /// Session default (normally "fresh").
     Default,
-    Gsn(u64),
     /// Wait until the source has ingested everything up to this LSN.
     AtLeastLsn(String),
     /// Wait for the ingestion frontier at the time the query arrives.
     Fresh,
-    /// Whatever is processed right now (no waiting).
-    Latest,
+    /// Wait until the engine has applied this GSN (never parsed: a fresh
+    /// read parked until then is retried in this form).
+    AtLeastGsn(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -66,7 +66,7 @@ pub enum Statement {
     AlterSourceRefresh { name: String },
     CreateSink { name: String, from: String, conninfo: String, table: String, key: Option<Vec<String>> },
     DropSink { name: String, if_exists: bool },
-    Subscribe { target: SubscribeTarget, snapshot: bool, progress: bool, as_of: AsOf, copy: bool },
+    Subscribe { target: SubscribeTarget, snapshot: bool, progress: bool, copy: bool },
     Show(ShowKind),
     Explain { kind: ExplainKind, target: ExplainTarget },
     Checkpoint,
@@ -452,10 +452,11 @@ fn strip_as_of(sql: &str) -> Result<(String, AsOf)> {
     } else if t.eat("fresh") {
         AsOf::Fresh
     } else if t.eat("latest") {
-        AsOf::Latest
+        sql_bail!(codes::FEATURE_NOT_SUPPORTED, "AS OF LATEST is not supported; use SET read_mode = latest");
+    } else if t.peek().is_some_and(|n| n.parse::<u64>().is_ok()) {
+        sql_bail!(codes::FEATURE_NOT_SUPPORTED, "AS OF <gsn> is not supported: reads see the latest state (the engine keeps no history)");
     } else {
-        let n = t.next().ok_or_else(|| SqlError::syntax("AS OF requires a GSN"))?;
-        AsOf::Gsn(n.parse().map_err(|_| SqlError::syntax(format!("invalid GSN {n}")))?)
+        sql_bail!(codes::SYNTAX_ERROR, "AS OF expects FRESH or AT LEAST LSN '<lsn>'");
     };
     if !t.at_end() {
         sql_bail!(codes::SYNTAX_ERROR, "unexpected tokens after AS OF clause");
@@ -786,7 +787,6 @@ fn parse_subscribe(sql: &str, t: &mut Toks, copy: bool) -> Result<Statement> {
     };
     let mut snapshot = true;
     let mut progress = false;
-    let mut as_of = AsOf::Default;
     while !t.at_end() {
         if t.eat("with") {
             t.expect("(")?;
@@ -810,13 +810,12 @@ fn parse_subscribe(sql: &str, t: &mut Toks, copy: bool) -> Result<Statement> {
             }
         } else if t.eat("as") {
             t.expect("of")?;
-            let n = t.next().ok_or_else(|| SqlError::syntax("AS OF requires a GSN"))?;
-            as_of = AsOf::Gsn(n.parse().map_err(|_| SqlError::syntax(format!("invalid GSN {n}")))?);
+            sql_bail!(codes::FEATURE_NOT_SUPPORTED, "SUBSCRIBE ... AS OF is not supported: a subscription starts at the last applied GSN");
         } else {
             sql_bail!(codes::SYNTAX_ERROR, "syntax error in SUBSCRIBE near {:?}", t.peek());
         }
     }
-    Ok(Statement::Subscribe { target, snapshot, progress, as_of, copy })
+    Ok(Statement::Subscribe { target, snapshot, progress, copy })
 }
 
 fn parse_show(t: &mut Toks) -> Result<Option<ShowKind>> {
@@ -915,19 +914,24 @@ mod tests {
     fn as_of_clause() {
         // non-ASCII text outside quotes used to panic (byte slicing inside a character)
         assert_eq!(as_of("select 1 as ü"), AsOf::Default);
-        assert_eq!(as_of("select 'İİ' as x, ü from t as of 7"), AsOf::Gsn(7));
+        assert_eq!(as_of("select 'İİ' as x, ü from t as of fresh"), AsOf::Fresh);
         // AS OF inside comments, strings and dollar quotes is not a clause
         assert_eq!(as_of("select a from t -- as of 1"), AsOf::Default);
         assert_eq!(as_of("select a from t /* as of 1 */"), AsOf::Default);
         assert_eq!(as_of("select $$ as of 1 $$"), AsOf::Default);
         assert_eq!(as_of("select ' as of 1'"), AsOf::Default);
         // any whitespace separates the words
-        assert_eq!(as_of("select a from t\nAS\tOF 12"), AsOf::Gsn(12));
-        assert_eq!(as_of("select a from t as of latest"), AsOf::Latest);
-        match parse_statement("select a from t as of 3").unwrap() {
+        assert_eq!(as_of("select a from t\nAS\tOF at\tleast lsn '0/1'"), AsOf::AtLeastLsn("0/1".into()));
+        match parse_statement("select a from t as of fresh").unwrap() {
             Statement::Select { text, .. } => assert_eq!(text, "select a from t"),
             other => panic!("{other:?}"),
         }
+        // time travel is gone
+        let code = |sql: &str| parse_statement(sql).unwrap_err().code;
+        assert_eq!(code("select a from t as of 7"), codes::FEATURE_NOT_SUPPORTED);
+        assert_eq!(code("select a from t as of latest"), codes::FEATURE_NOT_SUPPORTED);
+        assert_eq!(code("subscribe to v as of 7"), codes::FEATURE_NOT_SUPPORTED);
+        assert_eq!(code("select a from t as of yesterday"), codes::SYNTAX_ERROR);
         assert!(parse_statement("COPY (SUBSCRIBE (select 'İ' from t)) TO STDOUT").is_ok());
     }
 
@@ -968,8 +972,8 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match parse_statement("select * from t as of 42").unwrap() {
-            Statement::Select { as_of, .. } => assert_eq!(as_of, AsOf::Gsn(42)),
+        match parse_statement("select * from t as of at least lsn '0/16B3748'").unwrap() {
+            Statement::Select { as_of, .. } => assert_eq!(as_of, AsOf::AtLeastLsn("0/16B3748".into())),
             other => panic!("{other:?}"),
         }
         match parse_statement("SUBSCRIBE TO v WITH (SNAPSHOT = false, PROGRESS)").unwrap() {

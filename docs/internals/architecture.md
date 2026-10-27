@@ -18,16 +18,16 @@ Where the ideas of the design live in the code (paths relative to
 
 | Design (doc.md) | Code |
 |---|---|
-| One representation: rows with a weight, stamped with a GSN | `dataflow` (Z-set deltas, consolidated per GSN), `storage` (per-entry (GSN, weight) histories), `log.rs` |
+| One representation: rows with a weight, stamped with a GSN | `dataflow` (Z-set deltas, consolidated per GSN), `storage` (each entry's current weight), `log.rs` |
 | One clock: a GSN for every input, in arrival order | `coord/seq.rs` (sequencer, group commit); every upstream commit is logged with its LSN, from which the per-source LSN frontiers follow (`coord/mod.rs`) |
 | Determinism; the wall clock as a logged tick stream | `LogRecord::Tick`, `dataflow/temporal.rs` (temporal filters), `coord/ddl.rs` (`check_deterministic`) |
 | CDC edge: primary-key upserts, before-images and unchanged TOAST values from stored rows, DBLog chunked snapshots, slot acknowledged on log durability, schema in the log | `source/postgres.rs`, `dataflow/ops.rs` (`table_step`) |
-| Ordered MVCC index, (GSN, weight) histories, retention frontier, buffer pool | `storage` (copy-on-write B+trees, segments, manifest, CLOCK eviction, the maintenance pass: compaction, merging, segment garbage collection) |
+| Ordered index keyed by (key, value), buffer pool (without the histories: below) | `storage` (copy-on-write B+trees of weighted entries, segments, manifest, CLOCK eviction, the maintenance pass: segment garbage collection, merging) |
 | Augmented summaries; aggregates as range queries | `storage/summary.rs`, `dataflow/reduce.rs`, `Env::nth` (percentiles) |
 | Shared, reference-counted arrangements; the primary index as a table's first arrangement | `dataflow/mod.rs` (hash-consed nodes and arrangements) |
 | Delta joins; anti-joins for outer joins and `NOT EXISTS` | `dataflow/join.rs`, `dataflow/lower.rs` |
 | Changing views: shared fragments, hydration from arrangements, catalog in storage | `dataflow/mod.rs` (`Graph::hydrate`), `coord/ddl.rs`; the catalog and its DDL history in a storage tree, versioned by GSN (`coord/meta.rs`) |
-| Outputs: `AS OF`, `SUBSCRIBE` with progress, idempotent sinks, read modes | `coord/read.rs`, `server/`, `sink/postgres.rs` |
+| Outputs: reads (fresh, latest, at least an LSN), `SUBSCRIBE` with progress, idempotent sinks | `coord/read.rs`, `server/`, `sink/postgres.rs` |
 | `EXPLAIN MAINTENANCE` | `coord/read.rs` |
 | Expression semantics exactly PostgreSQL's | `expr/`, and the ports `crates/pgnumeric`, `crates/pgdatetime`, `crates/pgfuncs` |
 
@@ -39,6 +39,23 @@ Where the implementation differs from the design:
   durable frontiers ([Recovery](recovery.md)).
 - **No LSN→GSN mapping.** Each commit record carries its LSN, and
   `AS OF AT LEAST LSN` waits for the per-source LSN frontiers.
+- **No time travel.** The design keeps each index entry's history of
+  (GSN, weight) changes behind a retention frontier, so that reads,
+  hydration and recovery could all read the state as of a GSN. The indexes
+  keep each entry's current weight only. Nothing but `AS OF <gsn>` reads
+  needed an earlier state, and they are not supported: hydration reads the
+  current state (off the engine thread from a fork of the storage, then
+  catching up from the records it is forwarded), recovery replays the log
+  after a checkpoint, and the one earlier state the dataflow needs, an
+  arrangement as it was before the GSN being applied, is its current state
+  with that GSN's delta overlaid ([Dataflow](dataflow.md#arrangements-and-layouts)).
+  Histories had a cost that grew with the retention: a retracted entry
+  stayed in its leaf until the retention frontier passed it and a
+  maintenance pass compacted it, a lookup of a hot row walked every version
+  kept, and an entry took 56 bytes besides its key in memory (24 now), with
+  compaction machinery (per-subtree compaction states, budgets) to bound
+  the rest. Without them a deleted row leaves its index at once, and the
+  maintenance pass only reclaims dead space in segment files.
 - **Recursion by recomputation.** `WITH RECURSIVE` recomputes the fixpoint
   instead of using nested time ([Dataflow](dataflow.md#recursive)).
 - **Planning.** Join orders use equality edges, unique keys and exact index
@@ -340,8 +357,7 @@ its consumer's queue until the consumer drops it, and a consumer whose
 queue would exceed its limit is not sent the event ([Memory](#memory)).
 
 Records at or below the last applied GSN are ignored, which makes replay
-idempotent. After each record the retention frontier is moved to
-`processed − max(retention, 1)` (recovery sets it to `processed − retention`).
+idempotent.
 
 ## Memory
 
@@ -432,19 +448,18 @@ Frontiers derived from it:
 | durable GSN | `Shared::durable_gsn`, `SHOW FRONTIERS` | every record ≤ it is on disk |
 | processed GSN | `Shared::processed_gsn`, `Engine::processed` | every record ≤ it has been applied; reads at "latest" use it |
 | checkpoint GSN | manifest, `SHOW FRONTIERS` | the state ≤ it is in the last checkpoint; recovery replays from the next GSN |
-| retention frontier | `Env::frontier` | history at or before it is consolidated; `AS OF` must not be older |
 | source LSN frontier | `Shared::source_lsn`, `SHOW SOURCES` | every upstream commit with an end LSN ≤ it has been logged |
 
 Upstream LSNs are mapped to the GSN clock through the log: every source
 `Commit` record carries the upstream transaction's end LSN. The engine keeps
 the last logged LSN per source (checkpointed as the source's resume point).
 
-Reads choose a GSN from these frontiers
+Reads wait for these frontiers and then read the latest state
 ([Reads](../user-guide/reads.md#read-points)): a fresh read takes the
-durable GSN at arrival and waits for the processed GSN to reach it; an
-`AS OF AT LEAST LSN` read waits until every source of the catalog has
-reported a frontier at or past the LSN and then reads fresh (without any
-source it fails with `55000`).
+durable GSN at arrival and waits for the processed GSN to reach it (parked,
+it is run again as `AsOf::AtLeastGsn`); an `AS OF AT LEAST LSN` read waits
+until every source of the catalog has reported a frontier at or past the LSN
+and then reads fresh (without any source it fails with `55000`).
 
 ### Parked reads
 
@@ -473,9 +488,8 @@ client is gone.
 ## The logical clock
 
 The engine's logical clock (`Engine::clock`, PostgreSQL epoch microseconds)
-is the maximum of the tick times applied so far. A deque of recent
-(GSN, clock) pairs lets a read at GSN *g* evaluate `now()` as the clock at
-*g* (`clock_at`); pairs older than the retention frontier are dropped.
-Checkpoints save the deque (the metadata tree's tick records), so reads as of
-earlier GSNs see the same clock after a restart. The dataflow sees
-the clock as `Graph::now`; temporal-filter operators run whenever it moves.
+is the maximum of the tick times applied so far; reads evaluate `now()` as
+it. The engine keeps the GSN of the tick that set it (`Engine::clock_gsn`),
+and checkpoints save that tick (the metadata tree's tick record), so the
+clock is the same after a restart. The dataflow sees the clock as
+`Graph::now`; temporal-filter operators run whenever it moves.

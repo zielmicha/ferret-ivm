@@ -1627,8 +1627,9 @@ mod api {
             upstream_rows(up, "SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND backend_type = 'client backend'")
         };
         wait_until("the schema change", || {
-            let stmt = ivm::sql::parse_statement("SELECT x FROM t AS OF LATEST").unwrap();
-            h.execute(stmt, vec![], SessionVars::default(), String::new()).is_ok()
+            let stmt = ivm::sql::parse_statement("SELECT x FROM t").unwrap();
+            let latest = SessionVars { read_mode: "latest".into(), ..SessionVars::default() };
+            h.execute(stmt, vec![], latest, String::new()).is_ok()
         });
         wait_until("the re-snapshot to wait for the lock", || !chunk_waiting(&mut up).is_empty());
         // stop the engine: the source, once its chunk query fails, sees the

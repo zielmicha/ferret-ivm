@@ -321,9 +321,9 @@ While a table's snapshot is incomplete:
   the upstream ever had.
 - **`AS OF AT LEAST LSN`** reads wait as well: the source's LSN frontier does
   not advance until all of its tables are complete.
-- **`read_mode = latest`** and **`AS OF <gsn>`** reads do not wait and see the
-  partial contents: the rows copied so far, and the rows the stream
-  changed since the table's copy started.
+- **`read_mode = latest`** reads do not wait and see the partial contents:
+  the rows copied so far, and the rows the stream changed since the table's
+  copy started.
 - Materialized views over the table are maintained throughout; they show the
   partial contents too.
 

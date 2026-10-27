@@ -21,7 +21,7 @@ relying on a feature.
 | [Sinks](user-guide/sinks.md) | writing views back to PostgreSQL: `CREATE SINK`, exactly-once delivery across reconnects and restarts, target-table requirements |
 | [Introspection](user-guide/introspection.md) | `EXPLAIN PLAN`/`DATAFLOW`/`MAINTENANCE`, `SHOW`, the `ivm.*` relations, `pg_catalog` and `information_schema`, `psql` `\d` support |
 | [Temporal filters and errors](user-guide/temporal-filters-and-errors.md) | `now()` in maintained views and the logical clock; expression errors as data |
-| [Operations](user-guide/operations.md) | tuning, the data directory and `LOCK`, recovery and broken objects, checkpoints, retention, durability, what is safe to delete, backups, replication-slot cleanup, monitoring |
+| [Operations](user-guide/operations.md) | tuning, the data directory and `LOCK`, recovery and broken objects, checkpoints, space reclamation, durability, what is safe to delete, backups, replication-slot cleanup, monitoring |
 | [Troubleshooting and limitations](user-guide/troubleshooting.md) | common problems and their causes, limitations and differences from PostgreSQL, known problems with workarounds |
 | [Web UI](web-ui.md) | the inspection UI (`--http-listen`): enabling it, authentication, every screen, the JSON API |
 
@@ -41,7 +41,7 @@ relying on a feature.
 |---|---|
 | [Architecture](internals/architecture.md) | design map, threads and message flow, group commit and acknowledgements, the GSN clock and frontiers, the logical clock |
 | [Dataflow](internals/dataflow.md) | Z-sets and consolidation, the operator graph, hash-consing and reference counting, arrangements, every operator, hydration, errors |
-| [Storage](internals/storage.md) | copy-on-write MVCC B+trees, (GSN, weight) histories, summaries and range aggregates, the buffer pool, checkpoints, garbage collection |
+| [Storage](internals/storage.md) | copy-on-write B+trees of weighted entries, summaries and range aggregates, the buffer pool, checkpoints, garbage collection |
 | [Planner](internals/planner.md) | parsing, binding, decorrelation, optimization, lowering to dataflow, delta-join planning, batch execution |
 | [Recovery and snapshots](internals/recovery.md) | the recovery protocol, matching checkpointed indexes by structural fingerprint, source resumption, the DBLog snapshot algorithm as implemented |
 

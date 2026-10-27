@@ -300,7 +300,7 @@ fn schedule(layout: &Layout, now: i64, row: &[Datum], w: i64, (lo, hi): (i64, i6
     Ok(now >= lo)
 }
 
-pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
+pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &NodeDelta, _gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let now = g.now;
     let ev = g.arr(p.events);
     let layout = ev.layout.clone();
@@ -310,14 +310,13 @@ pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &NodeDelta, gsn: 
     let mut ups: Vec<(Vec<u8>, i64)> = Vec::new();
     let flush = |env: &mut Env, ups: &mut Vec<(Vec<u8>, i64)>, all: bool| {
         if ups.len() >= super::ops::BATCH_ROWS * 16 || (all && !ups.is_empty()) {
-            env.apply(tree, ups, gsn)?;
+            env.apply(tree, ups)?;
         }
         Ok::<(), SqlError>(())
     };
     // Events that are due: those up to now, after the clock of the previous
     // step (it released everything up to it, and events are only ever
-    // scheduled after the clock). Released events stay behind as entries of
-    // weight zero until they are compacted away; they are never visited.
+    // scheduled after the clock). Released events leave the tree.
     let after = |t: i64| crate::types::encoding::prefix_successor(&layout.encode_prefix(&[Datum::Int8(t)]));
     let lo = match g.released_through {
         None => Some(Bound::Unbounded),
@@ -334,12 +333,8 @@ pub fn step(g: &Graph, env: &mut Env, p: &TemporalPlan, delta: &NodeDelta, gsn: 
         // (nothing can be due)
         None => env.cursor(tree, Bound::Excluded(&[]), Bound::Included(&[])),
     };
-    while let Some((k, h)) = env.cursor_next(&mut c)? {
+    while let Some((k, w)) = env.cursor_next(&mut c)? {
         visited(1);
-        let w = h.total();
-        if w == 0 {
-            continue;
-        }
         let r = layout.decode_row(&k)?;
         let sign = if matches!(r[1], Datum::Int2(0)) { 1 } else { -1 };
         out.push(env, r[2..].to_vec(), sign * w)?;
@@ -383,13 +378,13 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &TemporalPlan, input: Delta, out: &
 
 /// Build the pending events of a new operator from the contents of its
 /// input node (streamed, the events sorted in bounded memory).
-pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: NodeId, gsn: Gsn) -> Result<()> {
+pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: NodeId) -> Result<()> {
     if g.arr(p.events).hydrated {
         return Ok(());
     }
     let ev = g.arr(p.events);
     let layout = ev.layout.clone();
-    let mut events = crate::storage::TreeBuilder::new(env, ev.tree, gsn);
+    let mut events = crate::storage::TreeBuilder::new(env, ev.tree);
     let now = g.now;
     let r = super::ops::snapshot_stream(g, env, input, &mut |env, batch| {
         let mut ups = Vec::new();
@@ -410,7 +405,7 @@ pub fn hydrate(g: &mut Graph, env: &mut Env, p: &TemporalPlan, input: NodeId, gs
             return Err(e);
         }
     }
-    g.set_arr_hydrated(p.events, true, gsn);
+    g.set_arr_hydrated(p.events, true);
     Ok(())
 }
 

@@ -62,7 +62,7 @@ SELECT [ ALL | DISTINCT | DISTINCT ON ( expr [ , ... ] ) ] select_list
   [ ORDER BY expr [ ASC | DESC ] [ NULLS { FIRST | LAST } ] [ , ... ] ]
   [ LIMIT { count | ALL } ] [ OFFSET start [ ROW | ROWS ] ]
   [ FETCH { FIRST | NEXT } [ count ] { ROW | ROWS } { ONLY | WITH TIES } ]
-  [ AS OF { gsn | FRESH | LATEST | AT LEAST LSN 'X/Y' } ]
+  [ AS OF { FRESH | AT LEAST LSN 'X/Y' } ]
 
 grouping_element: expr | ( ) | GROUPING SETS ( ... ) | ROLLUP ( ... ) | CUBE ( ... )
 
@@ -73,7 +73,8 @@ VALUES ( expr [ , ... ] ) [ , ... ]
 `OFFSET` goes with either.
 
 Details: [Queries](queries.md). `AS OF` only at the very end of a top-level
-statement ([Reads](../user-guide/reads.md#syntax)).
+statement ([Reads](../user-guide/reads.md#syntax)); there is no time travel
+(`AS OF <gsn>` and `AS OF LATEST` fail with `0A000`).
 
 ### Tables and DML
 
@@ -129,13 +130,12 @@ than `CASCADE` are ignored.
 ```sql
 SUBSCRIBE [ TO ] { name | ( query ) }
     [ WITH ( { SNAPSHOT | PROGRESS } [ [ = ] value ] [ , ... ] ) ]
-    [ AS OF gsn ]
 
 COPY ( SUBSCRIBE ... ) TO STDOUT
 ```
 
-`AS OF` is accepted but ignored: a subscription always starts at the last
-applied GSN.
+A subscription always starts at the last applied GSN (`AS OF` fails with
+`0A000`).
 
 ### Introspection and control
 
@@ -178,7 +178,7 @@ detail and hint. The engine's own errors use these SQLSTATEs most often:
 | `21000` | more than one row returned by a scalar subquery |
 | `23505`, `23502` | unique (primary key) / not-null violation |
 | `54001` | statement too complex (`stack depth limit exceeded`: expressions nested too deeply) |
-| `55000` | object not in prerequisite state (e.g. a broken materialized view, `AS OF` before the retention frontier or before the history of a relation, `AS OF AT LEAST LSN` without sources, a published table without a key) |
+| `55000` | object not in prerequisite state (e.g. a broken materialized view, `AS OF AT LEAST LSN` without sources, a published table without a key) |
 | `55006` | data directory in use |
 | `57014` | query canceled (`SUBSCRIBE`, a waiting read or queued DML cancelled) |
 | `57P01` | engine shutting down |

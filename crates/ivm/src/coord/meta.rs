@@ -1,7 +1,6 @@
 //! Durable metadata: the catalog and its DDL history, the dataflow's error
-//! state, source states and resume LSNs, the clock's recent ticks, the map
-//! from arrangement fingerprints to trees (and the GSN each tree's history
-//! starts at), and pending slot drops.
+//! state, source states and resume LSNs, the clock's last tick, the map
+//! from arrangement fingerprints to trees, and pending slot drops.
 //!
 //! They live in a storage tree of their own, the *metadata tree*, as
 //! entries of a weighted multiset like an arrangement's: a record is one
@@ -14,8 +13,7 @@
 //! The in-memory structures (`Catalog`, `Engine::source_states`, the
 //! graph's error records, ...) stay authoritative while the engine runs;
 //! `Engine::persist_meta` writes what changed since its previous call: after
-//! every DDL or schema record (at its GSN, so that the tree holds the
-//! catalog as of every GSN of the retention window) and at every checkpoint.
+//! every DDL or schema record and at every checkpoint.
 //! Recovery reads the tree back (`load`).
 //!
 //! The data directory's format version is in its `FORMAT` file
@@ -53,13 +51,15 @@ const T_HISTORY: u8 = 3;
 const T_SOURCE_STATE: u8 = 4;
 /// `u64 BE source` → resume LSN (`uvarint`)
 const T_SOURCE_LSN: u8 = 5;
-/// `bytes fingerprint` → `uvarint tree`, `uvarint since`
-const T_ARRANGEMENT: u8 = 6;
+/// `bytes fingerprint` → `uvarint tree`, `uvarint since` (written by earlier
+/// versions; read, the `since` ignored, and replaced by tag 13)
+const T_ARRANGEMENT_SINCE: u8 = 6;
 /// `bytes fingerprint`, `str sqlstate`, `str message`, weighted by the count
 const T_NODE_ERROR: u8 = 7;
 /// `bytes fingerprint`, `bytes group key`, `str sqlstate`, `str message`
 const T_GROUP_ERROR: u8 = 8;
-/// `u64 BE gsn` → clock (`ivarint`)
+/// `u64 BE gsn` → clock (`ivarint`): the last tick (earlier versions kept
+/// the ticks of their retention window)
 const T_TICK: u8 = 9;
 /// `str conninfo`, `str slot`
 const T_SLOT_DROP: u8 = 10;
@@ -68,6 +68,8 @@ const T_GROUPS_KNOWN: u8 = 11;
 /// `u64 BE source`, `u64 BE table` → the table's `SnapState` in the
 /// source's state (JSON)
 const T_SOURCE_TABLE: u8 = 12;
+/// `bytes fingerprint` → `uvarint tree`
+const T_ARRANGEMENT: u8 = 13;
 
 const F_NEXT_ID: u8 = 1;
 const F_INSTANCE_ID: u8 = 2;
@@ -93,11 +95,8 @@ pub(crate) struct AppState {
     /// Error records of arranged dataflow nodes (absent in older checkpoints).
     #[serde(default)]
     pub errors: ErrorState,
-    /// GSN from which each tree's history is complete (by fingerprint).
-    #[serde(default)]
-    pub arr_since: Vec<(Vec<u8>, Gsn)>,
-    /// Recent (gsn, clock) ticks, for now() in reads as of earlier GSNs
-    /// (absent in older checkpoints).
+    /// Recent (gsn, clock) ticks, oldest first (absent in older
+    /// checkpoints): the last one is the clock's.
     #[serde(default)]
     pub ticks: Vec<(Gsn, i64)>,
     /// Replication slots of dropped sources still to be dropped.
@@ -112,12 +111,10 @@ pub(crate) struct Meta {
     /// The metadata tree (created by the first `persist_meta`).
     pub tree: Option<TreeId>,
     /// Every entry of the records kept whole (catalog scalars, source
-    /// states and LSNs, arrangements, slot drops), by key.
+    /// states and LSNs, arrangements, the last tick, slot drops), by key.
     keyed: BTreeMap<Vec<u8>, Vec<u8>>,
     /// GSNs of the first and last history entries (0: none).
     history: (Gsn, Gsn),
-    /// GSNs of the first and last ticks (0: none).
-    ticks: (Gsn, Gsn),
     /// The tree does not hold the catalog's objects yet: write them all.
     all_objects: bool,
     /// The arrangement and source-state records are to be brought up to
@@ -165,11 +162,8 @@ fn error_entry(k: &ErrorKey) -> Vec<u8> {
 
 /// Retract every entry of `tree` in `[lo, hi)`.
 fn retract_range(env: &mut Env, tree: TreeId, lo: &[u8], hi: &[u8], ups: &mut Vec<(Vec<u8>, i64)>) -> Result<()> {
-    env.for_each(tree, Bound::Included(lo), Bound::Excluded(hi), &mut |k, h| {
-        let w = h.total();
-        if w != 0 {
-            ups.push((k.to_vec(), -w));
-        }
+    env.for_each(tree, Bound::Included(lo), Bound::Excluded(hi), &mut |k, w| {
+        ups.push((k.to_vec(), -w));
         Ok(true)
     })
 }
@@ -242,19 +236,16 @@ fn source_table_key(source: ObjectId, table: ObjectId) -> Vec<u8> {
     k
 }
 
-/// The key of an arrangement's record (tag 6).
+/// The key of an arrangement's record (tag 13).
 fn arrangement_key(fp: &[u8]) -> Vec<u8> {
     let mut k = vec![T_ARRANGEMENT];
     put_bytes(&mut k, fp);
     k
 }
 
-/// An arrangement's record: its tree and `since`.
-fn arrangement_entry(fp: &[u8], tree: TreeId, since: Gsn) -> Vec<u8> {
-    entry(arrangement_key(fp), |e| {
-        put_uvarint(e, tree);
-        put_uvarint(e, since);
-    })
+/// An arrangement's record: its tree.
+fn arrangement_entry(fp: &[u8], tree: TreeId) -> Vec<u8> {
+    entry(arrangement_key(fp), |e| put_uvarint(e, tree))
 }
 
 impl Engine {
@@ -271,8 +262,8 @@ impl Engine {
     }
 
     /// Write the metadata that changed since the previous call into the
-    /// metadata tree, at `gsn` (the last applied GSN).
-    pub(crate) fn persist_meta(&mut self, gsn: Gsn) -> Result<()> {
+    /// metadata tree.
+    pub(crate) fn persist_meta(&mut self) -> Result<()> {
         let tree = self.meta_tree();
         let mut ups: Vec<(Vec<u8>, i64)> = Vec::new();
         // catalog objects: the stored entry of each changed one (whatever
@@ -283,11 +274,8 @@ impl Engine {
         }
         for id in changed {
             let key = u64_key(T_OBJECT, id);
-            self.env.for_each_prefix(tree, &key, &mut |k, h| {
-                let w = h.total();
-                if w != 0 {
-                    ups.push((k.to_vec(), -w));
-                }
+            self.env.for_each_prefix(tree, &key, &mut |k, w| {
+                ups.push((k.to_vec(), -w));
                 Ok(true)
             })?;
             if let Some(o) = self.catalog.get(id) {
@@ -314,16 +302,13 @@ impl Engine {
             retract_range(&mut self.env, tree, &u64_key(T_HISTORY, first), &u64_key(T_HISTORY, front), &mut ups)?;
         }
         self.meta.history = (hist.first().map(|h| h.0).unwrap_or(0), hist.last().map(|h| h.0).unwrap_or(0));
-        // the same for the clock's ticks
-        let (first, last) = self.meta.ticks;
-        for (g, clock) in self.ticks.iter().rev().take_while(|(g, _)| *g > last) {
-            ups.push((entry(u64_key(T_TICK, *g), |e| put_ivarint(e, *clock)), 1));
+        // the clock: its last tick (none before the first)
+        let mut ticks = BTreeMap::new();
+        if self.clock_gsn != 0 {
+            let k = u64_key(T_TICK, self.clock_gsn);
+            ticks.insert(k.clone(), entry(k, |e| put_ivarint(e, self.clock)));
         }
-        let front = self.ticks.front().map(|t| t.0).unwrap_or(Gsn::MAX);
-        if first != 0 && first < front {
-            retract_range(&mut self.env, tree, &u64_key(T_TICK, first), &u64_key(T_TICK, front), &mut ups)?;
-        }
-        self.meta.ticks = (self.ticks.front().map(|t| t.0).unwrap_or(0), self.ticks.back().map(|t| t.0).unwrap_or(0));
+        self.meta.sync_keyed(T_TICK, ticks, &mut ups);
         // sources: their states' heads, and the entries of their tables
         // that changed (`Engine::source_changed`)
         let keyed = |tag: u8, id: u64, value: &dyn Fn(&mut Vec<u8>)| {
@@ -367,20 +352,16 @@ impl Engine {
         }
         let lsns = self.source_lsns.iter().map(|(id, l)| keyed(T_SOURCE_LSN, *id, &|e| put_uvarint(e, *l))).collect();
         self.meta.sync_keyed(T_SOURCE_LSN, lsns, &mut ups);
-        // arrangements: those that changed (all of them at first)
+        // arrangements: those that changed (all of them at first, replacing
+        // the records of earlier versions, which carried a `since`)
         let changes = self.graph.take_arrangement_changes();
         if std::mem::take(&mut self.meta.all_arrangements) {
-            let since = self.graph.arrangement_since();
-            let arrs = self
-                .graph
-                .arrangement_trees()
-                .into_iter()
-                .map(|(fp, t)| (arrangement_key(&fp), arrangement_entry(&fp, t, since.get(&fp).copied().unwrap_or(0))))
-                .collect();
+            let arrs = self.graph.arrangement_trees().into_iter().map(|(fp, t)| (arrangement_key(&fp), arrangement_entry(&fp, t))).collect();
             self.meta.sync_keyed(T_ARRANGEMENT, arrs, &mut ups);
+            self.meta.sync_keyed(T_ARRANGEMENT_SINCE, BTreeMap::new(), &mut ups);
         } else {
             for (fp, rec) in changes {
-                let e = rec.map(|(t, since)| arrangement_entry(&fp, t, since));
+                let e = rec.map(|t| arrangement_entry(&fp, t));
                 self.meta.sync_one(arrangement_key(&fp), e, &mut ups);
             }
         }
@@ -402,7 +383,7 @@ impl Engine {
         for (k, w) in self.graph.take_error_changes() {
             ups.push((error_entry(&k), w));
         }
-        self.env.apply(tree, &mut ups, gsn)
+        self.env.apply(tree, &mut ups)
     }
 }
 
@@ -439,11 +420,8 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
     let next_req = get_uvarint(b)?;
     env.attach_tree(tree, Arc::new(CountSummarizer))?;
     let mut entries = Vec::new();
-    env.for_each(tree, Bound::Unbounded, Bound::Unbounded, &mut |k, h| {
-        let w = h.total();
-        if w != 0 {
-            entries.push((k.to_vec(), w));
-        }
+    env.for_each(tree, Bound::Unbounded, Bound::Unbounded, &mut |k, w| {
+        entries.push((k.to_vec(), w));
         Ok(true)
     })?;
     let mut st = AppState { next_req, ..Default::default() };
@@ -512,11 +490,14 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
                 st.source_lsns.push((id, get_uvarint(&mut b)?));
                 Some(9)
             }
-            T_ARRANGEMENT => {
+            T_ARRANGEMENT | T_ARRANGEMENT_SINCE => {
                 let fp = get_bytes(&mut b)?.to_vec();
                 let n = e.len() - b.len();
-                st.trees.push((fp.clone(), get_uvarint(&mut b)?));
-                st.arr_since.push((fp, get_uvarint(&mut b)?));
+                st.trees.push((fp, get_uvarint(&mut b)?));
+                if tag == T_ARRANGEMENT_SINCE {
+                    // (the GSN the tree's history started at: none is kept)
+                    get_uvarint(&mut b)?;
+                }
                 Some(n)
             }
             T_NODE_ERROR => {
@@ -538,7 +519,7 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
             }
             T_TICK => {
                 st.ticks.push((be64(&mut b)?, get_ivarint(&mut b)?));
-                None
+                Some(9)
             }
             T_SLOT_DROP => {
                 let conninfo = get_str(&mut b)?.to_string();
@@ -561,10 +542,10 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
     st.source_states = sources.into_iter().map(|(id, s)| (id, s.to_json())).collect();
     // (the first write after recovery brings these up to date as a whole)
     (meta.all_arrangements, meta.all_sources) = (true, true);
+    // (the clock is the last tick's: earlier versions kept more)
     st.clock = st.ticks.last().map(|t| t.1).unwrap_or(0);
     st.errors = ErrorState { nodes: node_errors.into_iter().collect(), operators: group_errors.into_iter().collect(), known };
     meta.history = (st.catalog.history.first().map(|h| h.0).unwrap_or(0), st.catalog.history.last().map(|h| h.0).unwrap_or(0));
-    meta.ticks = (st.ticks.first().map(|t| t.0).unwrap_or(0), st.ticks.last().map(|t| t.0).unwrap_or(0));
     Ok((st, meta))
 }
 
@@ -643,6 +624,6 @@ pub fn edit_stored_catalog(data_dir: &Path, f: impl FnOnce(&mut BTreeMap<ObjectI
         let json = serde_json::to_vec(o).map_err(|e| SqlError::internal(e.to_string()))?;
         ups.push((entry(u64_key(T_OBJECT, *id), |e| e.extend_from_slice(&json)), 1));
     }
-    env.apply(tree, &mut ups, rec.gsn)?;
+    env.apply(tree, &mut ups)?;
     env.checkpoint(rec.gsn, &encode_header(&meta, st.next_req))
 }

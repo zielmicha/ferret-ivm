@@ -215,13 +215,12 @@ fn indexes_follow_upstream_schema_changes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// now() in a read AS OF an earlier GSN is the logical clock of that GSN,
-/// also after a restart: the checkpoint keeps the clock ticks of the
-/// retention window (a restart used to answer every earlier GSN with the
-/// checkpoint's clock).
+/// now() in a read is the logical clock: the last logged tick, also after
+/// a restart, from the checkpoint (which keeps that tick) or from the log
+/// replayed after it.
 #[test]
-fn now_as_of_earlier_gsns_after_a_restart() {
-    let dir = tmpdir("now-as-of");
+fn now_is_the_last_tick_after_a_restart() {
+    let dir = tmpdir("now-restart");
     let e = Engine::start(&dir);
     let tick = |e: &Engine, secs: i64| {
         let base = 1_767_225_600_000_000i64; // 2026-01-01T00:00:00Z in Unix microseconds
@@ -230,21 +229,18 @@ fn now_as_of_earlier_gsns_after_a_restart() {
     e.exec("CREATE TABLE t (id int PRIMARY KEY)");
     tick(&e, 10);
     e.exec("INSERT INTO t VALUES (1)");
-    let g1: u64 = e.rows("SHOW GSN")[0].parse().unwrap();
     tick(&e, 20);
-    e.exec("INSERT INTO t VALUES (2)");
-    let g2: u64 = e.rows("SHOW GSN")[0].parse().unwrap();
-    tick(&e, 30);
-    let reads = |e: &Engine| {
-        [g1, g2].map(|g| e.rows(&format!("SELECT now(), count(*) FROM t AS OF {g}"))[0].clone())
-    };
-    let want = ["2026-01-01 00:00:10+00|1", "2026-01-01 00:00:20+00|2"];
-    assert_eq!(reads(&e), want);
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:20+00|1"]);
     e.exec("CHECKPOINT");
     e.shutdown();
     let e = Engine::start(&dir);
-    assert_eq!(reads(&e), want);
-    assert_eq!(e.rows("SELECT now()"), ["2026-01-01 00:00:30+00"]);
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:20+00|1"]);
+    tick(&e, 30);
+    e.exec("INSERT INTO t VALUES (2)");
+    // (replayed from the log after the restart's checkpoint)
+    e.running.crash();
+    let e = Engine::start(&dir);
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:30+00|2"]);
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -433,13 +429,11 @@ fn check_format1(e: &Engine, app: &serde_json::Value) {
     let drops: Vec<(String, String)> = e.h.shared.slot_drops.lock().iter().map(|d| (d.conninfo.clone(), d.slot.clone())).collect();
     assert_eq!(drops, [(s(&app["slot_drops"][0]["conninfo"]), "fixture_src2".to_string())]);
     assert_eq!(e.rows("SELECT * FROM up ORDER BY id"), ["1|a", "2|b", "3|c"]);
-    // the clock as of earlier GSNs (as the format-1 engine answered), and
-    // histories: ti's starts at its creation (GSN 9), so the read as of
-    // GSN 8 does not use it
-    assert_eq!(e.rows("SELECT now(), count(*) FROM t AS OF 21"), ["2026-10-25 23:18:50.490978+00|4"]);
-    assert_eq!(e.rows("SELECT now()"), ["2026-10-25 23:18:55.673051+00"]);
-    assert_eq!(e.rows("SELECT v FROM t WHERE id = 2 AS OF 21"), ["20"]);
-    assert_eq!(e.rows("SELECT id FROM t WHERE v = '20' AS OF 8"), ["2"]);
+    // the clock (its last tick), and the rows (the index's histories
+    // collapsed to their current weights)
+    assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-10-25 23:18:55.673051+00|4"]);
+    assert_eq!(e.rows("SELECT v FROM t WHERE id = 2"), ["30"]);
+    assert_eq!(e.rows("SELECT id FROM t WHERE v = '20'"), Vec::<String>::new());
     assert_eq!(e.rows("SELECT id FROM t WHERE v = '30'"), ["2"]);
 }
 
@@ -451,8 +445,8 @@ fn checkpoint_state(dir: &Path) -> Vec<u8> {
 /// A data directory of format 1 opens, and is migrated at its first start:
 /// everything it held is kept (catalog, DDL history, error records of views
 /// and aggregation groups, source states and resume LSNs, pending slot
-/// drops, clock ticks, the histories of indexes), and from then on its
-/// checkpoints carry a small header naming the metadata tree.
+/// drops, the clock, the indexes' rows), and from then on its checkpoints
+/// carry a small header naming the metadata tree.
 #[test]
 fn format1_data_directories_are_migrated() {
     let app = format1_state("format1-state");
@@ -513,6 +507,113 @@ fn a_crash_during_migration_migrates_again() {
     check_format1(&e, &app);
     e.shutdown();
     assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A data directory written by the version before this one, which kept
+/// every entry's history of (GSN, weight) changes for `AS OF` reads:
+/// format 2 as now, but with leaves of histories (kind 1), internal nodes
+/// with compaction states (kind 3), arrangement records with the GSN their
+/// history starts at (tag 6), the clock ticks of the retention window
+/// (tag 9) and checkpoint records whose tree space has compaction states.
+/// perf-integration (58e8ea2), `ivm --retention-gsns 1000000 --tick-ms 200
+/// --checkpoint-secs 100000 --no-sync`, ran
+///
+/// ```sql
+/// CREATE TABLE t (id int PRIMARY KEY, v text);
+/// INSERT INTO t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
+/// CREATE MATERIALIZED VIEW m AS SELECT id, v FROM t WHERE id < 50;
+/// CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n, sum(id) AS s, max(v) AS mx FROM t;
+/// UPDATE t SET v = 'w' || id WHERE id % 3 = 0;
+/// DELETE FROM t WHERE id % 5 = 0;
+/// CREATE INDEX tv ON t (v);
+/// UPDATE t SET v = 'x' WHERE id = 7;
+/// DELETE FROM t WHERE id BETWEEN 900 AND 1000;
+/// ```
+///
+/// and stopped on SIGTERM (a final checkpoint, which kept every change).
+const FORMAT2_HISTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/format2-history");
+
+/// How many node frames of each kind the store's segment files hold.
+fn node_kinds(dir: &Path) -> std::collections::BTreeMap<u8, usize> {
+    let mut kinds = std::collections::BTreeMap::new();
+    for e in std::fs::read_dir(dir.join("store")).unwrap() {
+        let path = e.unwrap().path();
+        if !path.file_name().unwrap().to_string_lossy().starts_with("seg-") {
+            continue;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let mut pos = 0;
+        while pos + 8 < data.len() {
+            let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            *kinds.entry(data[pos + 8]).or_default() += 1;
+            pos += 8 + len;
+        }
+    }
+    kinds
+}
+
+/// The tags of the metadata tree's entries in a stopped engine's data
+/// directory, in key order.
+fn metadata_tags(dir: &Path) -> Vec<u8> {
+    let (mut env, rec) = ivm::storage::Env::open(&dir.join("store"), Default::default()).unwrap();
+    let app = rec.expect("a checkpoint").app;
+    let b = &mut &app[..];
+    assert_eq!(ivm::types::codec::get_uvarint(b).unwrap(), 2, "format of the checkpoint header");
+    let tree = ivm::types::codec::get_uvarint(b).unwrap();
+    env.attach_tree(tree, std::sync::Arc::new(ivm::storage::CountSummarizer)).unwrap();
+    let mut tags = Vec::new();
+    env.for_each(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, _| {
+        tags.push(k[0]);
+        Ok(true)
+    })
+    .unwrap();
+    tags
+}
+
+/// A data directory written by the version that kept histories opens as
+/// it is: each entry's weight is its history's sum (the versions of rows
+/// updated or deleted, kept for reads of earlier GSNs, are gone), the
+/// arrangements are found by fingerprint (the table's index exists nowhere
+/// else), the clock is the last tick. Its metadata records are rewritten
+/// at the first checkpoint (arrangement records without the start of their
+/// history, one tick), and the nodes that change are written in the current
+/// formats.
+#[test]
+fn data_directories_with_histories_open() {
+    let dir = tmpdir("format2-history");
+    copy_dir(Path::new(FORMAT2_HISTORY), &dir);
+    let kinds = node_kinds(&dir);
+    assert!(kinds.contains_key(&1) && kinds.contains_key(&3) && !kinds.contains_key(&4), "the fixture's node kinds: {kinds:?}");
+    let tags = metadata_tags(&dir);
+    assert!(tags.contains(&6) && !tags.contains(&13) && tags.iter().filter(|t| **t == 9).count() > 1, "the fixture's metadata: {tags:?}");
+    let e = Engine::start(&dir);
+    let check = |e: &Engine| {
+        assert_eq!(e.rows("SELECT count(*), sum(id) FROM t"), ["720|324000"]);
+        assert_eq!(e.rows("SELECT * FROM c"), ["720|324000|x"]);
+        assert_eq!(e.rows("SELECT * FROM m WHERE id < 10 ORDER BY id"), ["1|v1", "2|v2", "3|w3", "4|v4", "6|w6", "7|x", "8|v8", "9|w9"]);
+        assert_eq!(e.rows("SELECT id FROM t WHERE v = 'w9'"), ["9"]);
+        assert_eq!(e.rows("SELECT id FROM t WHERE v = 'v9'"), Vec::<String>::new());
+    };
+    check(&e);
+    // (the last tick before the final checkpoint)
+    assert_eq!(e.rows("SELECT now()"), ["2026-10-27 12:44:48.443173+00"]);
+    e.shutdown();
+    assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
+    let tags = metadata_tags(&dir);
+    assert!(!tags.contains(&6) && tags.contains(&13) && tags.iter().filter(|t| **t == 9).count() == 1, "metadata after the first checkpoint: {tags:?}");
+    let e = Engine::start(&dir);
+    check(&e);
+    // every leaf of t changes
+    e.exec("UPDATE t SET v = v || '!' WHERE id % 2 = 0");
+    assert_eq!(e.rows("SELECT count(*) FROM t WHERE v LIKE '%!'"), ["360"]);
+    assert_eq!(e.rows("SELECT * FROM c"), ["720|324000|x"]);
+    e.shutdown();
+    let kinds = node_kinds(&dir);
+    assert!(kinds.contains_key(&4) && kinds.contains_key(&2), "node kinds written: {kinds:?}");
+    let e = Engine::start(&dir);
+    assert_eq!(e.rows("SELECT v FROM t WHERE id IN (2, 3) ORDER BY id"), ["v2!", "w3"]);
+    e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

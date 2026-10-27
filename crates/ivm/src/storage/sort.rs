@@ -9,7 +9,7 @@
 //! of the target is built once. Entries that arrive in key order (a buffer
 //! wholly after everything before it) go to the target directly.
 
-use super::{CountSummarizer, Env, Gsn, TreeId};
+use super::{CountSummarizer, Env, TreeId};
 use crate::error::Result;
 use crate::memory::{heap_block, Charge, Work};
 use std::cmp::Reverse;
@@ -27,7 +27,6 @@ fn entry_mem(key: &[u8]) -> usize {
 
 pub struct TreeBuilder {
     target: TreeId,
-    gsn: Gsn,
     buf: Vec<(Vec<u8>, i64)>,
     /// The buffer's memory, charged to the working memory.
     charge: Charge,
@@ -40,24 +39,24 @@ pub struct TreeBuilder {
 }
 
 impl TreeBuilder {
-    /// A builder adding entries to `target` at `gsn`. Its buffer is a
+    /// A builder adding entries to `target`. Its buffer is a
     /// buffer of the environment's working memory (`Work::buffer`, within
     /// 1 and 64 MiB), charged to it, and is sorted out as a run once it is
     /// full (`Work::full`).
-    pub fn new(env: &Env, target: TreeId, gsn: Gsn) -> TreeBuilder {
+    pub fn new(env: &Env, target: TreeId) -> TreeBuilder {
         let work = env.work().clone();
-        TreeBuilder::with_work(target, gsn, work.buffer(1 << 20, 64 << 20), FAN_IN, work)
+        TreeBuilder::with_work(target, work.buffer(1 << 20, 64 << 20), FAN_IN, work)
     }
 
     /// A builder with the given buffer size and number of runs merged at
     /// once, and working memory of its own.
-    pub fn with_limits(target: TreeId, gsn: Gsn, run_bytes: usize, fan_in: usize) -> TreeBuilder {
-        TreeBuilder::with_work(target, gsn, run_bytes, fan_in, Work::new(usize::MAX / 2))
+    pub fn with_limits(target: TreeId, run_bytes: usize, fan_in: usize) -> TreeBuilder {
+        TreeBuilder::with_work(target, run_bytes, fan_in, Work::new(usize::MAX / 2))
     }
 
-    fn with_work(target: TreeId, gsn: Gsn, run_bytes: usize, fan_in: usize, work: Work) -> TreeBuilder {
+    fn with_work(target: TreeId, run_bytes: usize, fan_in: usize, work: Work) -> TreeBuilder {
         let charge = work.charge();
-        TreeBuilder { target, gsn, buf: Vec::new(), charge, work, run_bytes, fan_in: fan_in.max(2), runs: Vec::new(), direct_max: None }
+        TreeBuilder { target, buf: Vec::new(), charge, work, run_bytes, fan_in: fan_in.max(2), runs: Vec::new(), direct_max: None }
     }
 
     pub fn push(&mut self, env: &mut Env, entry: Vec<u8>, w: i64) -> Result<()> {
@@ -83,11 +82,11 @@ impl TreeBuilder {
         let (Some((first, _)), Some((last, _))) = (buf.first(), buf.last()) else { return Ok(()) };
         if self.direct_max.as_ref().is_none_or(|m| first > m) {
             self.direct_max = Some(last.clone());
-            return env.apply(self.target, &mut buf, self.gsn);
+            return env.apply(self.target, &mut buf);
         }
         let run = env.create_temp_tree(Arc::new(CountSummarizer));
         self.runs.push(run);
-        env.apply(run, &mut buf, self.gsn)?;
+        env.apply(run, &mut buf)?;
         drop(held);
         if self.runs.len() >= 2 * self.fan_in {
             self.merge_oldest(env)?;
@@ -100,7 +99,7 @@ impl TreeBuilder {
         let merged = env.create_temp_tree(Arc::new(CountSummarizer));
         let old: Vec<TreeId> = self.runs.drain(..self.fan_in).collect();
         self.runs.push(merged);
-        merge(env, &old, merged, self.gsn, self.run_bytes / 4)?;
+        merge(env, &old, merged, self.run_bytes / 4)?;
         for t in old {
             env.drop_tree(t)?;
         }
@@ -117,7 +116,7 @@ impl TreeBuilder {
         while self.runs.len() > self.fan_in {
             self.merge_oldest(env)?;
         }
-        let r = merge(env, &self.runs, self.target, self.gsn, self.run_bytes / 4);
+        let r = merge(env, &self.runs, self.target, self.run_bytes / 4);
         self.abort(env)?;
         r
     }
@@ -133,26 +132,26 @@ impl TreeBuilder {
 
 /// Merge sorted runs into `into` in key order, adding up equal entries,
 /// in batches of about `batch_bytes`.
-fn merge(env: &mut Env, runs: &[TreeId], into: TreeId, gsn: Gsn, batch_bytes: usize) -> Result<()> {
+fn merge(env: &mut Env, runs: &[TreeId], into: TreeId, batch_bytes: usize) -> Result<()> {
     let mut cursors: Vec<_> = runs.iter().map(|t| env.cursor(*t, Bound::Unbounded, Bound::Unbounded)).collect();
     let mut heads = BinaryHeap::with_capacity(runs.len());
     for (i, c) in cursors.iter_mut().enumerate() {
-        if let Some((k, h)) = env.cursor_next(c)? {
-            heads.push(Reverse((k, i, h.total())));
+        if let Some((k, w)) = env.cursor_next(c)? {
+            heads.push(Reverse((k, i, w)));
         }
     }
     let mut batch: Vec<(Vec<u8>, i64)> = Vec::new();
     let mut bytes = 0;
     while let Some(Reverse((k, i, w))) = heads.pop() {
-        if let Some((nk, h)) = env.cursor_next(&mut cursors[i])? {
-            heads.push(Reverse((nk, i, h.total())));
+        if let Some((nk, nw)) = env.cursor_next(&mut cursors[i])? {
+            heads.push(Reverse((nk, i, nw)));
         }
         match batch.last_mut() {
             Some((last, lw)) if **last == *k => *lw += w,
             _ => {
                 // batches end between keys, so equal entries meet in one
                 if bytes >= batch_bytes {
-                    env.apply(into, &mut batch, gsn)?;
+                    env.apply(into, &mut batch)?;
                     bytes = 0;
                 }
                 bytes += entry_mem(&k);
@@ -160,5 +159,5 @@ fn merge(env: &mut Env, runs: &[TreeId], into: TreeId, gsn: Gsn, batch_bytes: us
             }
         }
     }
-    env.apply(into, &mut batch, gsn)
+    env.apply(into, &mut batch)
 }

@@ -1,4 +1,4 @@
-//! Reads: point-in-time SELECT (fresh / AS OF GSN / at least LSN),
+//! Reads: SELECT of the latest state (fresh, latest, at least an LSN),
 //! SUBSCRIBE, SHOW, EXPLAIN.
 
 use super::*;
@@ -10,7 +10,6 @@ use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, ShowKind, Statement, 
 use crate::sql::plan::Rel;
 use crate::sql::ParamSlot;
 use crate::sql_bail;
-use crate::storage::ReadAt;
 use crate::types::{ColumnType, Datum, Row, SqlType};
 use sqlparser::ast;
 
@@ -195,7 +194,7 @@ impl Engine {
         }
         match stmt {
             Statement::Select { query, as_of, .. } => self.select(query, as_of, params, vars, reply),
-            Statement::Subscribe { target, snapshot, progress, as_of: _, copy: _ } => self.subscribe(target, snapshot, progress, params, reply),
+            Statement::Subscribe { target, snapshot, progress, copy: _ } => self.subscribe(target, snapshot, progress, params, reply),
             Statement::Show(k) => self.show(k).map(Some),
             Statement::Explain { kind, target } => self.explain(kind, target, params).map(Some),
             Statement::Checkpoint => {
@@ -230,8 +229,8 @@ impl Engine {
         }
     }
 
-    /// Run a logical plan against current (or historical) state.
-    pub(crate) fn execute_rel(&mut self, rel: &Rel, at: ReadAt) -> Result<Rows> {
+    /// Run a logical plan against the current state.
+    pub(crate) fn execute_rel(&mut self, rel: &Rel) -> Result<Rows> {
         if self.reads_hydrating(rel) {
             // (the request is parked until the hydration is done)
             return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
@@ -241,21 +240,21 @@ impl Engine {
         }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default(), visited: 0 };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, objects: &objects, rec: Default::default(), visited: 0 };
         ctx.execute(rel)
     }
 
-    /// The result rows of a query at `at`, handed to `out` as they are found
+    /// The result rows of a query, handed to `out` as they are found
     /// (`exec::ExecCtx::run_query`; false from `out` ends the read). Returns
     /// the number of arrangement entries its scans visited.
-    pub(crate) fn read_query(&mut self, q: &crate::sql::BoundQuery, at: ReadAt, out: &mut dyn FnMut(Row) -> Result<bool>) -> Result<u64> {
+    pub(crate) fn read_query(&mut self, q: &crate::sql::BoundQuery, out: &mut dyn FnMut(Row) -> Result<bool>) -> Result<u64> {
         if self.reads_hydrating(&q.rel) {
             // (the request is parked until the hydration is done)
             return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
         }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default(), visited: 0 };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, objects: &objects, rec: Default::default(), visited: 0 };
         ctx.run_query(q, out)?;
         Ok(ctx.visited)
     }
@@ -340,8 +339,7 @@ impl Engine {
         // fresh reads wait for the initial snapshots of what they read
         let fresh = match &as_of {
             AsOf::Default => vars.read_mode != "latest",
-            AsOf::Fresh | AsOf::AtLeastLsn(_) => true,
-            AsOf::Gsn(_) | AsOf::Latest => false,
+            AsOf::Fresh | AsOf::AtLeastLsn(_) | AsOf::AtLeastGsn(_) => true,
         };
         if fresh && !self.loading_tables().is_empty() {
             let bq = crate::sql::plan_query(&self.catalog, &query, params.clone())?;
@@ -360,9 +358,9 @@ impl Engine {
                 return Ok(None);
             }
         }
+        // what the read waits for the engine to apply
         let target = match &as_of {
-            AsOf::Gsn(g) => *g,
-            AsOf::Latest => self.processed,
+            AsOf::AtLeastGsn(g) => *g,
             AsOf::Default if vars.read_mode == "latest" => self.processed,
             AsOf::Default | AsOf::Fresh => self.shared.durable(),
             AsOf::AtLeastLsn(l) => {
@@ -393,7 +391,7 @@ impl Engine {
             self.parked.push(Parked {
                 wait: Wait::Gsn(target),
                 req: Request::Execute {
-                    stmt: Box::new(Statement::Select { query, as_of: AsOf::Gsn(target), text: String::new() }),
+                    stmt: Box::new(Statement::Select { query, as_of: AsOf::AtLeastGsn(target), text: String::new() }),
                     params,
                     vars,
                     extra: String::new(),
@@ -402,34 +400,23 @@ impl Engine {
             });
             return Ok(None);
         }
-        let at = if target >= self.processed {
-            ReadAt::Latest
-        } else {
-            if target < self.env.frontier() {
-                sql_bail!(
-                    codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "AS OF {target} is before the retention frontier {}",
-                    self.env.frontier()
-                );
-            }
-            ReadAt::AsOf(target)
-        };
+        // (the latest state: at or after the target)
         let mut bq = crate::sql::plan_query(&self.catalog, &query, params)?;
         self.check_broken(&bq.rel)?;
         self.check_view_errors(&bq.rel)?;
-        // now() is the logical clock as of the read, so reads are repeatable
-        bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
+        // now() is the logical clock of the state read
+        bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock);
         // within a budget on the engine thread, or else off it; the rows go
         // to the session in chunks as they are found
         let mut res = ChunkedReply::kept(result_columns(&bq), reply, self.shared.mem.outputs.clone());
         // (without threads, no budget: there is nowhere else to go)
         let budget = self.handle.is_some().then_some(super::reader::INLINE_READ_ENTRIES);
         self.env.set_read_budget(budget);
-        let r = self.read_query(&bq, at, &mut |row| res.push(row));
+        let r = self.read_query(&bq, &mut |row| res.push(row));
         self.env.set_read_budget(None);
         match r {
             // (it sent nothing yet: it runs again there)
-            Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, at, vars, res.abandon())?,
+            Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, vars, res.abandon())?,
             // (parked, to run again once the relation is hydrated)
             Err(e) if e.code == super::hydrate::HYDRATING => return Err(e),
             r => res.finish(r.map(|_| ())),
@@ -829,7 +816,6 @@ impl Engine {
                     vec!["durable_gsn".into(), self.shared.durable().to_string()],
                     vec!["processed_gsn".into(), self.processed.to_string()],
                     vec!["checkpoint_gsn".into(), st.checkpoint_gsn.to_string()],
-                    vec!["retention_frontier".into(), self.env.frontier().to_string()],
                     vec!["cache_bytes".into(), st.mem_bytes.to_string()],
                     vec!["segments".into(), st.segments.len().to_string()],
                 ];
@@ -1056,11 +1042,9 @@ impl Engine {
         rows
     }
 
-    /// Average live entries per key prefix of an arrangement, sampled from
-    /// runs of entries starting at evenly spaced ranks of its weight (found
-    /// through the subtree counts, which skip entries retracted but not yet
-    /// compacted away without visiting them; within a run they are skipped
-    /// too).
+    /// Average entries (of positive weight) per key prefix of an
+    /// arrangement, sampled from runs of entries starting at evenly spaced
+    /// ranks of its weight (found through the subtree counts).
     fn estimate_fanout(&mut self, arr: ArrId) -> f64 {
         use std::ops::Bound;
         const RUNS: i64 = 16;
@@ -1080,9 +1064,9 @@ impl Engine {
             let Ok(Some((start, _, _))) = self.env.nth(tree, Bound::Unbounded, Bound::Unbounded, rank) else { continue };
             let (mut n, mut visited) = (0usize, 0usize);
             let mut last: Option<Vec<u8>> = None;
-            let _ = self.env.for_each(tree, Bound::Included(&start), Bound::Unbounded, &mut |k, h| {
+            let _ = self.env.for_each(tree, Bound::Included(&start), Bound::Unbounded, &mut |k, w| {
                 visited += 1;
-                if h.total() > 0
+                if w > 0
                     && let Ok(kb) = layout.key_bytes(k)
                 {
                     // entries with equal keys are adjacent

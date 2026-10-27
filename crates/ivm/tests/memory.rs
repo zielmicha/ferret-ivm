@@ -126,9 +126,10 @@ impl Summarizer for MaxKey {
     }
 }
 
-/// Build a tree of `n` entries (keys from `key`, with `versions` changes
-/// each), checkpoint it, reopen the store and load all of it with a cache
-/// large enough to hold it: returns (accounted bytes, allocated bytes).
+/// Build a tree of `n` entries (keys from `key`, inserted and deleted again
+/// in turn, `versions` changes each), checkpoint it, reopen the store and
+/// load all of it with a cache large enough to hold it: returns (accounted
+/// bytes, allocated bytes).
 fn loaded(name: &str, n: u64, versions: u64, opts: EnvOptions, summ: fn() -> Arc<dyn Summarizer>, key: fn(u64) -> Vec<u8>) -> (usize, usize) {
     let d = dir(name);
     let tree = {
@@ -138,7 +139,7 @@ fn loaded(name: &str, n: u64, versions: u64, opts: EnvOptions, summ: fn() -> Arc
             let mut i = 0;
             while i < n {
                 let mut ups: Vec<(Vec<u8>, i64)> = (i..(i + 50_000).min(n)).map(|j| (key(j), if g % 2 == 1 { 1 } else { -1 })).collect();
-                env.apply(t, &mut ups, g).unwrap();
+                env.apply(t, &mut ups).unwrap();
                 i += 50_000;
             }
         }
@@ -181,12 +182,19 @@ fn narrow_entries_are_accounted_at_their_size_in_memory() {
     assert_close("narrow entries", r);
 }
 
-/// Histories longer than two changes leave their entry for a heap block.
+/// An entry takes its key and weight in memory however often it changed:
+/// about 40 bytes for an 8-byte key, inserted and deleted again five times.
+/// (With histories, an entry took 56 bytes besides its key, and one of more
+/// than two changes a heap block for them too.)
 #[test]
-fn long_histories_are_accounted() {
+fn entries_take_their_size_however_often_they_changed() {
     let _shared = EXCLUSIVE.read().unwrap_or_else(|e| e.into_inner());
-    let r = loaded("history", 50_000, 5, big_cache(), || Arc::new(CountSummarizer), |i| i.to_be_bytes().to_vec());
-    assert_close("entries with five versions", r);
+    let n = 50_000;
+    for versions in [1, 5] {
+        let r = loaded(&format!("versions-{versions}"), n, versions, big_cache(), || Arc::new(CountSummarizer), |i| i.to_be_bytes().to_vec());
+        assert_close(&format!("entries with {versions} changes"), r);
+        assert!(r.0 <= 44 * n as usize, "{} bytes for {n} entries changed {versions} times", r.0);
+    }
 }
 
 /// Wide entries with wide summaries: 300-byte keys, and a MAX over them in
@@ -246,7 +254,7 @@ fn a_full_scan_stays_within_the_cache() {
         let mut i = 0;
         while i < n {
             let mut ups: Vec<(Vec<u8>, i64)> = (i..(i + 50_000).min(n)).map(|j| (key(j), 1)).collect();
-            env.apply(t, &mut ups, 1).unwrap();
+            env.apply(t, &mut ups).unwrap();
             env.checkpoint(1, b"").unwrap();
             i += 50_000;
         }
@@ -294,7 +302,7 @@ fn a_scan_keeps_the_working_set() {
         let mut i = 0;
         while i < n {
             let mut ups: Vec<(Vec<u8>, i64)> = (i..(i + 50_000).min(n)).map(|j| (key(j), 1)).collect();
-            env.apply(t, &mut ups, 1).unwrap();
+            env.apply(t, &mut ups).unwrap();
             env.checkpoint(1, b"").unwrap();
             i += 50_000;
         }

@@ -352,14 +352,12 @@ fn distinct_on_infinite_intervals() {
 /// current sizes of their inputs. When the sizes changed since the view was
 /// created, the re-planned joins look up other indexes, the view's
 /// arrangements no longer match the checkpointed ones and are hydrated
-/// afresh: their history is gone, so reads AS OF a GSN before the restart
-/// fail ("before the history of a relation it reads"; they used to return
-/// the hydrated state) instead of returning what the view held.
+/// afresh, from the current state: the view's contents are those of its
+/// query, as before the restart.
 #[test]
-#[ignore = "bug: recovery re-plans joins from current table sizes; changed plans re-hydrate views, whose AS OF history then starts at the restart"]
-fn as_of_history_survives_restart_after_table_sizes_change() {
-    let dir = tmpdir("replan-history");
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, retention_gsns: 100_000, ..Default::default() };
+fn views_replanned_at_restart_after_table_sizes_change() {
+    let dir = tmpdir("replan-sizes");
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
     let running = coord::start(cfg.clone()).unwrap();
     let h = running.handle.clone();
     exec(&h, "CREATE TABLE a (id int PRIMARY KEY, k1 int, k3 int)");
@@ -368,18 +366,19 @@ fn as_of_history_survives_restart_after_table_sizes_change() {
     exec(&h, "INSERT INTO a SELECT g, g % 3, g % 5 FROM generate_series(1, 10) g");
     exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(1, 5) g");
     exec(&h, "INSERT INTO c SELECT g, g % 4, g % 5 FROM generate_series(1, 50) g");
-    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT count(*) AS n FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3");
-    let gsn = rows(&h, "SHOW GSN")[0].clone();
-    let then = rows(&h, "SELECT * FROM v");
+    let q = "SELECT count(*) AS n FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
     // b grows, c shrinks: the join order flips
     exec(&h, "DELETE FROM c WHERE id > 3");
     exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(6, 200) g");
-    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then);
+    let now = rows(&h, q);
+    assert_eq!(rows(&h, "SELECT * FROM v"), now);
     running.shutdown();
     let running = coord::start(cfg).unwrap();
     let h = running.handle.clone();
-    assert_eq!(rows(&h, "SELECT * FROM v"), rows(&h, "SELECT count(*) FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3"));
-    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then, "view v AS OF {gsn} after the restart");
+    assert_eq!(rows(&h, "SELECT * FROM v"), now);
+    exec(&h, "DELETE FROM a WHERE id % 2 = 0");
+    assert_eq!(rows(&h, "SELECT * FROM v"), rows(&h, q));
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -644,8 +643,8 @@ fn replacing_a_view_leaves_subscriptions_to_its_twin_alone() {
 
 /// Reads that stop at their LIMIT — in the order of an arrangement that is
 /// the ORDER BY (also within an equality on a key prefix, under computed
-/// columns, and AS OF an earlier GSN), or keeping only the top rows of
-/// another order — return what sorting the whole result returns. The
+/// columns, and after deletes), or keeping only the top rows of another
+/// order — return what sorting the whole result returns. The
 /// reference queries order by `+ 0` expressions, which no arrangement is in.
 #[test]
 fn limited_reads_match_sorts() {
@@ -698,12 +697,11 @@ fn limited_reads_match_sorts() {
     assert_eq!(rows(&h, "SELECT id FROM t WHERE v LIKE 'v1%' LIMIT 5").len(), 5);
     assert_eq!(rows(&h, "SELECT * FROM t LIMIT 0"), Vec::<String>::new());
     assert_eq!(n, 64);
-    // as of an earlier GSN
-    let gsn: u64 = rows(&h, "SHOW GSN")[0].parse().unwrap();
+    // after deletes
     exec(&h, "DELETE FROM t WHERE id % 2 = 0");
-    let q = format!("SELECT id, g FROM t ORDER BY id LIMIT 6 AS OF {gsn}");
-    assert_eq!(rows(&h, &q), rows(&h, &slow(&q)));
-    assert_eq!(rows(&h, &q).len(), 6);
+    let q = "SELECT id, g FROM t ORDER BY id LIMIT 6";
+    assert_eq!(rows(&h, q), rows(&h, &slow(q)));
+    assert_eq!(rows(&h, q).len(), 6);
     assert_eq!(rows(&h, "SELECT id FROM t ORDER BY id LIMIT 2"), ["1", "3"]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -815,39 +813,22 @@ fn indexed_reads_match_scans() {
         );
     }
     assert!(n > 200, "the queries return rows ({n})");
-    // as of an earlier GSN
-    let gsn: u64 = rows(&h, "SHOW GSN")[0].parse().unwrap();
+    // after changes, and through an index built after them
     exec(&h, "DELETE FROM t WHERE id % 3 = 0");
     exec(&h, "UPDATE a SET region = 'moved' WHERE id % 4 = 0");
-    let old = check(
-        &format!("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25 AS OF {gsn}"),
-        &format!("SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25 AS OF {gsn}"),
-    );
-    assert_eq!(old, 21);
-    check("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25", "SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25");
-    // arrangements built after the GSN lack the history before it: AS OF
-    // reads use neither their key ranges nor their lookups
+    let changed = check("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25", "SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25");
+    assert_eq!(changed, 21);
     exec(&h, "DROP INDEX t_kind");
     exec(&h, "CREATE INDEX t_kind_a ON t (kind, a_id)");
     let mut m = 0;
     for k in [1, 2] {
+        m += check(&format!("SELECT id FROM t WHERE kind = 'k{k}'"), &format!("SELECT id FROM t WHERE kind || '' = 'k{k}'"));
         m += check(
-            &format!("SELECT id FROM t WHERE kind = 'k{k}' AS OF {gsn}"),
-            &format!("SELECT id FROM t WHERE kind || '' = 'k{k}' AS OF {gsn}"),
-        );
-        m += check(
-            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
-            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind || '' = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind = 'k' || a.id::text WHERE a.id = {k}"),
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind || '' = 'k' || a.id::text WHERE a.id = {k}"),
         );
     }
-    assert!(m > 100, "the AS OF queries return rows ({m})");
-    // a relation rebuilt after the GSN has no history before it
-    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW per_a AS SELECT a.id, a.region FROM a");
-    for q in [format!("SELECT region FROM per_a WHERE id = 5 AS OF {gsn}"), format!("SELECT id FROM per_a AS OF {gsn}")] {
-        let stmt = ivm::sql::parse_statement(&q).unwrap();
-        let err = h.execute(stmt, vec![], SessionVars::default(), String::new()).err().map(|e| e.message);
-        assert!(err.as_deref().is_some_and(|e| e.contains("before the history")), "{q}: {err:?}");
-    }
+    assert!(m > 60, "the queries after the changes return rows ({m})");
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

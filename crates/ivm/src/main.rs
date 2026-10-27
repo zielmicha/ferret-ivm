@@ -17,7 +17,7 @@ use std::time::Duration;
 fn usage() -> ! {
     eprintln!(
         "usage: ivm [--data-dir DIR] [--listen ADDR] [--password PW] [--memory-mb N]\n\
-         \x20          [--checkpoint-secs N] [--retention-gsns N] [--tick-ms N] [--no-sync]\n\
+         \x20          [--checkpoint-secs N] [--tick-ms N] [--no-sync]\n\
          \x20          [--http-listen ADDR]\n\
          \n\
          Incremental view maintenance engine speaking the PostgreSQL protocol.\n\
@@ -58,7 +58,10 @@ fn main() {
             "--password" => scfg.password = Some(val()),
             "--memory-mb" | "--cache-mb" => cfg.memory_bytes = val().parse::<usize>().unwrap_or_else(|_| usage()) << 20,
             "--checkpoint-secs" => cfg.checkpoint_interval = Duration::from_secs(val().parse().unwrap_or_else(|_| usage())),
-            "--retention-gsns" => cfg.retention_gsns = val().parse().unwrap_or_else(|_| usage()),
+            "--retention-gsns" => {
+                eprintln!("ivm: --retention-gsns was removed: the engine keeps no history (AS OF <gsn> reads are gone)");
+                std::process::exit(2);
+            }
             "--tick-ms" => {
                 let ms: u64 = val().parse().unwrap_or_else(|_| usage());
                 cfg.tick = if ms == 0 { None } else { Some(Duration::from_millis(ms)) };

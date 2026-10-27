@@ -99,7 +99,7 @@ yet applied), throughput (log records per second), ingest (row changes per
 second over all sources), dataflow output rows per second and how busy the
 operators keep the engine thread, the last checkpoint and records since,
 buffer-pool use against its capacity, process memory and CPU, the logical
-clock and the retention frontier, and disk use of the store and the log.
+clock, and disk use of the store and the log.
 
 Six charts cover the last 1, 5 or 20 minutes, one measure each:
 throughput (GSN/s), ingest per source, apply lag, replication lag per
@@ -287,7 +287,7 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
 {
   "version": "0.1.0",
   "stats": {
-    "processed_gsn": 1453, "durable_gsn": 1453, "retention_frontier": 453,
+    "processed_gsn": 1453, "durable_gsn": 1453,
     "checkpoint_gsn": 1431, "records_since_checkpoint": 22,
     "last_checkpoint_ms": 1792931627308.5, "clock_ms": 1792931628328.0,
     "cache_used_bytes": 32505856, "cache_capacity_bytes": 268435456, "dirty_bytes": 11953766,
@@ -299,7 +299,7 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
     "subscriptions": 1, "parked_reads": 0, "view_errors": 30
   },
   "config": {"data_dir": "ivm-data", "memory_bytes": 2147483648, "checkpoint_interval_secs": 10.0,
-             "retention_gsns": 1000, "sync": true, "tick_ms": 1000},
+             "sync": true, "tick_ms": 1000},
   "storage": {"trees": 26, "loaded_nodes": 1520, "dirty_nodes": 410, "segments": 1,
               "segment_bytes": 136314880, "live_bytes": 120586240},
   "counts": {"tables": 4, "views": 1, "materialized_views": 8, "indexes": 2, "sources": 1,

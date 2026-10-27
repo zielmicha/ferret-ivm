@@ -10,7 +10,7 @@
 //! Semijoin inputs are "presence" inputs: their rows are the distinct keys
 //! of the underlying collection, read through count summaries.
 
-use super::delta::{NodeDelta, Rows, StepOut};
+use super::delta::{NodeDelta, Overlay, StepOut};
 use super::mfp::Mfp;
 use super::*;
 use crate::types::datum::exact_cmp;
@@ -141,68 +141,48 @@ impl JoinPlan {
 /// Receives a presence key and its weight change.
 type KeyChangeFn<'a> = dyn FnMut(&mut Env, &[u8], i64) -> Result<()> + 'a;
 
-/// This tick's weight change per key of a presence input's collection: in
-/// memory, or in a temporary tree when the input's delta was spilled.
-enum PresenceDelta {
-    Mem(FxHashMap<Vec<u8>, i64>),
-    Tree(TreeId),
-}
-
-impl PresenceDelta {
-    fn get(&self, env: &mut Env, prefix: &[u8]) -> Result<i64> {
-        match self {
-            PresenceDelta::Mem(m) => Ok(m.get(prefix).copied().unwrap_or(0)),
-            PresenceDelta::Tree(t) => Ok(env.get(*t, prefix)?.map(|h| h.total()).unwrap_or(0)),
-        }
-    }
-
-    /// The keys with a non-zero change, in key order.
-    fn for_each(&self, env: &mut Env, f: &mut KeyChangeFn) -> Result<()> {
-        match self {
-            PresenceDelta::Mem(m) => {
-                let mut keys: Vec<&Vec<u8>> = m.keys().collect();
-                keys.sort();
-                for k in keys {
-                    let dw = m[k];
-                    if dw != 0 {
-                        f(env, k, dw)?;
+/// The step's changes to a presence input's arrangement, added up per
+/// presence key (an entry's canonical key prefix, or for exact presence the
+/// entry), handed to `f` in key order for the keys that changed.
+fn presence_changes(env: &mut Env, changes: &Overlay, layout: &Layout, exact: bool, f: &mut KeyChangeFn) -> Result<()> {
+    let mut cur: Option<(Vec<u8>, i64)> = None;
+    changes.for_each_chunk(env, &mut |env, chunk| {
+        for (k, w) in chunk {
+            let key = if exact { &k[..] } else { &k[..layout.prefix_len(k, layout.key_len())?] };
+            match &mut cur {
+                Some((c, cw)) if c.as_slice() == key => *cw += w,
+                _ => {
+                    if let Some((c, cw)) = cur.replace((key.to_vec(), *w))
+                        && cw != 0
+                    {
+                        f(env, &c, cw)?;
                     }
                 }
-                Ok(())
-            }
-            PresenceDelta::Tree(t) => {
-                let mut c = env.cursor(*t, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-                while let Some((k, h)) = env.cursor_next(&mut c)? {
-                    f(env, &k, h.total())?;
-                }
-                Ok(())
             }
         }
-    }
-
-    fn release(self, env: &mut Env) -> Result<()> {
-        match self {
-            PresenceDelta::Mem(_) => Ok(()),
-            PresenceDelta::Tree(t) => env.drop_tree(t),
-        }
+        Ok(())
+    })?;
+    match cur {
+        Some((c, cw)) if cw != 0 => f(env, &c, cw),
+        _ => Ok(()),
     }
 }
 
-/// Presence count of a key under `at` (count summaries; "before" derived from
-/// this tick's delta of the presence collection).
-fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], at: ReadAt, delta: Option<&PresenceDelta>) -> Result<i64> {
+/// Presence count of a key: now (count summaries), or before the step,
+/// with the step's changes to the presence arrangement (`before`)
+/// subtracted.
+fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], before: Option<&Overlay>) -> Result<i64> {
     let a = g.arr(arr);
     let hi = crate::types::encoding::prefix_successor(prefix);
-    let s = match &hi {
-        Some(h) => env.range_summary(a.tree, std::ops::Bound::Included(prefix), std::ops::Bound::Excluded(h))?,
-        None => env.range_summary(a.tree, std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded)?,
-    };
-    let latest = s.count;
-    Ok(match at {
-        ReadAt::Latest => latest,
-        ReadAt::Before(_) => latest - delta.map_or(Ok(0), |d| d.get(env, prefix))?,
-        ReadAt::AsOf(_) => latest,
-    })
+    let hi = hi.as_deref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let mut count = env.range_summary(a.tree, std::ops::Bound::Included(prefix), hi)?.count;
+    if let Some(o) = before {
+        o.for_each(env, std::ops::Bound::Included(prefix), hi, &mut |_, w| {
+            count -= w;
+            Ok(true)
+        })?;
+    }
+    Ok(count)
 }
 
 /// Key of presence values in their arrangement: the canonical key prefix,
@@ -215,7 +195,20 @@ fn presence_prefix(layout: &Layout, vals: &[Datum], exact: bool) -> Result<Vec<u
 struct Ctx<'a> {
     g: &'a Graph,
     p: &'a JoinPlan,
-    pres_delta: Vec<Option<PresenceDelta>>,
+    /// The outputs of the step's nodes (None: a snapshot, reading the
+    /// current state only).
+    all: Option<&'a FxHashMap<NodeId, NodeDelta>>,
+}
+
+impl Ctx<'_> {
+    /// The step's changes to arrangement `arr` of input `i`, to overlay on
+    /// it to read it as it was before the step (None: it did not change).
+    fn changes(&self, i: usize, arr: ArrId) -> Result<Option<Overlay<'_>>> {
+        match self.all.and_then(|all| all.get(&self.p.inputs[i].node)) {
+            Some(d) if !d.rows.is_empty() => d.overlay(arr).map(Some),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Key values of a lookup step for a joined row (None: matches nothing).
@@ -232,23 +225,27 @@ fn lookup_key(step: &LookupStep, row: &[Datum]) -> Option<Vec<Datum>> {
 }
 
 /// Rows of input `step.input` matching the key values `key`, encoded as
-/// `prefix` (post-MFP), handed to `f` in batches (a key may match many
-/// rows); for presence inputs, whether the key is present (the row is then
-/// the key).
+/// `prefix` (post-MFP), now or before the step (`before`), handed to `f` in
+/// batches (a key may match many rows); for presence inputs, whether the
+/// key is present (the row is then the key).
 fn lookup_prefix(
     env: &mut Env,
     cx: &Ctx,
     step: &LookupStep,
     prefix: &[u8],
     key: &[Datum],
-    at: ReadAt,
+    before: bool,
     f: &mut super::ops::RowSink,
 ) -> Result<()> {
     let inp = &cx.p.inputs[step.input];
     if let Some(parr) = inp.presence {
-        let c = presence_count(env, cx.g, parr, prefix, at, cx.pres_delta[step.input].as_ref())?;
+        let changes = if before { cx.changes(step.input, parr)? } else { None };
+        let c = presence_count(env, cx.g, parr, prefix, changes.as_ref())?;
         return if c > 0 { f(env, vec![(Vec::new(), 1)]) } else { Ok(()) };
     }
+    // the input's entries before the step: the arrangement with the
+    // overlay of the step's changes to it (which may have removed some)
+    let changes = if before { cx.changes(step.input, step.arr)? } else { None };
     let a = cx.g.arr(step.arr);
     let layout = &a.layout;
     // only the columns the input's MFP (and an exact match) reads are decoded
@@ -267,8 +264,7 @@ fn lookup_prefix(
         let mut out = Vec::new();
         let mut bytes = 0;
         let mut last = None;
-        let mut visit = |k: &[u8], h: &crate::storage::History| {
-            let w = h.weight(at);
+        let mut visit = |k: &[u8], w: i64| {
             if w <= 0 {
                 return Ok(true);
             }
@@ -286,13 +282,15 @@ fn lookup_prefix(
             }
             Ok(true)
         };
-        match &resume {
-            None => env.for_each_prefix(a.tree, prefix, &mut visit)?,
-            Some(from) => {
-                let hi = crate::types::encoding::prefix_successor(prefix);
-                let hi = hi.as_deref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-                env.for_each(a.tree, std::ops::Bound::Excluded(from), hi, &mut visit)?
-            }
+        let lo = match &resume {
+            None => std::ops::Bound::Included(prefix),
+            Some(from) => std::ops::Bound::Excluded(from.as_slice()),
+        };
+        let hi = crate::types::encoding::prefix_successor(prefix);
+        let hi = hi.as_deref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        match &changes {
+            None => env.for_each(a.tree, lo, hi, &mut visit)?,
+            Some(o) => o.for_each_versioned(env, a.tree, lo, hi, &mut |k, _, w| visit(k, w))?,
         }
         if !out.is_empty() {
             f(env, out)?;
@@ -319,7 +317,6 @@ fn run_path(
     cx: &Ctx,
     path: &DeltaPath,
     start: Vec<(Row, i64)>,
-    gsn: Option<Gsn>,
     out: &mut super::ops::RowSink,
 ) -> Result<()> {
     let mut frontier: Vec<(Row, i64)> = Vec::with_capacity(start.len());
@@ -328,7 +325,7 @@ fn run_path(
             frontier.push((row, w));
         }
     }
-    run_steps(env, cx, path, &path.steps, frontier, gsn, out)
+    run_steps(env, cx, path, &path.steps, frontier, out)
 }
 
 /// Extend `frontier` along `steps`, depth first in chunks of `path_bytes`
@@ -339,23 +336,15 @@ fn run_steps(
     path: &DeltaPath,
     steps: &[LookupStep],
     frontier: Vec<(Row, i64)>,
-    gsn: Option<Gsn>,
     out: &mut super::ops::RowSink,
 ) -> Result<()> {
     if frontier.is_empty() {
         return Ok(());
     }
     let Some((step, rest)) = steps.split_first() else { return out(env, frontier) };
-    let at = match gsn {
-        None => ReadAt::Latest,
-        Some(g) => {
-            if step.input < path.source {
-                ReadAt::Latest
-            } else {
-                ReadAt::Before(g)
-            }
-        }
-    };
+    // in a step, the inputs before the path's source are read after it,
+    // those after it before it
+    let before = cx.all.is_some() && step.input > path.source;
     let mut start = 0;
     while start < frontier.len() {
         let mut end = start;
@@ -364,19 +353,20 @@ fn run_steps(
             bytes += row_bytes(&frontier[end].0);
             end += 1;
         }
-        lookup_step(env, cx, step, at, &frontier[start..end], &mut |env, next| run_steps(env, cx, path, rest, next, gsn, out))?;
+        lookup_step(env, cx, step, before, &frontier[start..end], &mut |env, next| run_steps(env, cx, path, rest, next, out))?;
         start = end;
     }
     Ok(())
 }
 
-/// The rows of `frontier` extended by one lookup step, handed to `emit` in
-/// chunks of `path_bytes`.
+/// The rows of `frontier` extended by one lookup step (into the input as
+/// it was before the step if `before`), handed to `emit` in chunks of
+/// `path_bytes`.
 fn lookup_step(
     env: &mut Env,
     cx: &Ctx,
     step: &LookupStep,
-    at: ReadAt,
+    before: bool,
     frontier: &[(Row, i64)],
     emit: &mut super::ops::RowSink,
 ) -> Result<()> {
@@ -409,7 +399,7 @@ fn lookup_step(
             end += 1;
         }
         let (k, n, _, key) = &keyed[j];
-        lookup_prefix(env, cx, step, &k[..*n], key, at, &mut |env, matches| {
+        lookup_prefix(env, cx, step, &k[..*n], key, before, &mut |env, matches| {
             for (_, _, i, key) in &keyed[j..end] {
                 let (row, w) = &frontier[*i];
                 for (post, mw) in &matches {
@@ -434,64 +424,13 @@ fn lookup_step(
     if next.is_empty() { Ok(()) } else { emit(env, next) }
 }
 
-fn presence_deltas(env: &mut Env, g: &Graph, p: &JoinPlan, all: &FxHashMap<NodeId, NodeDelta>, gsn: Gsn) -> Result<Vec<Option<PresenceDelta>>> {
-    let mut v = Vec::with_capacity(p.inputs.len());
-    for inp in &p.inputs {
-        match inp.presence {
-            None => v.push(None),
-            Some(parr) => {
-                let layout = &g.arr(parr).layout;
-                let d = match all.get(&inp.node) {
-                    Some(rows @ NodeDelta { rows: Rows::Tree { .. }, .. }) => {
-                        let tree = env.create_temp_tree(std::sync::Arc::new(crate::storage::CountSummarizer));
-                        let mut b = crate::storage::TreeBuilder::new(env, tree, gsn);
-                        let r = rows.for_each_batch(env, &mut |env, batch| {
-                            for (row, w) in batch {
-                                b.push(env, presence_prefix(layout, &layout.key_values(row)?, inp.exact)?, *w)?;
-                            }
-                            Ok(())
-                        });
-                        let r = match r {
-                            Ok(()) => b.finish(env),
-                            Err(e) => b.abort(env).and(Err(e)),
-                        };
-                        match r {
-                            Ok(()) => PresenceDelta::Tree(tree),
-                            Err(e) => {
-                                env.drop_tree(tree)?;
-                                return Err(e);
-                            }
-                        }
-                    }
-                    rows => {
-                        let mut m: FxHashMap<Vec<u8>, i64> = FxHashMap::default();
-                        if let Some(NodeDelta { rows: Rows::Mem(d), .. }) = rows {
-                            for (row, w) in d {
-                                let kv = layout.key_values(row)?;
-                                *m.entry(presence_prefix(layout, &kv, inp.exact)?).or_default() += w;
-                            }
-                        }
-                        PresenceDelta::Mem(m)
-                    }
-                };
-                v.push(Some(d));
-            }
-        }
-    }
-    Ok(v)
-}
-
-pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
-    let cx = Ctx { g, p, pres_delta: presence_deltas(env, g, p, all, gsn)? };
-    let r = step_paths(env, &cx, gsn, all, out);
-    for d in cx.pres_delta.into_iter().flatten() {
-        d.release(env)?;
-    }
-    r
+pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, _gsn: Gsn, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
+    let cx = Ctx { g, p, all: Some(all) };
+    step_paths(env, &cx, all, out)
 }
 
 /// Extend the changes of every input along its path.
-fn step_paths(env: &mut Env, cx: &Ctx, gsn: Gsn, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
+fn step_paths(env: &mut Env, cx: &Ctx, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
     let (g, p) = (cx.g, cx.p);
     for path in &p.paths {
         let src = &p.inputs[path.source];
@@ -524,17 +463,17 @@ fn step_paths(env: &mut Env, cx: &Ctx, gsn: Gsn, all: &FxHashMap<NodeId, NodeDel
         // columns the join does not use) need no lookups
         let mut run = |env: &mut Env, mut start: Delta| {
             consolidate(&mut start);
-            run_path(env, cx, path, start, Some(gsn), &mut emit)
+            run_path(env, cx, path, start, &mut emit)
         };
         let (mut errs, mut errs_limit) = (Vec::new(), super::ops::BATCH_ROWS);
         if let Some(parr) = src.presence {
             // presence changes of keys touched this tick
             let layout = g.arr(parr).layout.clone();
-            let deltas = cx.pres_delta[path.source].as_ref().unwrap();
+            let changes = d.overlay(parr)?;
             let mut start = Vec::new();
             let mut bytes = 0;
-            deltas.for_each(env, &mut |env, prefix, dw| {
-                let new = presence_count(env, g, parr, prefix, ReadAt::Latest, None)?;
+            presence_changes(env, &changes, &layout, src.exact, &mut |env, prefix, dw| {
+                let new = presence_count(env, g, parr, prefix, None)?;
                 let old = new - dw;
                 if (old > 0) != (new > 0) {
                     let kv = if src.exact { layout.decode_row(prefix)? } else { layout.decode_key_values(prefix)?.0 };
@@ -595,7 +534,7 @@ fn presence_key_exprs(p: &JoinPlan, i: usize) -> Option<&[Expr]> {
 /// Full join contents (latest): drive the cheapest regular input's path,
 /// over that input's snapshot a batch at a time.
 pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut super::ops::SnapOut) -> Result<()> {
-    let cx = Ctx { g, p, pres_delta: p.inputs.iter().map(|_| None).collect() };
+    let cx = Ctx { g, p, all: None };
     // pick the smallest regular input as the source
     let mut best: Option<(usize, i64)> = None;
     for (i, inp) in p.inputs.iter().enumerate() {
@@ -649,11 +588,11 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut super::ops::Sn
         }
         if start_bytes >= path_bytes(env) {
             start_bytes = 0;
-            run_path(env, &cx, path, std::mem::take(&mut start), None, &mut emit)?;
+            run_path(env, &cx, path, std::mem::take(&mut start), &mut emit)?;
         }
         Ok(())
     })?;
-    run_path(env, &cx, path, start, None, &mut emit)?;
+    run_path(env, &cx, path, start, &mut emit)?;
     out.errs(errs);
     Ok(())
 }

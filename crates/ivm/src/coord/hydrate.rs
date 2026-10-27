@@ -13,8 +13,8 @@
 //! which moves their nodes) and the fragment is maintained with the rest
 //! from the next record on, and what waited for it follows (`Then`). Its
 //! contents are exactly those an inline hydration at *g* followed by the
-//! same steps would have produced. (The version read is the fork, never
-//! the trees' history; the catch-up comes from the forwarded changes.)
+//! same steps would have produced. (The version read is the fork; the
+//! catch-up comes from the forwarded changes.)
 //!
 //! Meanwhile the engine applies records (the views that exist go on being
 //! maintained) and DDL that only adds to the graph (its fragment is
@@ -145,19 +145,19 @@ struct Conversion {
     pk: Vec<usize>,
 }
 
-/// Fill a rebuilt table's new primary index, as of `gsn`, with the old
-/// version's rows in the new shape: columns mapped by name and cast to their
-/// new types (NULL where that fails); rows without their (new) key are left
-/// to the re-snapshot, which upserts by key. The old rows are streamed in
+/// Fill a rebuilt table's new primary index with the old version's rows in
+/// the new shape: columns mapped by name and cast to their new types (NULL
+/// where that fails); rows without their (new) key are left to the
+/// re-snapshot, which upserts by key. The old rows are streamed in
 /// batches into a `TreeBuilder`, so a table of any size is rebuilt in
 /// bounded memory.
-fn fill_rebuilt(graph: &mut Graph, env: &mut Env, c: &Conversion, gsn: Gsn) -> Result<()> {
+fn fill_rebuilt(graph: &mut Graph, env: &mut Env, c: &Conversion) -> Result<()> {
     let crate::dataflow::NodeKind::Table { primary, .. } = graph.node(c.new_node).kind else {
         return Err(SqlError::internal("rebuilt table without a table node"));
     };
     let arr = graph.arr(primary);
     let (tree, layout) = (arr.tree, arr.layout.clone());
-    let mut b = crate::storage::TreeBuilder::new(env, tree, gsn);
+    let mut b = crate::storage::TreeBuilder::new(env, tree);
     let r = crate::dataflow::ops::snapshot_stream(graph, env, c.old_node, &mut |env, batch| {
         for (r, w) in batch {
             let nr: crate::types::Row = c
@@ -183,7 +183,7 @@ fn fill_rebuilt(graph: &mut Graph, env: &mut Env, c: &Conversion, gsn: Gsn) -> R
             return Err(e);
         }
     }
-    graph.set_arr_hydrated(primary, true, gsn);
+    graph.set_arr_hydrated(primary, true);
     graph.set_node_hydrated(c.new_node, true);
     Ok(())
 }
@@ -286,9 +286,9 @@ fn run(
 ) -> Result<Hydrated> {
     let ForkWork { roots, arrs, replaced, conversions } = work;
     for c in &conversions {
-        fill_rebuilt(&mut graph, &mut env, c, gsn)?;
+        fill_rebuilt(&mut graph, &mut env, c)?;
     }
-    graph.hydrate(&mut env, gsn)?;
+    graph.hydrate(&mut env)?;
     let mut changes: Vec<(ObjectId, NodeId, GsnDeltas)> = Vec::new();
     for (view, old, new, node) in replaced {
         changes.push((view, node, replacement_diff(&graph, &mut env, old, new, gsn)?));
@@ -400,9 +400,9 @@ impl Engine {
             Some(h) if !self.replaying && !(nodes.is_empty() && arrs.is_empty()) && !small() => h.tx.clone(),
             _ => {
                 for c in &conversions {
-                    fill_rebuilt(&mut self.graph, &mut self.env, c, gsn)?;
+                    fill_rebuilt(&mut self.graph, &mut self.env, c)?;
                 }
-                self.graph.hydrate(&mut self.env, gsn)?;
+                self.graph.hydrate(&mut self.env)?;
                 for t in then {
                     self.then_inline(t)?;
                 }

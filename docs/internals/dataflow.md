@@ -64,13 +64,13 @@ message) and flow to the consumers (see [Errors](#errors)).
   creation sequence number, and a `hydrated` flag;
 - **arrangements** (`Arrangement`): persistent indexes of a node's output —
   a storage tree plus a `Layout` (key expressions, sort order, per-node
-  summaries) — with a fingerprint, a reference count, a `hydrated` flag and
-  `since`, the GSN from which its history is complete;
+  summaries) — with a fingerprint, a reference count and a `hydrated`
+  flag;
 - the **error records** in each node's contents (`node_errors`, read with
   `Graph::errors_of`; see [Errors](#errors));
 - the logical clock `now`, per-node statistics (for `EXPLAIN MAINTENANCE`),
   per-node activity counters (for the web UI), and, during recovery, the
-  maps of recovered trees and their `since` by fingerprint.
+  map of recovered trees by fingerprint.
 
 Nodes and arrangements live in slots indexed by their ids; the slot of one
 that is freed is reused (a `SUBSCRIBE (query)` would otherwise leave its
@@ -148,25 +148,29 @@ depend on the size of the graph:
    because one of its inputs produced output at this GSN — or, for a
    temporal filter, because the clock moved — reading its inputs' deltas
    in batches.
-3. The node's output delta is applied to **all of its arrangements at
-   `gsn`** before any consumer runs (a spilled one by merging its trees),
+3. The node's output delta is applied to **all of its arrangements**
+   before any consumer runs (a spilled one by merging its trees),
    and its error records are added to the node's accumulated ones. The
    output of a node that nothing reads goes to its arrangements directly
    once it exceeds the spill threshold (through `TreeBuilder`s), rather
    than into temporary trees first.
-4. Consumers read arrangements *after* the current GSN (`ReadAt::Latest`)
-   or *before* it, so an operator can compute "old" and "new" results of
-   the same key and emit the difference. Before the GSN is read through the
-   entries' (GSN, weight) histories (`ReadAt::Before(gsn)`), or — TopK and
-   Window — by overlaying the input's delta on the input's arrangement
-   (`delta::Overlay`): the arrangement was changed at this GSN by exactly
-   that delta, so an entry's weight before it is its current weight minus
-   its change. The delta is read by key range in the arrangement's
+4. Consumers read arrangements *after* the current GSN (as they are) or
+   *before* it, so an operator can compute "old" and "new" results of the
+   same key and emit the difference. Arrangements hold the current weights
+   only ([Storage](storage.md)): before the GSN is read by overlaying the
+   input's delta on the input's arrangement (`delta::Overlay`). The
+   arrangement was changed at this GSN by exactly that delta, so an
+   entry's weight before it is its current weight minus its change, and an
+   entry the step removed from the tree (its weight became 0) is found in
+   the delta alone. The delta is read by key range in the arrangement's
    encoding, from memory or from its temporary tree alike: group by group
    (`Overlay::groups`, a group's changes collected in memory up to a
    limit), or merged with the arrangement's entries in chunks
-   (`Overlay::for_each_versioned`, which also visits entries the step left
-   at weight zero or removed).
+   (`Overlay::for_each_versioned`, and `EntryDeltas::for_each_versioned`
+   for a group's changes in memory), each entry with its weight now and
+   before the step, the removed entries included. Distinct and SetOp
+   representatives, delta-join lookups into inputs read before the GSN
+   (and their presence counts), and TopK and Window read this way.
 5. A node's output is freed as soon as all its consumers have run: handed
    to the caller as `Output` (its rows only if the node is observed — in
    memory as they are, or still spilled, `Output::spilled`, for the caller
@@ -193,8 +197,8 @@ entry = key encoding of the key values      (order-preserving, canonical)
 
 The key part orders and groups entries — a key prefix is a contiguous range,
 so lookups are prefix scans — while the payload carries the remaining
-columns exactly. Each entry's value in the tree is its history of
-(GSN, weight) changes. A layout may also declare per-node *summaries*
+columns exactly. Each entry's value in the tree is its weight (the row's
+multiplicity; an entry of weight 0 is no entry). A layout may also declare per-node *summaries*
 (aggregates over expressions of the row) that the tree maintains for every
 subtree. Byte formats: [On-disk format](../on-disk-format.md#data-encodings).
 
@@ -216,14 +220,6 @@ A materialized view is read through its *read arrangement*: the first
 arrangement of its root node if there is one (for example a `Reduce`'s
 output index), otherwise a full index added for the view.
 
-An arrangement's history is complete only from the GSN it was hydrated at
-(`Arrangement::since`; for a new table, its creation): its contents as of
-earlier GSNs were never stored. `Arrangement::covers(at)` tells whether a
-read can use it — `since <= g` for `AS OF g` — and reads in the past only use
-arrangements that cover them ([Planner](planner.md#batch-execution)). The
-value is saved with the tree in the metadata tree's arrangement records, so
-a recovered arrangement keeps its history; one rebuilt by hydration starts a
-new one.
 
 ## Operators
 
@@ -326,10 +322,17 @@ extended along *i*'s path. Input *j* is read *after* the GSN if `j < i` and
 - Rows of the frontier whose lookup keys encode equally (exact lookups:
   whose key values are identical) share one lookup. Looked-up entries are
   decoded only in the columns the input's MFP (and an exact match) reads.
+- An input read *before* the GSN is its arrangement with the overlay of
+  the input's delta at this GSN (in the arrangement's encoding, by the
+  lookup's key range, from memory or from the delta's temporary tree):
+  entries the step removed from the arrangement are seen with their weight
+  before it. An input that did not change at this GSN is read as it is.
 - A presence input contributes its key if the key's count (a range summary
   over the key prefix) is positive. Its count *before* the GSN is the current
-  count minus the presence delta of this GSN. When a presence input is the
-  delta source, a key contributes `+1` or `−1` only when its presence flips;
+  count minus the changes of this GSN in the key's range (the presence
+  input's delta in the presence arrangement's encoding). When a presence
+  input is the delta source, its changed keys come from that delta, added
+  up per key, and a key contributes `+1` or `−1` only when its presence flips;
   the rows such a path produces then get the presence input's columns
   recomputed with the key expressions the other paths look it up with, so
   that they carry the exact values (numeric scale, `-0`, ...) the other
@@ -471,7 +474,9 @@ threshold, in a temporary tree, and visited in key order.
 
 The input is arranged by all columns. For each changed value (canonical key
 prefix) the operator finds the first live entry before and after the GSN and
-the total weight; it emits `−representative` if the value was present before
+the total weight, in one walk of the value's entries with the overlay of the
+input's delta (so a representative the step deleted is seen before the
+GSN); it emits `−representative` if the value was present before
 and `+representative` if it is present after. Equal values in different
 representations are one group; the representative is the first in index
 order.
@@ -503,8 +508,8 @@ with the window after it, without reading either in full:
   changes of the changed entries before them, so the window before the GSN
   is located from the current counts as well. An entry's weight before the
   GSN is its current weight minus the step's change to it (the operator's
-  input delta overlaid on its input index, read group by group), not read
-  from its history;
+  input delta overlaid on its input index, read group by group; the
+  entries the step removed come from the delta);
 - if the first changed entry comes after the window (its position is past
   `offset + limit`, and with ties it is not tied with the last row), nothing
   changes;
@@ -599,8 +604,8 @@ valid", kind 1 "expires". At each step it releases the events that became
 due since the previous step: those after the previous step's clock
 (`Graph::released_through`), up to the current one. Events are only ever
 scheduled after the clock, so none at or before the previous step's clock
-is still pending; released events stay in the arrangement as entries of
-weight zero until compaction removes them, and are never visited again. A
+is still pending; released events leave the arrangement (their weights
+cancel), and the scan starts after the previous step's clock. A
 graph rebuilt by recovery starts from the checkpoint's clock
 (`Graph::restore_clock`), up to which the checkpointed filters released
 everything.
@@ -619,9 +624,9 @@ See [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal
 
 ## Hydration
 
-`Graph::hydrate(env, gsn)` brings every node and arrangement that is not yet
-hydrated up to date as of `gsn`, computing their contents **from existing
-state, never from the sources**, in memory bounded by the buffer pool and
+`Graph::hydrate(env)` brings every node and arrangement that is not yet
+hydrated up to date, computing their contents **from the current state,
+never from the sources**, in memory bounded by the buffer pool and
 a constant:
 
 1. Visit nodes in topological order. For a node that is not hydrated,
@@ -629,12 +634,12 @@ a constant:
    its pending events from its input's snapshot, loading them into its
    event index through a `TreeBuilder`).
 2. If the node has arrangements that are not hydrated, stream the node's
-   *snapshot* — its full contents, rows and error records — into them at
-   `gsn`: each batch of rows is encoded as each arrangement's entries and
+   *snapshot* — its full contents, rows and error records — into them: each
+   batch of rows is encoded as each arrangement's entries and
    pushed to a `TreeBuilder` per arrangement, which loads entries arriving
    in any order through sorted runs ([Storage](storage.md#loading-unordered-entries)),
    so that each leaf is written once and at most a buffer of entries is in
-   memory. The arrangement's `since` becomes `gsn`.
+   memory.
 3. A snapshot (`ops::snapshot_stream`) is produced in batches of at most
    1,024 rows: read from any hydrated arrangement of the node if there is
    one (`Graph::scan_stream`, batches also bounded by 1 MiB of entries),
@@ -716,8 +721,8 @@ hydration flags, error records and per-group error state
 node meanwhile and reused its slot); from the next record on the fragment is stepped
 by the engine with the rest. Its contents are exactly those of an inline
 hydration at *g* followed by the same steps. The version of the inputs it
-reads is the fork, not the trees' history, and the catch-up comes from the
-forwarded changes, not from the log.
+reads is the fork, and the catch-up comes from the forwarded changes, not
+from the log.
 
 Meanwhile:
 

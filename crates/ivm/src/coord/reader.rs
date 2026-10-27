@@ -2,8 +2,8 @@
 //! a budget of entries it may visit (and of rows it may return); one that
 //! exceeds it is run again on a reader thread, against a fork of the
 //! storage taken at once (every tree as of the last applied GSN,
-//! `Env::fork`) and a copy of the part of the graph it reads: the same read
-//! point and plan, hence the same result, while the engine goes on. The
+//! `Env::fork`) and a copy of the part of the graph it reads: the same
+//! state and plan, hence the same result, while the engine goes on. The
 //! budget bounds what a read costs the engine thread; small reads (point
 //! lookups, short ranges) cost no fork.
 //!
@@ -22,7 +22,6 @@ use super::*;
 use crate::dataflow::Delta;
 use crate::exec::ExecCtx;
 use crate::memory::Meter;
-use crate::storage::ReadAt;
 
 /// Entries a read may visit on the engine thread.
 pub(crate) const INLINE_READ_ENTRIES: u64 = 50_000;
@@ -39,7 +38,6 @@ pub(crate) enum ReadJob {
         /// Relation id -> its node, for the relations the plan reads.
         objects: Vec<(ObjectId, NodeId)>,
         bq: Box<crate::sql::BoundQuery>,
-        at: ReadAt,
         settings: Arc<BTreeMap<String, String>>,
         interrupts: Option<Arc<Interrupts>>,
         reply: Sender<Result<ExecResult>>,
@@ -51,9 +49,9 @@ pub(crate) enum ReadJob {
 
 fn run(job: ReadJob) {
     match job {
-        ReadJob::Query { mut env, graph, objects, bq, at, settings, interrupts, reply, meter } => {
+        ReadJob::Query { mut env, graph, objects, bq, settings, interrupts, reply, meter } => {
             let objects = |oid: u64| objects.iter().find(|(o, _)| *o == oid).map(|(_, n)| *n);
-            let mut ctx = ExecCtx { g: &graph, env: &mut env, at, objects: &objects, rec: Default::default(), visited: 0 };
+            let mut ctx = ExecCtx { g: &graph, env: &mut env, objects: &objects, rec: Default::default(), visited: 0 };
             // the rows go to the session in chunks as they are found; a
             // session that stops reading them (or a cancel) ends the read
             let stop = interrupts.clone();
@@ -112,9 +110,9 @@ fn snapshot_chunks(graph: &Graph, env: &mut Env, node: NodeId, f: &mut dyn FnMut
 }
 
 impl Engine {
-    /// Run a read that exceeded its budget on a reader thread, as of `at`
-    /// (the engine has applied nothing since it was planned).
-    pub(crate) fn read_elsewhere(&mut self, bq: crate::sql::BoundQuery, at: ReadAt, vars: SessionVars, reply: Sender<Result<ExecResult>>) -> Result<()> {
+    /// Run a read that exceeded its budget on a reader thread, against the
+    /// state it was planned in (the engine has applied nothing since).
+    pub(crate) fn read_elsewhere(&mut self, bq: crate::sql::BoundQuery, vars: SessionVars, reply: Sender<Result<ExecResult>>) -> Result<()> {
         fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
             if let crate::sql::Rel::Get { id, .. } = r {
                 out.push(*id);
@@ -132,7 +130,7 @@ impl Engine {
         let graph = self.graph.fork_of(&objects.iter().map(|(_, n)| *n).collect::<Vec<_>>());
         let env = self.fork_env()?;
         let meter = self.shared.mem.outputs.clone();
-        let job = ReadJob::Query { env, graph, objects, bq: Box::new(bq), at, settings: vars.settings, interrupts: vars.interrupts, reply, meter };
+        let job = ReadJob::Query { env, graph, objects, bq: Box::new(bq), settings: vars.settings, interrupts: vars.interrupts, reply, meter };
         self.send_to_reader(job)
     }
 
