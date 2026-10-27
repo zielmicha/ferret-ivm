@@ -9,7 +9,7 @@
   initial snapshot, and during a re-snapshot after an upstream schema or
   key change, a lost replication slot or `ALTER SOURCE ... REFRESH`.
   `SHOW SOURCES` shows `snapshotting <schema>.<table>`. Use
-  `SET read_mode = latest` or `AS OF LATEST` to read the partial state.
+  `SET read_mode = latest` to read the partial state.
 - **A table that cannot be copied** (`error: cannot copy table ...` in
   `SHOW SOURCES`): fresh reads of it wait until it can be read; reads of
   the other tables do not.
@@ -17,7 +17,6 @@
   passes the LSN: as long as any source is copying a table (or cannot copy
   one), disconnected (`error: ...`) or behind. Without any source it fails
   at once.
-- **`AS OF <gsn>` in the future** waits until the engine reaches that GSN.
 - **The engine thread is busy.** All statements run on one thread: while it
   applies a large upstream transaction, every other statement waits. (New
   and replaced views, indexes, tables rebuilt after upstream schema changes
@@ -91,12 +90,9 @@ stayed connected for 10 s.
   view, or a view it reads, could not be rebuilt at the last start. Drop it
   or repair it with `CREATE OR REPLACE MATERIALIZED VIEW`
   ([Recovery](operations.md#recovery)).
-- **`AS OF g is before the history of a relation it reads, which starts at
-  h`** (`55000`): an index the read needs was built after `g` (the relation
-  was created or replaced, or the index was rebuilt at a restart). Read at
-  `h` or later.
-- **`AS OF g is before the retention frontier f`** (`55000`): the history
-  before `f` is gone; raise `--retention-gsns` if older reads are needed.
+- **`AS OF <gsn> is not supported`, `AS OF LATEST is not supported`**
+  (`0A000`): there is no time travel; reads see the latest state. Use
+  `SET read_mode = latest` for what `AS OF LATEST` did.
 
 ### A statement is rejected
 
@@ -214,7 +210,6 @@ FRONTIERS`: `durable_gsn` − `processed_gsn`; `/api/overview`'s
   ([Operations](operations.md#checkpoints-and-garbage-collection)); up to
   half of any other sealed segment can stay garbage, and the active segment
   (up to 256 MiB) is not collected until it is full.
-- Large `--retention-gsns` keeps more versions in the indexes.
 
 ### Upstream WAL grows
 
@@ -252,8 +247,8 @@ background, retried until the upstream answers. Check
   postgres, encoding UTF-8; string comparison is by code point (the
   `C.UTF-8` collation); `COLLATE` only accepts `C`, `default`, `ucs_basic`,
   `pg_c_utf8` and `C.UTF-8`.
-- `AS OF` reads use the current catalog, and only read indexes whose
-  history covers the requested GSN.
+- There is no time travel: reads see the latest state (the indexes keep
+  the current weights of their rows only).
 - Changes queued for a subscription or a sink are bounded in memory: a
   subscription whose client does not keep up ends with `53000`, a sink that
   does not keep up resynchronises its target from a snapshot (see
@@ -340,14 +335,6 @@ test, with workarounds.
 | Problem | Effect | Workaround |
 |---|---|---|
 | `set_config()` changes nothing (it returns its value) | `SELECT set_config('read_mode', 'latest', false)` leaves the session's settings as they were | use `SET` |
-
-### Time travel
-
-| Problem | Effect | Workaround |
-|---|---|---|
-| Error records are not versioned | a read of a materialized view `AS OF g` fails if the view has error records *now*, and succeeds (without the failing rows) if it has none now, whatever it held at `g` | none |
-| Recovery re-plans joins from the current table sizes | when the sizes changed enough since a join view was created, a restart rebuilds its indexes, whose history then starts at the restart: reads `AS OF` a GSN before it fail with `AS OF g is before the history of a relation it reads` (test `as_of_history_survives_restart_after_table_sizes_change`, ignored) | none; read older history before restarting |
-| An upgrade that changes plan fingerprints (new functions renumber later ones; planner fixes) rebuilds the affected indexes at the first start ([Compatibility](../on-disk-format.md#compatibility)) | as above: `AS OF` reads before that start fail for those views | none |
 
 ### Replication and sinks
 

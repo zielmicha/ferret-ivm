@@ -1,8 +1,9 @@
 # Recovery and snapshots
 
-Fault tolerance, view creation, consistent reads and time travel all use one
-mechanism: *read the state as of GSN g, replay the log from g + 1*. This
-chapter describes the recovery protocol, how checkpointed indexes are found
+Fault tolerance and view creation use one mechanism: *read the state as of
+GSN g, replay the log (or the records forwarded) from g + 1* — a checkpoint's
+state, or a fork of the storage taken at g, not an earlier state kept in the
+indexes, which hold the current state only. This chapter describes the recovery protocol, how checkpointed indexes are found
 again, how sources resume, and the DBLog snapshot algorithm as implemented.
 Code: `crates/ivm/src/coord/mod.rs` (`start`, `recover`, `checkpoint`),
 `crates/ivm/src/coord/meta.rs` (the metadata tree, `FORMAT`),
@@ -24,15 +25,14 @@ included, are committed by one manifest append at one GSN (the design in
 implementation checkpoints everything together).
 
 The catalog and the engine state are stored like the indexes, as a weighted
-multiset of entries with GSN-stamped histories in a tree of their own
+multiset of entries in a tree of their own
 ([On-disk format](../on-disk-format.md#the-metadata-tree)): a change
 retracts the old entry and adds the new one, so a checkpoint writes only
 the nodes that changed, and its manifest record names the trees and carries
 a small header. The engine keeps the same state in memory (the catalog,
 source states, the graph's error records, ...) and writes what changed
-since the last time after every DDL or schema record, at its GSN (so the
-tree holds the catalog as of every GSN of the retention window), and at
-every checkpoint.
+since the last time after every DDL or schema record and at every
+checkpoint.
 
 ## The recovery protocol
 
@@ -68,16 +68,15 @@ with status 1 at once) and accepts connections only once recovery is done.
    application state is a header naming the metadata tree (`meta::load`
    attaches it and reads all of it), or, for format 1, the JSON `AppState`:
    catalog with its DDL history, the map from arrangement fingerprint to
-   tree id and to the GSN its history starts at (`arr_since`), the error
-   state, source states and resume LSNs, the request counter, the logical
-   clock and its recent ticks, and the pending slot drops.
+   tree id, the error state, source states and resume LSNs, the request
+   counter, the logical clock (its last tick), and the pending slot drops.
 5. **Rebuild the dataflow** from the catalog: tables (`table_rt`), then
    materialized views (planned and lowered again from their SQL text, as
    stored definitions) and indexes, each after the views it reads
    (`dependency_order`: ids are not a dependency order, as
    `CREATE OR REPLACE` keeps the object's id). Every arrangement the planner
    asks for looks up its fingerprint in the recovered map (see below); found
-   trees are attached, count as hydrated and keep their `since`. A view or
+   trees are attached and count as hydrated. A view or
    index that cannot be built (its definition no longer plans, it reads a
    view that cannot be built, or an index's columns are gone) is logged and
    recorded in `Runtime::broken` with the reason instead of stopping the
@@ -88,10 +87,9 @@ with status 1 at once) and accepts connections only once recovery is done.
    ([Dataflow](dataflow.md#errors)); records of nodes that no longer exist
    are retracted from the metadata tree.
 6. **Hydrate** everything that was not matched, from the recovered state at
-   the checkpoint GSN (`Graph::hydrate`; the rebuilt arrangements' history
-   starts there), give each materialized view the error records of its root
-   node, then **drop** recovered trees that nothing attached (arrangements
-   that no longer exist) and set the retention frontier.
+   the checkpoint GSN (`Graph::hydrate`), give each materialized view the
+   error records of its root node, then **drop** recovered trees that
+   nothing attached (arrangements that no longer exist).
 7. **Start the sinks** from the recovered state (each receives the changes
    after the checkpoint GSN; a target at least that far resumes, one behind
    it asks for a snapshot and is resynchronised, see
@@ -163,17 +161,15 @@ nodes get different ids after objects were dropped and re-created
 
 When `Graph::add_arrangement` creates an arrangement whose fingerprint is in
 the recovered map and whose tree exists, it attaches that tree (with the new
-layout's summarizer) instead of creating an empty one, marks the arrangement
-hydrated, and gives it its checkpointed `since`, so that `AS OF` reads of
-times before the restart can still use it. A node all of whose arrangements
+layout's summarizer) instead of creating an empty one and marks the
+arrangement hydrated. A node all of whose arrangements
 were recovered needs no computation during hydration. The error state of
 nodes and operators is restored by fingerprint as well; only the group
 caches of aggregations, an accelerator, start empty.
 
-An arrangement that is not matched is rebuilt, and its history starts at
-the checkpoint: reads as of earlier GSNs that would need it fail with
-`AS OF g is before the history of a relation it reads`. Besides code
-changes ([Compatibility](../on-disk-format.md#compatibility)), this happens
+An arrangement that is not matched is rebuilt from the checkpoint's state
+(which costs the time of creating it again). Besides code changes
+([Compatibility](../on-disk-format.md#compatibility)), this happens
 when re-planning picks another join order: delta paths are ordered by the
 current sizes of their inputs, so a view whose input tables changed size
 considerably since it was planned can get a different join plan, and then
@@ -209,16 +205,14 @@ A checkpoint is written in the background (`coord/checkpoint.rs`), one at
 a time. On the engine thread, between two records (`prepare_checkpoint`,
 `Engine::begin_checkpoint`):
 
-1. `persist_meta(processed GSN)`: write what changed since the last time
-   into the metadata tree — catalog objects changed by DDL since (normally
-   none: DDL records write them when applied), new and trimmed history
-   entries, new ticks and ticks behind the retention frontier, changed
-   source states and resume LSNs, arrangements hydrated or dropped, pending
-   slot drops, and the changes of the error state
-   ([On-disk format](../on-disk-format.md#the-metadata-tree));
-2. `Env::maintain()`: compact leaves behind the retention frontier, merge
-   underfull nodes, relocate the live nodes of sparse segments, in every
-   tree the metadata tree included
+1. `persist_meta()`: write what changed since the last time into the
+   metadata tree — catalog objects changed by DDL since (normally none: DDL
+   records write them when applied), new and trimmed history entries, the
+   last clock tick, changed source states and resume LSNs, arrangements
+   hydrated or dropped, pending slot drops, and the changes of the error
+   state ([On-disk format](../on-disk-format.md#the-metadata-tree));
+2. `Env::maintain()`: relocate the live nodes of sparse segments (merging
+   the underfull ones), in every tree the metadata tree included
    ([Storage](storage.md#space-reclamation));
 3. `Env::begin_checkpoint(processed GSN)`: freeze a version of the dirty
    nodes, those the first two steps wrote included
@@ -242,9 +236,8 @@ Back on the engine thread, once it is written (the thread sends `Wake`):
    dead in the engine's state too and that no fork pins;
 6. send `Truncate(checkpoint GSN)` to the sequencer, which deletes log
    segments whose records all lie at or before the checkpoint: recovery
-   replays the log after the checkpoint, and nothing else reads the log
-   (`AS OF` reads use the histories in the trees). The log is truncated
-   only once the checkpoint is committed.
+   replays the log after the checkpoint, and nothing else reads the log.
+   The log is truncated only once the checkpoint is committed.
 
 At shutdown, and in an engine without threads, the same steps run in a row
 on the engine thread (`Engine::checkpoint`), after the checkpoint being
@@ -520,9 +513,9 @@ replaces what the engine stores (`push_multiset`):
   incomplete, so `AS OF AT LEAST LSN` reads never see a partial table; fresh
   reads wait for the snapshot explicitly (per table: a table that cannot be
   read keeps the fresh reads of it waiting, not those of the others).
-- While a table is being copied, `read_mode = latest` and `AS OF <gsn>`
-  reads (and materialized views) see the rows copied so far and the rows
-  the stream changed since its copy started.
+- While a table is being copied, `read_mode = latest` reads (and
+  materialized views) see the rows copied so far and the rows the stream
+  changed since its copy started.
 - A restart in the middle of a snapshot resumes after the last logged
   boundary.
 - `ALTER SOURCE ... REFRESH` adds tables that are snapshotted the same way.

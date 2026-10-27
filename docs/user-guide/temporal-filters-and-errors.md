@@ -34,7 +34,7 @@ Where the clock is used:
 | Context | `now()` (and `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date`) |
 |---|---|
 | materialized views, `SUBSCRIBE (query)` | only in temporal filters (below), evaluated against the logical clock |
-| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN, also across restarts (checkpoints keep the clock ticks of the retention window) |
+| `SELECT` (ad hoc, virtual views) | the logical clock: the time of the state the read sees, also after a restart (checkpoints keep the last tick) |
 | `INSERT`/`UPDATE`/`DELETE` | the wall clock when the statement runs (the resulting values are logged) |
 
 `clock_timestamp()` always returns the wall clock and is rejected in
@@ -224,5 +224,3 @@ Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
   example `ON a.id = b.id AND a.x / b.y > 1` with `b.y = 0`. Errors in
   expressions over a single input (including computed join keys such as
   `ON a.v = 100 / b.x`) are error records as usual.
-- Error records are **not versioned**: an `AS OF` read checks the view's
-  current error records, whatever they were at the read's GSN.

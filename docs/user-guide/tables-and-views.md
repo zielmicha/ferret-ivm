@@ -158,7 +158,7 @@ CREATE [ OR REPLACE ] [ MATERIALIZED ] VIEW [ IF NOT EXISTS ] name
 |---|---|---|
 | Stored | the query text | the query text, a dataflow and an index of the results |
 | Work on change | none | incremental maintenance of the dataflow at every GSN that touches its inputs |
-| Read | the query is expanded inline and evaluated against current (or historical) state | served from the view's index |
+| Read | the query is expanded inline and evaluated against the current state | served from the view's index |
 | `SUBSCRIBE` | yes (a private dataflow is built for the subscription) | yes |
 | `CREATE INDEX` on it, sink from it | no | yes |
 | `now()`, `random()`, other non-deterministic functions | allowed | only `now()` family in [temporal filters](temporal-filters-and-errors.md); see [Maintained views](../sql/maintained-views.md) |
@@ -304,11 +304,9 @@ What indexes are used for:
   lookups on `t(c)` uses the existing index on `t(c)` instead of building
   another one, and vice versa.
 
-An `AS OF` read uses only indexes whose history covers its GSN
-([Time travel](reads.md#time-travel-as-of-gsn)): an index created after
-that GSN is not used for it. Indexes do not make joins in maintained views
-possible or impossible — the planner creates the arrangements it needs —
-they only avoid duplicates and speed up reads.
+Indexes do not make joins in maintained views possible or impossible — the
+planner creates the arrangements it needs — they only avoid duplicates and
+speed up reads.
 
 ## DROP
 

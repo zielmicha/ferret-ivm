@@ -1,15 +1,14 @@
-# Storage: MVCC B+trees, summaries and the buffer pool
+# Storage: B+trees of weighted entries, summaries and the buffer pool
 
 All persistent state except the input log lives in one storage environment
 (`storage::Env`, `crates/ivm/src/storage/`): a set of copy-on-write B+trees
-whose keys are byte strings and whose values are (GSN, weight) histories,
-augmented with aggregate summaries per subtree, cached in a node arena that
-acts as the buffer pool. This chapter describes the structures and
-algorithms; byte formats are in [On-disk format](../on-disk-format.md).
+whose keys are byte strings and whose values are weights, augmented with
+aggregate summaries per subtree, cached in a node arena that acts as the
+buffer pool. This chapter describes the structures and algorithms; byte
+formats are in [On-disk format](../on-disk-format.md).
 
 Files: `mod.rs` (trees, arena, reads, writes, eviction, checkpoint, the
-maintenance pass),
-`node.rs` (node encoding), `history.rs`, `summary.rs`, `segment.rs`,
+maintenance pass), `node.rs` (node encoding), `summary.rs`, `segment.rs`,
 `manifest.rs`, `sort.rs` (loading unordered entries through sorted runs),
 `inspect.rs` (buffer-pool residency per tree, for the web UI), `tests.rs`
 (model tests).
@@ -17,7 +16,12 @@ maintenance pass),
 ## Trees
 
 A tree (`TreeId`, a `u64` from a persistent counter) is an ordered map from
-**entry** (byte string) to **history**. The dataflow uses one tree per
+**entry** (byte string) to **weight** (`i64`, never 0: a change that makes
+an entry's weight 0 removes the entry). The trees hold the current state
+only: there are no versions, and nothing to read the state at an earlier
+GSN from (the dataflow reads an arrangement as it was before the GSN being
+applied by overlaying that GSN's delta on it, see
+[Dataflow](dataflow.md#processing-a-gsn)). The dataflow uses one tree per
 arrangement; an entry is the encoding of one row (key part, fidelity suffix,
 payload — see [Dataflow](dataflow.md#arrangements-and-layouts)), so the tree
 is keyed by (key, value) and distinct rows with the same key are distinct
@@ -27,25 +31,24 @@ engine's state as entries of the same kind
 *summarizer* that defines its per-node summaries.
 
 Each tree's state: its root pointer, the summary of the whole tree, the
-oldest segment holding any of its nodes (`min_seg`), the root's compaction
-state (`due`, below), the live bytes of its nodes per segment, its
-summarizer, and whether it has been attached after recovery.
+oldest segment holding any of its nodes (`min_seg`), the live bytes of its
+nodes per segment, its summarizer, and whether it has been attached after
+recovery.
 
 ### Nodes
 
 | Node | Contents |
 |---|---|
-| leaf | sorted entries, each `(key, history)` |
-| internal | sorted children, each `(separator, pointer, summary of the child's subtree, min_seg of the child's subtree, due of the child's subtree)` |
+| leaf | sorted entries, each `(key, weight)` |
+| internal | sorted children, each `(separator, pointer, summary of the child's subtree, min_seg of the child's subtree)` |
 
 A child's separator is the lower bound of its key range (ignored for the
 first child); a key belongs to the last child whose separator is `<=` it.
 Nodes are split by size: the target is 16 KiB of estimated serialized size
 for leaves and for internal nodes (`node::entry_size`, `node::child_size`: a
-leaf entry counts its key, 4 bytes and 6 per history element; a child its
-separator, its `due` and its summary as encoded and 24 bytes). Each node's
-estimate is kept exact as its contents change, also when writing it makes
-its children's `due` exact or a merge combines two children's summaries. A
+leaf entry counts its key and 6 bytes; a child its separator and its
+summary as encoded and 24 bytes). Each node's estimate is kept exact as its
+contents change, also when a merge combines two children's summaries. A
 node whose contents after an update exceed the target is split into chunks
 of balanced size (internal nodes keep at least two children per chunk);
 when they exceed twice the target (a bulk
@@ -60,8 +63,9 @@ of its first key that is greater than the previous chunk's last key (suffix
 truncation); a new internal node takes its first child's separator. The
 first chunk keeps the node's place (and separator) in its parent.
 
-A node that an update or the maintenance pass leaves smaller than a quarter
-of its target is merged with its right neighbour, or else its left one,
+A node that an update leaves smaller than a quarter of its target (a
+delete removes its entry at once), or that the maintenance pass relocates
+while it is that small, is merged with its right neighbour, or else its left one,
 when the two fit in three quarters of the target (so that the result does
 not split again soon); the result is merged again while it is still that
 small. Merging internal nodes moves the right node's children, its first
@@ -70,16 +74,6 @@ summary (the same entries), and the merged node's summary is the two
 summaries combined, which is exactly the summary of the merged entries:
 sums add exactly, and a `min`/`max` held as a prefix keeps its hash only
 when both sides had the same one (see [Summaries](#summaries)).
-
-`due` is the smallest retention frontier at which compacting some leaf of
-the subtree would remove at least a quarter of that leaf's estimated size
-(`node::leaf_compaction`): the point where rewriting the leaf is worth its
-cost. A leaf with less garbage than that keeps it until it is rewritten for
-another reason, which bounds the garbage behind the frontier to a quarter of
-each leaf. `due` is
-exact for clean children: a checkpoint computes it from the contents of
-each node it writes. For a dirty child it is a lower bound — an update sets
-it to 0, the maintenance pass to the exact value of the leaves it visits.
 
 Pointers are either `Disk(DiskLoc)` — segment id, offset and length of the
 node's frame in a segment file — or `Mem(slot)` — the node is loaded in the
@@ -90,24 +84,26 @@ arena.
 Loaded nodes live in `slots`. A slot holds the node, its disk location (if it
 has an up-to-date copy on disk), a dirty flag, its parent slot, its tree, the
 number of loaded children, a CLOCK reference bit, its estimated serialized
-size (for splits), its size in memory, and (for leaves) the number of
-in-place edits since it was last rebuilt. Accessing a child through a `Disk`
+size (for splits), and its size in memory. Accessing a child through a `Disk`
 pointer reads and decodes the frame, allocates a slot and replaces the
 pointer by `Mem(slot)`.
 
 The pool is accounted in bytes of memory, not in serialized bytes: a node's
 size in memory (`Node::mem_size`, plus its slot) is its vector of entries or
-children by capacity — 56 bytes per leaf entry, whatever the entry's
-serialized size — plus the heap blocks they own: each key or separator, a
-history of more than two changes, and the values of summaries (`min`/`max`
+children by capacity — 24 bytes per leaf entry (its key's pointer and
+length, and its weight), whatever the entry's serialized size — plus the
+heap blocks they own: each key or separator, and the values of summaries (`min`/`max`
 datums or the boxes of their prefixes, exact sums with a float sum's
 magnitude once it outgrows its four inline limbs). A heap block of *n*
 bytes is counted as *n* + 8 rounded up to 16 (`memory::heap_block`, close
 to what glibc and mimalloc take). In-place leaf edits maintain the size
 incrementally, as they do the serialized size, and so do merges and the
-maintenance pass for the children they change. (Counting serialized bytes undercounted narrow entries
-about fourfold: an 8-byte key with one change is 18 serialized bytes and
-about 80 in memory.)
+maintenance pass for the children they change. An entry with an 8-byte key
+takes 40 bytes in memory (14 by the serialized-size estimate, less on disk
+with prefix compression). (Counting serialized bytes
+undercounted narrow entries about fourfold; entries with histories took 56
+bytes besides their key, and a heap block for a history of more than two
+changes.)
 
 - **Copy-on-write.** Modifying a node marks it dirty; a dirty node has no
   disk location (its previous on-disk copy becomes garbage). A dirty node is
@@ -166,41 +162,27 @@ segment files (through the operating system's page cache). The same holds
 for data that is not yet durable: a batch, a commit or a hydration much
 larger than the cache is written out as it goes.
 
-## Histories
+## Weights
 
-A history (`storage::History`) is a sorted list of `(GSN, weight)` changes of
-one entry. Reads choose a version:
+An entry's weight is the sum of the changes applied to it; an entry whose
+weight a change makes 0 is removed from its leaf at once (a leaf left
+without entries goes with it). So a tree holds exactly the entries of
+non-zero weight: a deleted row, a released temporal event or a retracted
+error record leaves no trace in the tree, and a scan, a lookup or a range
+summary visits live entries only (a hot row updated at every GSN, whose
+versions sort one after the other, is one entry).
 
-| `ReadAt` | Weight |
-|---|---|
-| `Latest` | sum of all changes |
-| `AsOf(t)` | sum of changes with GSN ≤ t |
-| `Before(t)` | sum of changes with GSN < t |
-
-`add(g, w, frontier)` adds a change (merging with an existing change at `g`)
-and then compacts: all changes at or before the **retention frontier** are
-merged into one change stamped with the latest of their GSNs (dropped if the
-sum is zero), and zero-weight changes are removed. An entry whose history
-becomes empty is deleted from its leaf. Reads at or after the frontier are
-exact; the engine refuses `AS OF` reads before it. (A tree's history also
-only starts when the dataflow filled it: an arrangement records the GSN it
-was hydrated at, its `since`, and `AS OF` reads of earlier GSNs do not use
-it; see [Dataflow](dataflow.md).)
-
-Compaction happens to an entry when the entry is updated, to all entries of
-a leaf when the leaf is rebuilt (see below), and to the leaves the
-maintenance pass visits: those modified since the last checkpoint, and
-those whose `due` the frontier has passed — also leaves no update reaches
-again, such as the head of a queue, rows purged by age, or the old versions
-of a row whose versions sort one after the other. Retracted entries
-therefore stay until the frontier passes them and the next pass (a
-checkpoint interval later, or more if its budget runs out first) reaches
-them, unless they are less than a quarter of their leaf.
+Earlier versions kept each entry's history of (GSN, weight) changes, for
+reads as of earlier GSNs, consolidated behind a retention frontier by the
+maintenance pass. Their leaves (kind 1,
+[On-disk format](../on-disk-format.md#leaf-node)) are still read: an
+entry's weight is its history's sum, and an entry whose history adds up to
+0 is dropped as the leaf is decoded; the leaf is written in the current
+format when it is next rewritten.
 
 ## Writes
 
-`Env::apply(tree, updates, gsn)` applies a batch of `(entry, weight)`
-changes at one GSN:
+`Env::apply(tree, updates)` applies a batch of `(entry, weight)` changes:
 
 1. Sort by entry, add up equal entries, drop zero weights. A large batch is
    then applied in runs of consecutive entries whose cost — a leaf's size
@@ -211,36 +193,37 @@ changes at one GSN:
 2. Descend from the root, partitioning the sorted updates among the children
    by binary search on the separators; only children that receive updates
    are visited (and loaded).
-3. At a leaf, either edit in place — when the leaf is already dirty, has had
-   fewer than 16 in-place edits since it was last rebuilt, and the updates
-   are at most an eighth of its entries — or rebuild it by merging the
-   updates into its entries, compacting every untouched entry on the way.
-   (So the first change to a leaf after a checkpoint always rebuilds and
-   compacts it.)
+3. At a leaf, add each update's weight to its entry's (inserting the entry,
+   or removing it when its weight becomes 0): in place when the updates are
+   at most an eighth of the leaf's entries (each insert or removal shifts
+   the entries after it), otherwise by merging the updates into a new
+   vector of entries.
 4. Split oversized nodes into chunks (see above); a root that splits gets a
    new parent; a root left with a single child is replaced by it; empty
    nodes are removed; children the update made smaller than a quarter of
-   their target are merged with a neighbour (loading it if needed).
+   their target are merged with a neighbour (loading it if needed): a leaf
+   that deletes empty goes, and leaves that deletes leave nearly empty are
+   combined, without waiting for a maintenance pass.
 5. Update summaries on the way back up (incrementally where possible, see
-   below), and the tree's total summary. The sizes, `min_seg` and `due` of
-   the internal nodes on the path follow the children that changed: a
-   node's `min_seg` and `due` are the minimums of its children's, and they
-   are computed from all of its children only when a child that may have
-   held a minimum got a higher one (the first update of a clean leaf after
-   a checkpoint, which makes it dirty), children were merged, or the node
-   splits. (So they never exceed the minimums: between the scans and the
-   writes that make them exact, they are only lowered.)
+   below), and the tree's total summary. The sizes and `min_seg` of the
+   internal nodes on the path follow the children that changed: a node's
+   `min_seg` is the minimum of its children's, computed from all of its
+   children only when a child that may have held the minimum got a higher
+   one (the first update of a clean leaf after a checkpoint, which makes it
+   dirty), children were merged, or the node splits. (So it never exceeds
+   the minimum: between the scans and the writes that make it exact, it is
+   only lowered.)
 
 ## Reads
 
 | Operation | Algorithm |
 |---|---|
-| `get(key)` | descend to the leaf, binary search |
-| `for_each(lo, hi, f)` / `for_each_prefix(p, f)` | call `f` with each entry of the range in key order, where it lies in its leaf (nothing is copied), until `f` returns false. One leaf at a time: after a leaf it descends again from the root with the next separator as its new lower bound, so it never pins nodes; a large scan evicts the nodes it read once it is done with them, while the pool is over its target (see [eviction](#the-node-arena-buffer-pool)), so a scan of a tree larger than the pool holds about the pool's target plus one path. A key prefix `p` is the range `[p, successor(p))`. The dataflow's lookups and scans use these |
+| `get(key)` | descend to the leaf, binary search; the entry's weight |
+| `for_each(lo, hi, f)` / `for_each_prefix(p, f)` | call `f` with each entry of the range and its weight in key order, where it lies in its leaf (nothing is copied), until `f` returns false. One leaf at a time: after a leaf it descends again from the root with the next separator as its new lower bound, so it never pins nodes; a large scan evicts the nodes it read once it is done with them, while the pool is over its target (see [eviction](#the-node-arena-buffer-pool)), so a scan of a tree larger than the pool holds about the pool's target plus one path. A key prefix `p` is the range `[p, successor(p))`. The dataflow's lookups and scans use these |
 | `scan` / `scan_prefix` | `for_each` collecting copies of the entries |
 | `cursor(lo, hi)` | a stateless range cursor with the same descent that buffers one leaf's entries at a time (for callers that interleave other work between entries) |
 | `range_summary(lo, hi)` | combine the stored summaries of children that lie entirely inside the range and recurse into the (at most two per level) partially covered children, folding leaf entries at the edges: O(log n) nodes. The whole-tree summary is stored. A `min`/`max` that the result holds as a prefix is then resolved to the value ([below](#wide-min-and-max-values)) |
-| `nth(lo, hi, n)` | find the entry holding the n-th unit of weight in the range by skipping fully covered children by their counts |
+| `nth(lo, hi, n)` | find the entry holding the n-th unit of weight in the range (and its weight, and the unit's offset in it) by skipping fully covered children by their counts |
 | `tree_count(tree)` | the stored total count |
 
 `set_read_budget(Some(n))` limits the entries the scans (`for_each`,
@@ -250,9 +233,9 @@ move a large read off its thread ([Planner](planner.md#batch-execution)).
 A scan the budget stops is done with what it read: a large one evicts it
 first, as at its end.
 
-Summaries reflect the **current** weights only; historical reads use the
-histories. (Operators that need a previous aggregate value read it from
-their output arrangement.)
+Summaries reflect the current weights, which are all a tree holds.
+(Operators that need a previous aggregate value read it from their output
+arrangement.)
 
 ## Summaries
 
@@ -474,8 +457,7 @@ append-only file that is rolled over to the next id once it reaches
 the same operation (`write_node`, for a dirty node whose loaded children
 are clean): the frame counts as live bytes of its segment and of its tree,
 and towards the next maintenance pass's budget unless that pass dirtied
-the node; the child entry above the node gets its exact `min_seg` and
-`due` (and the parent's size, which counts the `due`, follows), and the
+the node; the child entry above the node gets its exact `min_seg`, and the
 entries above that (and the tree's) get a `min_seg` lowered to it where
 they were higher. A checkpoint has three parts, which can run on
 different threads:
@@ -493,8 +475,8 @@ different threads:
    of a child the environment counts at another).
 2. `CheckpointJob::run(app)` writes every frozen dirty node of every tree
    (temporary trees aside, below), depth-first so that each parent is
-   written after its children and records their locations, `min_seg` and
-   `due`, and updates each tree's `min_seg` and `due`; `fsync`s the active
+   written after its children and records their locations and `min_seg`,
+   and updates each tree's `min_seg`; `fsync`s the active
    segment and any segments rolled over since the last sync (outside the
    append side's lock: the record names the length that sync covered, and
    frames others append meanwhile lie beyond it); appends a checkpoint
@@ -502,15 +484,14 @@ different threads:
    `min_seg`, every segment's (total bytes, its length; live bytes), the
    active segment and its length, the next tree id, the application state
    (a header of a few bytes naming the metadata tree), and every tree's
-   `due` and live bytes per segment — to `store/MANIFEST` and `fsync`s it
+   live bytes per segment — to `store/MANIFEST` and `fsync`s it
    (this append is the commit point). It returns the sealed segments
    without live bytes in the committed state.
 3. `Env::finish_checkpoint` takes the append side and manifest back, and
    marks each written node clean, with its new location, if its slot still
    holds it unchanged (same stamp): it is then accounted as if written
    here (its frame live in its segment and its tree's, its exact `min_seg`
-   and `due` in its parent's child entry, `min_seg` lowered up the
-   ancestors), and the bytes the job wrote for the engine's updates count
+   in its parent's child entry, `min_seg` lowered up the ancestors), and the bytes the job wrote for the engine's updates count
    towards the next maintenance pass. A written node that was modified (or
    freed) since the job began stays dirty (or gone): its image is garbage
    from the start, counted in its segment's total but not as live. Then the
@@ -545,26 +526,25 @@ segment. A node that becomes dirty, is dropped, or is released with its
 tree subtracts its frame length from both — also a frame the buffer pool
 wrote early, whose node was modified again before a checkpoint.
 
-Garbage arises from updates: copy-on-write leaves the previous image of
-every node a checkpoint rewrites in its segment, and retractions leave
-dead history in leaves. Neither is reclaimed by the updates themselves (a
-leaf no update reaches again keeps its dead entries, a segment keeps its
-dead frames), so one pass finds both by need and removes them.
+Garbage arises from updates in one place only: copy-on-write leaves the
+previous image of every node a checkpoint rewrites in its segment (the
+leaves themselves hold live entries only: a retraction removes its entry,
+and merges combine the leaves deletes leave underfull, as the updates
+happen). The updates do not reclaim the dead frames, so a pass finds them
+by need and removes them.
 
 `Env::maintain()` runs before every checkpoint (the checkpoint then writes
 what it rewrote, and deletes the segments it emptied). It visits a tree only
-if its root is dirty, its `due` has passed the frontier, or it has live
-bytes in a segment being evacuated, and descends only into children that
-qualify the same way (`due` ≤ frontier, or a node of an evacuated segment
-in the subtree, found through `min_seg` and the child's own location). At a
-leaf it compacts every entry at the frontier when the leaf is dirty (the
-checkpoint writes it anyway) and anything is compactable, when its `due`
-has passed, or when its segment is being evacuated; a leaf compacted empty
-is removed. Then it merges what that left underfull, as updates do. A clean
-node whose `due` was not exact (read from a kind-2 node) gets the exact
-value, which rewrites its parent. None of this changes a summary:
-compaction keeps every entry's current weight, and merging keeps the
-entries. Rewriting a clean node marks it and its ancestors dirty.
+if it has live bytes in a segment being evacuated, and descends only into
+children that may hold such nodes (a node of an evacuated segment in the
+subtree, found through `min_seg` and the child's own location). A node in
+an evacuated segment is made dirty, so that the checkpoint writes it to the
+active segment, and the path to it with it; a relocated node smaller than
+a quarter of its target is merged with a neighbour, as after an update (a
+leaf of an earlier version is smaller once its retracted entries are
+dropped, and one that decodes empty is removed). None of this changes a
+summary: relocating and merging keep the entries. Rewriting a clean node
+marks it and its ancestors dirty.
 
 The segments to evacuate are the sealed segments less than half live, in
 decreasing order of the cost-benefit of cleaning them: free space gained per
@@ -576,18 +556,18 @@ whether it lies in such a segment: the parent's pointer says, and every
 leaf of a tree is at the depth of the first one the pass reaches.
 
 Reading and rewriting clean nodes is budgeted (`MaintBudget`; rewriting the
-path to a rewritten node and anything dirty is not counted): for compaction
-(and merges) and for evacuation each, 8 MiB plus the bytes written for the
-engine's own updates since the previous pass (by checkpoints and early),
-which is the rate at which garbage arises. The nodes it rewrites are dirty
+path to a rewritten node and anything dirty is not counted): for evacuation
+and the merges it brings, 8 MiB plus the bytes written for the engine's own
+updates since the previous pass (by checkpoints and early), which is the
+rate at which garbage arises. The nodes it rewrites are dirty
 until the checkpoint that follows the pass writes them, so their memory is
 budgeted too: no more than the pool's target leaves besides the dirty
 nodes already in it (the buffer pool keeps those within half of the
 target, writing the rest early). What does not fit waits for the next pass:
 the pass reports that it left work (`MaintStats::unfinished`), which makes
 the engine's next checkpoint due even if nothing else changes.
-`maintain_with` takes an explicit budget (a zero budget compacts only dirty
-leaves). Once a segment has no live bytes it is deleted at the end of a
+`maintain_with` takes an explicit budget (a zero budget does nothing but
+report the work it found). Once a segment has no live bytes it is deleted at the end of a
 checkpoint. The active segment itself is never evacuated.
 
 Dropping a tree (`drop_tree`) reads nothing: it frees the tree's loaded

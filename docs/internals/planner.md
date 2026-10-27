@@ -37,7 +37,9 @@ empty statement when nothing else is left.
 - The `AS OF` suffix is the last `AS OF` (two words separated by any
   whitespace and followed by more text) outside parentheses, string literals
   (`E''` escapes included), quoted identifiers, comments and dollar quotes,
-  found on an ASCII-lowercased copy so that byte offsets stay valid.
+  found on an ASCII-lowercased copy so that byte offsets stay valid. It is
+  `FRESH` or `AT LEAST LSN '...'`; `AS OF <gsn>` and `AS OF LATEST`, time
+  travel of earlier versions, are refused with `0A000`.
 - Before parsing, the statement's text is checked for chains of more than
   50,000 operators at one nesting level (`MAX_OPERATOR_CHAIN`), which are
   refused with `54001 stack depth limit exceeded`: the parser builds such a
@@ -348,24 +350,22 @@ view its root's error records.
 
 Ad hoc queries (and the evaluation of DML statements) do not build dataflow.
 `exec::ExecCtx` evaluates the optimised `Rel` directly against the
-arrangements at a given `ReadAt`:
+arrangements as they are (their current state):
 
-- `Get` scans the node's first arrangement whose history covers the read
-  (`Arrangement::covers`); a read as of a GSN before the history of every
-  arrangement of the relation fails with `55000` (`AS OF g is before the
-  history of a relation it reads, which starts at s`);
+- `Get` scans the node's first hydrated arrangement (a node without one is
+  computed from its inputs' snapshots);
 - a base relation read — a `Get` under filters and projections — reads one
   arrangement: equalities with constants on a key prefix, optionally
   followed by a range (`<`, `<=`, `>`, `>=`, `BETWEEN`) on the next key
   column, select a key range of the arrangement they narrow most (ascending
-  keys only; constants of exactly the column's type; only arrangements that
-  cover the read). Only the columns the projection and the predicates use
+  keys only; constants of exactly the column's type; only hydrated
+  arrangements). Only the columns the projection and the predicates use
   are decoded, and every predicate is still checked on every row;
 - joins are hash joins on the equality conditions (all join kinds), except
   that an inner, left, semi or anti join whose right side is a base relation
   read, and whose left side is small compared to an arrangement of that
-  relation keyed by equated columns and covering the read (less than 1/64 of
-  its entries), looks each left row's key up in the arrangement instead;
+  relation keyed by equated columns (less than 1/64 of its entries), looks
+  each left row's key up in the arrangement instead;
 - aggregation is hash aggregation using the same aggregate definitions and
   summary arithmetic as `Reduce`, window functions the same partition
   computation as `Window`, `WITH RECURSIVE` semi-naive iteration;
@@ -394,8 +394,8 @@ arrangements at a given `ReadAt`:
   chunks follow on a stream, `coord::stream`; a closed stream ends the
   read).
 
-Before a read runs, `now()` and its relatives are bound to the logical clock
-as of the read's GSN, and the read fails if it touches a broken view
+Before a read runs, `now()` and its relatives are bound to the logical clock,
+and the read fails if it touches a broken view
 (`55000`) or a materialized view with error records. Expression errors fail
 the query, as in PostgreSQL (after the chunks already sent, if any).
 

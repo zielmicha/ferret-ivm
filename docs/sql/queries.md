@@ -52,8 +52,9 @@ Materialized views have additional restrictions
 | `a JOIN LATERAL (...) l ON ...`, `LEFT JOIN LATERAL (...) l ON true` | only inner and left lateral joins; a left lateral join needs `ON true` |
 | `( a JOIN b ... ) [AS alias]` | parenthesised joins; the alias names the join's output columns |
 
-Not supported: `ROWS FROM (...)`, table versions (`FOR SYSTEM_TIME`; use
-`AS OF`). `TABLESAMPLE` is accepted and **ignored** (all rows are returned).
+Not supported: `ROWS FROM (...)`, table versions (`FOR SYSTEM_TIME`: reads
+see the latest state). `TABLESAMPLE` is accepted and **ignored** (all rows
+are returned).
 
 ### WHERE, GROUP BY, HAVING
 

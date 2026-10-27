@@ -2,23 +2,25 @@
 
 Every read sees the engine's state as of one GSN — the global sequence number
 the engine assigns to every logged input (source transaction, local DML
-statement, DDL statement, clock tick). This chapter describes how a read
-chooses its GSN, the session settings, and `SUBSCRIBE`. Code:
+statement, DDL statement, clock tick): the latest state, after the last GSN
+the engine has applied when the read runs. This chapter describes what a
+read waits for before it reads, the session settings, and `SUBSCRIBE`. Code:
 `crates/ivm/src/coord/read.rs`, `crates/ivm/src/server/mod.rs`,
 `crates/ivm/src/exec.rs`.
 
 ## Read points
 
-| Form | Reads the state at | Waits for |
-|---|---|---|
-| `SELECT ...` (session `read_mode = fresh`, the default) | the last durable GSN when the query arrives | the engine to apply that GSN; the snapshots of the replicated tables read |
-| `SELECT ... AS OF FRESH` | same, regardless of `read_mode` | same |
-| `SELECT ...` with `read_mode = latest`, or `SELECT ... AS OF LATEST` | the last applied GSN | nothing |
-| `SELECT ... AS OF <gsn>` | `<gsn>` | the engine to apply `<gsn>` if it is in the future |
-| `SELECT ... AS OF AT LEAST LSN '<X/Y>'` | the last durable GSN once every source's frontier has reached the LSN | every source frontier ≥ LSN; the snapshots of the replicated tables read |
+| Form | Waits for (then reads the latest state) |
+|---|---|
+| `SELECT ...` (session `read_mode = fresh`, the default) | the engine to apply the last GSN made durable when the query arrives; the snapshots of the replicated tables read |
+| `SELECT ... AS OF FRESH` | same, regardless of `read_mode` |
+| `SELECT ...` with `read_mode = latest` | nothing |
+| `SELECT ... AS OF AT LEAST LSN '<X/Y>'` | every source frontier ≥ LSN, then as a fresh read |
 
 All relations in one query are read at the same GSN, so a query never sees a
-half-applied upstream transaction or a mix of two points in time.
+half-applied upstream transaction or a mix of two points in time. There is
+no time travel: the engine keeps the current state of its indexes only, so
+a read cannot ask for the state at an earlier GSN ([Architecture](../internals/architecture.md#where-the-implementation-differs-from-the-design)).
 
 ### Syntax
 
@@ -26,23 +28,29 @@ half-applied upstream transaction or a mix of two points in time.
 statement — after `ORDER BY`, `LIMIT` and `OFFSET`:
 
 ```sql
-SELECT * FROM revenue ORDER BY region AS OF 123456;
 SELECT * FROM orders WHERE id = 7 AS OF AT LEAST LSN '0/16B3748';
-SELECT count(*) FROM orders AS OF LATEST;
+SELECT count(*) FROM orders AS OF FRESH;
 ```
 
 It is recognised as the last `AS OF` (case-insensitive, the two words
 separated by whitespace, with whitespace before and after) at the top level
 of the statement: outside parentheses, string literals, quoted identifiers,
 comments and dollar-quoted strings. Anything after the clause is a syntax
-error (`unexpected tokens after AS OF clause`). Sub-selects cannot have
-their own `AS OF`; `FOR SYSTEM_TIME`-style table versions are rejected
-(`table versions are not supported; use AS OF on the query`).
+error (`unexpected tokens after AS OF clause`), and so is an `AS OF`
+followed by anything but `FRESH` or `AT LEAST LSN` (`AS OF expects FRESH or
+AT LEAST LSN '<lsn>'`), except the forms of time travel earlier versions
+accepted, which fail with SQLSTATE `0A000`: `AS OF <gsn>` (`AS OF <gsn> is
+not supported: reads see the latest state (the engine keeps no history)`)
+and `AS OF LATEST` (`AS OF LATEST is not supported; use SET read_mode =
+latest`). Sub-selects cannot have their own `AS OF`; `FOR
+SYSTEM_TIME`-style table versions are rejected (`table versions are not
+supported: reads see the latest state`).
 
 ### Fresh reads (default)
 
 A fresh read takes the GSN of the last input the sequencer has made durable
-when the query arrives, and waits until the engine thread has applied it.
+when the query arrives, waits until the engine thread has applied it, and
+then reads the latest state (which may include inputs applied since).
 This includes every local DML statement whose reply the client has already
 received, and every upstream transaction that has been logged. Fresh reads
 also wait while a replicated table that the query reads — directly or through
@@ -56,52 +64,10 @@ of `SELECT` upstream) holds back the fresh reads of that table only.
 
 ### Latest reads
 
-`SET read_mode = latest` (or `AS OF LATEST`) reads whatever is applied right
-now, without waiting. Use it when staleness of a few milliseconds does not
-matter, or to inspect tables while a snapshot is loading.
-
-### Time travel: AS OF gsn
-
-`AS OF <gsn>` reads the state at a past GSN from the multi-version histories
-of the indexes. The history kept is controlled by `--retention-gsns`
-(default 1000): reads before the *retention frontier* (last applied GSN minus
-the retention) fail with SQLSTATE `55000`:
-
-```
-ERROR:  AS OF 2 is before the retention frontier 3
-```
-
-A GSN in the future makes the read wait until the engine reaches it (the
-wait can be cancelled, see below).
-`SHOW GSN` returns the last applied GSN, and `SHOW FRONTIERS`
-the retention frontier. Note that every clock tick (by default one per
-second) consumes a GSN, so 1000 GSNs are at most about 17 minutes on an idle
-engine.
-
-Time-travel reads use the **current** catalog: a virtual view is expanded
-with its current definition over the historical table contents.
-
-An index keeps history only from the GSN at which it was built, and an
-`AS OF` read uses only indexes whose history covers its GSN. A secondary
-index created after that GSN is simply not used. When a relation the read
-needs has no such index at all, the read fails with SQLSTATE `55000`:
-
-```
-ERROR:  AS OF 133 is before the history of a relation it reads, which starts at 134
-```
-
-This happens for a relation created after the GSN, and for one whose index
-was rebuilt since: a materialized view replaced with `CREATE OR REPLACE` or
-re-planned after a change to what it reads, a replicated table after an
-upstream schema change, and a materialized view whose dataflow a restart
-rebuilt (recovery plans every view again; when the plan comes out
-different, for example because join orders follow the current table sizes,
-the view's indexes are hydrated afresh; see
-[Known problems](troubleshooting.md#known-problems)).
-
-Error records are not versioned: a read of a materialized view as of any GSN
-fails if the view has error records *now*, and succeeds if it has none now,
-whatever its state at that GSN.
+`SET read_mode = latest` reads whatever is applied right now, without
+waiting. Use it when staleness of a few milliseconds does not matter, or to
+inspect tables while a snapshot is loading. `SHOW GSN` returns the last
+applied GSN.
 
 ### Read-your-writes against PostgreSQL: AS OF AT LEAST LSN
 
@@ -130,10 +96,10 @@ waiting read when the last source is dropped: the LSN is a position in an
 upstream's WAL, so a read without sources could not show the commit it
 waits for.
 
-A read that waits — for freshness, an LSN, a future GSN or an initial
-snapshot — ends with SQLSTATE `57014` (`canceling statement due to user
-request`) when the client cancels it (a `CancelRequest`, Ctrl-C in psql);
-DML queued behind another statement is cancelled the same way. The engine
+A read that waits — for freshness, an LSN or an initial snapshot — ends
+with SQLSTATE `57014` (`canceling statement due to user request`) when the
+client cancels it (a `CancelRequest`, Ctrl-C in psql); DML queued behind
+another statement is cancelled the same way. The engine
 also drops a waiting read when its client disconnects (the session checks
 the connection every 200 ms while it waits), and the web UI console drops
 its read when it stops waiting (after 30 s).
@@ -142,18 +108,16 @@ its read when it stops waiting (after 30 s).
 
 `now()`, `current_timestamp`, `current_date`, `localtimestamp`,
 `transaction_timestamp()` and `statement_timestamp()` return the engine's
-**logical clock as of the read's GSN**: the value of the latest logged clock
-tick at or before that GSN. Reads are therefore repeatable — the same query
-`AS OF g` returns the same result every time, also after a restart
-(checkpoints keep the clock ticks). `clock_timestamp()` is the real wall
-clock. See [Temporal filters](temporal-filters-and-errors.md#the-logical-clock).
+**logical clock**: the value of the latest logged clock tick applied, which
+is the time of the state the read sees (also after a restart: checkpoints
+keep the last tick). `clock_timestamp()` is the real wall clock. See
+[Temporal filters](temporal-filters-and-errors.md#the-logical-clock).
 
 ### Views with errors
 
 A read that references a materialized view that currently has
 [error records](temporal-filters-and-errors.md#errors-as-data) fails with
-that error (the error's SQLSTATE and message), regardless of the read point.
-A read that references a [broken](operations.md#recovery) materialized view
+that error (the error's SQLSTATE and message). A read that references a [broken](operations.md#recovery) materialized view
 (directly or through views) fails with SQLSTATE `55000`
 (`materialized view "v" is broken: <reason>`).
 
@@ -161,8 +125,8 @@ A read that references a [broken](operations.md#recovery) materialized view
 
 Ad hoc queries do not create dataflow: they are planned like views and then
 evaluated once by a batch executor over the indexes (key lookups and
-ranges, index or hash joins, hash aggregation, sorting), at the chosen GSN.
-Reading a materialized view is a scan of its index (or a key range of it,
+ranges, index or hash joins, hash aggregation, sorting). Reading a
+materialized view is a scan of its index (or a key range of it,
 see [Indexes](tables-and-views.md#indexes)); reading a virtual view
 evaluates its query. Expression errors make the query fail, as in
 PostgreSQL.
@@ -272,8 +236,8 @@ is_local)` returns `value` without changing or checking anything.
 `SUBSCRIBE` streams the changes of a relation or query as they are applied.
 
 ```sql
-SUBSCRIBE [ TO ] name    [ WITH ( option [ , ... ] ) ] [ AS OF gsn ]
-SUBSCRIBE [ TO ] ( query ) [ WITH ( option [ , ... ] ) ] [ AS OF gsn ]
+SUBSCRIBE [ TO ] name    [ WITH ( option [ , ... ] ) ]
+SUBSCRIBE [ TO ] ( query ) [ WITH ( option [ , ... ] ) ]
 COPY ( SUBSCRIBE ... ) TO STDOUT
 
 option:
@@ -294,8 +258,9 @@ and `1` mean true and anything else false; without `=`, only the words
   already have — hydrated, and released when the subscription ends.
 - A [broken](operations.md#recovery) materialized view, or a query reading
   one, cannot be subscribed to (SQLSTATE `55000`).
-- `AS OF gsn` is accepted but ignored: a subscription always starts at the
-  last applied GSN.
+- A subscription always starts at the last applied GSN: `AS OF` after the
+  options fails with SQLSTATE `0A000` (`SUBSCRIBE ... AS OF is not
+  supported: a subscription starts at the last applied GSN`).
 
 ### Output
 

@@ -31,7 +31,7 @@ decoding files written by a running engine.
 9. [Format 1 application state (AppState)](#format-1-application-state-appstate)
 10. [Data encodings](#data-encodings)
 11. [Structural fingerprints](#structural-fingerprints)
-12. [Garbage collection and retention](#garbage-collection-and-retention)
+12. [Garbage collection](#garbage-collection)
 13. [Compatibility](#compatibility)
 
 ## Conventions
@@ -388,8 +388,7 @@ the session ends, and any left by a crash when the log is opened.
   successor starts at or before `g + 1` (so all its records are ≤ `g`) is
   deleted, and so is every parts file of a GSN ≤ `g`. Recovery replays the
   log after the checkpoint, and nothing else reads the log, so the records a
-  checkpoint covers are not kept (`AS OF` reads use the histories in the
-  trees, not the log).
+  checkpoint covers are not kept.
 - The engine ignores records whose GSN is at or below the last GSN it has
   applied.
 
@@ -427,7 +426,7 @@ header. Reading a node reads exactly `len` bytes at `off` and checks that
   existing file of that name is truncated) and the store directory
   `fsync`ed. Sealed segments are never modified; they are `fsync`ed at the
   next sync and deleted whole once no live node remains in them (see
-  [Garbage collection and retention](#garbage-collection-and-retention)).
+  [Garbage collection](#garbage-collection)).
 - On open, the active segment named by the last checkpoint (segment 1 for a
   new store) is opened, created if missing (then the store directory is
   `fsync`ed), and resized to the checkpoint's `active_len` (0 for a new
@@ -438,47 +437,77 @@ header. Reading a node reads exactly `len` bytes at `off` and checks that
 ### Leaf node
 
 ```
-u8       kind = 1
+u8       kind = 4
 uvarint  n                         number of entries
 n × entry:
   uvarint  shared                  length of the prefix shared with the previous entry's key (0 for the first)
   bytes    suffix                  the rest of the key
+  ivarint  weight                  the entry's weight (never 0)
+```
+
+Keys are unique, in ascending `memcmp` order. A leaf holds the current
+weight of each entry and nothing else: an entry whose weight a change makes
+0 is removed, and a leaf left without entries is removed from its tree.
+Example — the three entries of a table `customers (id int PRIMARY KEY,
+region text)` after `INSERT INTO customers VALUES (1, 'eu'), (2, 'us')`,
+`INSERT INTO customers VALUES (3, 'apac')` and `UPDATE customers SET region
+= 'EU' WHERE id = 1` (decoded from a running engine; key = `02` + int4 key
++ payload, see [Arrangement entries](#arrangement-entries)):
+
+```
+20 00 00 00  ad f1 20 64           frame: len 32, crc
+04  03                             leaf, 3 entries
+00  09 02 80 00 00 01 09 02 45 55  02
+                                   key (1, 'EU'); weight 1
+04  05 02 09 02 75 73  02          shares 4 bytes; key (2, 'us'); weight 1
+04  07 03 09 04 61 70 61 63  02    shares 4 bytes; key (3, 'apac'); weight 1
+```
+
+(The update of row 1 retracted its old version (1, 'eu'), whose entry is
+gone, and added (1, 'EU').)
+
+Leaves of kind 1, written by versions that kept every entry's history of
+(GSN, weight) changes for reads as of earlier GSNs, are still read:
+
+```
+u8       kind = 1
+uvarint  n                         number of entries
+n × entry:
+  uvarint  shared, bytes suffix    as above
   uvarint  h                       number of history elements
   h × (uvarint gsn_delta, ivarint weight)
                                    gsn = previous element's gsn + gsn_delta (the first delta is from 0)
 ```
 
-Keys are unique, in ascending `memcmp` order; history elements are in
-ascending GSN order with non-zero weights. Example — the four entries of a
-table `customers (id int PRIMARY KEY, region text)` (decoded from a running
-engine; key = `02` + int4 key + payload, see
-[Arrangement entries](#arrangement-entries)):
+An entry's weight is the sum of its history's weights; an entry whose
+weights add up to 0 (a retraction kept for reads of earlier GSNs) is
+dropped as the leaf is decoded. The same table written by such a version,
+the update at GSN 115:
 
 ```
 2f 00 00 00  e0 4d a2 e2           frame: len 47, crc
 01  04                             leaf, 4 entries
 00  09 02 80 00 00 01 09 02 45 55  01 73 02
-                                   key (1, 'EU'); history [(115, +1)]
-07  02 65 75  02 32 02 41 01       shares 7 bytes; key (1, 'eu'); history [(50, +1), (115, −1)]
+                                   key (1, 'EU'); history [(115, +1)]: weight 1
+07  02 65 75  02 32 02 41 01       shares 7 bytes; key (1, 'eu'); history [(50, +1), (115, −1)]: dropped
 04  05 02 09 02 75 73  01 32 02    shares 4 bytes; key (2, 'us'); [(50, +1)]
 04  07 03 09 04 61 70 61 63  01 4c 02
                                    shares 4 bytes; key (3, 'apac'); [(76, +1)]
 ```
 
-(The update of row 1 from `'eu'` to `'EU'` at GSN 115 left two entries:
-retention had not yet consolidated the old version.)
+A leaf is written in the current kind when it is next rewritten (a change
+in it, or the maintenance pass relocating it).
 
 ### Internal node
 
 ```
-u8       kind = 3
+u8       kind = 2
 uvarint  n                         number of children (at least 1)
 n × child:
   bytes    separator               lower bound of the child's key range (stored but ignored for the first child)
   uvarint  seg, uvarint off, uvarint len
                                    DiskLoc of the child's frame
   uvarint  min_seg                 oldest segment id holding any node of the child's subtree (4294967295 = none)
-  uvarint  due + 1                 compaction state of the child's subtree (below); 0 = none
   summary                          the child subtree's summary (below)
 ```
 
@@ -486,21 +515,11 @@ A key belongs to the last child whose separator is `<=` the key. Separators
 are shortened at leaf splits: the separator of a new leaf is the shortest
 prefix of its first key that is greater than the previous leaf's last key.
 
-`due` is the smallest retention frontier at which compacting some leaf of
-the subtree is worth rewriting it, the minimum over its leaves. A leaf's
-`due` (`node::leaf_due`) is the smallest frontier *f* at which compacting
-every entry's history at *f* (as described in
-[Garbage collection and retention](#garbage-collection-and-retention))
-removes at least a quarter of the leaf's estimated size: `8 + Σ (key length
-+ 4 + 6 × history elements)` over its entries, an entry that compaction
-empties counting all of its size. "None" (`due + 1 = 0`, the value
-2^64 − 1 wrapped) means that no frontier would. The value of each child is
-computed from the child's contents when the node is written.
-
-Internal nodes of kind 2, written by earlier versions, are still read: the
-same layout without the `due` field. Their children's `due` reads as 0, so
-that the next maintenance pass visits every subtree under them once and
-writes the nodes on the way again as kind 3.
+Internal nodes of kind 3, written by versions that compacted histories, are
+still read: the same layout with a `uvarint due + 1` after `min_seg`, the
+child subtree's compaction state (the retention frontier at which
+compacting some leaf of it was worth rewriting the leaf), which is skipped.
+Kind 2 is also the layout versions before those wrote.
 
 ### Summary
 
@@ -593,7 +612,9 @@ uvarint  next_tree_id            next tree id to allocate
 bytes    app                     application state: the header below (format 1: JSON, see AppState below)
 [ uvarint  nt                    tree space: the number of trees again, then for each
                                  tree, in the order of the trees above:
-  nt × (uvarint due + 1          the root's due (as in an internal node; 0 = none)
+  nt × (uvarint 0                written as 0 (versions that compacted histories
+                                 recorded the root's compaction state, due + 1, here;
+                                 it is read and ignored)
         uvarint ns
         ns × (uvarint seg, uvarint live_bytes)) ]
                                  bytes of the tree's node frames still live, per segment
@@ -614,7 +635,7 @@ The tree space section follows `app` to the end of the record. Records of
 format 1 end after `app`; reading one, the engine counts each tree's live
 bytes per segment from its internal nodes (the leaves' frame lengths are in
 their parents' pointers, so no leaf is read; every leaf is at the depth of
-the leftmost one) and takes every root's `due` as 0.
+the leftmost one).
 
 Every record is complete: it lists every tree (the metadata tree included),
 every segment and every tree's live bytes per segment, so only the last
@@ -626,23 +647,23 @@ VIEW c AS SELECT id, region::int AS r FROM customers` (three error records,
 no rows):
 
 ```
-30 00 00 00  f6 fe 2c ac     len 48, crc
+30 00 00 00  6d 77 06 7f     len 48, crc
 01                           seq 1
 0e                           gsn 14
 03                           three trees
-01  01  01 00 2b  06 00  01  tree 1 (customers): root at segment 1, offset 0, 43 bytes; count 3, no aggregates; min_seg 1
-02  01  01 2b b5 09  2a 00  01
-                             tree 2 (the metadata tree): root at offset 43, 1205 bytes; 21 entries
+01  01  01 00 25  06 00  01  tree 1 (customers): root at segment 1, offset 0, 37 bytes; count 3, no aggregates; min_seg 1
+02  01  01 25 88 08  16 00  01
+                             tree 2 (the metadata tree): root at offset 37, 1032 bytes; 11 entries
 03  00                       tree 3 (c): empty
-01  01 e0 09 e0 09           one segment: id 1, 1248 bytes written, 1248 live
+01  01 ad 08 ad 08           one segment: id 1, 1069 bytes written, 1069 live
 01                           active segment 1
-e0 09                        active length 1248
+ad 08                        active length 1069
 04                           next tree id 4
 03  02 02 04                 app: format 2, metadata tree 2, next request 4
 03                           tree space of three trees:
-00  01  01 2b                  tree 1: due none; 43 bytes live in segment 1
-00  01  01 b5 09               tree 2: due none; 1205 bytes live in segment 1
-00  00                         tree 3: due none; no live bytes
+00  01  01 25                  tree 1: 0; 37 bytes live in segment 1
+00  01  01 88 08               tree 2: 0; 1032 bytes live in segment 1
+00  00                         tree 3: 0; no live bytes
 ```
 
 A checkpoint after changes to some rows of one tree has the same size; the
@@ -674,10 +695,10 @@ segments each tree has nodes in).
 0. The engine writes the metadata changed since the previous checkpoint into
    the [metadata tree](#the-metadata-tree) (`Engine::persist_meta`), then
    runs a maintenance pass, which marks the nodes it rewrites dirty (see
-   [Garbage collection and retention](#garbage-collection-and-retention)).
+   [Garbage collection](#garbage-collection)).
 1. Every tree with a dirty root is written depth-first, children before their
    parent, so that each internal node records the final locations (and
-   `min_seg` and `due`) of its children; each written frame adds its length
+   `min_seg`) of its children; each written frame adds its length
    to its segment's `total_bytes` and `live_bytes`, and to its tree's live
    bytes in that segment. (Nodes the buffer pool wrote earlier, and did not
    modify since, are clean: their frames are referred to as they are, and
@@ -707,13 +728,10 @@ The catalog, its DDL history and the engine's state live in one storage
 tree, the *metadata tree*, named by the [checkpoint header](#checkpoint-record).
 It is stored like an arrangement's tree (the same nodes; its summaries hold
 the count only), and each record is one entry: a byte string whose first
-byte is the record's tag, with a (GSN, weight) history. A record kept by
-key — every record but the error records — has weight 1; changing it
-retracts the old entry (weight −1) and adds the new one (+1) at the GSN of
-the change, so the tree holds the metadata as of every GSN of the retention
-window, as an arrangement holds its rows (versions at or before the
-retention frontier are merged when a leaf is rewritten). An error record's
-weight is its count.
+byte is the record's tag, with a weight. A record kept by key — every
+record but the error records — has weight 1; changing it retracts the old
+entry (weight −1, which removes it) and adds the new one (+1), as an
+arrangement's rows change. An error record's weight is its count.
 
 | Tag | Record | Entry after the tag | Weight |
 |---|---|---|---|
@@ -722,17 +740,18 @@ weight is its count.
 | 3 | DDL history | `u64 BE gsn`, then the statement (UTF-8, to the end of the entry) | 1 |
 | 4 | source state | `u64 BE source`, then its `SourceState` JSON (to the end of the entry), as in [`Progress` records](#logrecord), written without its tables' entries (tag 12 holds them; one written by earlier versions with them is read with them) | 1 |
 | 5 | source resume LSN | `u64 BE source`, `uvarint lsn` | 1 |
-| 6 | arrangement | `bytes fingerprint`, `uvarint tree`, `uvarint since` | 1 |
+| 6 | arrangement, with the start of its history (read only) | `bytes fingerprint`, `uvarint tree`, `uvarint since` | 1 |
 | 7 | node error record | `bytes node fingerprint`, `str sqlstate`, `str message` | its count |
 | 8 | group error | `bytes node fingerprint`, `bytes group key`, `str sqlstate`, `str message` | 1 |
-| 9 | clock tick | `u64 BE gsn`, `ivarint clock` | 1 |
+| 9 | the last clock tick | `u64 BE gsn`, `ivarint clock` | 1 |
 | 10 | pending slot drop | `str conninfo`, `str slot` | 1 |
 | 11 | groups in error known | `bytes node fingerprint` | 1 |
 | 12 | source table state | `u64 BE source`, `u64 BE table`, then the table's `SnapState` JSON (to the end of the entry): its entry in the source's `SourceState` | 1 |
+| 13 | arrangement | `bytes fingerprint`, `uvarint tree` | 1 |
 
 The *key* of a record kept by key is its entry up to its value: tag and
 id for tags 1, 3, 4, 5 and 9, tag and field for 2, tag and fingerprint for
-6, tag, source and table for 12, the whole entry for 10. Fixed-width big-endian ids and length-prefixed
+6 and 13, tag, source and table for 12, the whole entry for 10. Fixed-width big-endian ids and length-prefixed
 fields make keys prefix-free, so the entries of one key are found by a
 prefix scan.
 
@@ -742,22 +761,21 @@ prefix scan.
 | DDL history | `ivm.catalog_history`: the successfully applied DDL statements, by GSN, the most recent 10,000; when a statement makes the history longer than 11,000, the oldest are retracted down to 10,000. Trimming happens when a statement is applied, so replay trims identically |
 | catalog scalars | the next object id; the instance id: 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted |
 | source states, resume LSNs | per source: its `SourceState` (its tables' entries one record each, so that progress logged for one table changes one record); the end LSN of its last logged commit, from which it resumes streaming |
-| arrangements | every hydrated arrangement (also private state arrangements, such as a temporal filter's events): its [structural fingerprint](#structural-fingerprints), its tree, and the GSN from which its history is complete (when it was hydrated, or created with its table): `AS OF` reads of earlier GSNs do not use it |
+| arrangements | every hydrated arrangement (also private state arrangements, such as a temporal filter's events): its [structural fingerprint](#structural-fingerprints) and its tree (tag 13). Versions that kept histories wrote tag 6, with the GSN from which the arrangement's history was complete; it is read as tag 13 is (the GSN is ignored), and the first write after recovery replaces every tag-6 record by a tag-13 one |
 | node error records | the error records in the contents of every arranged node, by node fingerprint, so that views created later over the node start with them (an arrangement holds rows only); a materialized view's error records are those of its root node |
 | group errors | for every `Reduce`, `Recursive` and `Window` node, the groups (a window's partitions) in error with their error record, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (of a window's partition columns; empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers |
 | groups in error known | the `Window` nodes whose group errors are complete (computed by a snapshot, or restored), also when none is in error. A window operator changes a partition in part only when it knows that the partition is not in error; one recovered without this record (from an earlier version, or format 1) computes its partitions in error at the end of the hydration after recovery, reading its input once |
-| clock ticks | `(gsn, clock)` of the clock ticks of the retention window, for `now()` in reads as of earlier GSNs: the last tick at or before the retention frontier and every later one. `clock` is microseconds since the PostgreSQL epoch; the logical clock is the last tick's (0 without ticks) |
+| the last clock tick | `(gsn, clock)` of the last clock tick applied (none before the first): `clock` is microseconds since the PostgreSQL epoch, and the logical clock (0 without ticks). Versions that kept histories kept the ticks of their retention window, for `now()` in reads as of earlier GSNs; the logical clock is the last of them, and the first write after recovery retracts the others |
 | pending slot drops | replication slots of dropped sources not dropped upstream yet, retried after the start |
 
 **Writing** (`Engine::persist_meta`): after every applied DDL or `Schema`
-record, at its GSN (catalog objects and history entries are thus stamped
-with the GSN of their change), and at every checkpoint, at the checkpoint's
-GSN, before its nodes are written. Each time only what changed since the
-previous time is written, and only what may have changed is looked at:
-the catalog objects inserted, replaced or removed (the stored entries of
-each are retracted, whatever their bytes); history entries and ticks after
-the last ones written, and those trimmed or behind the frontier (retracted
-by a range scan); the arrangements created, hydrated or freed since
+record, and at every checkpoint, before its nodes are written. Each time
+only what changed since the previous time is written, and only what may
+have changed is looked at: the catalog objects inserted, replaced or
+removed (the stored entries of each are retracted, whatever their bytes);
+history entries after the last ones written, and those trimmed (retracted
+by a range scan); the last tick, replacing the record of the one before;
+the arrangements created, hydrated or freed since
 (`Graph::take_arrangement_changes`) and the source states' heads and table
 entries changed since (`Engine::source_changed`), whose entries are
 replaced where they differ from the ones the tree holds — all of them at
@@ -770,7 +788,7 @@ when it loses its last one or leaves the graph; an operator's group errors
 when it is first seen and when it leaves, its record of being known when
 it becomes known and when it leaves).
 
-**Reading** (recovery, `meta::load`): every entry with a non-zero weight.
+**Reading** (recovery, `meta::load`): every entry.
 An entry with an unknown tag or trailing bytes, a record kept by key whose
 weight is not 1 or whose key appears twice, a catalog object whose key is
 not its `id`, and a tree without the next object id are refused
@@ -782,16 +800,16 @@ decoded:
 ```
 01 00 00 00 00 00 00 03 e8  7b 22 69 64 22 3a 31 30 30 30 ...
                                    catalog object 1000: {"id":1000,"name":"customers","kind":{"Table":...
-02 01  ea 07                       next object id 1002 (history [(5, +1)]; the entry 02 01 e9 07,
-                                   1001, has [(3, +1), (5, −1)] until the frontier passes GSN 5)
-03 00 00 00 00 00 00 00 03  43 52 45 41 54 45 ...
-                                   history: GSN 3, CREATE TABLE customers (id INT PRIMARY KEY, region TEXT)
-06 10 b7 47 23 59 ... 1f 56  01  03
-                                   arrangement b7472359...ae511f56 (customers' primary index): tree 1, since GSN 3
+02 01  ea 07                       next object id 1002 (the entry 02 01 e9 07, 1001, was
+                                   retracted when the view took id 1001: it is gone)
+03 00 00 00 00 00 00 00 04  43 52 45 41 54 45 ...
+                                   history: GSN 4, CREATE TABLE customers (id INT PRIMARY KEY, region TEXT)
 07 10 c3 bf 44 d5 ... 2d ef 75  05 32 32 50 30 32  2a 69 6e 76 61 6c 69 64 ...
                                    node c3bf44d5...2def75: 22P02, invalid input syntax for type integer: "x"; weight 1
-09 00 00 00 00 00 00 00 0e  94 d9 f7 d4 ad ec 80 03
-                                   tick at GSN 14: 846286484862538 (2026-10-25 23:34:44.862538 UTC)
+09 00 00 00 00 00 00 00 0e  ee aa ab e3 9a f4 80 03
+                                   the last tick, at GSN 14: 846421388782263 (2026-10-27 13:03:08.782263 UTC)
+0d 10 b7 47 23 59 ... 1f 56  01
+                                   arrangement b7472359...ae511f56 (customers' primary index): tree 1
 ```
 
 ### Catalog objects
@@ -873,8 +891,8 @@ it.
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
 | `errors` | error state of the dataflow, by node fingerprint. `nodes`: for every node that has an arrangement and error records, the error records in its contents (`[[sqlstate, message], count]`), so that views created later over the node start with them (an arrangement holds rows only). `operators`: for every `Reduce` and `Recursive` node with groups in error, `[group key, [sqlstate, message]]`, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers. Restored by fingerprint before hydration; `{"nodes": [], "operators": []}` if absent (`operators` may also be absent alone) |
-| `arr_since` | `[fingerprint, gsn]` for every hydrated arrangement: the GSN from which its history is complete (when it was hydrated, or created with its table). `AS OF` reads of earlier GSNs do not use the arrangement. `[]` if absent: recovered arrangements then count as complete from GSN 0 |
-| `ticks` | `[gsn, clock]` of recent clock ticks, for `now()` in reads as of earlier GSNs: the last tick at or before the retention frontier and every later one, at most the last 100,000; `[]` if absent (recovery then starts from `[[checkpoint gsn, clock]]`) |
+| `arr_since` | `[fingerprint, gsn]` for every hydrated arrangement: the GSN from which its history was complete, for `AS OF` reads. Ignored: there are no histories |
+| `ticks` | `[gsn, clock]` of recent clock ticks, for `now()` in reads as of earlier GSNs (the ticks of the retention window, at most the last 100,000). Only the last one's GSN is used: as the GSN of the tick that set `clock`, which the migration writes to the metadata tree; `[]` if absent (the checkpoint's GSN then, if `clock` is not 0) |
 | `slot_drops` | replication slots of dropped sources not dropped upstream yet (`conninfo`, `slot`), retried after the start; `[]` if absent |
 
 `view_errors` duplicates the error records of each view's root node in
@@ -1085,7 +1103,7 @@ The payload columns are all row columns that are not a plain `Column` key
 expression, in column order (without a count prefix). Decoding reads the key
 values, applies the fidelity suffix, decodes the payload, and copies plain
 key columns into the row; trailing bytes are an error. The tree value of an
-entry is its history.
+entry is its weight (the row's multiplicity).
 
 Examples (decoded from a running engine):
 
@@ -1202,7 +1220,7 @@ and arrangement fingerprint
 (recomputed independently from the description above and matching the
 checkpoint of a running engine).
 
-## Garbage collection and retention
+## Garbage collection
 
 - **Segment liveness**: the manifest's segment table records, per segment,
   the bytes written and the bytes still referenced by some tree, and its tree
@@ -1212,26 +1230,23 @@ checkpoint of a running engine).
   in it are deleted, unless the running engine still holds live nodes in
   them or a fork pins them (see [Checkpoint procedure](#checkpoint-procedure)).
   The active segment is never deleted or collected.
-- **Compaction**: compacting a history at frontier *f* merges its elements
-  at or before *f* into one stamped with the latest of their GSNs, dropped
-  if their weights add up to 0; an entry left without elements is removed.
-  An update compacts the entries it touches, and every entry of a leaf it
-  rebuilds, at the current retention frontier (`processed GSN −
-  --retention-gsns`).
+- **Removed entries**: an entry whose weight a change makes 0 is removed
+  from its leaf at once, a leaf left without entries from its parent, and a
+  node an update leaves smaller than a quarter of its target size (16 KiB)
+  is merged with a neighbour when both fit in three quarters of it. Leaves
+  of kind 1, written by versions that kept histories, keep their retracted
+  entries on disk until they are rewritten (they are dropped when the leaf
+  is read).
 - **Maintenance pass** (`Env::maintain`, before each checkpoint, which then
-  writes what it rewrote): it rewrites, compacting them, the leaves whose
-  `due` has passed the frontier (found through the subtrees' `due`) and
-  compacts the leaves modified since the last checkpoint. It merges a node
-  left smaller than a quarter of its target size (16 KiB) with a neighbour
-  when both fit in three quarters of it. And it relocates the live nodes of
-  the evacuated segments (chosen below): it marks them dirty (compacting
-  leaves among them), found through the per-subtree `min_seg` values, the
-  per-tree live bytes and the parents' locations of leaves (which it does
-  not read unless they are rewritten). Reading and rewriting clean nodes is
-  budgeted: for compaction and for relocation each, 8 MiB plus the bytes the
-  checkpoints since the previous pass wrote for the engine's own updates,
-  and in memory, what the buffer pool has room for besides its dirty
-  nodes.
+  writes what it rewrote): it relocates the live nodes of the evacuated
+  segments (chosen below): it marks them dirty, found through the
+  per-subtree `min_seg` values, the per-tree live bytes and the parents'
+  locations of leaves (which it does not read unless they are rewritten),
+  and merges a relocated node smaller than a quarter of its target size
+  with a neighbour when both fit in three quarters of it. Reading and
+  rewriting clean nodes is budgeted: 8 MiB plus the bytes the checkpoints
+  since the previous pass wrote for the engine's own updates, and in
+  memory, what the buffer pool has room for besides its dirty nodes.
 - **Evacuated segments**: sealed segments with `live_bytes × 2 <
   total_bytes`, in decreasing order of `(1 − u) × age / (1 + u)` (`u` =
   live / total, `age` = active segment id − segment id), while their live
@@ -1247,12 +1262,8 @@ checkpoint of a running engine).
   `next_tree_id`, and are dropped by the operation that creates them. A
   checkpoint taken while one exists does not record it: its nodes, also
   those written early, are garbage in that checkpoint.
-- **Retention**: history elements at or before the retention frontier
-  (`processed GSN − --retention-gsns`) are merged when a leaf is next
-  modified or by a maintenance pass (in the metadata tree too, which merges
-  away replaced records). Input-log segments whose records all lie at or
-  before the checkpoint's GSN are deleted after the checkpoint, whatever the
-  retention.
+- **Input log**: segments whose records all lie at or before the
+  checkpoint's GSN are deleted after the checkpoint.
 
 ## Compatibility
 
@@ -1287,6 +1298,19 @@ as JSON in every checkpoint record. Format 2 keeps them in the
 - A directory of a newer format than the engine reads is refused before
   anything in it is opened.
 
+Dropping the entries' histories kept format 2: leaves are written as kind 4
+(weights) instead of kind 1 (histories), internal nodes as kind 2 instead of
+kind 3 (its layout without the compaction state), arrangement records as
+tag 13 instead of tag 6 (without the start of their history), the tree
+space section's compaction state as 0, and one tick record instead of the
+ticks of a retention window. Each is additive: a new node kind and a new
+record tag; kind 2, tag 9 and the tree space's field written with their
+existing meaning (a constant for a field that no longer has a use); and
+everything written before reads as it is, the histories added up to the
+weights they stood for (nothing is reinterpreted, nothing needs migrating).
+What is lost is what the histories were for: reads as of earlier GSNs,
+which the engine no longer offers.
+
 ### Migrating format 1
 
 A data directory without `FORMAT` whose `log/` or `store/` holds a file is
@@ -1300,11 +1324,12 @@ beyond the recorded length of the active segment, and truncated); after it,
 the next start finds a record of the current format — the application
 state tells the formats apart: JSON starts with `{` (0x7B), the header with
 its format number — and only writes `FORMAT`. The migration keeps
-everything format 1 kept: the catalog and its history, the trees with
-their history starts, the error records of nodes and the groups in error,
-source states and resume LSNs, the request counter, the clock ticks and the
-pending slot drops (a view's error records, which format 1 also kept with
-the view, are its root node's).
+everything format 1 kept but the entries' histories: the catalog and its
+history, the trees (each entry's history read as its weight), the error
+records of nodes and the groups in error, source states and resume LSNs,
+the request counter, the clock (its last tick) and the pending slot drops
+(a view's error records, which format 1 also kept with the view, are its
+root node's).
 
 ### Checks
 
@@ -1325,23 +1350,25 @@ Consequences of code changes for an existing data directory:
 |---|---|
 | frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag fails to replay a log holding it (versions before `CommitParts` truncated the newest log segment at the first such record, losing it and everything after it: a log with `CommitParts` records, tag 6, `ProgressDelta` records, tag 7, or `UpsertIfPresent` changes, kind 6, cannot be opened by them) |
 | `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType`, `SourceState` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`, `SourceState` also in `Progress` records: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
-| metadata record layouts (tags 1–12), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tags 11 and 12 were added within format 2 (a directory without tag 11 recomputes its window operators' partitions in error once, at the first start; one written without tag 12 keeps its source states' tables in tag 4, which the first write splits out) |
-| format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate`, `index_order`, `scanned` and `reread` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
+| metadata record layouts (tags 1–13), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tags 11, 12 and 13 were added within format 2 (a directory without tag 11 recomputes its window operators' partitions in error once, at the first start; one written without tag 12 keeps its source states' tables in tag 4, which the first write splits out; one written with tag 6 instead of 13 has its arrangement records replaced at the first write) |
+| format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since` (now ignored), `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate`, `index_order`, `scanned` and `reread` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
 | summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tags 8–10 (float sums as normalized dyadic rationals, `min`/`max` prefixes) are written instead of format 1's tag 5 and wide values under tags 6 and 7, which are still read (as described [above](#summary)) |
-| internal node kind 3, the checkpoint record's tree space section | format 1's kind-2 nodes and records without the section are read (see [Internal node](#internal-node) and [Checkpoint record](#checkpoint-record)): the first start reads every tree's internal nodes once, and maintenance passes then visit every subtree once |
+| node kinds (leaf kind 4, internal node kind 2), the checkpoint record's tree space section | leaves of kind 1 (histories) and internal nodes of kind 3 (compaction states) are read ([Leaf node](#leaf-node), [Internal node](#internal-node)), and so are records without the section ([Checkpoint record](#checkpoint-record)): the first start reads every tree's internal nodes once to count its live bytes. Code that does not know kind 4 stops with `bad node kind` |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
-| inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again, and the rebuilt arrangements' history (`arr_since`) starts at the checkpoint the engine restarted from: `AS OF` reads that need them at earlier GSNs fail |
+| inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again |
 | semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
 | planner or lowering changes that produce different plans for the same SQL | as for fingerprint changes: the views are rebuilt |
 | catalog SQL that no longer binds (removed syntax or functions, stricter checks) | the view (and what reads it) is marked broken at start-up: not maintained, reads of it fail with the reason; drop it or repair it with `CREATE OR REPLACE` ([Operations](user-guide/operations.md#recovery)). Stored view definitions are planned leniently: a parameter placeholder (`$1`) in a definition logged by an older version binds as NULL instead of failing |
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
 Data directories written by earlier versions of the engine are compatible:
-format 1 only gained fields with defaults (and a node kind and summary
-state encodings that are written instead of older ones still read: float
-sums, wide `min`/`max` values; [Summary](#summary)), and is migrated to
-format 2 at the first start; the log gained record tags and a change kind
+format 1 only gained fields with defaults (and node kinds and summary
+state encodings that are written instead of older ones still read: leaves
+of weights, float sums, wide `min`/`max` values; [Leaf node](#leaf-node),
+[Summary](#summary)), and is migrated to format 2 at the first start; a
+format-2 directory written while the engine kept histories opens as it is
+(their reads as of earlier GSNs are gone); the log gained record tags and a change kind
 (`CommitParts`, `ProgressDelta`, `UpsertIfPresent`) next to the ones it
 still reads. A table whose snapshot an upgrade interrupts is copied again
 from its first key if its key has a string column (see `index_order`
@@ -1356,7 +1383,8 @@ whose frames reach a partition's end, which carry summaries), so such a
 data directory keeps its tables and rebuilds those arrangements once at
 its first start.
 `crates/ivm/tests/data/format1` is a format-1 directory that the restart
-tests migrate.
+tests migrate, and `crates/ivm/tests/data/format2-history` a format-2
+directory with histories that they open.
 
 A change in any of the "incompatible" rows needs a new format version whose
 migration the engine runs at the first start (as for format 1), or starting
