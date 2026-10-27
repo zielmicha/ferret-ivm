@@ -130,6 +130,10 @@ struct Slot {
     /// changed or it became dirty): a checkpoint job's image of a dirty node
     /// is still current when its stamp is unchanged.
     version: u64,
+    /// In-place edits of a leaf since its entries were last rebuilt into a
+    /// vector of their size (in-place inserts leave the vector room to
+    /// grow, which rebuilding every few edits returns).
+    edits: u32,
     parent: u32,
     tree: TreeId,
     loaded_children: u32,
@@ -758,6 +762,7 @@ impl Env {
             disk,
             dirty: disk.is_none(),
             version,
+            edits: 0,
             parent,
             tree,
             loaded_children: 0,
@@ -1085,6 +1090,8 @@ impl Env {
     /// `min_seg` (as its entry above holds it). Returns the nodes now
     /// covering its key range.
     fn apply_node(&mut self, id: u32, ups: &[(Vec<u8>, i64)], summ: &Arc<dyn Summarizer>, old: Option<&Summary>, min_seg: u32) -> Result<Parts> {
+        let was_dirty = self.slot(id).dirty;
+        let edits = self.slot(id).edits;
         let old_bytes = self.slot(id).bytes;
         self.make_dirty(id);
         // its write is the update's now
@@ -1101,10 +1108,14 @@ impl Env {
                 // into the leaf's old summary afterwards if the leaf does
                 // not split and that is cheaper than recomputing it
                 let mut changes: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::with_capacity(ups.len());
-                // Few updates: edit in place; more: merge into a new vector
-                // (each in-place insert or removal shifts the entries after
-                // it).
-                let in_place = ups.len() * 8 <= entries.len();
+                // Few updates to a dirty leaf: edit in place (each insert or
+                // removal shifts the entries after it). More updates, the
+                // first ones since the leaf was read or written, or those
+                // after 16 in-place edits: merge into a new vector sized to
+                // the entries, returning the capacity in-place inserts grew
+                // and removals left (memory is accounted by capacity).
+                let in_place = was_dirty && edits < 16 && ups.len() * 8 <= entries.len();
+                self.slot_mut(id).edits = if in_place { edits + 1 } else { 0 };
                 // the leaf's byte size, kept up to date by in-place edits
                 let mut size = old_bytes;
                 let out = if in_place {
@@ -1388,6 +1399,7 @@ impl Env {
         let merged = match (na, nb) {
             (Node::Leaf(mut x), Node::Leaf(y)) => {
                 x.extend(y);
+                self.slot_mut(a).edits = 0;
                 c.min_seg = u32::MAX;
                 Node::Leaf(x)
             }
@@ -2638,6 +2650,7 @@ impl Env {
         slot.parent = parent;
         slot.tree = tree;
         slot.version = self.next_stamp();
+        slot.edits = 0;
         self.mem_bytes += slot.mem;
         if slot.dirty {
             self.dirty_bytes += slot.mem;

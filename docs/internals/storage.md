@@ -194,10 +194,12 @@ format when it is next rewritten.
    by binary search on the separators; only children that receive updates
    are visited (and loaded).
 3. At a leaf, add each update's weight to its entry's (inserting the entry,
-   or removing it when its weight becomes 0): in place when the updates are
-   at most an eighth of the leaf's entries (each insert or removal shifts
-   the entries after it), otherwise by merging the updates into a new
-   vector of entries.
+   or removing it when its weight becomes 0): in place when the leaf is
+   already dirty, has had fewer than 16 in-place edits since it was last
+   rebuilt, and the updates are at most an eighth of its entries (each
+   insert or removal shifts the entries after it); otherwise by merging the
+   updates into a new vector sized to the entries, which returns the spare
+   capacity in-place inserts and removals left behind.
 4. Split oversized nodes into chunks (see above); a root that splits gets a
    new parent; a root left with a single child is replaced by it; empty
    nodes are removed; children the update made smaller than a quarter of
