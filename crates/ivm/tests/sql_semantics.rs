@@ -828,6 +828,56 @@ fn invalid_window_frames_are_rejected() {
     running.shutdown();
 }
 
+/// ntile reads its argument at the first row of the partition where it is
+/// not NULL, as PostgreSQL's `window_ntile` does: that value is the number
+/// of buckets for every row (later rows' arguments are ignored, also when
+/// they are not positive), the rows before it are NULL, and the buckets are
+/// counted from it. ivm used each row's argument: `ntile(i) OVER (ORDER BY
+/// i)` gave 1, 1, 2, 4 for i = 1..4. Expected rows are PostgreSQL's.
+#[test]
+fn ntile_reads_its_argument_at_the_first_row_where_it_is_not_null() {
+    let running = start("ntile-arg");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE nt (i int PRIMARY KEY, g int, a int)");
+    exec(&h, "INSERT INTO nt SELECT i, i % 3, CASE WHEN i < 6 THEN NULL WHEN i % 4 = 0 AND i > 10 THEN -i ELSE i % 5 + 1 END FROM generate_series(1, 30) i");
+    let q = "SELECT i, ntile(a) OVER (PARTITION BY g ORDER BY i) AS n1, ntile(a + 2) OVER (ORDER BY i DESC) AS n2, ntile(i) OVER (ORDER BY i) AS n3 FROM nt";
+    let want = |s: &str| s.split(',').map(String::from).collect::<Vec<_>>();
+    exec(&h, &format!("CREATE MATERIALIZED VIEW ntv AS {q}"));
+    let check = |want: Vec<String>| {
+        assert_eq!(rows(&h, &format!("{q} ORDER BY i")), want);
+        assert_eq!(rows(&h, "SELECT * FROM ntv ORDER BY i"), want);
+    };
+    check(want(
+        "1||3|1,2||3|1,3||3|1,4||3|1,5||3|1,6|1|3|1,7|1|3|1,8|1|3|1,9|1|3|1,10|1|3|1,11|1|2|1,12|1|2|1,13|1|2|1,14|1|2|1,15|1|2|1,\
+         16|1|2|1,17|2|2|1,18|1|2|1,19|2|2|1,20|2|2|1,21|2|1|1,22|2|1|1,23|2|1|1,24|2|1|1,25|2|1|1,26|3|1|1,27|2|1|1,28|3|1|1,29|3|1|1,30|2|1|1",
+    ));
+    // a NULL before the first argument, the first argument NULL, the first row gone
+    exec(&h, "UPDATE nt SET a = 1 WHERE i = 3");
+    exec(&h, "UPDATE nt SET a = NULL WHERE i = 30");
+    check(want(
+        "1||7|1,2||7|1,3|1|7|1,4||6|1,5||6|1,6|1|6|1,7|1|6|1,8|1|5|1,9|1|5|1,10|1|5|1,11|1|5|1,12|1|4|1,13|1|4|1,14|1|4|1,15|1|4|1,\
+         16|1|3|1,17|2|3|1,18|1|3|1,19|2|3|1,20|2|2|1,21|1|2|1,22|2|2|1,23|2|2|1,24|1|2|1,25|2|1|1,26|3|1|1,27|1|1|1,28|3|1|1,29|3|1|1,30|1||1",
+    ));
+    exec(&h, "DELETE FROM nt WHERE i = 1");
+    check(want(
+        "2||7|1,3|1|7|1,4||7|1,5||6|1,6|1|6|1,7|1|6|1,8|1|6|1,9|1|5|1,10|1|5|1,11|1|5|1,12|1|5|1,13|1|4|1,14|1|4|1,15|1|4|1,\
+         16|2|4|1,17|2|3|2,18|1|3|2,19|2|3|2,20|2|3|2,21|1|2|2,22|2|2|2,23|2|2|2,24|1|2|2,25|3|1|2,26|3|1|2,27|1|1|2,28|3|1|2,29|3|1|2,30|1||2",
+    ));
+    // a later row's argument is not checked, the first one's is
+    assert_eq!(
+        rows(&h, "SELECT i, ntile(CASE WHEN i = 3 THEN 0 ELSE 2 END) OVER (ORDER BY i) FROM nt WHERE i <= 6 ORDER BY i"),
+        vec!["2|1", "3|1", "4|1", "5|2", "6|2"]
+    );
+    for q in [
+        "SELECT i, ntile(CASE WHEN i = 2 THEN NULL ELSE 0 END) OVER (ORDER BY i) FROM nt WHERE i <= 6",
+        "SELECT i, ntile(CASE WHEN g = 0 THEN 0 END) OVER (PARTITION BY g ORDER BY i) FROM nt",
+    ] {
+        let err = try_rows(&h, q).unwrap_err();
+        assert!(err.contains("argument of ntile must be greater than zero"), "{q}: {err}");
+    }
+    running.shutdown();
+}
+
 #[test]
 fn bool_casts_to_text_and_case_typing() {
     let running = start("bool-text");

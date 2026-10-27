@@ -147,16 +147,25 @@ fn order_cmp(a: &Row, b: &Row, order: &[SortKey]) -> Ordering {
 /// Consecutive rows of a partition (one per unit of multiplicity), at
 /// positions `base..base + rows.len()` of its `n` rows, with what lies
 /// outside them: the summaries of the rows before and after them (all of
-/// the input layout's summaries; None if there are none), and the rows at
-/// other positions.
+/// the input layout's summaries; None if there are none), the rows at
+/// other positions, and for `ntile` the first row with a non-NULL argument
+/// if it lies before them.
 struct Run<'a> {
     rows: Vec<&'a Row>,
     base: i64,
     n: i64,
     before: Option<Summary>,
     after: Option<Summary>,
+    /// Per function, for `ntile`: the partition's first row with a non-NULL
+    /// argument, if it lies before the run (None: no row before the run
+    /// has one).
+    ntile_first: Vec<Option<First>>,
     outside: &'a mut dyn FnMut(i64) -> Result<Row>,
 }
+
+/// A partition's first row with a non-NULL `ntile` argument: its position
+/// and the argument.
+type First = (i64, i64);
 
 impl Run<'_> {
     fn end(&self) -> i64 {
@@ -429,7 +438,8 @@ fn compute(run: &mut Run, order: &[SortKey], funcs: &[WinSpec], slots: &[Vec<usi
     let p = Peers::of(&run.rows, order);
     let mut cols: Vec<Vec<Datum>> = Vec::with_capacity(funcs.len());
     for (fi, f) in funcs.iter().enumerate() {
-        cols.push(compute_func(run, f, &slots[fi], &p, from, to)?);
+        let ntile_first = run.ntile_first[fi];
+        cols.push(compute_func(run, f, &slots[fi], ntile_first, &p, from, to)?);
     }
     let mut out: Vec<(Row, i64)> = Vec::with_capacity(to - from);
     for i in from..to {
@@ -447,7 +457,7 @@ fn compute(run: &mut Run, order: &[SortKey], funcs: &[WinSpec], slots: &[Vec<usi
 }
 
 /// One function's values for the run's rows `from..to` (relative).
-fn compute_func(run: &mut Run, f: &WinSpec, slots: &[usize], p: &Peers, from: usize, to: usize) -> Result<Vec<Datum>> {
+fn compute_func(run: &mut Run, f: &WinSpec, slots: &[usize], ntile_first: Option<First>, p: &Peers, from: usize, to: usize) -> Result<Vec<Datum>> {
     let (group, gstart, gend) = (&p.group, &p.gstart, &p.gend);
     let (base, n) = (run.base, run.n);
     let mut out = Vec::with_capacity(to - from);
@@ -461,16 +471,26 @@ fn compute_func(run: &mut Run, f: &WinSpec, slots: &[usize], p: &Peers, from: us
         })),
         WindowFunc::CumeDist => out.extend((from..to).map(|i| Datum::Float8((base + gend[group[i]] as i64 + 1) as f64 / n as f64))),
         WindowFunc::Ntile => {
+            // As in PostgreSQL (window_ntile), the argument is read at the
+            // partition's first row where it is not NULL, and only there:
+            // it is the number of buckets of the partition's n rows, which
+            // are counted from that row; the rows before it are NULL
+            let first = ntile_first.or_else(|| run.rows.iter().enumerate().find_map(|(i, r)| Some((base + i as i64, r[f.args[0]].as_i64()?))));
+            let Some((first, k)) = first else {
+                out.extend((from..to).map(|_| Datum::Null));
+                return Ok(out);
+            };
+            if k <= 0 {
+                return Err(SqlError::new("22014", "argument of ntile must be greater than zero"));
+            }
+            let (k, n) = (k as i128, n as i128);
+            let (per, extra) = (n / k, n % k);
             for i in from..to {
-                let Some(k) = run.rows[i][f.args[0]].as_i64() else {
+                let at = (base + i as i64 - first) as i128;
+                if at < 0 {
                     out.push(Datum::Null);
                     continue;
-                };
-                if k <= 0 {
-                    return Err(SqlError::new("22014", "argument of ntile must be greater than zero"));
                 }
-                let (k, at) = (k as i128, (base + i as i64) as i128);
-                let (per, extra) = ((n as i128) / k, (n as i128) % k);
                 // the first `extra` buckets have per+1 rows
                 let bucket = if at < extra * (per + 1) { at / (per + 1) } else { extra + (at - extra * (per + 1)) / per.max(1) };
                 out.push(Datum::Int4(bucket as i32 + 1));
@@ -583,7 +603,7 @@ pub fn compute_partition(rows: &[(Row, i64)], order: &[SortKey], funcs: &[WinSpe
     }
     let n = rs.len();
     let mut outside = |pos: i64| -> Result<Row> { Err(SqlError::internal(format!("window row {pos} outside its partition"))) };
-    let mut run = Run { rows: rs, base: 0, n: n as i64, before: None, after: None, outside: &mut outside };
+    let mut run = Run { rows: rs, base: 0, n: n as i64, before: None, after: None, ntile_first: vec![None; funcs.len()], outside: &mut outside };
     let slots = vec![vec![]; funcs.len()];
     compute(&mut run, order, funcs, &slots, 0, n)
 }
@@ -708,8 +728,9 @@ fn bound_pos(f: &WinSpec, start: bool) -> (Reach, bool) {
 
 /// The rows whose values a change can change, as reaches toward the
 /// partition's start and end from the changed rows. `resized`: the
-/// partition's size changes.
-fn change_reach(f: &WinSpec, resized: bool) -> (Reach, Reach) {
+/// partition's size changes; `ntile_moved`: `ntile`'s first row with a
+/// non-NULL argument, or that argument, can change (see `ntile_first`).
+fn change_reach(f: &WinSpec, resized: bool, ntile_moved: bool) -> (Reach, Reach) {
     use WindowFunc as W;
     let all_if = |b: bool, r: Reach| if b { Reach::All } else { r };
     match f.func {
@@ -718,7 +739,8 @@ fn change_reach(f: &WinSpec, resized: bool) -> (Reach, Reach) {
         W::DenseRank => (Reach::None, Reach::All),
         W::PercentRank => (all_if(resized, Reach::None), all_if(resized, Reach::Groups(0))),
         W::CumeDist => (all_if(resized, Reach::Groups(0)), all_if(resized, Reach::Groups(0))),
-        W::Ntile => (all_if(resized, Reach::None), all_if(resized, Reach::None)),
+        // (that row's argument is the number of buckets of every row)
+        W::Ntile => (all_if(resized || ntile_moved, Reach::None), all_if(resized || ntile_moved, Reach::None)),
         W::Lag => (Reach::None, if f.args.len() > 1 { Reach::All } else { Reach::Rows(1) }),
         W::Lead => (if f.args.len() > 1 { Reach::All } else { Reach::Rows(1) }, Reach::None),
         // rows whose frame holds the changed row: frames ending after it
@@ -843,6 +865,57 @@ struct Changed {
 /// Partitions of at most this many rows are recomputed whole.
 const SMALL_PARTITION: i64 = 32;
 
+/// Entries walked from a partition's start at most to find `ntile`'s first
+/// row with a non-NULL argument; one further away is taken as moved by any
+/// change.
+const MAX_NTILE_WALK: usize = 32;
+
+/// `ntile`'s first row with a non-NULL argument in a partition changed by
+/// a step (which sets every row's value, see `compute_func`), per function
+/// (None for other functions): its position and argument, the same before
+/// and after the step. None if they may differ: they do, or that row is not
+/// among the partition's first `MAX_NTILE_WALK` entries (or there is none).
+fn ntile_first(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDeltas) -> Result<Option<Vec<Option<First>>>> {
+    let args: Vec<Option<usize>> = p.funcs.iter().map(|f| (f.func == WindowFunc::Ntile).then(|| f.args[0])).collect();
+    // per version (before and after the step): the rows passed, and the
+    // first row found per function
+    let mut pos = [0i64; 2];
+    let mut first = [vec![None; args.len()], vec![None; args.len()]];
+    let found = |first: &[Vec<Option<First>>; 2]| (0..args.len()).all(|i| args[i].is_none() || (first[0][i].is_some() && first[1][i].is_some()));
+    let mut walked = 0;
+    if !found(&first) {
+        env.for_each(part.tree, Bound::Included(&part.lo), part.hi(), &mut |k, h| {
+            visited(1);
+            walked += 1;
+            let after = h.total();
+            let before = deltas.before(k, after);
+            if before > 0 || after > 0 {
+                let row = part.layout.decode_row(k)?;
+                for (v, w) in [before, after].into_iter().enumerate() {
+                    if w <= 0 {
+                        continue;
+                    }
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(a) = a
+                            && first[v][i].is_none()
+                            && let Some(arg) = row[*a].as_i64()
+                        {
+                            first[v][i] = Some((pos[v], arg));
+                        }
+                    }
+                    pos[v] += w;
+                }
+            }
+            Ok(!found(&first) && walked < MAX_NTILE_WALK)
+        })?;
+    }
+    let [old, new] = first;
+    if args.iter().zip(old.iter().zip(&new)).any(|(a, (o, n))| a.is_some() && (o.is_none() || o != n)) {
+        return Ok(None);
+    }
+    Ok(Some(old))
+}
+
 fn data_error(e: SqlError) -> Result<SqlError> {
     if super::reduce::is_data_error(&e) { Ok(e) } else { Err(e) }
 }
@@ -877,6 +950,7 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDelt
     for c in changed.iter_mut() {
         c.rank = part.rank(env, &c.key)?;
     }
+    let ntile_fixed = ntile_first(env, p, part, deltas)?;
     let (first, last) = (&changed[0], &changed[changed.len() - 1]);
     let (at, at_end) = (first.rank, last.rank + last.after);
     // the rows whose values can change: positions [reg_lo, reg_hi) of the
@@ -884,7 +958,7 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDelt
     // both versions)
     let (mut reg_lo, mut reg_hi) = (at, at_end);
     for f in &p.funcs {
-        let (back, fwd) = change_reach(f, resize != 0);
+        let (back, fwd) = change_reach(f, resize != 0, ntile_fixed.is_none());
         reg_lo = reg_lo.min(reach_to(env, part, p, n, &first.key, at, at, &back, true)?);
         reg_hi = reg_hi.max(reach_to(env, part, p, n, &last.key, at_end, at_end, &fwd, false)?);
     }
@@ -954,6 +1028,11 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDelt
     let before_run = if summarized && base > 0 { Some(env.range_summary(part.tree, Bound::Included(&part.lo), Bound::Excluded(&lo_key))?) } else { None };
     let after_run = if summarized { Some(env.range_summary(part.tree, Bound::Excluded(&hi_key), part.hi())?) } else { None };
     let slots = p.slots();
+    // (where it can move, the run starts at the partition's start)
+    let ntile_first: Vec<Option<First>> = match &ntile_fixed {
+        Some(v) => v.iter().map(|x| x.filter(|(at, _)| *at < base)).collect(),
+        None => vec![None; p.funcs.len()],
+    };
     let mut out = Delta::new();
     for (sign, weight) in [(-1i64, 1usize), (1, 2)] {
         // rows of this version, and those of the region
@@ -972,7 +1051,7 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDelt
         // (rows after the run: positions shifted by the change in the old version)
         let (len, shift) = if sign < 0 { (n - resize, resize) } else { (n, 0) };
         let mut outside = |pos: i64| -> Result<Row> { part.row_at(env, if pos < base { pos } else { pos + shift }) };
-        let mut run = Run { rows, base, n: len, before: before_run.clone(), after: after_run.clone(), outside: &mut outside };
+        let mut run = Run { rows, base, n: len, before: before_run.clone(), after: after_run.clone(), ntile_first: ntile_first.clone(), outside: &mut outside };
         if from == usize::MAX {
             continue;
         }
@@ -1174,7 +1253,7 @@ mod tests {
             // from scratch, row by row
             let rs: Vec<&Row> = rows.iter().flat_map(|(r, w)| std::iter::repeat_n(r, *w as usize)).collect();
             let mut outside = |_: i64| -> Result<Row> { unreachable!() };
-            let run = Run { rows: rs.clone(), base: 0, n: rs.len() as i64, before: None, after: None, outside: &mut outside };
+            let run = Run { rows: rs.clone(), base: 0, n: rs.len() as i64, before: None, after: None, ntile_first: vec![None], outside: &mut outside };
             let p = Peers::of(&rs, &order);
             let agg = spec.agg().unwrap();
             let kinds = agg.summaries();
