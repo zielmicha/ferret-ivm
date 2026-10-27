@@ -1562,6 +1562,11 @@ impl Env {
         self.read_budget = n;
     }
 
+    /// Entries the read budget has left (None: no limit).
+    pub fn read_budget(&self) -> Option<u64> {
+        self.read_budget
+    }
+
     /// Count `n` entries visited against the read budget.
     fn spend(&mut self, n: u64) -> Result<()> {
         if let Some(b) = self.read_budget.as_mut() {

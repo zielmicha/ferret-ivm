@@ -205,6 +205,8 @@ pub struct Engine {
     /// Threads running large reads on forks (`reader.rs`), started when
     /// first needed.
     readers: Option<Sender<reader::ReadJob>>,
+    /// What reads and snapshots cost the engine thread (`inspect`).
+    pub(crate) reads: inspect::ReadCounters,
     /// Command tags of DML waiting to be applied.
     pub(crate) dml_counts: HashMap<u64, String>,
     /// Requests to run after the current message.
@@ -595,6 +597,7 @@ impl Engine {
             dml_reads: None,
             outbox: Vec::new(),
             readers: None,
+            reads: Default::default(),
             dml_counts: HashMap::new(),
             deferred: Vec::new(),
             last_checkpoint: Instant::now(),

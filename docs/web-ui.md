@@ -296,6 +296,7 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
     "nodes": 27, "arrangements": 26, "nodes_created": 27, "arrangements_created": 26,
     "catalog_version": 15,
     "steps": {"steps": 604, "in_rows": 274155, "out_rows": 267461, "nanos": 437892939},
+    "reads": {"inline_entries": 1250310, "offloaded": 7},
     "subscriptions": 1, "parked_reads": 0, "view_errors": 30
   },
   "config": {"data_dir": "ivm-data", "memory_bytes": 2147483648, "checkpoint_interval_secs": 10.0,
@@ -325,6 +326,10 @@ hydration, large reads) and the changes forwarded to a hydration not
 applied there yet; `config.memory_bytes` is the budget (`--memory-mb`, see
 [Memory](user-guide/operations.md#memory)).
 `stats.steps` sums the per-operator counters since start (monotonic);
+`stats.reads` counts, also since start, the index entries that ad hoc
+reads and the snapshots of subscriptions and sinks visited on the engine
+thread (each within its budget of 50,000) and how many of them exceeded
+the budget and went to a reader thread;
 `catalog_version` is the length of the catalog history, so it changes with
 every applied DDL statement (the history is trimmed back to 10,000 entries
 once it exceeds 11,000); `last_checkpoint_ms` is the engine start until the

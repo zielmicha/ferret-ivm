@@ -102,9 +102,22 @@ pub struct EngineStats {
     pub catalog_version: usize,
     /// Dataflow activity since start (monotonic).
     pub steps: NodeCounters,
+    /// Ad hoc reads and snapshots since start (monotonic).
+    pub reads: ReadCounters,
     pub subscriptions: usize,
     pub parked_reads: usize,
     pub view_errors: i64,
+}
+
+/// What ad hoc reads and the snapshots of subscriptions and sinks cost the
+/// engine thread (`coord::reader`).
+#[derive(Serialize, Clone, Copy, Debug, Default)]
+pub struct ReadCounters {
+    /// Index entries they visited on the engine thread, within their
+    /// budget there.
+    pub inline_entries: u64,
+    /// Those that exceeded the budget and went to a reader thread.
+    pub offloaded: u64,
 }
 
 #[derive(Serialize, Debug)]
@@ -711,6 +724,7 @@ impl Engine {
             arrangements_created: self.graph.arr_count(),
             catalog_version: self.catalog.history.len(),
             steps: self.graph.step_totals,
+            reads: self.reads,
             subscriptions: self.subs.len(),
             parked_reads: self.parked.len(),
             view_errors: self.rt.views.values().flat_map(|v| v.errors.values()).filter(|w| **w > 0).sum(),

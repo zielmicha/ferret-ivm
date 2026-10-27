@@ -615,58 +615,86 @@ fn concurrent_dml_shares_log_appends() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The engine's counters.
+fn stats(h: &EngineHandle) -> ivm::coord::inspect::EngineStats {
+    match h.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
+        ivm::coord::inspect::InspectReply::Stats(s) => s,
+        other => panic!("unexpected reply {other:?}"),
+    }
+}
+
 /// Large ad hoc reads run off the engine thread (on a fork of the storage
-/// taken when they exceed their budget there): commits keep being applied
-/// and answered while they run, none waiting for a good part of them, and
-/// each returns the table as of one GSN. (Six queued `LIMIT 1` scans used
-/// to hold up a single-row insert for seconds.)
+/// taken when they exceed their budget there): commits are applied and
+/// answered while they run, and each returns the table as of the GSN it
+/// was handed off at. Counted, not timed: the reads' sessions stop taking
+/// rows after the first chunk, so that every read is still running (or
+/// waiting for a reader thread) while the commits are applied, and the
+/// engine thread visits a small part of what the reads read. (Six queued
+/// `LIMIT 1` scans used to hold up a single-row insert for seconds.)
 #[test]
 fn large_reads_do_not_hold_up_commits() {
     let _serial = serial();
     let dir = tmpdir("reads");
     let running = start(&dir);
     let h = running.handle.clone();
+    let n = 600_000u64;
     exec(&h, "CREATE TABLE wide (id int PRIMARY KEY, g int, pad text)");
-    for lo in (0..600_000).step_by(100_000) {
+    for lo in (0..n).step_by(100_000) {
         exec(&h, &format!("INSERT INTO wide SELECT i, i % 7, repeat('x', 50) FROM generate_series({lo}, {}) i", lo + 99_999));
     }
-    exec(&h, "CREATE TABLE small (id int PRIMARY KEY, v int)");
     let g0 = gsn(&h);
-    let reads: Vec<_> = (0..6)
+    let r0 = stats(&h).reads;
+    // the sessions take one chunk each, then wait for the gate
+    let gate = std::sync::Arc::new(std::sync::RwLock::new(()));
+    let held = gate.write().unwrap();
+    let reads: Vec<_> = (0..6u64)
         .map(|k| {
-            let h = h.clone();
+            let (h, gate) = (h.clone(), gate.clone());
             std::thread::spawn(move || {
-                let t0 = Instant::now();
-                let q = format!("SELECT g, count(*), min(pad), max(id) FROM wide WHERE id % 6 <> {k} GROUP BY g ORDER BY g LIMIT 1");
-                (rows(&h, &q), t0.elapsed())
+                let q = format!("SELECT id, g FROM wide WHERE id % 6 <> {k}");
+                let stmt = ivm::sql::parse_statement(&q).unwrap();
+                let res = h.execute_while(stmt, vec![], SessionVars::default(), String::new(), || true).unwrap();
+                let ExecResult::Rows { mut rows, .. } = res else { panic!("{q}: not streamed") };
+                let mut chunk = rows.next_chunk();
+                drop(gate.read().unwrap());
+                // (rows, sum of g)
+                let (mut count, mut sum) = (0u64, 0i64);
+                while let Some(c) = chunk {
+                    for r in c.unwrap().into_parts().0 {
+                        count += 1;
+                        sum += r[1].as_i64().unwrap();
+                    }
+                    chunk = rows.next_chunk();
+                }
+                (count, sum)
             })
         })
         .collect();
-    let (mut during, mut slowest) = (0, Duration::ZERO);
-    let mut i = 0;
-    while reads.iter().any(|r| !r.is_finished()) {
-        let t0 = Instant::now();
+    // every read has gone to a reader thread (its fork taken)
+    let t0 = Instant::now();
+    while stats(&h).reads.offloaded < r0.offloaded + 6 {
+        assert!(t0.elapsed() < Duration::from_secs(60), "the reads were not handed off");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let commits = 20;
+    for i in 0..commits {
         exec(&h, &format!("INSERT INTO wide VALUES ({}, 0, 'y')", 1_000_000 + i));
-        i += 1;
-        if reads.iter().any(|r| !r.is_finished()) {
-            during += 1;
-            slowest = slowest.max(t0.elapsed());
-        }
     }
-    let results: Vec<(Vec<String>, Duration)> = reads.into_iter().map(|t| t.join().unwrap()).collect();
-    let longest = results.iter().map(|r| r.1).max().unwrap();
-    assert!(during >= 3, "{during} commits answered while the reads ran");
-    assert!(slowest * 3 < longest, "a commit took {slowest:?} of the reads' {longest:?}");
-    // each read saw the table as of some GSN between g0 and the end: all of
-    // the 600,000 rows, plus some of the inserts of group 0
-    for (k, (r, _)) in results.iter().enumerate() {
-        let base = (0..600_000).filter(|x| x % 7 == 0 && x % 6 != k).count();
-        let n: usize = r[0].split('|').nth(1).unwrap().parse().unwrap();
-        assert!(r[0].starts_with("0|") && n >= base && n <= base + i as usize, "read {k}: {r:?} (base {base}, {i} inserts)");
+    assert_eq!(gsn(&h), g0 + commits);
+    assert!(reads.iter().all(|r| !r.is_finished()), "a read finished before its session took its rows");
+    // (each read visited at most its budget on the engine thread: a small
+    // part of the table)
+    let inline = stats(&h).reads.inline_entries - r0.inline_entries;
+    assert!(inline <= 6 * n / 8, "{inline} entries visited on the engine thread for six reads of {n}");
+    drop(held);
+    for (k, r) in reads.into_iter().enumerate() {
+        let k = k as u64;
+        let ids = (0..n).filter(|x| x % 6 != k);
+        let want = (ids.clone().count() as u64, ids.map(|x| (x % 7) as i64).sum::<i64>());
+        assert_eq!(r.join().unwrap(), want, "read {k}: the table as of the GSN it was handed off at");
     }
-    assert_eq!(gsn(&h), g0 + i);
-    let sum = (0..600_000i64).map(|x| x % 7).sum::<i64>();
-    assert_eq!(rows(&h, "SELECT count(*), sum(g) FROM wide"), vec![format!("{}|{sum}", 600_000 + i)]);
+    let sum = (0..n as i64).map(|x| x % 7).sum::<i64>();
+    assert_eq!(rows(&h, "SELECT count(*), sum(g) FROM wide"), vec![format!("{}|{sum}", n + commits)]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -677,7 +705,8 @@ fn large_reads_do_not_hold_up_commits() {
 /// has not been read yet, what is in flight meanwhile stays a few chunks
 /// (counted in the outputs' memory), and the snapshot (as of the GSN the
 /// subscription started at) and the changes after it add up to the view's
-/// contents. (A sink's snapshot is read the same way.) It used to be built
+/// contents. The engine thread reads no more of the view than its read
+/// budget. (A sink's snapshot is read the same way.) It used to be built
 /// whole, on the engine thread or held by it until done.
 #[test]
 fn large_subscription_snapshots_do_not_hold_up_commits() {
@@ -690,6 +719,7 @@ fn large_subscription_snapshots_do_not_hold_up_commits() {
         exec(&h, &format!("INSERT INTO wide SELECT i, i % 7, repeat('x', 50) FROM generate_series({lo}, {}) i", lo + 99_999));
     }
     exec(&h, "CREATE MATERIALIZED VIEW wv AS SELECT id, g FROM wide WHERE g < 5");
+    let r0 = stats(&h).reads;
     let ExecResult::Subscribe { rx, cancel, .. } = exec(&h, "SUBSCRIBE wv WITH (PROGRESS)") else { panic!("not a subscription") };
     let SubEvent::Snapshot { rows: mut snapshot, .. } = rx.recv().unwrap() else { panic!("no snapshot first") };
     let mut n: i64 = snapshot.next().unwrap().unwrap().iter().map(|(_, w)| w).sum();
@@ -697,14 +727,16 @@ fn large_subscription_snapshots_do_not_hold_up_commits() {
     for i in 0..20 {
         exec(&h, &format!("INSERT INTO wide VALUES ({}, {}, 'y')", 1_000_000 + i, i % 7));
     }
-    let stats = |h: &EngineHandle| match h.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
-        ivm::coord::inspect::InspectReply::Stats(s) => s,
-        other => panic!("unexpected reply {other:?}"),
-    };
-    let queued = stats(&h).output_queue_bytes;
+    let st = stats(&h);
+    let queued = st.output_queue_bytes;
     // (two chunks of 10,000 rows in flight, one held by the reader, and the
     // changes since: a few MiB, not the view's 430,000 rows)
     assert!(queued < 8 << 20, "{queued} bytes in flight for the subscription");
+    // (read on a reader thread, the engine thread having read at most its
+    // budget of the view's entries)
+    let inline = st.reads.inline_entries - r0.inline_entries;
+    assert_eq!(st.reads.offloaded, r0.offloaded + 1, "the snapshot was not read on a reader thread");
+    assert!(inline <= 430_000 / 8, "{inline} entries of the view visited on the engine thread");
     for chunk in snapshot {
         n += chunk.unwrap().iter().map(|(_, w)| w).sum::<i64>();
     }

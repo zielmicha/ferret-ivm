@@ -134,7 +134,17 @@ impl Engine {
         self.send_to_reader(job)
     }
 
+    /// End a read's budget on the engine thread, counting the entries it
+    /// visited there.
+    pub(crate) fn end_inline_read(&mut self) {
+        if let Some(left) = self.env.read_budget() {
+            self.reads.inline_entries += INLINE_READ_ENTRIES.saturating_sub(left);
+        }
+        self.env.set_read_budget(None);
+    }
+
     fn send_to_reader(&mut self, job: ReadJob) -> Result<()> {
+        self.reads.offloaded += 1;
         let tx = match &self.readers {
             Some(tx) => tx.clone(),
             None => {
@@ -171,7 +181,7 @@ impl Engine {
             chunks.push((rows, mem));
             true
         });
-        self.env.set_read_budget(None);
+        self.end_inline_read();
         match r {
             Err(e) if e.code == crate::storage::READ_BUDGET => {}
             Err(e) => return Err(e),

@@ -413,7 +413,7 @@ impl Engine {
         let budget = self.handle.is_some().then_some(super::reader::INLINE_READ_ENTRIES);
         self.env.set_read_budget(budget);
         let r = self.read_query(&bq, &mut |row| res.push(row));
-        self.env.set_read_budget(None);
+        self.end_inline_read();
         match r {
             // (it sent nothing yet: it runs again there)
             Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, vars, res.abandon())?,
