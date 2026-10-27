@@ -103,7 +103,9 @@ start/end: UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | UNBOU
   that is not positive there fails with `argument of ntile must be greater
   than zero`, SQLSTATE `22014`; later rows' `n` are ignored), the rows
   before it are NULL, and the buckets are counted from it. The `offset` of
-  `lag`/`lead` and the `n` of `nth_value` are read at every row.
+  `lag`/`lead` and the `n` of `nth_value` are read at every row. The
+  arguments are computed for every row, also where PostgreSQL does not
+  compute them ([Known problems](../user-guide/troubleshooting.md#known-problems)).
 - Default frame: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 - `ROWS` and `GROUPS` offsets are integer constants. `RANGE` offsets need
   exactly one `ORDER BY` column of a numeric type (offset of the same type)

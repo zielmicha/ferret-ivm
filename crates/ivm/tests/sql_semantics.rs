@@ -878,6 +878,33 @@ fn ntile_reads_its_argument_at_the_first_row_where_it_is_not_null() {
     running.shutdown();
 }
 
+/// Open bug: PostgreSQL computes a window function's arguments only where
+/// the function reads them (ntile's up to the partition's first non-NULL
+/// one, the value of lag and first_value at the rows they return, lag's
+/// default where the offset leaves the partition, an aggregate's at the
+/// rows of some frame), while ivm computes them for every row before the
+/// window functions, so an error at a row PostgreSQL does not read fails
+/// the query. Expected rows are PostgreSQL's.
+#[test]
+#[ignore]
+fn window_arguments_are_computed_only_where_read() {
+    let running = start("window-args");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE wa (i int PRIMARY KEY)");
+    exec(&h, "INSERT INTO wa SELECT i FROM generate_series(1, 5) i");
+    for (f, want) in [
+        ("ntile(10 / (i - 3)) OVER (ORDER BY i DESC)", ["1|5", "2|4", "3|3", "4|2", "5|1"]),
+        ("lag(10 / (i - 5)) OVER (ORDER BY i)", ["1|", "2|-2", "3|-3", "4|-5", "5|-10"]),
+        ("lag(i, 1, 10 / (i - 3)) OVER (ORDER BY i)", ["1|-5", "2|1", "3|2", "4|3", "5|4"]),
+        ("first_value(10 / (i - 3)) OVER (ORDER BY i)", ["1|-5", "2|-5", "3|-5", "4|-5", "5|-5"]),
+        ("sum(10 / (i - 5)) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)", ["1|", "2|-2", "3|-5", "4|-10", "5|-20"]),
+        ("sum(10 / (i - 1)) OVER (ORDER BY i ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING)", ["1|15", "2|8", "3|5", "4|2", "5|"]),
+    ] {
+        assert_eq!(try_rows(&h, &format!("SELECT i, {f} FROM wa ORDER BY i")), Ok(want.map(String::from).to_vec()), "{f}");
+    }
+    running.shutdown();
+}
+
 #[test]
 fn bool_casts_to_text_and_case_typing() {
     let running = start("bool-text");
