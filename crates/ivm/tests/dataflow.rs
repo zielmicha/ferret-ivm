@@ -682,6 +682,8 @@ fn windows_follow_random_changes() {
         // (ntile's number of buckets from the first row whose argument is not NULL)
         "SELECT id, ntile(CASE WHEN v > 4 THEN v - 4 END) OVER (PARTITION BY g ORDER BY id) AS a, ntile(CASE WHEN id > 100 THEN v + 1 END) OVER (ORDER BY id) AS b, ntile(v + 1) OVER (PARTITION BY g ORDER BY v DESC) AS c FROM t",
         "SELECT g, v, ntile(v + 2) OVER (PARTITION BY g ORDER BY v NULLS FIRST) AS n, sum(v) OVER (PARTITION BY g ORDER BY v ROWS 1 PRECEDING) AS s FROM t",
+        // (offsets that differ between rows, negative ones reading the other way)
+        "SELECT id, lag(id, v - 3, -id) OVER (PARTITION BY g ORDER BY id) AS l, lead(v, id % 3 - 1) OVER (PARTITION BY g ORDER BY id) AS ld, lag(v, -2) OVER (PARTITION BY g ORDER BY id) AS lf, lead(id, -1, 0) OVER (PARTITION BY g ORDER BY id) AS lb FROM t",
         "SELECT id, count(*) OVER (PARTITION BY g ORDER BY d RANGE BETWEEN interval '2 days' PRECEDING AND interval '1 day' FOLLOWING) AS c FROM (SELECT id, g, date '2026-01-01' + v AS d FROM t) s",
         "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v GROUPS BETWEEN 40 PRECEDING AND 1 PRECEDING) AS s, lag(v, 2) OVER (PARTITION BY g ORDER BY id) AS l FROM t",
     ];

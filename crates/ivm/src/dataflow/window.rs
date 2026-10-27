@@ -32,6 +32,10 @@ pub struct WinSpec {
     pub arg_types: Vec<SqlType>,
     pub ret: ColumnType,
     pub range: Option<RangeOffsets>,
+    /// `lag` and `lead`: the offset if it is the same for every row (a
+    /// constant, or 1 when it is not given), which bounds the rows a change
+    /// reaches; None otherwise.
+    pub offset: Option<i64>,
 }
 
 impl WinSpec {
@@ -741,8 +745,13 @@ fn change_reach(f: &WinSpec, resized: bool, ntile_moved: bool) -> (Reach, Reach)
         W::CumeDist => (all_if(resized, Reach::Groups(0)), all_if(resized, Reach::Groups(0))),
         // (that row's argument is the number of buckets of every row)
         W::Ntile => (all_if(resized || ntile_moved, Reach::None), all_if(resized || ntile_moved, Reach::None)),
-        W::Lag => (Reach::None, if f.args.len() > 1 { Reach::All } else { Reach::Rows(1) }),
-        W::Lead => (if f.args.len() > 1 { Reach::All } else { Reach::Rows(1) }, Reach::None),
+        // the rows reading the changed rows' positions: `lag` reads back by
+        // a positive offset and forward by a negative one; offsets that
+        // differ between rows can reach any row
+        W::Lag | W::Lead => match f.offset.map(|k| if f.func == W::Lag { k } else { k.saturating_neg() }) {
+            Some(back) => (Reach::Rows(back.saturating_neg().max(0)), Reach::Rows(back.max(0))),
+            None => (Reach::All, Reach::All),
+        },
         // rows whose frame holds the changed row: frames ending after it
         // reach back from it, frames starting before it forward
         _ => (bound_reach(f, false), bound_reach(f, true)),
@@ -1247,6 +1256,7 @@ mod tests {
                 arg_types,
                 ret: ColumnType::new(if matches!(func, AggFunc::StringAgg) { SqlType::Text } else { SqlType::Numeric }),
                 range: None,
+                offset: None,
             };
             let order = [SortKey { col: 0, spec: SortSpec::ASC }];
             let got = compute_partition(&rows, &order, std::slice::from_ref(&spec)).unwrap();

@@ -563,6 +563,40 @@ fn windows_read_only_what_a_change_reaches() {
     }
 }
 
+/// lag and lead read the row at their offset: with a constant offset (also
+/// a negative one, reading the other way), a change in the middle of a
+/// partition reads the rows up to that offset from it; offsets that differ
+/// between rows can reach any row, and the partition is read once.
+#[test]
+fn lag_and_lead_read_the_rows_their_offsets_reach() {
+    let mut t = T::new("work-lag");
+    let n = 3000;
+    let cases = [
+        // (the row reading the changed one)
+        ("back2", "lag(v, 2)", Some(n / 2 + 2)),
+        ("ahead", "lead(v, 3, 0)", Some(n / 2 - 3)),
+        ("negative", "lead(v, -2)", Some(n / 2 + 2)),
+        ("by_row", "lag(v, (id % 3 - 1)::int)", None),
+    ];
+    for (name, f, want) in cases {
+        t.ddl(&format!("CREATE TABLE {name} (id bigint PRIMARY KEY, g bigint, v bigint)"));
+        t.upsert(name, (0..n).map(|i| vec![int(i), int(1), int(i)]).collect());
+        let q = format!("SELECT id, {f} OVER (PARTITION BY g ORDER BY id) AS x FROM {name}");
+        t.ddl(&format!("CREATE MATERIALIZED VIEW {name}_v AS {q}"));
+        let (entries, _) = t.work(|t| t.upsert(name, vec![vec![int(n / 2), int(1), int(-1)]]));
+        match want {
+            Some(_) => assert!(entries <= 20, "{name}: {entries} entries"),
+            None => assert!(entries > n as u64 && entries <= n as u64 + 50, "{name}: {entries} entries"),
+        }
+        let rows = t.rows(&format!("{name}_v"));
+        if let Some(at) = want {
+            assert_eq!(rows.iter().find(|r| r[0] == int(at)).unwrap()[1], int(-1), "{name}");
+        }
+        t.ddl(&format!("CREATE MATERIALIZED VIEW {name}_fresh AS {q}"));
+        assert_eq!(rows, t.rows(&format!("{name}_fresh")), "{name}");
+    }
+}
+
 /// A window operator's partitions in error, and that they are known (also
 /// without any in error), are kept in the metadata tree: recovery restores
 /// them without reading the operator's input, and a change after it is

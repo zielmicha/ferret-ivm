@@ -15,7 +15,7 @@ use super::window::{WinSpec, WindowPlan};
 use super::*;
 use crate::error::codes;
 use crate::expr::func::func_def;
-use crate::sql::plan::{AggCall, AggFunc, JoinKind, Rel, SetOpKind, SortKey};
+use crate::sql::plan::{AggCall, AggFunc, JoinKind, Rel, SetOpKind, SortKey, WindowFunc};
 use crate::sql_bail;
 use crate::types::{Datum, SqlType};
 
@@ -197,6 +197,20 @@ impl<'a> Lowerer<'a> {
             Rel::Window { input, funcs } => {
                 let l = self.lower(input)?;
                 let mut cur_schema = l.schema.clone();
+                // lag's and lead's offsets that are constants (computed by
+                // the input's pending MFP)
+                let constant = |c: usize| match l.mfp.output_expr(c) {
+                    Expr::Literal(d, _) => d.as_i64(),
+                    _ => None,
+                };
+                let offsets: Vec<Option<i64>> = funcs
+                    .iter()
+                    .map(|f| match (f.func, f.args.get(1)) {
+                        (WindowFunc::Lag | WindowFunc::Lead, Some(c)) => constant(*c),
+                        (WindowFunc::Lag | WindowFunc::Lead, None) => Some(1),
+                        _ => None,
+                    })
+                    .collect();
                 let mut node = self.materialize(l);
                 let mut i = 0;
                 while i < funcs.len() {
@@ -213,13 +227,15 @@ impl<'a> Lowerer<'a> {
                     }
                     let specs_w: Vec<WinSpec> = funcs[i..j]
                         .iter()
-                        .map(|f| WinSpec {
+                        .zip(&offsets[i..j])
+                        .map(|(f, offset)| WinSpec {
                             func: f.func,
                             args: f.args.clone(),
                             frame: f.frame,
                             arg_types: f.args.iter().map(|a| cur_schema[*a].ty.clone()).collect(),
                             ret: f.ret.clone(),
                             range: f.range.clone(),
+                            offset: *offset,
                         })
                         .collect();
                     // (summaries for the parts of frames up to the partitions' ends)
