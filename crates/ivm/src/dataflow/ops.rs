@@ -87,9 +87,9 @@ fn step_operator(
         })?,
         NodeKind::Join(p) => join::step(g, env, node, p, gsn, all, out)?,
         NodeKind::Reduce(p) => reduce::step(g, env, p, inputs[0], gsn, out)?,
-        NodeKind::Distinct { arr } => distinct_step(g, env, *arr, inputs[0], gsn, out)?,
+        NodeKind::Distinct { arr } => distinct_step(g, env, *arr, inputs[0], out)?,
         NodeKind::SetOp { op, all: is_all, left_arr, right_arr } => {
-            setop_step(g, env, *op, *is_all, *left_arr, *right_arr, inputs[0], inputs[1], gsn, out)?
+            setop_step(g, env, *op, *is_all, *left_arr, *right_arr, inputs[0], inputs[1], out)?
         }
         NodeKind::TopK(p) => topk_step(g, env, p, inputs[0], gsn, out)?,
         NodeKind::Window(p) => window::step(g, env, p, inputs[0], gsn, out)?,
@@ -100,8 +100,8 @@ fn step_operator(
 }
 
 /// The distinct key prefixes `key` gives the rows of a delta, in order.
-pub fn affected_keys(env: &mut Env, delta: &NodeDelta, gsn: Gsn, key: &dyn Fn(&Row) -> Result<Vec<u8>>) -> Result<Keys> {
-    let mut set = KeySet::new(gsn);
+pub fn affected_keys(env: &mut Env, delta: &NodeDelta, key: &dyn Fn(&Row) -> Result<Vec<u8>>) -> Result<Keys> {
+    let mut set = KeySet::default();
     let r = delta.for_each_batch(env, &mut |env, batch| {
         for (row, _) in batch {
             set.push(env, key(row)?)?;
@@ -118,11 +118,11 @@ pub fn affected_keys(env: &mut Env, delta: &NodeDelta, gsn: Gsn, key: &dyn Fn(&R
 }
 
 /// Hydration hook for operators with private state.
-pub fn hydrate_node(g: &mut Graph, env: &mut Env, id: NodeId, gsn: Gsn) -> Result<()> {
+pub fn hydrate_node(g: &mut Graph, env: &mut Env, id: NodeId) -> Result<()> {
     if let NodeKind::Temporal(p) = &g.node(id).kind {
         let p = p.clone();
         let input = g.node(id).inputs[0];
-        temporal::hydrate(g, env, &p, input, gsn)?;
+        temporal::hydrate(g, env, &p, input)?;
     }
     Ok(())
 }
@@ -381,8 +381,8 @@ pub fn table_step(
             return Ok::<usize, SqlError>(i);
         }
         let mut found = None;
-        env.for_each_prefix(tree, &key, &mut |k, h| {
-            if h.total() > 0 {
+        env.for_each_prefix(tree, &key, &mut |k, w| {
+            if w > 0 {
                 found = Some(layout.decode_row(k)?);
             }
             Ok(true)
@@ -497,8 +497,8 @@ enum After {
 // ---------------------------------------------------------------- distinct
 
 /// The canonical key prefixes of a delta's rows, in order.
-fn affected_prefixes(env: &mut Env, layout: &Layout, delta: &NodeDelta, gsn: Gsn) -> Result<Keys> {
-    affected_keys(env, delta, gsn, &|row| Ok(layout.encode_prefix(&layout.key_values(row)?)))
+fn affected_prefixes(env: &mut Env, layout: &Layout, delta: &NodeDelta) -> Result<Keys> {
+    affected_keys(env, delta, &|row| Ok(layout.encode_prefix(&layout.key_values(row)?)))
 }
 
 /// The first entry with positive weight under `prefix` (the
@@ -521,11 +521,11 @@ fn representatives(env: &mut Env, changes: &Overlay, tree: TreeId, layout: &Layo
     Ok(v)
 }
 
-fn distinct_step(g: &Graph, env: &mut Env, arr: ArrId, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
+fn distinct_step(g: &Graph, env: &mut Env, arr: ArrId, delta: &NodeDelta, out: &mut StepOut) -> Result<()> {
     let a = g.arr(arr);
     let layout = a.layout.clone();
     let changes = delta.overlay(arr)?;
-    affected_prefixes(env, &layout, delta, gsn)?.for_each(env, &mut |env, p| {
+    affected_prefixes(env, &layout, delta)?.for_each(env, &mut |env, p| {
         let [(old, oc), (new, nc)] = representatives(env, &changes, a.tree, &layout, p)?;
         if oc > 0
             && let Some(o) = old
@@ -546,8 +546,8 @@ fn distinct_snapshot(g: &Graph, env: &mut Env, arr: ArrId, out: &mut SnapOut) ->
     let layout = a.layout.clone();
     let mut c = env.cursor(a.tree, Bound::Unbounded, Bound::Unbounded);
     let mut last: Option<Vec<u8>> = None;
-    while let Some((k, h)) = env.cursor_next(&mut c)? {
-        if h.total() <= 0 {
+    while let Some((k, w)) = env.cursor_next(&mut c)? {
+        if w <= 0 {
             continue;
         }
         let kb = layout.key_bytes(&k)?.to_vec();
@@ -583,12 +583,11 @@ fn setop_step(
     ra: ArrId,
     ld: &NodeDelta,
     rd: &NodeDelta,
-    gsn: Gsn,
     out: &mut StepOut,
 ) -> Result<()> {
     let (l, r) = (g.arr(la), g.arr(ra));
     let (ll, rl) = (l.layout.clone(), r.layout.clone());
-    let mut prefixes = KeySet::new(gsn);
+    let mut prefixes = KeySet::default();
     for (layout, d) in [(&ll, ld), (&rl, rd)] {
         let res = d.for_each_batch(env, &mut |env, batch| {
             for (row, _) in batch {
@@ -630,7 +629,7 @@ fn setop_snapshot(g: &Graph, env: &mut Env, op: SetOpKind, all: bool, la: ArrId,
     let mut cursors = [env.cursor(l.tree, Bound::Unbounded, Bound::Unbounded), env.cursor(r.tree, Bound::Unbounded, Bound::Unbounded)];
     let mut heads = [None, None];
     for side in 0..2 {
-        heads[side] = next_live(env, &mut cursors[side], &layouts[side])?;
+        heads[side] = next_keyed(env, &mut cursors[side], &layouts[side])?;
     }
     loop {
         let value = match (&heads[0], &heads[1]) {
@@ -649,7 +648,7 @@ fn setop_snapshot(g: &Graph, env: &mut Env, op: SetOpKind, all: bool, la: ArrId,
                     *rep = Some(layouts[side].decode_row(k)?);
                 }
                 *total += w;
-                heads[side] = next_live(env, &mut cursors[side], &layouts[side])?;
+                heads[side] = next_keyed(env, &mut cursors[side], &layouts[side])?;
             }
         }
         let [(lrep, a), (rrep, b)] = sides;
@@ -665,15 +664,12 @@ fn setop_snapshot(g: &Graph, env: &mut Env, op: SetOpKind, all: bool, la: ArrId,
 /// An entry with its canonical key and weight.
 type KeyedEntry = (Vec<u8>, Box<[u8]>, i64);
 
-/// The next entry with a non-zero weight.
-fn next_live(env: &mut Env, c: &mut crate::storage::Cursor, layout: &Layout) -> Result<Option<KeyedEntry>> {
-    while let Some((k, h)) = env.cursor_next(c)? {
-        let w = h.total();
-        if w != 0 {
-            return Ok(Some((layout.key_bytes(&k)?.to_vec(), k, w)));
-        }
+/// The next entry, with its canonical key.
+fn next_keyed(env: &mut Env, c: &mut crate::storage::Cursor, layout: &Layout) -> Result<Option<KeyedEntry>> {
+    match env.cursor_next(c)? {
+        Some((k, w)) => Ok(Some((layout.key_bytes(&k)?.to_vec(), k, w))),
+        None => Ok(None),
     }
-    Ok(None)
 }
 
 // ---------------------------------------------------------------- top-k
@@ -958,9 +954,8 @@ fn topk_rows(env: &mut Env, g: &TopKGroup, p: &TopKPlan) -> Result<Delta> {
         Bound::Unbounded => g.hi(),
         b => b.as_ref().map(|k| k.as_slice()),
     };
-    env.for_each(g.tree, Bound::Included(&from), to, &mut |k, h| {
+    env.for_each(g.tree, Bound::Included(&from), to, &mut |k, n| {
         visited(1);
-        let n = h.total();
         let take = w.rows(k, pos, n);
         if take > 0 {
             out.push((g.layout.decode_row(k)?, take));
@@ -1018,7 +1013,7 @@ fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, deltas: &EntryDeltas, 
     }
     let mut changed: Vec<Changed> = Vec::with_capacity(deltas.entries().len());
     for (key, d) in deltas.entries() {
-        let after = env.get(g.tree, key)?.map(|h| h.total()).unwrap_or(0);
+        let after = env.get(g.tree, key)?.unwrap_or(0);
         changed.push(Changed { key: key.clone(), before: after - d, after, rank: 0 });
     }
     if changed.is_empty() {
@@ -1150,8 +1145,8 @@ fn topk_snapshot(g: &Graph, env: &mut Env, p: &TopKPlan, out: &mut SnapOut) -> R
             None => Bound::Unbounded,
         };
         let mut next = None;
-        env.for_each(a.tree, lo, Bound::Unbounded, &mut |k, h| {
-            if h.total() <= 0 {
+        env.for_each(a.tree, lo, Bound::Unbounded, &mut |k, w| {
+            if w <= 0 {
                 return Ok(true);
             }
             next = Some(k[..layout.prefix_len(k, ng)?].to_vec());

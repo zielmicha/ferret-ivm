@@ -289,7 +289,7 @@ fn lookup_prefix(
         let hi = crate::types::encoding::prefix_successor(prefix);
         let hi = hi.as_deref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
         match &changes {
-            None => env.for_each(a.tree, lo, hi, &mut |k, h| visit(k, h.total()))?,
+            None => env.for_each(a.tree, lo, hi, &mut visit)?,
             Some(o) => o.for_each_versioned(env, a.tree, lo, hi, &mut |k, _, w| visit(k, w))?,
         }
         if !out.is_empty() {

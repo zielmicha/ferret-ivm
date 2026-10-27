@@ -9,10 +9,11 @@
 //! it. Consumers read the delta in batches, and can read it by key range in
 //! the encoding of any of the node's arrangements (`for_each_entry`) until
 //! they have all run: overlaid on that arrangement (`Overlay`), it gives the
-//! entries' weights before the step without their histories. The spilled
-//! trees are merged into the arrangements in key order. The output of a node that nobody reads goes to its
-//! arrangements directly. Sets of affected keys (groups, partitions,
-//! values) spill likewise.
+//! entries' weights before the step, also of the entries the step removed
+//! (arrangements keep the current weights only). The spilled trees are
+//! merged into the arrangements in key order. The output of a node that
+//! nobody reads goes to its arrangements directly. Sets of affected keys
+//! (groups, partitions, values) spill likewise.
 
 use super::*;
 use crate::memory::{heap_block, row_heap, Charge};
@@ -49,6 +50,9 @@ pub type GroupFn<'a> = dyn FnMut(&mut Env, &[u8], Option<&EntryDeltas>) -> Resul
 /// Receives an entry with its weights now and before the step (false:
 /// stop).
 pub type VersionedFn<'a> = dyn FnMut(&[u8], i64, i64) -> Result<bool> + 'a;
+
+/// Receives a chunk of entries with their weights.
+pub type ChunkFn<'a> = dyn FnMut(&mut Env, &[(Vec<u8>, i64)]) -> Result<()> + 'a;
 
 /// An encoding a node's delta is kept in: an arrangement of the node (with
 /// the tree to apply the delta to, unless that is done already), or an
@@ -134,8 +138,8 @@ impl NodeDelta {
             let mut batch = Vec::new();
             let mut bytes = 0;
             let mut last = None;
-            env.for_each(tree, lo, Bound::Unbounded, &mut |k, h| {
-                batch.push((layout.decode_row(k)?, h.total()));
+            env.for_each(tree, lo, Bound::Unbounded, &mut |k, w| {
+                batch.push((layout.decode_row(k)?, w));
                 bytes += k.len();
                 if batch.len() >= ops::BATCH_ROWS || bytes >= 1 << 20 {
                     last = Some(k.to_vec());
@@ -189,14 +193,14 @@ impl NodeDelta {
                 }
                 Ok(())
             }
-            Rows::Tree { trees, .. } => env.for_each(trees[i], lo, hi, &mut |k, h| f(k, h.total())),
+            Rows::Tree { trees, .. } => env.for_each(trees[i], lo, hi, f),
             Rows::Applied { .. } => Err(SqlError::internal("reading a delta applied to its arrangements")),
         }
     }
 
     /// Apply the delta to the targets' trees (a spilled one by merging each
     /// of its trees in key order).
-    pub fn apply(&self, env: &mut Env, gsn: Gsn) -> Result<()> {
+    pub fn apply(&self, env: &mut Env) -> Result<()> {
         match &self.rows {
             Rows::Mem(d) => {
                 if d.is_empty() {
@@ -208,14 +212,14 @@ impl NodeDelta {
                     for (row, w) in d {
                         ups.push((t.layout.encode_row(row)?, *w));
                     }
-                    env.apply(tree, &mut ups, gsn)?;
+                    env.apply(tree, &mut ups)?;
                 }
                 Ok(())
             }
             Rows::Tree { trees, .. } => {
                 for (t, from) in self.targets.iter().zip(trees) {
                     let Some(into) = t.apply_to else { continue };
-                    merge_into(env, *from, into, gsn)?;
+                    merge_into(env, *from, into)?;
                 }
                 Ok(())
             }
@@ -268,8 +272,9 @@ const OVERLAY_CHUNK: usize = 4096;
 /// delta (it is applied before any consumer runs), so an entry's weight
 /// before the step is its current weight minus its change: an operator that
 /// compares its input before and after a step reads the arrangement and
-/// overlays the delta, by key range, instead of reading the entries'
-/// histories. In memory or spilled alike (the spilled delta is a tree in the
+/// overlays the delta, by key range (the arrangement holds the current
+/// weights only; an entry the step removed is in the delta alone). In
+/// memory or spilled alike (the spilled delta is a tree in the
 /// arrangement's encoding).
 pub struct Overlay<'a> {
     delta: &'a NodeDelta,
@@ -392,7 +397,7 @@ impl Overlay<'_> {
 
     /// Hand the changes to `f` in key order, at most `OVERLAY_CHUNK` at a
     /// time (for consumers that read other trees as they go).
-    pub fn for_each_chunk(&self, env: &mut Env, f: &mut dyn FnMut(&mut Env, &[(Vec<u8>, i64)]) -> Result<()>) -> Result<()> {
+    pub fn for_each_chunk(&self, env: &mut Env, f: &mut ChunkFn) -> Result<()> {
         let mut lo: Option<Vec<u8>> = None;
         loop {
             let mut changes: Vec<(Vec<u8>, i64)> = Vec::new();
@@ -420,7 +425,7 @@ impl Overlay<'_> {
 /// stopped the walk.
 fn merge_versioned(env: &mut Env, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, changes: &[(Vec<u8>, i64)], f: &mut VersionedFn) -> Result<bool> {
     let (mut i, mut stopped) = (0, false);
-    env.for_each(tree, lo, hi, &mut |k, h| {
+    env.for_each(tree, lo, hi, &mut |k, now| {
         while i < changes.len() && changes[i].0.as_slice() < k {
             i += 1;
             if !f(&changes[i - 1].0, 0, -changes[i - 1].1)? {
@@ -428,7 +433,6 @@ fn merge_versioned(env: &mut Env, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8
                 return Ok(false);
             }
         }
-        let now = h.total();
         let before = if i < changes.len() && changes[i].0.as_slice() == k {
             i += 1;
             now - changes[i - 1].1
@@ -514,7 +518,7 @@ impl Version<'_> {
     /// other version), until `f` returns false.
     pub fn for_each(&self, env: &mut Env, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: &mut dyn FnMut(&[u8], i64) -> Result<bool>) -> Result<()> {
         match self {
-            Version::Now => env.for_each(tree, lo, hi, &mut |k, h| f(k, h.total())),
+            Version::Now => env.for_each(tree, lo, hi, f),
             Version::Before(d) => d.for_each_versioned(env, tree, lo, hi, &mut |k, _, before| f(k, before)),
             Version::BeforeStep(o) => o.for_each_versioned(env, tree, lo, hi, &mut |k, _, before| f(k, before)),
         }
@@ -523,7 +527,7 @@ impl Version<'_> {
 
 /// Apply the entries of tree `from` to tree `into` in key order, in
 /// batches of about 1 MiB (each covering the next key range).
-fn merge_into(env: &mut Env, from: TreeId, into: TreeId, gsn: Gsn) -> Result<()> {
+fn merge_into(env: &mut Env, from: TreeId, into: TreeId) -> Result<()> {
     let mut resume: Option<Vec<u8>> = None;
     loop {
         let lo = match &resume {
@@ -533,8 +537,8 @@ fn merge_into(env: &mut Env, from: TreeId, into: TreeId, gsn: Gsn) -> Result<()>
         let mut batch = Vec::new();
         let mut bytes = 0;
         let mut last = None;
-        env.for_each(from, lo, Bound::Unbounded, &mut |k, h| {
-            batch.push((k.to_vec(), h.total()));
+        env.for_each(from, lo, Bound::Unbounded, &mut |k, w| {
+            batch.push((k.to_vec(), w));
             bytes += k.len() + 40;
             if bytes >= 1 << 20 {
                 last = Some(k.to_vec());
@@ -542,7 +546,7 @@ fn merge_into(env: &mut Env, from: TreeId, into: TreeId, gsn: Gsn) -> Result<()>
             }
             Ok(true)
         })?;
-        env.apply(into, &mut batch, gsn)?;
+        env.apply(into, &mut batch)?;
         match last {
             Some(k) => resume = Some(k),
             None => return Ok(()),
@@ -571,7 +575,6 @@ pub struct DeltaBuf {
     rows: Delta,
     /// The rows' memory, charged to the working memory once rows arrive.
     charge: Charge,
-    gsn: Gsn,
     targets: Vec<Target>,
     direct: bool,
     /// Once spilled: per target, its builder and temporary tree.
@@ -586,14 +589,14 @@ pub struct DeltaBuf {
 impl DeltaBuf {
     /// A delta kept, in memory or in temporary trees in the encodings of
     /// `targets`, until the consumers have read it.
-    pub fn new(gsn: Gsn, targets: Vec<Target>) -> DeltaBuf {
-        DeltaBuf { rows: Vec::new(), charge: Charge::none(), gsn, targets, direct: false, spill: None, spilled: 0, consolidated: false, extends: 0 }
+    pub fn new(targets: Vec<Target>) -> DeltaBuf {
+        DeltaBuf { rows: Vec::new(), charge: Charge::none(), targets, direct: false, spill: None, spilled: 0, consolidated: false, extends: 0 }
     }
 
     /// The output of a node nobody reads: past the spill threshold, rows
     /// go to the targets' trees directly.
-    pub fn direct(gsn: Gsn, targets: Vec<Target>) -> DeltaBuf {
-        DeltaBuf { rows: Vec::new(), charge: Charge::none(), gsn, targets, direct: true, spill: None, spilled: 0, consolidated: false, extends: 0 }
+    pub fn direct(targets: Vec<Target>) -> DeltaBuf {
+        DeltaBuf { rows: Vec::new(), charge: Charge::none(), targets, direct: true, spill: None, spilled: 0, consolidated: false, extends: 0 }
     }
 
     pub fn push(&mut self, env: &mut Env, row: Row, w: i64) -> Result<()> {
@@ -616,10 +619,10 @@ impl DeltaBuf {
             let mut spill = Vec::with_capacity(self.targets.len());
             for t in &self.targets {
                 match t.apply_to {
-                    Some(tree) if self.direct => spill.push((TreeBuilder::new(env, tree, self.gsn), None)),
+                    Some(tree) if self.direct => spill.push((TreeBuilder::new(env, tree), None)),
                     _ => {
                         let tree = env.create_temp_tree(Arc::new(CountSummarizer));
-                        spill.push((TreeBuilder::new(env, tree, self.gsn), Some(tree)));
+                        spill.push((TreeBuilder::new(env, tree), Some(tree)));
                     }
                 }
             }
@@ -734,11 +737,11 @@ impl StepOut {
 
 /// Distinct keys collected in any order, visited in key order: sorted in
 /// memory while small, else through a `TreeBuilder` into a temporary tree.
+#[derive(Default)]
 pub struct KeySet {
     keys: Vec<Vec<u8>>,
     /// The keys' memory, charged to the working memory once keys arrive.
     charge: Charge,
-    gsn: Gsn,
     spill: Option<(TreeId, TreeBuilder)>,
 }
 
@@ -749,10 +752,6 @@ pub enum Keys {
 }
 
 impl KeySet {
-    pub fn new(gsn: Gsn) -> KeySet {
-        KeySet { keys: Vec::new(), charge: Charge::none(), gsn, spill: None }
-    }
-
     pub fn push(&mut self, env: &mut Env, key: Vec<u8>) -> Result<()> {
         if let Some((_, b)) = &mut self.spill {
             return b.push(env, key, 1);
@@ -764,7 +763,7 @@ impl KeySet {
         self.keys.push(key);
         if env.work().full(self.charge.bytes(), spill_bytes(env)) {
             let tree = env.create_temp_tree(Arc::new(CountSummarizer));
-            let mut b = TreeBuilder::new(env, tree, self.gsn);
+            let mut b = TreeBuilder::new(env, tree);
             let held = std::mem::take(&mut self.charge);
             for k in std::mem::take(&mut self.keys) {
                 b.push(env, k, 1)?;
@@ -850,7 +849,7 @@ impl GsnDeltas {
     /// Changes of a node with output `schema`.
     pub fn new(env: &mut Env, schema: &[ColumnType]) -> GsnDeltas {
         let tree = env.create_temp_tree(Arc::new(CountSummarizer));
-        let builder = Some(TreeBuilder::new(env, tree, 1));
+        let builder = Some(TreeBuilder::new(env, tree));
         GsnDeltas { layout: Arc::new(spill_layout(schema)), tree, builder, gsns: Vec::new() }
     }
 
@@ -910,21 +909,18 @@ impl GsnDeltas {
                 let mut batch = Vec::new();
                 let mut bytes = 0;
                 let mut more = false;
-                while let Some((k, h)) = next.take() {
+                while let Some((k, w)) = next.take() {
                     if gsn_of(&k)? != *gsn {
-                        next = Some((k, h));
+                        next = Some((k, w));
                         break;
                     }
                     if batch.len() >= ops::BATCH_ROWS || bytes >= 1 << 20 {
-                        next = Some((k, h));
+                        next = Some((k, w));
                         more = true;
                         break;
                     }
-                    let w = h.total();
-                    if w != 0 {
-                        bytes += k.len();
-                        batch.push((self.layout.decode_row(&k[8..])?, w));
-                    }
+                    bytes += k.len();
+                    batch.push((self.layout.decode_row(&k[8..])?, w));
                     next = env.cursor_next(&mut c)?;
                 }
                 if !batch.is_empty() || calls == 0 {
@@ -970,7 +966,7 @@ mod tests {
         for n in [100, 40_000] {
             let arr = env.create_tree(Arc::new(CountSummarizer));
             let targets = vec![Target { arr: Some(0), layout: by_b.clone(), apply_to: Some(arr) }];
-            let mut buf = DeltaBuf::new(5, targets);
+            let mut buf = DeltaBuf::new(targets);
             let mut model: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
             for _ in 0..n {
                 let a = rng.below(n / 2) as i64;
@@ -1005,9 +1001,8 @@ mod tests {
                 let want: Vec<(Vec<u8>, i64)> = model.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(k, w)| (k.clone(), *w)).collect();
                 assert_eq!(got, want, "entries of key {b} in the delta of {n}");
             }
-            d.apply(&mut env, 5).unwrap();
-            let applied: BTreeMap<Vec<u8>, i64> =
-                env.scan(arr, Bound::Unbounded, Bound::Unbounded).unwrap().into_iter().map(|(k, h)| (k.to_vec(), h.total())).collect();
+            d.apply(&mut env).unwrap();
+            let applied: BTreeMap<Vec<u8>, i64> = env.scan(arr, Bound::Unbounded, Bound::Unbounded).unwrap().into_iter().map(|(k, w)| (k.to_vec(), w)).collect();
             assert!(applied == model, "applied delta of {n}");
             d.release(&mut env).unwrap();
             env.drop_tree(arr).unwrap();
@@ -1037,7 +1032,7 @@ mod tests {
                 let (g, v) = (rng.below(40) as i64, rng.below(n / 4) as i64);
                 *before.entry(layout.encode_row(&row(g, v)).unwrap()).or_default() += 1 + rng.below(2) as i64;
             }
-            let mut buf = DeltaBuf::new(7, vec![Target { arr: Some(3), layout: layout.clone(), apply_to: None }]);
+            let mut buf = DeltaBuf::new(vec![Target { arr: Some(3), layout: layout.clone(), apply_to: None }]);
             let mut changes: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
             for _ in 0..n {
                 let (g, v) = (rng.below(40) as i64, rng.below(n / 4) as i64);
@@ -1058,7 +1053,7 @@ mod tests {
             now.retain(|_, w| *w != 0);
             let tree = env.create_tree(Arc::new(CountSummarizer));
             let mut ups: Vec<(Vec<u8>, i64)> = now.iter().map(|(k, w)| (k.clone(), *w)).collect();
-            env.apply(tree, &mut ups, 7).unwrap();
+            env.apply(tree, &mut ups).unwrap();
             let o = d.overlay(3).unwrap();
             let mut seen: BTreeMap<Vec<u8>, (i64, i64)> = BTreeMap::new();
             o.for_each_versioned(&mut env, tree, Bound::Unbounded, Bound::Unbounded, &mut |k, w_now, w_before| {

@@ -814,3 +814,72 @@ fn window_summaries_with_wide_extremes_and_float_sums() {
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Reads of an input as it was before a step see the rows that the step
+/// removed: arrangements hold the current state only, and an entry a step
+/// deleted is found in the overlay of its delta. Distinct's representative
+/// of equal values (the first of their representations) is deleted, and
+/// the view shows the next one; joins read an input changed at the same
+/// GSN before it (a self-join, a join of two views over one table, a
+/// semijoin on the table itself); top-k and windows lose rows. With deltas
+/// in memory, and under a small memory budget with deltas of thousands of
+/// rows spilled into temporary trees.
+#[test]
+fn reads_before_a_step_see_the_rows_it_removed() {
+    for (name, memory) in [("before-mem", None), ("before-spill", Some(16 << 20))] {
+        let dir = tmpdir(name);
+        let mut cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+        if let Some(m) = memory {
+            cfg.memory_bytes = m;
+        }
+        let running = coord::start(cfg).expect("engine starts");
+        let h = running.handle.clone();
+        // every value i twice: as `i` (id i) and as `i.00` (id n + i)
+        let n = 12_000;
+        exec(&h, "CREATE TABLE r (id int PRIMARY KEY, x numeric)");
+        exec(&h, &format!("INSERT INTO r SELECT i, i::numeric FROM generate_series(1, {n}) i"));
+        exec(&h, &format!("INSERT INTO r SELECT {n} + i, i::numeric(10,2) FROM generate_series(1, {n}) i"));
+        exec(&h, "CREATE MATERIALIZED VIEW d AS SELECT DISTINCT x FROM r");
+        let shown = rows(&h, "SELECT * FROM d WHERE x = 7");
+        assert_eq!(shown.len(), 1);
+        // delete every value's representative in one statement
+        let (gone, left) = if shown[0] == "7" { ("id <= 12000", ".00") } else { ("id > 12000", "") };
+        exec(&h, &format!("DELETE FROM r WHERE {gone}"));
+        let d = rows(&h, "SELECT * FROM d");
+        assert_eq!(d.len(), n, "{name}: values left");
+        assert!(d.iter().all(|x| x.ends_with(left) && (left.is_empty() == !x.contains('.'))), "{name}: representatives after the delete: {:?}", &d[..3]);
+
+        exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v int)");
+        exec(&h, "INSERT INTO t SELECT i, i % 7, (i * 7919) % 1000 FROM generate_series(1, 20000) i");
+        let queries = [
+            "SELECT a.id, b.v FROM t a JOIN t b ON b.id / 2 = a.id / 2",
+            "SELECT id FROM t a WHERE a.g IN (SELECT g FROM t WHERE id % 1000 = 3)",
+            "SELECT id, v FROM t ORDER BY v, id LIMIT 30 OFFSET 5",
+            "SELECT id, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM t",
+            "SELECT x FROM r EXCEPT SELECT v::numeric FROM t",
+        ];
+        for (i, q) in queries.iter().enumerate() {
+            exec(&h, &format!("CREATE MATERIALIZED VIEW q{i} AS {q}"));
+        }
+        exec(&h, "CREATE MATERIALIZED VIEW m1 AS SELECT g, count(*) AS n FROM t GROUP BY g");
+        exec(&h, "CREATE MATERIALIZED VIEW m2 AS SELECT g, sum(v) AS s FROM t GROUP BY g");
+        exec(&h, "CREATE MATERIALIZED VIEW j AS SELECT m1.g, n, s FROM m1 JOIN m2 ON m2.g = m1.g");
+        let join = "SELECT g, count(*), sum(v) FROM t GROUP BY g";
+        for sql in [
+            "DELETE FROM t WHERE id % 2 = 0",
+            "DELETE FROM t WHERE g = 3",
+            "UPDATE t SET v = v + 1 WHERE id % 3 = 0",
+            "DELETE FROM t WHERE id % 1000 = 3 AND g < 4",
+            "DELETE FROM t WHERE v < 500",
+        ] {
+            exec(&h, sql);
+            for (i, q) in queries.iter().enumerate() {
+                assert_eq!(rows(&h, &format!("SELECT * FROM q{i}")).len(), rows(&h, q).len(), "{name}: after {sql}: view {i}: {q}");
+                assert_eq!(sorted(rows(&h, &format!("SELECT * FROM q{i}"))), sorted(rows(&h, q)), "{name}: after {sql}: view {i}: {q}");
+            }
+            assert_eq!(sorted(rows(&h, "SELECT * FROM j")), sorted(rows(&h, join)), "{name}: after {sql}: join of two views");
+        }
+        running.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

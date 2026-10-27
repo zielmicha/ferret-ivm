@@ -1042,11 +1042,9 @@ impl Engine {
         rows
     }
 
-    /// Average live entries per key prefix of an arrangement, sampled from
-    /// runs of entries starting at evenly spaced ranks of its weight (found
-    /// through the subtree counts, which skip entries retracted but not yet
-    /// compacted away without visiting them; within a run they are skipped
-    /// too).
+    /// Average entries (of positive weight) per key prefix of an
+    /// arrangement, sampled from runs of entries starting at evenly spaced
+    /// ranks of its weight (found through the subtree counts).
     fn estimate_fanout(&mut self, arr: ArrId) -> f64 {
         use std::ops::Bound;
         const RUNS: i64 = 16;
@@ -1066,9 +1064,9 @@ impl Engine {
             let Ok(Some((start, _, _))) = self.env.nth(tree, Bound::Unbounded, Bound::Unbounded, rank) else { continue };
             let (mut n, mut visited) = (0usize, 0usize);
             let mut last: Option<Vec<u8>> = None;
-            let _ = self.env.for_each(tree, Bound::Included(&start), Bound::Unbounded, &mut |k, h| {
+            let _ = self.env.for_each(tree, Bound::Included(&start), Bound::Unbounded, &mut |k, w| {
                 visited += 1;
-                if h.total() > 0
+                if w > 0
                     && let Ok(kb) = layout.key_bytes(k)
                 {
                     // entries with equal keys are adjacent

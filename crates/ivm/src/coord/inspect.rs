@@ -1304,7 +1304,7 @@ impl Engine {
         }
         let mut c = self.env.cursor(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
         while out.scanned < MAX_SCAN {
-            let (k, h) = match self.env.cursor_next(&mut c) {
+            let (k, w) = match self.env.cursor_next(&mut c) {
                 Ok(Some(e)) => e,
                 Ok(None) => return out,
                 Err(e) => {
@@ -1313,10 +1313,6 @@ impl Engine {
                 }
             };
             out.scanned += 1;
-            let w = h.total();
-            if w == 0 {
-                continue;
-            }
             if out.rows.len() >= limit {
                 out.truncated = true;
                 return out;

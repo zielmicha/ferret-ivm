@@ -1,5 +1,5 @@
 //! Manifest: append-only log of checkpoint records. The last valid record
-//! describes the durable state (tree roots, segment liveness, frontier).
+//! describes the durable state (tree roots, segment liveness).
 
 use super::node::DiskLoc;
 use super::summary::Summary;
@@ -20,8 +20,6 @@ pub struct TreeRecord {
 /// Space accounting of one tree (in the order of `CheckpointRecord::trees`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TreeSpace {
-    /// The root's `Child::due` (see `node::leaf_due`).
-    pub due: Gsn,
     /// Live bytes of the tree's nodes per segment.
     pub segs: Vec<(u32, u64)>,
 }
@@ -74,7 +72,9 @@ impl CheckpointRecord {
         if let Some(space) = &self.space {
             put_uvarint(&mut out, space.len() as u64);
             for t in space {
-                put_uvarint(&mut out, t.due.wrapping_add(1));
+                // (where versions that compacted histories recorded the
+                // root's compaction state: none)
+                put_uvarint(&mut out, 0);
                 put_uvarint(&mut out, t.segs.len() as u64);
                 for (seg, live) in &t.segs {
                     put_uvarint(&mut out, *seg as u64);
@@ -122,13 +122,14 @@ impl CheckpointRecord {
             }
             let mut space = Vec::with_capacity(n);
             for _ in 0..n {
-                let due = get_uvarint(b)?.wrapping_sub(1);
+                // (a compaction state, written by earlier versions)
+                get_uvarint(b)?;
                 let ns = get_uvarint(b)? as usize;
                 let mut segs = Vec::with_capacity(ns.min(1 << 16));
                 for _ in 0..ns {
                     segs.push((get_uvarint(b)? as u32, get_uvarint(b)?));
                 }
-                space.push(TreeSpace { due, segs });
+                space.push(TreeSpace { segs });
             }
             Some(space)
         };

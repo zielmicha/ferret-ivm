@@ -4,8 +4,10 @@
 //! deltas at a GSN to an output delta (consolidated, so no reader observes
 //! intermediate retract/insert pairs). Arrangements are persistent indexes of
 //! a node's output, shared and refcounted; a node's output delta is applied to
-//! its arrangements before any consumer runs, and consumers read "before" or
-//! "after" the current GSN through the MVCC histories.
+//! its arrangements before any consumer runs: consumers read them "after"
+//! the current GSN as they are, and "before" it with the overlay of the
+//! node's delta (`delta::Overlay`). Arrangements hold the current state
+//! only.
 //!
 //! Errors are data: expression errors become weighted error records that flow
 //! alongside rows and retract when the offending rows retract.
@@ -828,12 +830,9 @@ impl Graph {
         let a = self.arr(arr);
         let layout = &a.layout;
         let mut out = Vec::with_capacity(env.tree_count(a.tree).clamp(0, 1 << 24) as usize);
-        env.for_each(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, h| {
+        env.for_each(a.tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |k, w| {
             visited(1);
-            let w = h.total();
-            if w != 0 {
-                out.push((layout.decode_row(k)?, w));
-            }
+            out.push((layout.decode_row(k)?, w));
             Ok(true)
         })?;
         Ok(out)
@@ -853,16 +852,13 @@ impl Graph {
             let mut batch = Vec::new();
             let mut bytes = 0;
             let mut last = None;
-            env.for_each(a.tree, lo, std::ops::Bound::Unbounded, &mut |k, h| {
+            env.for_each(a.tree, lo, std::ops::Bound::Unbounded, &mut |k, w| {
                 visited(1);
-                let w = h.total();
-                if w != 0 {
-                    batch.push((layout.decode_row(k)?, w));
-                    bytes += k.len();
-                    if batch.len() >= ops::BATCH_ROWS || bytes >= 1 << 20 {
-                        last = Some(k.to_vec());
-                        return Ok(false);
-                    }
+                batch.push((layout.decode_row(k)?, w));
+                bytes += k.len();
+                if batch.len() >= ops::BATCH_ROWS || bytes >= 1 << 20 {
+                    last = Some(k.to_vec());
+                    return Ok(false);
                 }
                 Ok(true)
             })?;
@@ -914,23 +910,23 @@ impl Graph {
         loop {
             let (key, w) = match (&x, &y) {
                 (None, None) => return Ok(()),
-                (Some((ka, ha)), Some((kb, hb))) if ka == kb => {
-                    let r = (ka.clone(), hb.total() - ha.total());
+                (Some((ka, wa)), Some((kb, wb))) if ka == kb => {
+                    let r = (ka.clone(), wb - wa);
                     (x, y) = (env.cursor_next(&mut ca)?, env.cursor_next(&mut cb)?);
                     r
                 }
-                (Some((ka, ha)), Some((kb, _))) if ka < kb => {
-                    let r = (ka.clone(), -ha.total());
+                (Some((ka, wa)), Some((kb, _))) if ka < kb => {
+                    let r = (ka.clone(), -wa);
                     x = env.cursor_next(&mut ca)?;
                     r
                 }
-                (Some((ka, ha)), None) => {
-                    let r = (ka.clone(), -ha.total());
+                (Some((ka, wa)), None) => {
+                    let r = (ka.clone(), -wa);
                     x = env.cursor_next(&mut ca)?;
                     r
                 }
-                (_, Some((kb, hb))) => {
-                    let r = (kb.clone(), hb.total());
+                (_, Some((kb, wb))) => {
+                    let r = (kb.clone(), *wb);
                     y = env.cursor_next(&mut cb)?;
                     r
                 }
@@ -962,11 +958,8 @@ impl Graph {
         let prefix = a.layout.encode_prefix(key);
         let layout = &a.layout;
         let mut out = Vec::new();
-        env.for_each_prefix(a.tree, &prefix, &mut |k, h| {
-            let w = h.total();
-            if w != 0 {
-                out.push((layout.decode_row(k)?, w));
-            }
+        env.for_each_prefix(a.tree, &prefix, &mut |k, w| {
+            out.push((layout.decode_row(k)?, w));
             Ok(true)
         })?;
         Ok(out)
@@ -1218,13 +1211,12 @@ impl Graph {
         }
         let NodeKind::Table { primary, .. } = n.kind else { return Err(SqlError::internal("changes fed to a node that is not a table")) };
         let started = std::time::Instant::now();
-        let gsn = input.gsn;
         let read = self.is_read(node, &input.observed);
         let fed = input.tables.entry(node).or_insert_with(|| {
             // the primary index is updated as the changes are fed
             let targets = self.delta_targets(node, Some(primary));
             FedTable {
-                out: if read { delta::DeltaBuf::new(gsn, targets) } else { delta::DeltaBuf::direct(gsn, targets) },
+                out: if read { delta::DeltaBuf::new(targets) } else { delta::DeltaBuf::direct(targets) },
                 carry: ops::TableCarry::default(),
                 in_rows: 0,
                 out_rows: 0,
@@ -1254,7 +1246,7 @@ impl Graph {
                     for (row, w) in &delta {
                         ups.push((arr.layout.encode_row(row)?, *w));
                     }
-                    env.apply(arr.tree, &mut ups, gsn)?;
+                    env.apply(arr.tree, &mut ups)?;
                 }
                 fed.out_rows += delta.len();
                 fed.out.extend_consolidated(env, delta)
@@ -1327,7 +1319,7 @@ impl Graph {
                         let (in_rows, out_rows, nanos) = (fed.in_rows, fed.out_rows, fed.nanos);
                         // (the primary index was updated as the changes were fed)
                         let out = fed.out.into_delta(env)?;
-                        if let Err(e) = out.apply(env, gsn) {
+                        if let Err(e) = out.apply(env) {
                             out.release(env)?;
                             return Err(e);
                         }
@@ -1342,7 +1334,7 @@ impl Graph {
                 let in_rows = ins.iter().map(|o| o.rows.len()).sum();
                 // a node nobody reads hands a large output to its arrangements directly
                 let targets = self.delta_targets(id, None);
-                let rows = if self.is_read(id, observed) { delta::DeltaBuf::new(gsn, targets) } else { delta::DeltaBuf::direct(gsn, targets) };
+                let rows = if self.is_read(id, observed) { delta::DeltaBuf::new(targets) } else { delta::DeltaBuf::direct(targets) };
                 let out = ops::step_node(self, env, node, &ins, gsn, deltas, rows)?;
                 // (its groups in error may have changed)
                 if operator_errors(&self.node(id).kind).is_some() {
@@ -1350,7 +1342,7 @@ impl Graph {
                 }
                 if !out.is_empty() {
                     self.add_errors(id, &out.errs);
-                    if let Err(e) = out.apply(env, gsn) {
+                    if let Err(e) = out.apply(env) {
                         out.release(env)?;
                         return Err(e);
                     }
@@ -1436,13 +1428,13 @@ impl Graph {
 
     // ------------------------------------------------------------------ hydration
 
-    /// Bring every new node and arrangement up to date as of `gsn`, computing
-    /// their contents from existing state (never from the sources). The
+    /// Bring every new node and arrangement up to date, computing their
+    /// contents from the current state (never from the sources). The
     /// error records in their contents are kept per node (`errors_of`).
     /// Memory stays bounded: a node's snapshot is streamed into its new
     /// arrangements a batch at a time, and each arrangement is built by an
     /// external sort (`TreeBuilder`).
-    pub fn hydrate(&mut self, env: &mut Env, gsn: Gsn) -> Result<()> {
+    pub fn hydrate(&mut self, env: &mut Env) -> Result<()> {
         // the pending nodes and those with pending arrangements, in sequence
         // (topological) order: what the graph holds besides is not visited
         let mut order: Vec<(u64, NodeId)> = self
@@ -1459,14 +1451,14 @@ impl Graph {
             let needs_node = !self.node(id).hydrated;
             if needs_node {
                 // stateful operators initialize their own arrangements here
-                ops::hydrate_node(self, env, id, gsn)?;
+                ops::hydrate_node(self, env, id)?;
             }
             let pending_arrs: Vec<ArrId> =
                 self.node(id).arrangements.iter().copied().filter(|a| !self.arr(*a).hydrated).collect();
             if !pending_arrs.is_empty() {
                 let layouts: Vec<Arc<Layout>> = pending_arrs.iter().map(|a| self.arr(*a).layout.clone()).collect();
                 let mut builders: Vec<crate::storage::TreeBuilder> =
-                    pending_arrs.iter().map(|a| crate::storage::TreeBuilder::new(env, self.arr(*a).tree, gsn)).collect();
+                    pending_arrs.iter().map(|a| crate::storage::TreeBuilder::new(env, self.arr(*a).tree)).collect();
                 // the rows go to every new arrangement, in their key orders
                 let r = ops::snapshot_stream(self, env, id, &mut |env, batch| {
                     for (b, layout) in builders.iter_mut().zip(&layouts) {

@@ -686,7 +686,7 @@ impl Engine {
         }
         // anything that could not be matched to a recovered tree is rebuilt
         // from the recovered state
-        self.graph.hydrate(&mut self.env, self.processed)?;
+        self.graph.hydrate(&mut self.env)?;
         // a view's error records are those of its root
         for v in self.rt.views.values_mut() {
             v.errors = self.graph.errors_of(v.node).into_iter().collect();
@@ -695,7 +695,6 @@ impl Engine {
             self.env.drop_tree(t)?;
         }
         self.graph.recovery.clear();
-        self.env.set_frontier(self.processed);
         Ok(())
     }
 
@@ -1025,7 +1024,7 @@ impl Engine {
                     }
                 }
                 // the catalog in the metadata tree as of this GSN
-                self.persist_meta(gsn)?;
+                self.persist_meta()?;
                 if let Err(e) = &res
                     && self.replaying
                 {
@@ -1077,7 +1076,7 @@ impl Engine {
                 if let Err(e) = r {
                     log::error!("schema change for table {table} failed: {e}");
                 }
-                self.persist_meta(gsn)?;
+                self.persist_meta()?;
             }
             LogRecord::Tick { micros } => {
                 // monotonic even if the wall clock steps back
@@ -1096,7 +1095,6 @@ impl Engine {
                 self.deliver(gsn, outputs)?;
             }
         }
-        self.env.set_frontier(self.processed);
         self.records_since_checkpoint += 1;
         self.changes_since_checkpoint += changed as u64;
         Ok(())
@@ -1432,7 +1430,7 @@ impl Engine {
     /// what the maintenance pass rewrote. Records applied from now on count
     /// towards the next checkpoint.
     pub(crate) fn prepare_checkpoint(&mut self) -> Result<Vec<u8>> {
-        self.persist_meta(self.processed)?;
+        self.persist_meta()?;
         let maint = self.env.maintain()?;
         self.last_checkpoint = Instant::now();
         self.records_since_checkpoint = 0;
@@ -1873,9 +1871,9 @@ mod tests {
             let tree = e.meta.tree.unwrap();
             let (mut entries, mut live) = (0, 0);
             e.env
-                .for_each(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |_, h| {
+                .for_each(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded, &mut |_, w| {
                     entries += 1;
-                    live += (h.total() != 0) as usize;
+                    live += (w != 0) as usize;
                     Ok(true)
                 })
                 .unwrap();

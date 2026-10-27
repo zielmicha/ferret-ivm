@@ -867,7 +867,7 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDelt
     }
     let mut changed: Vec<Changed> = Vec::with_capacity(deltas.entries().len());
     for (key, d) in deltas.entries() {
-        let after = env.get(part.tree, key)?.map(|h| h.total()).unwrap_or(0);
+        let after = env.get(part.tree, key)?.unwrap_or(0);
         changed.push(Changed { key: key.clone(), before: after - d, after, rank: 0 });
     }
     if changed.is_empty() {
@@ -1083,9 +1083,8 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &WindowPlan, out: &mut super::ops::
         rows.clear();
         Ok(())
     };
-    while let Some((k, h)) = env.cursor_next(&mut c)? {
+    while let Some((k, w)) = env.cursor_next(&mut c)? {
         visited(1);
-        let w = h.total();
         if w <= 0 {
             continue;
         }

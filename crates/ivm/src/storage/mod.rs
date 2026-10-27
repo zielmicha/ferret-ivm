@@ -1,6 +1,7 @@
-//! Storage: an ordered MVCC index keyed by byte strings (memcomparable
-//! (key, value) encodings) holding (GSN, weight) histories, augmented with
-//! monoid summaries per subtree.
+//! Storage: an ordered index keyed by byte strings (memcomparable (key,
+//! value) encodings) holding a weight per entry, augmented with monoid
+//! summaries per subtree. It keeps the current weights only: a change that
+//! makes an entry's weight 0 removes the entry.
 //!
 //! The tree is copy-on-write. Nodes live in a node arena that acts as the
 //! buffer pool, accounted in bytes of memory: clean nodes are evicted under
@@ -11,11 +12,10 @@
 //! durably until a checkpoint does). A checkpoint is: write the remaining
 //! dirty nodes bottom-up, fsync, append a manifest record naming the new
 //! roots. Sealed segments are immutable. A budgeted maintenance pass before
-//! each checkpoint reclaims space: it compacts histories behind the
-//! retention frontier in leaves that per-subtree `due` augmentation says
-//! are worth rewriting, merges underfull neighbours, and relocates the live
-//! nodes of sparse segments (found through per-subtree `min_seg`
-//! augmentation), which are deleted once nothing references them.
+//! each checkpoint reclaims space: it relocates the live nodes of sparse
+//! segments (found through per-subtree `min_seg` augmentation), which are
+//! deleted once nothing references them, merging the underfull ones with
+//! a neighbour.
 //!
 //! Loaded nodes are shared (`Arc`) and copied on write when shared: a fork
 //! of the environment ([`Env::fork`]) is an independent version of every
@@ -23,7 +23,6 @@
 //! thread, and a checkpoint is written from such a version of the dirty
 //! nodes ([`Env::begin_checkpoint`]) while the environment goes on.
 
-pub mod history;
 mod inspect;
 pub mod manifest;
 pub mod node;
@@ -31,14 +30,13 @@ pub mod segment;
 pub mod sort;
 pub mod summary;
 
-pub use history::{History, ReadAt};
 pub use inspect::TreeResidency;
 pub use sort::TreeBuilder;
 pub use summary::{AggKind, AggState, FloatSum, Summary};
 
 use crate::error::{Result, SqlError};
 use manifest::{CheckpointRecord, Manifest, TreeRecord, TreeSpace};
-use node::{child_heap, entry_heap, entry_size, leaf_compaction, leaf_due, Child, DiskLoc, LeafEntry, Node, NodePtr};
+use node::{child_heap, entry_heap, entry_size, Child, DiskLoc, LeafEntry, Node, NodePtr};
 use rustc_hash::FxHashMap;
 use segment::SegmentStore;
 use std::collections::{BTreeMap, VecDeque};
@@ -53,6 +51,10 @@ pub type Gsn = u64;
 /// (`Env::set_read_budget`; never sent to a client).
 pub const READ_BUDGET: &str = "IVMRB";
 pub type TreeId = u64;
+
+/// An entry `Env::nth` finds: its key, its weight and the offset of the
+/// unit of weight sought within it.
+pub type NthEntry = (Box<[u8]>, i64, i64);
 
 /// Computes a tree's per-node summaries from leaf entries.
 pub trait Summarizer: Send + Sync {
@@ -128,8 +130,6 @@ struct Slot {
     /// changed or it became dirty): a checkpoint job's image of a dirty node
     /// is still current when its stamp is unchanged.
     version: u64,
-    /// In-place leaf edits since the leaf's entries were last compacted.
-    edits: u32,
     parent: u32,
     tree: TreeId,
     loaded_children: u32,
@@ -155,8 +155,6 @@ struct TreeState {
     summarizer: Arc<dyn Summarizer>,
     /// False for trees recovered from the manifest but not yet attached.
     attached: bool,
-    /// `Child::due` of the root (a lower bound while the root is dirty).
-    due: Gsn,
     /// Live bytes of the tree's nodes per segment, so that dropping the tree
     /// releases them without visiting its nodes.
     seg_live: BTreeMap<u32, u64>,
@@ -205,14 +203,14 @@ pub struct Env {
     next_tree_id: TreeId,
     /// segment id -> (total bytes written, live bytes referenced)
     seg_live: BTreeMap<u32, (u64, u64)>,
-    frontier: Gsn,
     checkpoint_seq: u64,
     checkpoint_gsn: Gsn,
     /// Bytes written (by checkpoints or early) for nodes the engine (not
     /// the maintenance pass) modified, since the last pass.
     fg_appended: u64,
-    /// Write internal nodes as kind 2 and checkpoint records without tree
-    /// space (tests of stores written by earlier versions).
+    /// Write nodes in the formats of versions that kept history and
+    /// checkpoint records without tree space (tests of stores written by
+    /// earlier versions).
     legacy_format: bool,
     /// The manifest (None in forks, and while a checkpoint job holds it).
     manifest: Option<Manifest>,
@@ -240,13 +238,12 @@ pub struct Env {
 }
 
 /// A node a checkpoint job wrote: its slot and stamp in the parent
-/// environment, its location and the `min_seg` and `due` of its subtree.
+/// environment, its location and the `min_seg` of its subtree.
 struct Flushed {
     slot: u32,
     version: u64,
     loc: DiskLoc,
     min_seg: u32,
-    due: Gsn,
 }
 
 /// A checkpoint in progress (`Env::begin_checkpoint`): a version of the
@@ -296,7 +293,7 @@ pub struct Cursor {
     tree: TreeId,
     lo: Bound<Vec<u8>>,
     hi: Bound<Vec<u8>>,
-    buf: VecDeque<(Box<[u8]>, History)>,
+    buf: VecDeque<(Box<[u8]>, i64)>,
     done: bool,
 }
 
@@ -468,7 +465,6 @@ impl Env {
             trees: FxHashMap::default(),
             next_tree_id: 1,
             seg_live: BTreeMap::new(),
-            frontier: 0,
             checkpoint_seq: 0,
             checkpoint_gsn: 0,
             fg_appended: 0,
@@ -500,12 +496,11 @@ impl Env {
                         Some((loc, s, m)) => (Some(NodePtr::Disk(loc)), s, m),
                     };
                     // without recorded space (an earlier version's record),
-                    // every subtree is due for a visit (as its kind-2 nodes
-                    // say) and the tree's live bytes are counted below
+                    // the tree's live bytes are counted below
                     let sp = space.next().unwrap_or_default();
                     let seg_live = sp.segs.into_iter().filter(|(_, l)| *l > 0).collect();
                     let summarizer: Arc<dyn Summarizer> = Arc::new(CountSummarizer);
-                    let state = TreeState { root, summary, min_seg, summarizer, attached: false, due: sp.due, seg_live };
+                    let state = TreeState { root, summary, min_seg, summarizer, attached: false, seg_live };
                     env.trees.insert(t.id, state);
                 }
                 if !recorded {
@@ -534,7 +529,7 @@ impl Env {
         self.next_tree_id += 1;
         let summary = Summary::empty(summarizer.spec());
         let seg_live = BTreeMap::new();
-        let state = TreeState { root: None, summary, min_seg: u32::MAX, summarizer, attached: true, due: Gsn::MAX, seg_live };
+        let state = TreeState { root: None, summary, min_seg: u32::MAX, summarizer, attached: true, seg_live };
         self.trees.insert(id, state);
         id
     }
@@ -588,7 +583,7 @@ impl Env {
         }
         debug_assert!(id >= TEMP_TREES, "temporary trees exhausted their ids");
         let summary = Summary::empty(summarizer.spec());
-        let state = TreeState { root: None, summary, min_seg: u32::MAX, summarizer, attached: true, due: Gsn::MAX, seg_live: BTreeMap::new() };
+        let state = TreeState { root: None, summary, min_seg: u32::MAX, summarizer, attached: true, seg_live: BTreeMap::new() };
         self.trees.insert(id, state);
         id
     }
@@ -618,16 +613,6 @@ impl Env {
         let mut v: Vec<_> = self.trees.iter().filter(|(_, t)| !t.attached).map(|(id, _)| *id).collect();
         v.sort();
         v
-    }
-
-    pub fn set_frontier(&mut self, f: Gsn) {
-        if f > self.frontier {
-            self.frontier = f;
-        }
-    }
-
-    pub fn frontier(&self) -> Gsn {
-        self.frontier
     }
 
     pub fn checkpoint_gsn(&self) -> Gsn {
@@ -773,7 +758,6 @@ impl Env {
             disk,
             dirty: disk.is_none(),
             version,
-            edits: 0,
             parent,
             tree,
             loaded_children: 0,
@@ -961,9 +945,10 @@ impl Env {
     // ------------------------------------------------------------------
     // writes
 
-    /// Apply weighted updates at time `gsn`. Updates need not be sorted; equal
+    /// Apply weighted updates: each adds its weight to its entry's (an entry
+    /// whose weight becomes 0 is removed). Updates need not be sorted; equal
     /// keys are consolidated.
-    pub fn apply(&mut self, tree: TreeId, updates: &mut Vec<(Vec<u8>, i64)>, gsn: Gsn) -> Result<()> {
+    pub fn apply(&mut self, tree: TreeId, updates: &mut Vec<(Vec<u8>, i64)>) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -995,7 +980,7 @@ impl Env {
                 cost += self.leaf_mem(updates[end].0.len());
                 end += 1;
             }
-            if let Err(e) = self.apply_run(tree, &updates[start..end], gsn, &summ) {
+            if let Err(e) = self.apply_run(tree, &updates[start..end], &summ) {
                 updates.clear();
                 return Err(e);
             }
@@ -1006,16 +991,16 @@ impl Env {
         Ok(())
     }
 
-    /// Memory of a full leaf of entries with `key`-byte keys and one change
-    /// each (`Node::mem_size`): what an update dirties at most, besides
-    /// the path above it.
+    /// Memory of a full leaf of entries with `key`-byte keys
+    /// (`Node::mem_size`): what an update dirties at most, besides the path
+    /// above it.
     fn leaf_mem(&self, key: usize) -> usize {
-        let entries = self.opts.leaf_bytes / (key + 10) + 1;
+        let entries = self.opts.leaf_bytes / (key + 6) + 1;
         SLOT_BYTES + entries * (std::mem::size_of::<LeafEntry>() + crate::memory::heap_block(key))
     }
 
     /// Apply sorted, consolidated updates (one descent from the root).
-    fn apply_run(&mut self, tree: TreeId, updates: &[(Vec<u8>, i64)], gsn: Gsn, summ: &Arc<dyn Summarizer>) -> Result<()> {
+    fn apply_run(&mut self, tree: TreeId, updates: &[(Vec<u8>, i64)], summ: &Arc<dyn Summarizer>) -> Result<()> {
         let root = match self.root_slot(tree)? {
             Some(id) => id,
             None => self.alloc_slot(Node::Leaf(Vec::new()), None, NONE, tree),
@@ -1023,8 +1008,8 @@ impl Env {
         // the tree's summary is replaced below
         let t = self.trees.get_mut(&tree).unwrap();
         let old = std::mem::take(&mut t.summary);
-        let space = (t.min_seg, t.due);
-        let parts = self.apply_node(root, updates, gsn, summ, Some(&old), space);
+        let min_seg = t.min_seg;
+        let parts = self.apply_node(root, updates, summ, Some(&old), min_seg);
         let parts = match parts {
             Ok(p) => p,
             Err(e) => {
@@ -1043,33 +1028,29 @@ impl Env {
             1 => parts.pop(),
             _ => Some(self.build_root(parts, tree, summ)?),
         };
-        let (new_root, summary, min_seg, due) = match top {
-            None => (None, Summary::empty(summ.spec()), u32::MAX, Gsn::MAX),
+        let (new_root, summary, min_seg) = match top {
+            None => (None, Summary::empty(summ.spec()), u32::MAX),
             Some(p) => {
                 // a single-child root covers the same entries as its child
-                let (r, due) = self.collapse_root(p.id, p.due)?;
+                let r = self.collapse_root(p.id)?;
                 let min_seg = if r == p.id { p.min_seg } else { self.node_min_seg(r) };
-                (Some(r), p.summary, min_seg, due)
+                (Some(r), p.summary, min_seg)
             }
         };
         let t = self.trees.get_mut(&tree).unwrap();
         t.root = new_root.map(NodePtr::Mem);
         t.summary = summary;
         t.min_seg = min_seg;
-        t.due = due;
         Ok(())
     }
 
-    /// Replace a single-child internal root (whose `due` is `due`) by its
-    /// child; returns the new root and its `due`.
-    fn collapse_root(&mut self, mut root: u32, mut due: Gsn) -> Result<(u32, Gsn)> {
+    /// Replace a single-child internal root by its child; returns the new
+    /// root.
+    fn collapse_root(&mut self, mut root: u32) -> Result<u32> {
         loop {
-            let single = match self.node(root) {
-                Node::Internal(ch) if ch.len() == 1 => Some(ch[0].due),
-                _ => None,
-            };
-            let Some(child_due) = single else { return Ok((root, due)) };
-            due = child_due;
+            if !matches!(self.node(root), Node::Internal(ch) if ch.len() == 1) {
+                return Ok(root);
+            }
             let child = self.load_child(root, 0)?;
             self.make_dirty(root);
             self.slot_mut(child).parent = NONE;
@@ -1100,20 +1081,10 @@ impl Env {
     }
 
     /// Apply sorted, consolidated updates below node `id`, whose summary is
-    /// `old` when known, and whose subtree's `min_seg` and `due` are at
-    /// least `space` (as its entry above holds them). Returns the nodes now
+    /// `old` when known, and whose subtree's `min_seg` is at least
+    /// `min_seg` (as its entry above holds it). Returns the nodes now
     /// covering its key range.
-    fn apply_node(
-        &mut self,
-        id: u32,
-        ups: &[(Vec<u8>, i64)],
-        gsn: Gsn,
-        summ: &Arc<dyn Summarizer>,
-        old: Option<&Summary>,
-        space: (u32, Gsn),
-    ) -> Result<Parts> {
-        let was_dirty = self.slot(id).dirty;
-        let edits = self.slot(id).edits;
+    fn apply_node(&mut self, id: u32, ups: &[(Vec<u8>, i64)], summ: &Arc<dyn Summarizer>, old: Option<&Summary>, min_seg: u32) -> Result<Parts> {
         let old_bytes = self.slot(id).bytes;
         self.make_dirty(id);
         // its write is the update's now
@@ -1123,19 +1094,17 @@ impl Env {
         let mut heap = self.slot(id).mem - SLOT_BYTES - node.mem_base();
         match node {
             Node::Leaf(entries) => {
-                let frontier = self.frontier;
                 // only inserts past the leaf's last key: an append, which
                 // will not come back to the leaf's left part
                 let append = entries.last().is_none_or(|e| *ups[0].0 > *e.key);
-                // weight changes as (index into ups, total weight before),
-                // folded into the leaf's old summary afterwards if the leaf
-                // does not split and that is cheaper than recomputing it
+                // weight changes as (index into ups, weight before), folded
+                // into the leaf's old summary afterwards if the leaf does
+                // not split and that is cheaper than recomputing it
                 let mut changes: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::with_capacity(ups.len());
-                // Few updates: edit in place. Untouched entries are compacted
-                // (dropping versions retracted before the frontier) on the
-                // first edit after a checkpoint and then every few edits.
-                let in_place = was_dirty && edits < 16 && ups.len() * 8 <= entries.len();
-                self.slot_mut(id).edits = if in_place { edits + 1 } else { 0 };
+                // Few updates: edit in place; more: merge into a new vector
+                // (each in-place insert or removal shifts the entries after
+                // it).
+                let in_place = ups.len() * 8 <= entries.len();
                 // the leaf's byte size, kept up to date by in-place edits
                 let mut size = old_bytes;
                 let out = if in_place {
@@ -1144,29 +1113,22 @@ impl Env {
                     for (ui, (k, w)) in ups.iter().enumerate() {
                         pos += entries[pos..].partition_point(|e| *e.key < **k);
                         let before = if pos < entries.len() && *entries[pos].key == **k {
-                            let e = &mut entries[pos];
-                            let before = e.hist.total();
-                            size -= entry_size(e);
-                            heap -= entry_heap(e);
-                            e.hist.add(gsn, *w, frontier);
-                            if e.hist.is_empty() {
-                                entries.remove(pos);
+                            let before = entries[pos].weight;
+                            entries[pos].weight += w;
+                            if entries[pos].weight == 0 {
+                                let e = entries.remove(pos);
+                                size -= entry_size(&e);
+                                heap -= entry_heap(&e);
                             } else {
-                                size += entry_size(&entries[pos]);
-                                heap += entry_heap(&entries[pos]);
                                 pos += 1;
                             }
                             before
                         } else {
-                            let mut h = History::default();
-                            h.add(gsn, *w, frontier);
-                            if !h.is_empty() {
-                                let e = LeafEntry { key: k.as_slice().into(), hist: h };
-                                size += entry_size(&e);
-                                heap += entry_heap(&e);
-                                entries.insert(pos, e);
-                                pos += 1;
-                            }
+                            let e = LeafEntry { key: k.as_slice().into(), weight: *w };
+                            size += entry_size(&e);
+                            heap += entry_heap(&e);
+                            entries.insert(pos, e);
+                            pos += 1;
                             0
                         };
                         changes.push((ui, before));
@@ -1176,44 +1138,26 @@ impl Env {
                     let mut out: Vec<LeafEntry> = Vec::with_capacity(entries.len() + ups.len());
                     let mut it = entries.into_iter().peekable();
                     for (ui, (k, w)) in ups.iter().enumerate() {
-                        while let Some(e) = it.peek() {
-                            if *e.key < **k {
-                                let mut e = it.next().unwrap();
-                                e.hist.compact(frontier);
-                                if !e.hist.is_empty() {
-                                    out.push(e);
-                                }
-                            } else {
-                                break;
-                            }
+                        while let Some(e) = it.next_if(|e| *e.key < **k) {
+                            out.push(e);
                         }
-                        let before = match it.peek() {
-                            Some(e) if *e.key == **k => {
-                                let mut e = it.next().unwrap();
-                                let before = e.hist.total();
-                                e.hist.add(gsn, *w, frontier);
-                                if !e.hist.is_empty() {
+                        let before = match it.next_if(|e| *e.key == **k) {
+                            Some(mut e) => {
+                                let before = e.weight;
+                                e.weight += w;
+                                if e.weight != 0 {
                                     out.push(e);
                                 }
                                 before
                             }
-                            _ => {
-                                let mut h = History::default();
-                                h.add(gsn, *w, frontier);
-                                if !h.is_empty() {
-                                    out.push(LeafEntry { key: k.as_slice().into(), hist: h });
-                                }
+                            None => {
+                                out.push(LeafEntry { key: k.as_slice().into(), weight: *w });
                                 0
                             }
                         };
                         changes.push((ui, before));
                     }
-                    for mut e in it {
-                        e.hist.compact(frontier);
-                        if !e.hist.is_empty() {
-                            out.push(e);
-                        }
-                    }
+                    out.extend(it);
                     out
                 };
                 if out.is_empty() {
@@ -1226,7 +1170,7 @@ impl Env {
                     let summary = summary_after(old, &out, ups, &changes, summ)?;
                     self.put_node_sized(id, Node::Leaf(out), size, heap);
                     // the first part keeps the node's place (and separator) in the parent
-                    return Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary, min_seg: u32::MAX, due: 0 }]);
+                    return Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary, min_seg: u32::MAX }]);
                 }
                 let chunks = split_by_bytes(out, self.opts.leaf_bytes, entry_size, 1, append);
                 let single = chunks.len() == 1;
@@ -1250,10 +1194,8 @@ impl Env {
                         }
                         nid
                     };
-                    // dirty leaves have no location of their own yet, and
-                    // their compaction state is found by the maintenance
-                    // pass or the checkpoint
-                    parts.push(Part { sep: first, id: pid, summary, min_seg: u32::MAX, due: 0 });
+                    // (dirty leaves have no location of their own yet)
+                    parts.push(Part { sep: first, id: pid, summary, min_seg: u32::MAX });
                 }
                 Ok(parts)
             }
@@ -1263,13 +1205,13 @@ impl Env {
                 self.put_node(id, Node::Internal(Vec::new()));
                 let mut size = old_bytes;
                 let mut incr = old.cloned();
-                // The subtree's min_seg and due, the minimums of the
-                // children's, follow the children that changed, like its
-                // size and summary (computed from all the children only
-                // when a child that may have held a minimum got a higher
-                // one, or children were merged): scanning a node's children
-                // for them took a tenth of a single-row update.
-                let mut incr_space = Some(space);
+                // The subtree's min_seg, the minimum of the children's,
+                // follows the children that changed, like its size and
+                // summary (computed from all the children only when a child
+                // that may have held the minimum got a higher one, or
+                // children were merged): scanning a node's children for it
+                // took a tenth of a single-row update.
+                let mut incr_space = Some(min_seg);
                 let n = children.len();
                 // (child, update range) for each child receiving updates
                 let mut runs: smallvec::SmallVec<[(usize, usize, usize); 4]> = smallvec::SmallVec::new();
@@ -1296,21 +1238,19 @@ impl Env {
                 for &(ci, start, end) in runs.iter().rev() {
                     let cid = self.load(children[ci].ptr, id, tree)?;
                     let before = self.slot(cid).bytes;
-                    let was = (children[ci].min_seg, children[ci].due);
-                    let parts = self.apply_node(cid, &ups[start..end], gsn, summ, Some(&children[ci].summary), was)?;
+                    let was = children[ci].min_seg;
+                    let parts = self.apply_node(cid, &ups[start..end], summ, Some(&children[ci].summary), was)?;
                     if let [p] = &parts[..]
                         && self.slot(p.id).bytes < before
                     {
                         shrunk.push(p.id);
                     }
-                    if let Some((min_seg, due)) = incr_space.as_mut() {
-                        let now_seg = parts.iter().map(|p| p.min_seg).min().unwrap_or(u32::MAX);
-                        let now_due = parts.iter().map(|p| p.due).min().unwrap_or(Gsn::MAX);
-                        if (was.0 <= *min_seg && now_seg > was.0) || (was.1 <= *due && now_due > was.1) {
+                    if let Some(min_seg) = incr_space.as_mut() {
+                        let now = parts.iter().map(|p| p.min_seg).min().unwrap_or(u32::MAX);
+                        if was <= *min_seg && now > was {
                             incr_space = None;
                         } else {
-                            *min_seg = (*min_seg).min(now_seg);
-                            *due = (*due).min(now_due);
+                            *min_seg = (*min_seg).min(now);
                         }
                     }
                     if let Some(s) = incr.as_mut() {
@@ -1438,8 +1378,7 @@ impl Env {
         self.make_dirty(a);
         self.make_dirty(b);
         let right = children.remove(l + 1);
-        // (the merged child's summary and `due` change, and with them its
-        // sizes)
+        // (the merged child's summary changes, and with it its sizes)
         *size -= node::child_size(&right) + node::child_size(&children[l]);
         *heap -= child_heap(&right) + child_heap(&children[l]);
         let nb = self.take_node(b);
@@ -1449,8 +1388,7 @@ impl Env {
         let merged = match (na, nb) {
             (Node::Leaf(mut x), Node::Leaf(y)) => {
                 x.extend(y);
-                self.slot_mut(a).edits = 0;
-                (c.min_seg, c.due) = (u32::MAX, 0);
+                c.min_seg = u32::MAX;
                 Node::Leaf(x)
             }
             (Node::Internal(mut x), Node::Internal(mut y)) => {
@@ -1465,7 +1403,6 @@ impl Env {
                 self.slot_mut(a).loaded_children += moved;
                 x.extend(y);
                 c.min_seg = x.iter().map(|g| g.min_seg).fold(u32::MAX, u32::min);
-                c.due = x.iter().map(|g| g.due).min().unwrap_or(Gsn::MAX);
                 Node::Internal(x)
             }
             _ => unreachable!("siblings at different depths"),
@@ -1488,7 +1425,7 @@ impl Env {
         id: u32,
         children: Vec<Child>,
         summary: Option<Summary>,
-        space: Option<(u32, Gsn)>,
+        min_seg: Option<u32>,
         summ: &Arc<dyn Summarizer>,
         size: usize,
         heap: usize,
@@ -1511,17 +1448,17 @@ impl Env {
             Some(s) => s,
             None => children_summary(&children, summ),
         };
-        let (min_seg, due) = match space {
-            Some(s) => s,
+        let min_seg = match min_seg {
+            Some(m) => m,
             None => {
                 #[cfg(test)]
                 SPACE_SCANS.with(|c| c.set(c.get() + children.len() as u64));
-                (children.iter().map(|c| c.min_seg).fold(u32::MAX, u32::min), children.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX))
+                children.iter().map(|c| c.min_seg).fold(u32::MAX, u32::min)
             }
         };
         self.put_node_sized(id, Node::Internal(children), size, heap);
         // the first part keeps the node's place (and separator) in the parent
-        Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary: s, min_seg, due }])
+        Ok(smallvec::smallvec![Part { sep: Box::default(), id, summary: s, min_seg }])
     }
 
     /// Store `children` in internal node `id`, splitting by size (see
@@ -1567,10 +1504,9 @@ impl Env {
                 _ => children_summary(&chunk, summ),
             };
             let min_seg = chunk.iter().map(|c| c.min_seg).fold(u32::MAX, u32::min);
-            let due = chunk.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX);
             self.slot_mut(target).loaded_children = loaded;
             self.put_node(target, Node::Internal(chunk));
-            parts.push(Part { sep: first, id: target, summary: s, min_seg, due });
+            parts.push(Part { sep: first, id: target, summary: s, min_seg });
         }
         Ok(parts)
     }
@@ -1578,13 +1514,13 @@ impl Env {
     // ------------------------------------------------------------------
     // reads
 
-    /// Exact key lookup.
-    pub fn get(&mut self, tree: TreeId, key: &[u8]) -> Result<Option<History>> {
+    /// Exact key lookup: the entry's weight (None: there is no such entry).
+    pub fn get(&mut self, tree: TreeId, key: &[u8]) -> Result<Option<i64>> {
         let Some(mut id) = self.root_slot(tree)? else { return Ok(None) };
         loop {
             match self.node(id) {
                 Node::Leaf(entries) => {
-                    let r = entries.binary_search_by(|e| (*e.key).cmp(key)).ok().map(|i| entries[i].hist.clone());
+                    let r = entries.binary_search_by(|e| (*e.key).cmp(key)).ok().map(|i| entries[i].weight);
                     self.maybe_evict()?;
                     return Ok(r);
                 }
@@ -1618,7 +1554,7 @@ impl Env {
         Cursor { tree, lo: own_bound(lo), hi: own_bound(hi), buf: VecDeque::new(), done: false }
     }
 
-    pub fn cursor_next(&mut self, c: &mut Cursor) -> Result<Option<(Box<[u8]>, History)>> {
+    pub fn cursor_next(&mut self, c: &mut Cursor) -> Result<Option<(Box<[u8]>, i64)>> {
         loop {
             if let Some(x) = c.buf.pop_front() {
                 return Ok(Some(x));
@@ -1666,7 +1602,7 @@ impl Env {
                     hit_hi = true;
                     break;
                 }
-                c.buf.push_back((e.key.clone(), e.hist.clone()));
+                c.buf.push_back((e.key.clone(), e.weight));
             }
             if hit_hi {
                 c.done = true;
@@ -1690,39 +1626,34 @@ impl Env {
     }
 
     /// Collect all entries in a range (convenience for small ranges).
-    pub fn scan(&mut self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Result<Vec<(Box<[u8]>, History)>> {
+    pub fn scan(&mut self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Result<Vec<(Box<[u8]>, i64)>> {
         let mut out = Vec::new();
-        self.for_each(tree, lo, hi, &mut |k, h| {
-            out.push((k.into(), h.clone()));
+        self.for_each(tree, lo, hi, &mut |k, w| {
+            out.push((k.into(), w));
             Ok(true)
         })?;
         Ok(out)
     }
 
     /// Entries whose key starts with `prefix`.
-    pub fn scan_prefix(&mut self, tree: TreeId, prefix: &[u8]) -> Result<Vec<(Box<[u8]>, History)>> {
+    pub fn scan_prefix(&mut self, tree: TreeId, prefix: &[u8]) -> Result<Vec<(Box<[u8]>, i64)>> {
         let mut out = Vec::new();
-        self.for_each_prefix(tree, prefix, &mut |k, h| {
-            out.push((k.into(), h.clone()));
+        self.for_each_prefix(tree, prefix, &mut |k, w| {
+            out.push((k.into(), w));
             Ok(true)
         })?;
         Ok(out)
     }
 
-    /// Call `f` with the entries in [lo, hi) in key order until it returns
-    /// false. Entries are visited where they are, without copying them.
-    pub fn for_each(
-        &mut self,
-        tree: TreeId,
-        lo: Bound<&[u8]>,
-        hi: Bound<&[u8]>,
-        f: &mut dyn FnMut(&[u8], &History) -> Result<bool>,
-    ) -> Result<()> {
+    /// Call `f` with the entries in [lo, hi) and their weights, in key
+    /// order, until it returns false. Entries are visited where they are,
+    /// without copying them.
+    pub fn for_each(&mut self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: &mut dyn FnMut(&[u8], i64) -> Result<bool>) -> Result<()> {
         self.walk(tree, lo, &|k| below_hi(k, hi), f)
     }
 
     /// `for_each` over the entries whose key starts with `prefix`.
-    pub fn for_each_prefix(&mut self, tree: TreeId, prefix: &[u8], f: &mut dyn FnMut(&[u8], &History) -> Result<bool>) -> Result<()> {
+    pub fn for_each_prefix(&mut self, tree: TreeId, prefix: &[u8], f: &mut dyn FnMut(&[u8], i64) -> Result<bool>) -> Result<()> {
         self.walk(tree, Bound::Included(prefix), &|k| k.starts_with(prefix), f)
     }
 
@@ -1740,7 +1671,7 @@ impl Env {
         tree: TreeId,
         lo: Bound<&[u8]>,
         in_range: &dyn Fn(&[u8]) -> bool,
-        f: &mut dyn FnMut(&[u8], &History) -> Result<bool>,
+        f: &mut dyn FnMut(&[u8], i64) -> Result<bool>,
     ) -> Result<()> {
         let mut resume: Option<Vec<u8>> = None;
         // bytes read from disk, and the nodes read that a large scan may
@@ -1785,7 +1716,7 @@ impl Env {
             let mut visited = 0u64;
             for e in &entries[start..] {
                 visited += 1;
-                if !in_range(&e.key) || !f(&e.key, &e.hist)? {
+                if !in_range(&e.key) || !f(&e.key, e.weight)? {
                     self.maybe_evict()?;
                     return self.spend(visited);
                 }
@@ -1944,7 +1875,7 @@ impl Env {
             Node::Leaf(_) if !inside => return Ok(()),
             Node::Leaf(entries) => {
                 for e in entries {
-                    summ.add_entry(found, &e.key, e.hist.total())?;
+                    summ.add_entry(found, &e.key, e.weight)?;
                     let mut all = true;
                     for (d, &t) in done.iter_mut().zip(targets) {
                         *d = *d || want.aggs[t].found_in(&found.aggs[t]);
@@ -2021,9 +1952,9 @@ impl Env {
                 let entries = &entries[start..end];
                 let acc = if parts.past_left { &mut parts.right } else { &mut parts.left };
                 if summ.spec().is_empty() {
-                    acc.count += entries.iter().map(|e| e.hist.total()).sum::<i64>();
+                    acc.count += entries.iter().map(|e| e.weight).sum::<i64>();
                 } else {
-                    summ.add_entries(acc, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
+                    summ.add_entries(acc, &mut entries.iter().map(|e| (&*e.key, e.weight)))?;
                 }
                 Ok(())
             }
@@ -2047,15 +1978,9 @@ impl Env {
         }
     }
 
-    /// The n-th unit of weight (0-based) in [lo, hi): returns the entry and
-    /// the offset within that entry's multiplicity.
-    pub fn nth(
-        &mut self,
-        tree: TreeId,
-        lo: Bound<&[u8]>,
-        hi: Bound<&[u8]>,
-        n: i64,
-    ) -> Result<Option<(Box<[u8]>, History, i64)>> {
+    /// The n-th unit of weight (0-based) in [lo, hi): returns the entry,
+    /// its weight and the offset within that entry's multiplicity.
+    pub fn nth(&mut self, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, n: i64) -> Result<Option<NthEntry>> {
         let Some(root) = self.root_slot(tree)? else { return Ok(None) };
         let mut rem = n;
         let r = self.nth_rec(root, lo, hi, &mut rem)?;
@@ -2063,13 +1988,7 @@ impl Env {
         Ok(r)
     }
 
-    fn nth_rec(
-        &mut self,
-        id: u32,
-        lo: Bound<&[u8]>,
-        hi: Bound<&[u8]>,
-        rem: &mut i64,
-    ) -> Result<Option<(Box<[u8]>, History, i64)>> {
+    fn nth_rec(&mut self, id: u32, lo: Bound<&[u8]>, hi: Bound<&[u8]>, rem: &mut i64) -> Result<Option<NthEntry>> {
         match self.node(id) {
             Node::Leaf(entries) => {
                 let start = match lo {
@@ -2081,9 +2000,9 @@ impl Env {
                     if !below_hi(&e.key, hi) {
                         break;
                     }
-                    let w = e.hist.total();
+                    let w = e.weight;
                     if w > *rem {
-                        return Ok(Some((e.key.clone(), e.hist.clone(), *rem)));
+                        return Ok(Some((e.key.clone(), w, *rem)));
                     }
                     *rem -= w.max(0);
                 }
@@ -2244,11 +2163,10 @@ impl Env {
     /// The one way nodes are written, early or by a checkpoint: the frame
     /// counts as live in its segment and its tree's, and towards the next
     /// maintenance pass's budget unless that pass dirtied the node; the
-    /// child entry above it gets the node's exact `min_seg` and `due` (the
-    /// parent's size follows), the entries above that a `min_seg` lowered
-    /// to it where they were higher (they cover more than the node), and so
-    /// does the tree when the node is its root. `idx` is the node's position
-    /// in its parent, if known.
+    /// child entry above it gets the node's exact `min_seg`, the entries
+    /// above that a `min_seg` lowered to it where they were higher (they
+    /// cover more than the node), and so does the tree when the node is its
+    /// root. `idx` is the node's position in its parent, if known.
     fn write_node(&mut self, id: u32, idx: usize) -> Result<DiskLoc> {
         let slot = self.slot(id);
         debug_assert!(slot.dirty, "writing a clean node");
@@ -2266,9 +2184,9 @@ impl Env {
         let mut buf = Vec::with_capacity(slot.bytes + 16);
         node.encode_as(&locs, &mut buf, self.legacy_format);
         // (the entries of clean children are exact)
-        let (min_seg, due) = match node {
-            Node::Leaf(entries) => (u32::MAX, leaf_due(entries)),
-            Node::Internal(ch) => (ch.iter().map(|c| c.min_seg).min().unwrap_or(u32::MAX), ch.iter().map(|c| c.due).min().unwrap_or(Gsn::MAX)),
+        let min_seg = match node {
+            Node::Leaf(_) => u32::MAX,
+            Node::Internal(ch) => ch.iter().map(|c| c.min_seg).min().unwrap_or(u32::MAX),
         };
         let (tree, by_maint) = (slot.tree, slot.by_maint);
         let loc = self.segs.append(&buf)?;
@@ -2283,28 +2201,26 @@ impl Env {
         slot.by_maint = false;
         let (mem, parent) = (slot.mem, slot.parent);
         self.dirty_bytes -= mem;
-        self.set_child_space(parent, id, idx, min_seg, due);
+        self.set_child_space(parent, id, idx, min_seg);
         if let Some(f) = self.flushed.as_mut() {
             let version = self.slots[id as usize].as_ref().unwrap().version;
-            f.push(Flushed { slot: id, version, loc, min_seg, due });
+            f.push(Flushed { slot: id, version, loc, min_seg });
         }
         Ok(loc)
     }
 
     /// Node `id`, a child of `parent` (at `idx` there, if known), was
-    /// written with subtree `min_seg` and `due`: its entry gets them exactly
-    /// (the parent's size follows the `due`'s encoded length), the entries
-    /// above that a `min_seg` lowered to it where they were higher (they
-    /// cover more than the node), and so does its tree when the node is its
-    /// root.
-    fn set_child_space(&mut self, parent: u32, id: u32, idx: usize, min_seg: u32, due: Gsn) {
+    /// written with subtree `min_seg`: its entry gets it exactly, the
+    /// entries above that a `min_seg` lowered to it where they were higher
+    /// (they cover more than the node), and so does its tree when the node
+    /// is its root.
+    fn set_child_space(&mut self, parent: u32, id: u32, idx: usize, min_seg: u32) {
         let tree = self.slot(id).tree;
         if parent == NONE {
             if let Some(t) = self.trees.get_mut(&tree)
                 && t.root == Some(NodePtr::Mem(id))
             {
                 t.min_seg = min_seg;
-                t.due = due;
             }
             return;
         }
@@ -2313,12 +2229,7 @@ impl Env {
             Some(c) if c.ptr == NodePtr::Mem(id) => idx,
             _ => ch.iter().position(|c| c.ptr == NodePtr::Mem(id)).expect("child pointer"),
         };
-        let c = &mut ch[i];
-        let resized = summary::uvarint_len(due.wrapping_add(1)) as isize - summary::uvarint_len(c.due.wrapping_add(1)) as isize;
-        c.min_seg = min_seg;
-        c.due = due;
-        let p = self.slot_mut(parent);
-        p.bytes = p.bytes.checked_add_signed(resized).expect("node size");
+        ch[i].min_seg = min_seg;
         let mut child = parent;
         let mut at = self.slot(parent).parent;
         while at != NONE {
@@ -2434,7 +2345,6 @@ impl Env {
             trees: self.trees.clone(),
             next_tree_id: self.next_tree_id,
             seg_live: self.seg_live.clone(),
-            frontier: self.frontier,
             checkpoint_seq: self.checkpoint_seq,
             checkpoint_gsn: self.checkpoint_gsn,
             fg_appended: 0,
@@ -2485,7 +2395,7 @@ impl Env {
             slot.by_maint = false;
             let (mem, parent) = (slot.mem, slot.parent);
             self.dirty_bytes -= mem;
-            self.set_child_space(parent, f.slot, usize::MAX, f.min_seg, f.due);
+            self.set_child_space(parent, f.slot, usize::MAX, f.min_seg);
         }
         for id in done.dead {
             if self.seg_live.get(&id).is_none_or(|(_, live)| *live == 0) && self.segs.delete(id)? {
@@ -2523,7 +2433,7 @@ impl Env {
             };
             let t = &self.trees[&tid];
             records.push(TreeRecord { id: tid, root: loc.map(|l| (l, t.summary.clone(), t.min_seg)) });
-            space.push(TreeSpace { due: t.due, segs: t.seg_live.iter().map(|(s, l)| (*s, *l)).collect() });
+            space.push(TreeSpace { segs: t.seg_live.iter().map(|(s, l)| (*s, *l)).collect() });
         }
         // (what others appended meanwhile and is synced too lies beyond
         // what the record names, as any frame after a checkpoint does)
@@ -2657,7 +2567,6 @@ impl Env {
             trees: self.trees.clone(),
             next_tree_id: self.next_tree_id,
             seg_live: self.seg_live.clone(),
-            frontier: self.frontier,
             checkpoint_seq: self.checkpoint_seq,
             checkpoint_gsn: self.checkpoint_gsn,
             fg_appended: 0,
@@ -2729,7 +2638,6 @@ impl Env {
         slot.parent = parent;
         slot.tree = tree;
         slot.version = self.next_stamp();
-        slot.edits = 0;
         self.mem_bytes += slot.mem;
         if slot.dirty {
             self.dirty_bytes += slot.mem;
@@ -2770,41 +2678,37 @@ impl Env {
     }
 
     // ------------------------------------------------------------------
-    // maintenance: compaction, merging and segment GC
+    // maintenance: segment GC and merging
 
-    /// One maintenance pass with the default budget: for compaction and
-    /// for GC each, `MAINT_MIN_BYTES` plus the bytes written for the
-    /// engine's own updates since the previous pass (garbage arises at
-    /// that rate, so reclaiming keeps pace with it). Run before a
-    /// checkpoint, which then writes the nodes it rewrote.
+    /// One maintenance pass with the default budget: `MAINT_MIN_BYTES`
+    /// plus the bytes written for the engine's own updates since the
+    /// previous pass (garbage arises at that rate, so reclaiming keeps pace
+    /// with it). Run before a checkpoint, which then writes the nodes it
+    /// rewrote.
     pub fn maintain(&mut self) -> Result<MaintStats> {
         let written = std::mem::take(&mut self.fg_appended);
-        let b = MAINT_MIN_BYTES.saturating_add(written);
+        let gc = MAINT_MIN_BYTES.saturating_add(written);
         // the nodes it rewrites are dirty until the checkpoint after it
         // writes them: what the pool's target leaves besides the dirty
         // nodes it holds (which the pool keeps within half of the target)
         let memory = self.opts.cache_bytes.saturating_sub(self.dirty_bytes);
-        self.maintain_with(MaintBudget { compact: b, gc: b, memory })
+        self.maintain_with(MaintBudget { gc, memory })
     }
 
-    /// A maintenance pass: rewrite the leaves whose compaction is due (and
-    /// compact every dirty leaf, which the next checkpoint writes anyway),
-    /// merge what that leaves underfull, and rewrite the live nodes of the
-    /// segments chosen for evacuation (compacting the leaves among them).
-    /// Only subtrees whose `due` has passed the retention frontier, or that
-    /// hold nodes of a chosen segment, are visited; reading and rewriting
-    /// clean nodes stops when their budget is exhausted (the next pass
-    /// continues). No summary changes: compaction keeps every entry's
-    /// current weight, and merging keeps the entries.
+    /// A maintenance pass: rewrite the live nodes of the segments chosen
+    /// for evacuation, and merge those of them that are underfull with a
+    /// neighbour (a leaf written by a version that kept history is smaller
+    /// once its retracted entries are dropped). Only subtrees that hold
+    /// nodes of a chosen segment are visited; reading and rewriting clean
+    /// nodes stops when the budget is exhausted (the next pass continues).
+    /// No summary changes: relocating and merging keep the entries.
     pub fn maintain_with(&mut self, budget: MaintBudget) -> Result<MaintStats> {
         // (segments' totals with what forks wrote, for choosing victims)
         self.count_foreign();
         let (victims, left_out) = self.gc_victims(budget.gc);
         let mut m = Maint {
-            frontier: self.frontier,
             stats: MaintStats { victims: victims.clone(), unfinished: left_out, ..Default::default() },
             victims,
-            compact: budget.compact,
             gc: budget.gc,
             memory: budget.memory,
             leaf_depth: None,
@@ -2814,27 +2718,19 @@ impl Env {
             let Some(root) = t.root else { continue };
             // (trees not attached after recovery are about to be dropped,
             // temporary ones are dropped by their users)
-            if !t.attached || tid >= TEMP_TREES {
-                continue;
-            }
-            let dirty = matches!(root, NodePtr::Mem(id) if self.slot(id).dirty);
-            let gc = t.seg_live.keys().any(|s| m.victim(*s));
-            let compact = t.due <= m.frontier;
-            if !dirty && !gc && !compact {
+            if !t.attached || tid >= TEMP_TREES || !t.seg_live.keys().any(|s| m.victim(*s)) {
                 continue;
             }
             if let NodePtr::Disk(loc) = root
-                && !m.charge(gc, loc.len as u64)
+                && !m.charge(loc.len as u64)
             {
                 continue;
             }
-            let (old, due, summ) = (t.summary.clone(), t.due, t.summarizer.clone());
+            let (old, summ) = (t.summary.clone(), t.summarizer.clone());
             let rid = self.root_slot(tid)?.expect("tree with a root");
             m.leaf_depth = None;
-            match self.maint_node(rid, 0, &old, due, &mut m, &summ)? {
-                Visit::Same => {}
-                Visit::Due(d) => self.trees.get_mut(&tid).unwrap().due = d,
-                Visit::New(parts) => self.install_root(tid, parts, &summ)?,
+            if let Visit::New(parts) = self.maint_node(rid, 0, &old, &mut m, &summ)? {
+                self.install_root(tid, parts, &summ)?;
             }
         }
         self.maybe_evict()?;
@@ -2874,61 +2770,30 @@ impl Env {
     }
 
     /// Visit node `id` of a maintenance pass (`depth` below the root; `old`
-    /// and `due` are its summary and `due` as recorded by its parent).
-    fn maint_node(
-        &mut self,
-        id: u32,
-        depth: usize,
-        old: &Summary,
-        due: Gsn,
-        m: &mut Maint,
-        summ: &Arc<dyn Summarizer>,
-    ) -> Result<Visit> {
+    /// is its summary as recorded by its parent).
+    fn maint_node(&mut self, id: u32, depth: usize, old: &Summary, m: &mut Maint, summ: &Arc<dyn Summarizer>) -> Result<Visit> {
         let dirty = self.slot(id).dirty;
         let bytes = self.slot(id).bytes as u64;
+        // (a dirty node has no location: it is written to the active
+        // segment anyway)
         let in_victim = self.slot(id).disk.is_some_and(|l| m.victim(l.seg));
-        if let Node::Leaf(entries) = self.node(id) {
+        if self.node(id).is_leaf() {
             m.leaf_depth = Some(depth);
-            let (first, now_due) = leaf_compaction(entries);
-            // a dirty leaf is written by the next checkpoint anyway
-            let compact = if dirty { first <= m.frontier } else { now_due <= m.frontier };
-            let unchanged = if now_due == due { Visit::Same } else { Visit::Due(now_due) };
-            if !compact && !in_victim {
-                return Ok(unchanged);
+            if !in_victim || !m.charge(bytes) {
+                return Ok(Visit::Same);
             }
-            if !dirty {
-                if !m.charge(in_victim, bytes) {
-                    return Ok(unchanged);
-                }
-                if in_victim {
-                    m.stats.relocated += 1;
-                } else {
-                    m.stats.compacted += 1;
-                }
-                self.make_dirty(id);
-                self.slot_mut(id).by_maint = true;
-            }
-            self.slot_mut(id).edits = 0;
-            let Node::Leaf(mut entries) = self.take_node(id) else { unreachable!() };
-            let f = m.frontier;
-            entries.retain_mut(|e| {
-                e.hist.compact(f);
-                !e.hist.is_empty()
-            });
-            if entries.is_empty() {
-                self.put_node(id, Node::Leaf(entries));
+            m.stats.relocated += 1;
+            self.make_dirty(id);
+            self.slot_mut(id).by_maint = true;
+            // (a leaf of an earlier version whose entries were all retracted)
+            if matches!(self.node(id), Node::Leaf(e) if e.is_empty()) {
                 self.free_slot(id);
                 return Ok(Visit::New(Parts::new()));
             }
-            let due = leaf_due(&entries);
-            self.put_node(id, Node::Leaf(entries));
-            if !dirty {
-                // (as compacted: what stays in memory)
-                m.dirtied(self.slot(id).mem);
-            }
-            return Ok(Visit::New(smallvec::smallvec![Part { sep: Box::default(), id, summary: old.clone(), min_seg: u32::MAX, due }]));
+            m.dirtied(self.slot(id).mem);
+            return Ok(Visit::New(smallvec::smallvec![Part { sep: Box::default(), id, summary: old.clone(), min_seg: u32::MAX }]));
         }
-        let relocate = in_victim && m.charge(true, bytes);
+        let relocate = in_victim && m.charge(bytes);
         let tree = self.slot(id).tree;
         let node = self.take_node(id);
         // what the children own, kept up to date like the byte size
@@ -2938,7 +2803,8 @@ impl Env {
         self.put_node(id, Node::Internal(Vec::new()));
         let mut size = bytes as usize;
         let mut changed = relocate;
-        let mut shrunk: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
+        // the children rewritten (merged with a neighbour if underfull)
+        let mut moved: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
         let mut i = 0;
         while i < children.len() {
             let c = &children[i];
@@ -2950,35 +2816,24 @@ impl Env {
             };
             let gc_self = own.is_some_and(|s| m.victim(s));
             let gc_below = leaf != Some(true) && m.victims.last().is_some_and(|v| c.min_seg <= *v);
-            let gc = gc_self || gc_below;
-            if !gc && c.due > m.frontier {
+            if !gc_self && !gc_below {
                 i += 1;
                 continue;
             }
             if let NodePtr::Disk(loc) = c.ptr
-                && !m.charge(gc, loc.len as u64)
+                && !m.charge(loc.len as u64)
             {
                 i += 1;
                 continue;
             }
             let cid = self.load(c.ptr, id, tree)?;
             children[i].ptr = NodePtr::Mem(cid);
-            let before = self.slot(cid).bytes;
-            match self.maint_node(cid, depth + 1, &children[i].summary, children[i].due, m, summ)? {
+            match self.maint_node(cid, depth + 1, &children[i].summary, m, summ)? {
                 Visit::Same => i += 1,
-                Visit::Due(d) => {
-                    size -= node::child_size(&children[i]);
-                    children[i].due = d;
-                    size += node::child_size(&children[i]);
-                    changed = true;
-                    i += 1;
-                }
                 Visit::New(parts) => {
                     changed = true;
-                    if let [p] = &parts[..]
-                        && self.slot(p.id).bytes < before
-                    {
-                        shrunk.push(p.id);
+                    if let [p] = &parts[..] {
+                        moved.push(p.id);
                     }
                     // the first part keeps the child's separator
                     size -= node::child_size(&children[i]);
@@ -3000,10 +2855,10 @@ impl Env {
                 }
             }
         }
-        if !shrunk.is_empty() {
-            m.stats.merged += self.merge_underfull(id, &mut children, &shrunk, &mut size, &mut heap, &mut m.compact, true)?;
+        if !moved.is_empty() {
+            m.stats.merged += self.merge_underfull(id, &mut children, &moved, &mut size, &mut heap, &mut m.gc, true)?;
             // (merges are tried only while there is budget)
-            m.stats.unfinished |= m.compact == 0;
+            m.stats.unfinished |= m.gc == 0;
         }
         if !changed {
             self.put_node_sized(id, Node::Internal(children), size, heap);
@@ -3056,8 +2911,7 @@ impl Env {
 /// least `min_items` items, balancing chunk sizes. After an append past the
 /// node's previous last key (`append`), all chunks but the last are filled
 /// to 90% instead: the appends that follow go to the last one, so the others
-/// would stay half empty (the 10% leave room for the history of later
-/// updates and retractions).
+/// would stay half empty (the 10% leave room for later inserts).
 fn split_by_bytes<T>(items: Vec<T>, target: usize, size: fn(&T) -> usize, min_items: usize, append: bool) -> Vec<Vec<T>> {
     let total: usize = items.iter().map(size).sum();
     if total <= target || items.len() < 2 * min_items.max(1) {
@@ -3094,19 +2948,16 @@ fn split_by_bytes<T>(items: Vec<T>, target: usize, size: fn(&T) -> usize, min_it
     out
 }
 
-/// Bytes of node frames a maintenance pass may read and rewrite for
-/// compaction, and as many for GC, besides the share proportional to the
-/// engine's writes (see `Env::maintain`).
+/// Bytes of node frames a maintenance pass may read and rewrite, besides
+/// the share proportional to the engine's writes (see `Env::maintain`).
 const MAINT_MIN_BYTES: u64 = 8 << 20;
 
 /// Work a maintenance pass may do: bytes of clean node frames it may read
 /// or rewrite (the next checkpoint writes them).
 #[derive(Clone, Copy, Debug)]
 pub struct MaintBudget {
-    /// For leaves whose compaction is due, and for merges.
-    pub compact: u64,
-    /// For evacuating sparse segments (it also bounds the live bytes of
-    /// the segments chosen).
+    /// For evacuating sparse segments and merging what they leave
+    /// underfull (it also bounds the live bytes of the segments chosen).
     pub gc: u64,
     /// Memory (`Slot::mem`) that the clean nodes the pass rewrites may take:
     /// they stay in the buffer pool, dirty, until the checkpoint writes
@@ -3115,14 +2966,12 @@ pub struct MaintBudget {
 }
 
 impl MaintBudget {
-    pub const UNLIMITED: MaintBudget = MaintBudget { compact: u64::MAX, gc: u64::MAX, memory: usize::MAX };
+    pub const UNLIMITED: MaintBudget = MaintBudget { gc: u64::MAX, memory: usize::MAX };
 }
 
 /// What a maintenance pass did.
 #[derive(Clone, Debug, Default)]
 pub struct MaintStats {
-    /// Clean leaves rewritten to compact their histories.
-    pub compacted: usize,
     /// Clean nodes rewritten because their segment is being evacuated.
     pub relocated: usize,
     /// Merges of underfull neighbours.
@@ -3137,11 +2986,9 @@ pub struct MaintStats {
 
 /// State of a maintenance pass.
 struct Maint {
-    frontier: Gsn,
     /// Segments being evacuated, sorted.
     victims: Vec<u32>,
     /// Remaining budgets.
-    compact: u64,
     gc: u64,
     memory: usize,
     /// Depth of the leaves of the tree being visited, once one was seen.
@@ -3154,15 +3001,14 @@ impl Maint {
         self.victims.binary_search(&seg).is_ok()
     }
 
-    /// Take `bytes` from the GC or the compaction budget; false (taking
-    /// nothing) once it is exhausted, or the memory for rewritten nodes is.
-    fn charge(&mut self, gc: bool, bytes: u64) -> bool {
-        let b = if gc { &mut self.gc } else { &mut self.compact };
-        if *b == 0 || self.memory == 0 {
+    /// Take `bytes` from the budget; false (taking nothing) once it is
+    /// exhausted, or the memory for rewritten nodes is.
+    fn charge(&mut self, bytes: u64) -> bool {
+        if self.gc == 0 || self.memory == 0 {
             self.stats.unfinished = true;
             return false;
         }
-        *b = b.saturating_sub(bytes);
+        self.gc = self.gc.saturating_sub(bytes);
         true
     }
 
@@ -3176,8 +3022,6 @@ impl Maint {
 enum Visit {
     /// Nothing changed.
     Same,
-    /// The node is unchanged, but its `due` is not what its parent recorded.
-    Due(Gsn),
     /// The nodes now covering its key range: itself rewritten, or none.
     New(Parts),
 }
@@ -3198,18 +3042,17 @@ struct RangeParts {
 /// The nodes an update leaves in place of one (usually just that one).
 type Parts = smallvec::SmallVec<[Part; 1]>;
 
-/// A node produced by an update: its separator, slot, summary, min_seg and due.
+/// A node produced by an update: its separator, slot, summary and min_seg.
 struct Part {
     sep: Box<[u8]>,
     id: u32,
     summary: Summary,
     min_seg: u32,
-    due: Gsn,
 }
 
 impl Part {
     fn into_child(self) -> Child {
-        Child { sep: self.sep, ptr: NodePtr::Mem(self.id), summary: self.summary, min_seg: self.min_seg, due: self.due }
+        Child { sep: self.sep, ptr: NodePtr::Mem(self.id), summary: self.summary, min_seg: self.min_seg }
     }
 }
 
@@ -3220,14 +3063,14 @@ impl Part {
 fn leaf_summary(entries: &[LeafEntry], summ: &Arc<dyn Summarizer>) -> Result<Summary> {
     let mut s = Summary::empty(summ.spec());
     if summ.spec().is_empty() {
-        s.count = entries.iter().map(|e| e.hist.total()).sum();
+        s.count = entries.iter().map(|e| e.weight).sum();
         return Ok(s);
     }
-    summ.add_entries(&mut s, &mut entries.iter().map(|e| (&*e.key, e.hist.total())))?;
+    summ.add_entries(&mut s, &mut entries.iter().map(|e| (&*e.key, e.weight)))?;
     if let Some(mut wide) = summary::WideExtremes::of(&s) {
         for e in entries {
             let mut one = Summary::empty(summ.spec());
-            summ.add_entry(&mut one, &e.key, e.hist.total())?;
+            summ.add_entry(&mut one, &e.key, e.weight)?;
             wide.note(&s, &one);
         }
         wide.apply(&mut s);
@@ -3282,7 +3125,7 @@ fn shortest_separator(a: &[u8], b: &[u8]) -> Box<[u8]> {
 
 #[cfg(test)]
 thread_local! {
-    /// Children scanned for an internal node's `min_seg` and `due` by
+    /// Children scanned for an internal node's `min_seg` by
     /// `finish_internal_sized` (counted by tests).
     static SPACE_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }

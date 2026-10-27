@@ -1,5 +1,5 @@
-//! Batch execution of logical plans against arrangements (point-in-time
-//! reads, including time travel via MVCC histories, and WITH RECURSIVE).
+//! Batch execution of logical plans against arrangements (reads of the
+//! current state, and WITH RECURSIVE).
 //!
 //! Reads stream: `run_query` hands a query's result rows on as they are
 //! produced, scans stop once a LIMIT is reached (in the arrangement's order
@@ -382,9 +382,8 @@ impl<'a> ExecCtx<'a> {
         let (preds, cols) = (&b.preds, &b.cols);
         let distinct = cols.as_ref().is_some_and(|c| c.iter().enumerate().all(|(i, x)| !c[..i].contains(x)));
         let (mut visited, mut done) = (0u64, true);
-        self.env.for_each(a.tree, Bound::Included(lo), hi, &mut |k, h| {
+        self.env.for_each(a.tree, Bound::Included(lo), hi, &mut |k, w| {
             visited += 1;
-            let w = h.total();
             if w <= 0 {
                 return Ok(true);
             }
@@ -808,8 +807,7 @@ impl<'a> ExecCtx<'a> {
             let mut matched = false;
             if kv.len() == used.len() {
                 let mut cands = Vec::new();
-                self.env.for_each_prefix(tree, &layout.encode_prefix(&kv), &mut |k, h| {
-                    let w = h.total();
+                self.env.for_each_prefix(tree, &layout.encode_prefix(&kv), &mut |k, w| {
                     if w > 0 {
                         cands.push((layout.decode_row_with(k, plan.as_ref())?, w));
                     }

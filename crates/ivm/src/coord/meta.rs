@@ -162,11 +162,8 @@ fn error_entry(k: &ErrorKey) -> Vec<u8> {
 
 /// Retract every entry of `tree` in `[lo, hi)`.
 fn retract_range(env: &mut Env, tree: TreeId, lo: &[u8], hi: &[u8], ups: &mut Vec<(Vec<u8>, i64)>) -> Result<()> {
-    env.for_each(tree, Bound::Included(lo), Bound::Excluded(hi), &mut |k, h| {
-        let w = h.total();
-        if w != 0 {
-            ups.push((k.to_vec(), -w));
-        }
+    env.for_each(tree, Bound::Included(lo), Bound::Excluded(hi), &mut |k, w| {
+        ups.push((k.to_vec(), -w));
         Ok(true)
     })
 }
@@ -265,8 +262,8 @@ impl Engine {
     }
 
     /// Write the metadata that changed since the previous call into the
-    /// metadata tree, at `gsn` (the last applied GSN).
-    pub(crate) fn persist_meta(&mut self, gsn: Gsn) -> Result<()> {
+    /// metadata tree.
+    pub(crate) fn persist_meta(&mut self) -> Result<()> {
         let tree = self.meta_tree();
         let mut ups: Vec<(Vec<u8>, i64)> = Vec::new();
         // catalog objects: the stored entry of each changed one (whatever
@@ -277,11 +274,8 @@ impl Engine {
         }
         for id in changed {
             let key = u64_key(T_OBJECT, id);
-            self.env.for_each_prefix(tree, &key, &mut |k, h| {
-                let w = h.total();
-                if w != 0 {
-                    ups.push((k.to_vec(), -w));
-                }
+            self.env.for_each_prefix(tree, &key, &mut |k, w| {
+                ups.push((k.to_vec(), -w));
                 Ok(true)
             })?;
             if let Some(o) = self.catalog.get(id) {
@@ -389,7 +383,7 @@ impl Engine {
         for (k, w) in self.graph.take_error_changes() {
             ups.push((error_entry(&k), w));
         }
-        self.env.apply(tree, &mut ups, gsn)
+        self.env.apply(tree, &mut ups)
     }
 }
 
@@ -426,11 +420,8 @@ pub(crate) fn load(env: &mut Env, app: &[u8]) -> Result<(AppState, Meta)> {
     let next_req = get_uvarint(b)?;
     env.attach_tree(tree, Arc::new(CountSummarizer))?;
     let mut entries = Vec::new();
-    env.for_each(tree, Bound::Unbounded, Bound::Unbounded, &mut |k, h| {
-        let w = h.total();
-        if w != 0 {
-            entries.push((k.to_vec(), w));
-        }
+    env.for_each(tree, Bound::Unbounded, Bound::Unbounded, &mut |k, w| {
+        entries.push((k.to_vec(), w));
         Ok(true)
     })?;
     let mut st = AppState { next_req, ..Default::default() };
@@ -633,6 +624,6 @@ pub fn edit_stored_catalog(data_dir: &Path, f: impl FnOnce(&mut BTreeMap<ObjectI
         let json = serde_json::to_vec(o).map_err(|e| SqlError::internal(e.to_string()))?;
         ups.push((entry(u64_key(T_OBJECT, *id), |e| e.extend_from_slice(&json)), 1));
     }
-    env.apply(tree, &mut ups, rec.gsn)?;
+    env.apply(tree, &mut ups)?;
     env.checkpoint(rec.gsn, &encode_header(&meta, st.next_req))
 }

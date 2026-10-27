@@ -425,11 +425,11 @@ fn source_progress_costs_what_it_changes() {
     for (i, id) in ids.iter().enumerate() {
         progress(&mut t, *id, i % 2 == 0);
     }
-    t.e.persist_meta(t.gsn).unwrap();
+    t.e.persist_meta().unwrap();
     let epoch = t.e.snap_epoch;
     BOOKKEEPING.with(|b| b.set(0));
     progress(&mut t, ids[1], true);
-    t.e.persist_meta(t.gsn).unwrap();
+    t.e.persist_meta().unwrap();
     let cost = BOOKKEEPING.with(|b| b.get());
     assert!(cost < 20, "{cost} records for one table's progress");
     assert_eq!(t.e.loading.len(), n / 2 - 1);
@@ -535,7 +535,7 @@ fn windows_read_only_what_a_change_reaches() {
                 .unwrap();
             let errors = p.errors;
             t.e.graph.forget_window_errors(id);
-            t.e.graph.hydrate(&mut t.e.env, t.gsn).unwrap();
+            t.e.graph.hydrate(&mut t.e.env).unwrap();
             assert!(errors.lock().known());
         }
         let (update, _) = t.work(|t| t.upsert(name, vec![vec![int(n - 1), int(1), int(n)]]));

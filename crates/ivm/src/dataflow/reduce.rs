@@ -251,8 +251,8 @@ fn compute_group(
         kv.extend_from_slice(exact);
     } else if ng > 0 {
         let mut first = None;
-        env.for_each(tree, lo, hib, &mut |k, h| {
-            if h.total() > 0 {
+        env.for_each(tree, lo, hib, &mut |k, w| {
+            if w > 0 {
                 first = Some(layout.decode_row(k)?);
                 return Ok(false);
             }
@@ -267,9 +267,8 @@ fn compute_group(
     let mut scanned: Option<Vec<(Row, i64)>> = None;
     if p.scans() {
         let mut rows = Vec::new();
-        env.for_each(tree, lo, hib, &mut |k, h| {
+        env.for_each(tree, lo, hib, &mut |k, w| {
             visited(1);
-            let w = h.total();
             if w > 0 {
                 rows.push((layout.decode_row(k)?, w));
             }
@@ -372,8 +371,8 @@ fn old_row(g: &Graph, env: &mut Env, p: &ReducePlan, gvals: &[Datum]) -> Result<
     Ok(rows.into_iter().find(|(_, w)| *w > 0).map(|(r, _)| r))
 }
 
-pub fn step(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
-    let r = step_groups(g, env, p, delta, gsn, out);
+pub fn step(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, _gsn: Gsn, out: &mut StepOut) -> Result<()> {
+    let r = step_groups(g, env, p, delta, out);
     if r.is_err() {
         // the cache may be ahead of what this failed step will leave behind
         p.cache.0.lock().clear();
@@ -381,7 +380,7 @@ pub fn step(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn: Gs
     r
 }
 
-fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
+fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, out: &mut StepOut) -> Result<()> {
     let layout = g.arr(p.input_arr).layout.clone();
     let ng = p.group_key.len();
     static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -396,7 +395,7 @@ fn step_groups(g: &Graph, env: &mut Env, p: &ReducePlan, delta: &NodeDelta, gsn:
         // set, each summarized from the index (no rows to fold into a
         // cached summary); the key values are the prefix's (canonical, which
         // is exact where it matters: without fidelity suffixes).
-        let groups = super::ops::affected_keys(env, delta, gsn, &|row| {
+        let groups = super::ops::affected_keys(env, delta, &|row| {
             let kv: Vec<Datum> = p.group_key.iter().map(|c| row[*c].clone()).collect();
             Ok(layout.encode_prefix(&kv))
         })?;
@@ -555,8 +554,8 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &ReducePlan, out: &mut super::ops::
             None => Bound::Unbounded,
         };
         let mut next = None;
-        env.for_each(tree, lo, Bound::Unbounded, &mut |k, h| {
-            if h.total() <= 0 {
+        env.for_each(tree, lo, Bound::Unbounded, &mut |k, w| {
+            if w <= 0 {
                 return Ok(true);
             }
             let row = layout.decode_row(k)?;
