@@ -1354,7 +1354,9 @@ over `bigint`, joins whose input filters or maps can fail, which have
 error-tracker inputs, and the input arrangements of window aggregates
 whose frames reach a partition's end, which carry summaries), so such a
 data directory keeps its tables and rebuilds those arrangements once at
-its first start. The arrangements of views with conditions over the
+its first start. The arrangements of views with aggregates with `FILTER`
+(their input map now computes the arguments and `ORDER BY` keys only for
+the rows that pass the filter) and of views with conditions over the
 computed columns of nested projections, or expressions around a
 correlated scalar aggregate, that inlining would make too large (which
 are no longer inlined, see [Planner](internals/planner.md#optimizer)) are

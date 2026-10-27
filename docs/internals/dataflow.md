@@ -401,7 +401,11 @@ every subtree:
 | `percentile_cont/disc` | non-null count (values read at their ranks with `Env::nth`); with `FILTER`, none (the group is scanned) |
 | `string_agg`, `array_agg`, `json(b)_agg`, `json(b)_object_agg`, `mode` | none (the group is scanned) |
 
-`FILTER (WHERE f)` is folded into the argument (`CASE WHEN f THEN x END`).
+With `FILTER (WHERE f)`, the input carries the filter's value, and the
+arguments and `ORDER BY` keys are computed only for rows that pass it (see
+[Planner](planner.md#binder)); the summaries count the argument as
+`CASE WHEN f THEN x END`, and ordered aggregates skip the rows that do not
+pass.
 The output is arranged by the group key; it supplies the previous output row
 of a group.
 

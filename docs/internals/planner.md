@@ -127,7 +127,7 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
   is then assembled as
 
   ```
-  FROM/WHERE ─▶ Map(group keys, aggregate arguments, filters, orders)
+  FROM/WHERE ─▶ Map(group keys, per aggregate: FILTER, arguments, orders)
              ─▶ Aggregate            (or UnionAll of one Aggregate per grouping set)
              ─▶ Filter(HAVING)
              ─▶ Map(window arguments) ─▶ Window
@@ -136,6 +136,12 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
              ─▶ Distinct | TopK(DISTINCT ON)
   ```
 
+  As in PostgreSQL, an aggregate's arguments and `ORDER BY` keys are
+  evaluated only for the rows that pass its `FILTER`, after it: in the map
+  they are `CASE WHEN filter THEN expr END` over the filter's column (a
+  column or constant, which cannot fail, as it is), and the aggregate skips
+  the rows that do not pass by the filter column, so
+  `sum(10 / x) FILTER (WHERE x <> 0)` does not divide by zero.
   Expressions after the aggregation are rewritten to refer to the
   aggregation's output (grouping expressions are matched by fingerprint);
   ungrouped column references fail with SQLSTATE `42803`. Grouping sets are

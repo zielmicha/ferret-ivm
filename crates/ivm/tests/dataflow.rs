@@ -573,6 +573,62 @@ fn numeric_aggregates_beyond_the_numeric_range() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An aggregate's arguments and ORDER BY keys are evaluated only for the
+/// rows that pass its FILTER, after it, maintained and ad hoc: they used to
+/// be computed for every row, so `sum(10 / x) FILTER (WHERE x <> 0)` failed
+/// with a division by zero. Expected results and errors are PostgreSQL's.
+#[test]
+fn aggregate_filter_guards_arguments() {
+    let dir = tmpdir("filter-guard");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, x int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 0), (2, 1, 1), (3, 2, 2)");
+    let queries = [
+        "SELECT sum(10 / x) FILTER (WHERE x <> 0) AS s FROM t",
+        "SELECT g, count(DISTINCT 10 / x) FILTER (WHERE x <> 0) AS c, string_agg((10 / x)::text, ',' ORDER BY 10 / x) FILTER (WHERE x <> 0) AS s, \
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY 10 / x) FILTER (WHERE x <> 0) AS p FROM t GROUP BY g",
+        "SELECT count(*) FILTER (WHERE 10 / x > 1) AS n FROM t",
+        // the FILTER's own error, not its argument's (the rows of x = 0 pass)
+        "SELECT sum((x::text || 'a')::int) FILTER (WHERE 1 / (x - 1) > 0) AS s FROM t WHERE x < 2",
+    ];
+    for (i, q) in queries.iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    let check = |want: [Result<Vec<&str>, &str>; 4]| {
+        for (i, (q, want)) in queries.iter().zip(want).enumerate() {
+            let want = want.map(|w| w.iter().map(|s| s.to_string()).collect::<Vec<_>>()).map_err(|e| e.to_string());
+            assert_eq!(rows_of(&h, &format!("{q} ORDER BY 1")), want, "{q}");
+            assert_eq!(rows_of(&h, &format!("SELECT * FROM v{i} ORDER BY 1")), want, "view {i}: {q}");
+        }
+    };
+    let div0 = "22012 division by zero";
+    check([Ok(vec!["15"]), Ok(vec!["1|1|10|10", "2|1|5|5"]), Err(div0), Err(div0)]);
+    exec(&h, "INSERT INTO t VALUES (4, 2, 0), (5, 2, 5)");
+    check([Ok(vec!["17"]), Ok(vec!["1|1|10|10", "2|2|2,5|2"]), Err(div0), Err(div0)]);
+    exec(&h, "DELETE FROM t WHERE x = 0");
+    check([Ok(vec!["17"]), Ok(vec!["1|1|10|10", "2|2|2,5|2"]), Ok(vec!["3"]), Err(div0)]);
+    exec(&h, "UPDATE t SET x = 2 WHERE id = 2");
+    check([Ok(vec!["12"]), Ok(vec!["1|1|5|5", "2|2|2,5|2"]), Ok(vec!["3"]), Ok(vec![""])]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FILTERed aggregates of every kind over arguments that fail on the rows
+/// the filter excludes follow random changes.
+#[test]
+fn filtered_aggregates_follow_random_changes() {
+    let queries = [
+        "SELECT g, sum(10 / v) FILTER (WHERE v <> 0) AS s, count(*) FILTER (WHERE v > 2) AS c, avg(100 / v) FILTER (WHERE v > 0) AS a, \
+         max(10 / v) FILTER (WHERE v <> 0) AS m FROM t GROUP BY g",
+        "SELECT g, string_agg((10 / v)::text, ',' ORDER BY 10 / v, id) FILTER (WHERE v <> 0) AS s, \
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY 10 / v) FILTER (WHERE v <> 0) AS p FROM t GROUP BY g",
+        "SELECT g, count(DISTINCT 10 / v) FILTER (WHERE v <> 0) AS c, sum(DISTINCT 6 / v) FILTER (WHERE v <> 0) AS d FROM t GROUP BY g",
+        "SELECT sum(10 / v) FILTER (WHERE v <> 0) AS s, array_agg(DISTINCT 12 / v) FILTER (WHERE v > 1) AS a, count(*) AS n FROM t",
+    ];
+    random_changes_keep_views_equal("filter-random", &queries, 40, 11);
+}
+
 /// A small deterministic random generator (xorshift64*).
 struct Rng(u64);
 

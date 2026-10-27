@@ -219,7 +219,11 @@ agg( fraction ) WITHIN GROUP ( ORDER BY sort_expr )      -- ordered-set aggregat
 | `any_value(x)` | any | same as argument |
 
 - `DISTINCT`, `FILTER (WHERE ...)` and `ORDER BY` inside the call are
-  supported for all aggregates. With `DISTINCT`, the `ORDER BY` expressions
+  supported for all aggregates. As in PostgreSQL, the arguments and the
+  `ORDER BY` expressions are evaluated only for the rows that pass the
+  `FILTER`, after it: `sum(10 / x) FILTER (WHERE x <> 0)` does not divide
+  by zero, and an error of the filter itself is raised before any of its
+  arguments'. With `DISTINCT`, the `ORDER BY` expressions
   must be arguments (`in an aggregate with DISTINCT, ORDER BY expressions
   must appear in argument list`, as in PostgreSQL). A materialized view with
   several different `DISTINCT` argument sets (or filters), `DISTINCT` and
