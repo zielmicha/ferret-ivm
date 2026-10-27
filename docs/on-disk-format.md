@@ -1369,42 +1369,85 @@ Consequences of code changes for an existing data directory:
 | catalog SQL that no longer binds (removed syntax or functions, stricter checks) | the view (and what reads it) is marked broken at start-up: not maintained, reads of it fail with the reason; drop it or repair it with `CREATE OR REPLACE` ([Operations](user-guide/operations.md#recovery)). Stored view definitions are planned leniently: a parameter placeholder (`$1`) in a definition logged by an older version binds as NULL instead of failing |
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
-Data directories written by earlier versions of the engine are compatible:
-format 1 only gained fields with defaults (and node kinds and summary
-state encodings that are written instead of older ones still read: leaves
-of weights, float sums, wide `min`/`max` values; [Leaf node](#leaf-node),
-[Summary](#summary)), and is migrated to format 2 at the first start; a
-format-2 directory written while the engine kept histories opens as it is
-(their reads as of earlier GSNs are gone); the log gained record tags and a change kind
-(`CommitParts`, `ProgressDelta`, `UpsertIfPresent`) next to the ones it
-still reads. A table whose snapshot an upgrade interrupts is copied again
-from its first key if its key has a string column (see `index_order`
-under [Progress](#logrecord)). New functions (registered among the
-existing ones, which renumbers the later ones) and planner fixes did
-change the fingerprints of many views' arrangements (for example joins on
-computed keys, whose keys are materialized in an `Mfp` node, semijoins
-whose presence inputs match exactly, the summaries of `var*`/`stddev*`
-over `bigint`, joins whose input filters or maps can fail, which have
-error-tracker inputs, and the input arrangements of window aggregates
-whose frames reach a partition's end, which carry summaries), so such a
-data directory keeps its tables and rebuilds those arrangements once at
-its first start; so are the window operators of `ntile` whose argument is
-not a constant and of `lag` and `lead` whose offset is not a constant of
-at least 0 (see the table above). The arrangements of views with
-aggregates with `FILTER` (their input map now computes the arguments and
-`ORDER BY` keys only for the rows that pass the filter) and of views with
-conditions over the computed columns of nested projections, or
-expressions around a correlated scalar aggregate, that inlining would make
-too large (which are no longer inlined, see
-[Planner](internals/planner.md#optimizer)) are rebuilt once in the same
-way. Results that fixes of aggregate semantics change keep their old
-values until their group changes: an `avg`, `var*` or `stddev*` of
-`double precision` values whose sum or sum of squares overflowed was
-`Infinity` (now the value, or an error where the variance or standard
-deviation itself is beyond the range).
-`crates/ivm/tests/data/format1` is a format-1 directory that the restart
-tests migrate, and `crates/ivm/tests/data/format2-history` a format-2
-directory with histories that they open.
+Data directories written by earlier versions of the engine are compatible.
+A format-1 directory is migrated to format 2 at its first start (above).
+Within format 2, every additive change since the version was introduced is
+read as it was written, and what changed is rewritten once, as follows.
+
+- **Read, no longer written.** Earlier encodings are decoded and written
+  anew in the current ones when their data is next written:
+  - leaves of kind 1 (each entry's history, read as its sum; an entry whose
+    history adds up to 0 is dropped) become kind 4 (weights), and internal
+    nodes of kind 3 (whose compaction state is skipped) kind 2, when the
+    node is modified or relocated by the maintenance pass
+    ([Leaf node](#leaf-node), [Internal node](#internal-node));
+  - checkpoint records without the tree space section are read, the first
+    start reading every tree's internal nodes once to count its live
+    bytes; the section's compaction state (now 0) is ignored
+    ([Checkpoint record](#checkpoint-record));
+  - summary states of float sums under tag 5 and of `min`/`max` values
+    wider than 128 bytes under tags 6 and 7 are read as tags 8–10 hold
+    them, which are written instead ([Summary](#summary));
+  - metadata records: arrangement records of tag 6 (the start of their
+    history ignored) and the ticks of a retention window (tag 9) are
+    replaced at the first write after recovery by tag-13 records and the
+    last tick; a source state of tag 4 that holds its tables' entries has
+    them split out into tag 12; a directory without tag 11 recomputes its
+    window operators' partitions in error once
+    ([The metadata tree](#the-metadata-tree));
+  - the `CREATE SOURCE` record's `extra` as a plain array, next to the
+    object form; format 1's `AppState` fields added with defaults (read
+    only to migrate).
+
+  The log only gained record tags and a change kind (`CommitParts`,
+  `ProgressDelta`, `UpsertIfPresent`) next to the ones it still reads.
+- **Rebuilt once.** Arrangements whose [structural
+  fingerprint](#structural-fingerprints) changed are not matched: they are
+  rebuilt by hydration at the first start and their old trees dropped
+  (tables keep their rows; start-up takes as long as creating those views
+  again):
+  - new functions (registered among the existing ones, which renumbers
+    the later ones) and planner fixes changed the plans of many views:
+    joins on computed keys (whose keys are materialized in an `Mfp`
+    node), semijoins whose presence inputs match exactly, the summaries of
+    `var*`/`stddev*` over `bigint`, joins whose input filters or maps can
+    fail (which have error-tracker inputs), and the input arrangements of
+    window aggregates whose frames reach a partition's end (which carry
+    summaries);
+  - views with aggregates with `FILTER`, whose input map now computes the
+    arguments and `ORDER BY` keys only for the rows that pass the filter,
+    and views with conditions over the computed columns of nested
+    projections, or expressions around a correlated scalar aggregate, that
+    inlining would make too large (no longer inlined, see
+    [Planner](internals/planner.md#optimizer));
+  - window operators of functions maintained otherwise than before (the
+    suffix `0xF8 0x01`, see the table above): `ntile` whose argument is not
+    a constant, `lag` and `lead` whose offset is not a constant of at
+    least 0;
+  - temporal filters whose clock expression adds an interval with months
+    (the suffix `0xD0`): their event indexes, which could end a row's
+    validity at another change of the predicate, are rebuilt with a
+    validity of several intervals;
+
+  and the arrangements downstream of all of them.
+- **Kept until they change.** Results that fixes of aggregate semantics
+  change keep their old values until their group changes: an `avg`,
+  `var*` or `stddev*` of `double precision` values whose sum or sum of
+  squares overflowed was `Infinity` (now the value, or an error where the
+  variance or standard deviation itself is beyond the range).
+- **Gone.** Reads as of earlier GSNs: the histories they read are added up
+  (a format-2 directory written while the engine kept them opens as it
+  is).
+- A table whose snapshot an upgrade interrupts is copied again from its
+  first key if its key has a string column (see `index_order` under
+  [Progress](#logrecord)).
+
+The restart tests open data directories written by earlier versions:
+`crates/ivm/tests/data/format1` (format 1, migrated),
+`crates/ivm/tests/data/format2-history` (format 2 with histories: kind-1
+leaves, kind-3 internal nodes, tag-6 arrangement records, many ticks) and
+`crates/ivm/tests/data/window-revision` (window operators of functions
+maintained otherwise since, rebuilt).
 
 A change in any of the "incompatible" rows needs a new format version whose
 migration the engine runs at the first start (as for format 1), or starting
