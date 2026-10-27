@@ -32,10 +32,11 @@ pub struct WinSpec {
     pub arg_types: Vec<SqlType>,
     pub ret: ColumnType,
     pub range: Option<RangeOffsets>,
-    /// `lag` and `lead`: the offset if it is the same for every row (a
-    /// constant, or 1 when it is not given), which bounds the rows a change
-    /// reaches; None otherwise.
-    pub offset: Option<i64>,
+    /// `ntile`'s number of buckets, `lag`'s and `lead`'s offset: its value
+    /// if it is a constant of the query (1 for an offset not given), None if
+    /// it can differ between rows. (An offset bounds the rows a change
+    /// reaches.)
+    pub constant_arg: Option<Datum>,
 }
 
 impl WinSpec {
@@ -66,6 +67,23 @@ impl WinSpec {
 
     fn frame_based(&self) -> bool {
         matches!(self.func, WindowFunc::Agg(_) | WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue)
+    }
+
+    /// Maintained otherwise than by earlier versions, so that an output
+    /// they checkpointed can differ from what this one computes from the
+    /// input (and a change would retract rows the operator does not hold):
+    /// `ntile` of an argument that is not a constant (they read every row's,
+    /// not the partition's first that is not NULL), `lag` and `lead` of an
+    /// offset that is not a constant of at least 0 (they did not recompute
+    /// the rows that a negative offset, or one differing between rows,
+    /// reads a change from). It changes the operator's fingerprint, so that
+    /// recovery rebuilds the operator instead of matching its output.
+    fn revised(&self) -> bool {
+        match self.func {
+            WindowFunc::Ntile => self.constant_arg.is_none(),
+            WindowFunc::Lag | WindowFunc::Lead => !self.constant_arg.as_ref().is_some_and(|k| k.as_i64().is_none_or(|k| k >= 0)),
+            _ => false,
+        }
     }
 
     /// Uses peer groups (rank-like functions, RANGE and GROUPS frames).
@@ -106,6 +124,10 @@ impl WindowPlan {
         fp.extend_from_slice(cx.arr(self.input_arr));
         for f in &self.funcs {
             fp.extend_from_slice(format!("{:?}{:?}{:?}{:?}", f.func, f.args, f.frame, f.range).as_bytes());
+            if f.revised() {
+                // (bytes no Debug text has)
+                fp.extend_from_slice(&[0xF8, 1]);
+            }
         }
     }
 
@@ -747,9 +769,11 @@ fn change_reach(f: &WinSpec, resized: bool, ntile_moved: bool) -> (Reach, Reach)
         W::Ntile => (all_if(resized || ntile_moved, Reach::None), all_if(resized || ntile_moved, Reach::None)),
         // the rows reading the changed rows' positions: `lag` reads back by
         // a positive offset and forward by a negative one; offsets that
-        // differ between rows can reach any row
-        W::Lag | W::Lead => match f.offset.map(|k| if f.func == W::Lag { k } else { k.saturating_neg() }) {
-            Some(back) => (Reach::Rows(back.saturating_neg().max(0)), Reach::Rows(back.max(0))),
+        // differ between rows can reach any row (a NULL offset: none, every
+        // value is NULL)
+        W::Lag | W::Lead => match f.constant_arg.as_ref().map(|k| k.as_i64().map(|k| if f.func == W::Lag { k } else { k.saturating_neg() })) {
+            Some(Some(back)) => (Reach::Rows(back.saturating_neg().max(0)), Reach::Rows(back.max(0))),
+            Some(None) => (Reach::None, Reach::None),
             None => (Reach::All, Reach::All),
         },
         // rows whose frame holds the changed row: frames ending after it
@@ -1256,7 +1280,7 @@ mod tests {
                 arg_types,
                 ret: ColumnType::new(if matches!(func, AggFunc::StringAgg) { SqlType::Text } else { SqlType::Numeric }),
                 range: None,
-                offset: None,
+                constant_arg: None,
             };
             let order = [SortKey { col: 0, spec: SortSpec::ASC }];
             let got = compute_partition(&rows, &order, std::slice::from_ref(&spec)).unwrap();

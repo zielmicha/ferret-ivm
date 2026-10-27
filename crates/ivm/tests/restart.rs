@@ -552,3 +552,82 @@ fn newer_formats_are_refused_untouched() {
     assert_eq!(all_files(&dir), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A data directory written by the version before ntile read its argument
+/// at the partition's first row where it is not NULL and lag and lead
+/// recomputed the rows that a negative offset, or one differing between
+/// rows, reads a change from (`perf-integration` at 58e8ea2): `ivm
+/// --retention-gsns 1000000 --tick-ms 0` ran
+///
+/// ```sql
+/// CREATE TABLE w (id int PRIMARY KEY, g int, a int);
+/// INSERT INTO w SELECT i, i % 2, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 5 + 1 END FROM generate_series(1, 90) i;
+/// CREATE MATERIALIZED VIEW nv AS SELECT id, g, ntile(a) OVER (PARTITION BY g ORDER BY id) AS n FROM w;
+/// CREATE MATERIALIZED VIEW nc AS SELECT g, n, count(*) AS c FROM nv GROUP BY g, n;
+/// CREATE MATERIALIZED VIEW lv AS SELECT id, lag(a, (id % 3 - 1)::int, -1) OVER (PARTITION BY g ORDER BY id) AS l, lead(id, -1) OVER (PARTITION BY g ORDER BY id) AS ld FROM w;
+/// CREATE MATERIALIZED VIEW cv AS SELECT id, ntile(4) OVER (PARTITION BY g ORDER BY id) AS n, lag(a, 2) OVER (PARTITION BY g ORDER BY id) AS l, lead(a) OVER (PARTITION BY g ORDER BY id) AS ld FROM w;
+/// DELETE FROM w WHERE id IN (40, 41);  -- GSN 7
+/// ```
+///
+/// and stopped on SIGTERM (final checkpoint). Its `nv` (and `nc`) hold
+/// ntile values computed from every row's argument, and its `lv` still
+/// reads the deleted rows in three rows.
+const WINDOW_REVISION: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/window-revision");
+
+/// Window operators that this version maintains otherwise than the one
+/// that wrote a data directory (`WinSpec::revised`) do not match its
+/// checkpoint: they are rebuilt from their input at the first start, with
+/// the views over them, and follow changes from then on (matched, the
+/// first change would have retracted rows they never held). Those of
+/// functions maintained as before are recovered.
+#[test]
+fn revised_window_operators_are_rebuilt() {
+    let dir = tmpdir("window-revision");
+    copy_dir(Path::new(WINDOW_REVISION), &dir);
+    let queries = [
+        ("nv", "SELECT id, g, ntile(a) OVER (PARTITION BY g ORDER BY id) AS n FROM w"),
+        ("nc", "SELECT g, n, count(*) AS c FROM (SELECT g, ntile(a) OVER (PARTITION BY g ORDER BY id) AS n FROM w) s GROUP BY g, n"),
+        ("lv", "SELECT id, lag(a, (id % 3 - 1)::int, -1) OVER (PARTITION BY g ORDER BY id) AS l, lead(id, -1) OVER (PARTITION BY g ORDER BY id) AS ld FROM w"),
+        ("cv", "SELECT id, ntile(4) OVER (PARTITION BY g ORDER BY id) AS n, lag(a, 2) OVER (PARTITION BY g ORDER BY id) AS l, lead(a) OVER (PARTITION BY g ORDER BY id) AS ld FROM w"),
+    ];
+    let check = |e: &Engine, when: &str| {
+        for (view, q) in queries {
+            let mut got = e.rows(&format!("SELECT * FROM {view}"));
+            let mut want = e.rows(q);
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "{view} {when}");
+        }
+    };
+    let e = Engine::start(&dir);
+    check(&e, "at the first start");
+    // (ntile's buckets from each partition's first argument, 3 and 2)
+    assert_eq!(e.rows("SELECT n, c FROM nc WHERE g = 1 ORDER BY n"), ["1|22", "2|22"]);
+    // rebuilt: their history starts at the restart; cv's indexes were found
+    for view in ["nv", "nc", "lv"] {
+        let err = e.err(&format!("SELECT count(*) FROM {view} AS OF 6")).message;
+        assert!(err.contains("before the history"), "{view}: {err}");
+    }
+    assert_eq!(e.rows("SELECT count(*) FROM cv AS OF 6"), ["90"]);
+    for (i, sql) in [
+        "UPDATE w SET a = 1 WHERE id = 1",
+        "DELETE FROM w WHERE id = 2",
+        "INSERT INTO w VALUES (40, 0, 4), (41, 1, NULL), (91, 1, 2)",
+        "UPDATE w SET a = NULL WHERE id IN (3, 4)",
+        "DELETE FROM w WHERE id BETWEEN 50 AND 54",
+    ]
+    .iter()
+    .enumerate()
+    {
+        e.exec(sql);
+        check(&e, &format!("after change {i}"));
+    }
+    e.exec("CHECKPOINT");
+    e.shutdown();
+    let e = Engine::start(&dir);
+    check(&e, "after another restart");
+    e.exec("UPDATE w SET a = 5 WHERE id = 5");
+    check(&e, "after the last change");
+    e.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

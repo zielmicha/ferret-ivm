@@ -1152,7 +1152,7 @@ operator name (ASCII: Table, Constant, Mfp, Union, Negate, FlatMap, DeltaJoin,
 | `Distinct` | arrangement fingerprint |
 | `SetOp` | `Debug` text `"<op><all>"` (e.g. `Exceptfalse`), left and right arrangement fingerprints |
 | `TopK` | `Debug` text of group key, limit, offset and with-ties concatenated; input arrangement fingerprint |
-| `Window` | `Debug` of partition and order; input arrangement fingerprint; per function `Debug` of function, arguments, frame, range offsets |
+| `Window` | `Debug` of partition and order; input arrangement fingerprint; per function `Debug` of function, arguments, frame, range offsets, followed by `0xF8 0x01` if the function is maintained otherwise than before (`WinSpec::revised`, see [Compatibility](#compatibility)): `ntile` whose argument is not a constant, `lag` or `lead` whose offset is not a constant of at least 0 |
 | `Recursive` | `Debug` text of the base and step plans (`Rel`), distinct flag byte, per source object: id `u64 LE` + node fingerprint |
 | `TemporalFilter` | per predicate: clock expression, operator byte (`<` 0, `<=` 1, `>` 2, `>=` 3), row expression |
 
@@ -1332,7 +1332,8 @@ Consequences of code changes for an existing data directory:
 | internal node kind 3, the checkpoint record's tree space section | format 1's kind-2 nodes and records without the section are read (see [Internal node](#internal-node) and [Checkpoint record](#checkpoint-record)): the first start reads every tree's internal nodes once, and maintenance passes then visit every subtree once |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
 | inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again, and the rebuilt arrangements' history (`arr_since`) starts at the checkpoint the engine restarted from: `AS OF` reads that need them at earlier GSNs fail |
-| semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
+| semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views (window functions: below) |
+| what a window function computes, or which rows a change recomputes, for some of its uses | the Window operator computes a partition's values before a change from its input, not from its stored output: an output stored by the old code that differs from what the new code computes would make a change retract rows the operator never emitted (negative multiplicities in the arrangements downstream). Such a change marks the affected uses in the operator's fingerprint (`WinSpec::revised`, the suffix of [`Window`](#structural-fingerprints)), so their operators are not matched and are rebuilt by hydration at the first start, with what is downstream of them, as for any fingerprint change; other uses keep their fingerprints. Marked so far (suffix `0xF8 0x01`): `ntile` whose argument is not a constant (it is read at the partition's first row where it is not NULL, where earlier versions read every row's), `lag` and `lead` whose offset is not a constant of at least 0 (earlier versions did not recompute the rows that a negative offset, or one differing between rows, reads a change from, so their output can be wrong). `crates/ivm/tests/data/window-revision`, written before, is rebuilt so by the restart tests |
 | planner or lowering changes that produce different plans for the same SQL | as for fingerprint changes: the views are rebuilt |
 | catalog SQL that no longer binds (removed syntax or functions, stricter checks) | the view (and what reads it) is marked broken at start-up: not maintained, reads of it fail with the reason; drop it or repair it with `CREATE OR REPLACE` ([Operations](user-guide/operations.md#recovery)). Stored view definitions are planned leniently: a parameter placeholder (`$1`) in a definition logged by an older version binds as NULL instead of failing |
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
@@ -1354,7 +1355,9 @@ over `bigint`, joins whose input filters or maps can fail, which have
 error-tracker inputs, and the input arrangements of window aggregates
 whose frames reach a partition's end, which carry summaries), so such a
 data directory keeps its tables and rebuilds those arrangements once at
-its first start.
+its first start; so are the window operators of `ntile` whose argument is
+not a constant and of `lag` and `lead` whose offset is not a constant of
+at least 0 (see the table above).
 `crates/ivm/tests/data/format1` is a format-1 directory that the restart
 tests migrate.
 

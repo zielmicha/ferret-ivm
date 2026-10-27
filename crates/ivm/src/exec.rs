@@ -1426,7 +1426,7 @@ fn window(rows: Rows, funcs: &[crate::sql::plan::WindowCall], schema: &[crate::t
                 ret: f.ret.clone(),
                 range: f.range.clone(),
                 // (only bounds what a change reaches)
-                offset: None,
+                constant_arg: None,
             })
             .collect();
         let mut groups: FxHashMap<Vec<u8>, Rows> = FxHashMap::default();

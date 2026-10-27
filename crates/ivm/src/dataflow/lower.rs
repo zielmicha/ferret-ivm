@@ -197,17 +197,18 @@ impl<'a> Lowerer<'a> {
             Rel::Window { input, funcs } => {
                 let l = self.lower(input)?;
                 let mut cur_schema = l.schema.clone();
-                // lag's and lead's offsets that are constants (computed by
-                // the input's pending MFP)
+                // ntile's number of buckets and lag's and lead's offsets
+                // that are constants (computed by the input's pending MFP)
                 let constant = |c: usize| match l.mfp.output_expr(c) {
-                    Expr::Literal(d, _) => d.as_i64(),
+                    Expr::Literal(d, _) => Some(d),
                     _ => None,
                 };
-                let offsets: Vec<Option<i64>> = funcs
+                let constant_args: Vec<Option<Datum>> = funcs
                     .iter()
                     .map(|f| match (f.func, f.args.get(1)) {
+                        (WindowFunc::Ntile, _) => constant(f.args[0]),
                         (WindowFunc::Lag | WindowFunc::Lead, Some(c)) => constant(*c),
-                        (WindowFunc::Lag | WindowFunc::Lead, None) => Some(1),
+                        (WindowFunc::Lag | WindowFunc::Lead, None) => Some(Datum::Int4(1)),
                         _ => None,
                     })
                     .collect();
@@ -227,15 +228,15 @@ impl<'a> Lowerer<'a> {
                     }
                     let specs_w: Vec<WinSpec> = funcs[i..j]
                         .iter()
-                        .zip(&offsets[i..j])
-                        .map(|(f, offset)| WinSpec {
+                        .zip(&constant_args[i..j])
+                        .map(|(f, constant_arg)| WinSpec {
                             func: f.func,
                             args: f.args.clone(),
                             frame: f.frame,
                             arg_types: f.args.iter().map(|a| cur_schema[*a].ty.clone()).collect(),
                             ret: f.ret.clone(),
                             range: f.range.clone(),
-                            offset: *offset,
+                            constant_arg: constant_arg.clone(),
                         })
                         .collect();
                     // (summaries for the parts of frames up to the partitions' ends)
