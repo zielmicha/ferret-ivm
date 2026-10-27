@@ -281,7 +281,9 @@ What a run does:
    `max`, `bool_and`, ordered `string_agg`, `array_agg`, `json_agg` and
    `jsonb_agg`, `percentile_cont`/`percentile_disc`, `mode()`, with
    `FILTER`), `HAVING`, `ROLLUP`, `CUBE` and `GROUPING SETS` with
-   `grouping()`, window functions with `ROWS` and `RANGE` frames,
+   `grouping()`, window functions with `ROWS` and `RANGE` frames (and
+   arguments that differ between rows: `ntile`'s number of buckets, `lag`'s
+   and `lead`'s offset and default, `nth_value`'s position),
    `DISTINCT` and `DISTINCT ON`, top-k with `LIMIT`/`OFFSET` and `FETCH
    FIRST ... WITH TIES`, set operations with and without `ALL`, derived
    tables, CTEs and `WITH RECURSIVE`, `VALUES` and set-returning functions
