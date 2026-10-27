@@ -561,9 +561,11 @@ and any row can read it), and so on.
 NULL, as PostgreSQL does: that value is the number of buckets of every row,
 counted from that row, so a change that can change that row's position or
 its argument changes every row. The operator walks the partition from its
-start to find that row before and after the GSN (`ntile_first`); if it is
-not among the first 32 entries in either version, any change is taken to
-change it. The operator reads the run those rows' values depend on — their
+start to find that row before and after the GSN (`ntile_first`), both in
+one walk of the input index with the step's changes overlaid, which also
+visits the rows the step removed (moving that row past the next one makes
+the next one the first); if it is not among the first 32 entries in either
+version, any change is taken to change it. The operator reads the run those rows' values depend on — their
 frames, except the parts that summaries or row lookups provide; whole peer
 groups; from the partition's start for `dense_rank` — computes their values
 before and after the GSN, and emits the difference. Positions outside the

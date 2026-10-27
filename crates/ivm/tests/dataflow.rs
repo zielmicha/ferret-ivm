@@ -889,3 +889,39 @@ fn reads_before_a_step_see_the_rows_it_removed() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// `ntile`'s number of buckets is the argument of the partition's first
+/// row where it is not NULL, read in both versions around a step. A step
+/// that moves that row past the next one (deleting it where it was and
+/// inserting it a little further) makes the next row the first, with
+/// another argument, and changes the bucket of every row, also of those
+/// far from the change. The version before the step must see the row the
+/// step removed from the input arrangement: without it, both versions
+/// find the next row at the same position, and only the rows near the
+/// change are recomputed.
+#[test]
+fn ntile_sees_the_first_row_a_step_removed() {
+    let dir = tmpdir("ntile-removed-first");
+    let running = coord::start(coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() }).expect("engine starts");
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE w (id int PRIMARY KEY, o int, a int)");
+    // (more rows than are recomputed whole; the first one's argument NULL)
+    exec(&h, "INSERT INTO w SELECT i, 2 * i, CASE WHEN i = 1 THEN NULL ELSE i + 1 END FROM generate_series(1, 200) i");
+    let q = "SELECT id, ntile(a) OVER (ORDER BY o) AS n FROM w";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
+    assert_eq!(rows(&h, "SELECT count(DISTINCT n) FROM v WHERE n IS NOT NULL"), ["3"]);
+    for (sql, buckets) in [
+        // (row 2, the first with an argument, behind row 3)
+        ("UPDATE w SET o = 7 WHERE id = 2", 4),
+        // (row 3 behind row 2 again)
+        ("UPDATE w SET o = 9 WHERE id = 3", 3),
+        // (row 2 changes its argument to NULL)
+        ("UPDATE w SET a = NULL WHERE id = 2", 5),
+    ] {
+        exec(&h, sql);
+        assert_eq!(rows(&h, "SELECT count(DISTINCT n) FROM v WHERE n IS NOT NULL"), [buckets.to_string()], "after {sql}");
+        assert_eq!(sorted(rows(&h, "SELECT * FROM v")), sorted(rows(&h, q)), "after {sql}");
+    }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
