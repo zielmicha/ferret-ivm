@@ -405,7 +405,9 @@ pub fn format_type(ty: &SqlType, typmod: i32) -> String {
             }
             s
         }
-        SqlType::Array(e) if typmod >= 0 => format!("{}[]", format_type(e, typmod)),
+        // (the modifier is the elements': without one, a bpchar[] is not
+        // the character(1)[] that `character[]` means)
+        SqlType::Array(e) => format!("{}[]", format_type(e, typmod)),
         _ => ty.name(),
     }
 }
