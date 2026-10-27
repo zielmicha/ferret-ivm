@@ -1042,28 +1042,48 @@ fn simple_scalar_agg(left: &Rel, right: &Rel) -> Result<Option<Rel>> {
             }
         })
         .collect();
-    // compose the peeled layers as expressions over the aggregate outputs
-    let mut exprs: Vec<Expr> = (0..na).map(Expr::Column).collect();
-    for layer in layers.iter().rev() {
-        match layer {
-            Rel::Map { exprs: m, .. } => {
-                let mut all = exprs.clone();
-                for e in m {
-                    let s = e.substitute(&all);
-                    all.push(s);
-                }
-                exprs = all;
-            }
-            Rel::Project { cols, .. } => exprs = cols.iter().map(|c| exprs[*c].clone()).collect(),
-            _ => unreachable!(),
-        }
-    }
-    if exprs.len() != 1 {
+    if right.arity() != 1 {
         return Ok(None);
     }
-    let value = exprs[0].substitute(&vals);
+    // the value: the peeled layers inlined, top-down, into one expression
+    // over the aggregate outputs, or where that would copy expressions too
+    // often or ones that may change (`Inliner`), the layers as maps over the
+    // joined row
+    let mut value = Some(Expr::Column(0));
+    for layer in &layers {
+        value = match (layer, value) {
+            (Rel::Project { cols, .. }, Some(v)) => Some(v.remapped(&|c| cols[c])),
+            (Rel::Map { input, exprs: m }, Some(v)) => {
+                let inliner = Inliner::new(input.arity(), m);
+                if inliner.stable(&v) { inliner.inline(&v) } else { None }
+            }
+            _ => None,
+        };
+    }
+    let (rel, value) = match value {
+        Some(v) => (j, v.substitute(&vals)),
+        None => {
+            let w = j.arity();
+            let mut rel = j.map(vals);
+            // positions of the current layer's columns in the row
+            let mut at: Vec<usize> = (w..w + na).collect();
+            for layer in layers.iter().rev() {
+                match layer {
+                    Rel::Map { exprs: m, .. } => {
+                        // (an expression may reference the ones before it)
+                        let base = rel.arity();
+                        at.extend(base..base + m.len());
+                        rel = rel.map(m.iter().map(|e| e.remapped(&|c| at[c])).collect());
+                    }
+                    Rel::Project { cols, .. } => at = cols.iter().map(|c| at[*c]).collect(),
+                    _ => unreachable!(),
+                }
+            }
+            (rel, Expr::Column(at[0]))
+        }
+    };
     // one aggregate row per outer row: the row count is 1
-    let out = j.map(vec![value, Expr::Literal(Datum::Int8(1), SqlType::Int8)]);
+    let out = rel.map(vec![value, Expr::Literal(Datum::Int8(1), SqlType::Int8)]);
     let a = out.arity();
     let mut proj: Vec<usize> = (0..nl).collect();
     proj.extend([a - 2, a - 1]);

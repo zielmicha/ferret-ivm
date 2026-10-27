@@ -425,6 +425,49 @@ fn computed_join_keys() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Plans of deeply nested projections are as large as the query: pushing a
+/// predicate below them, and finding the keys of a join on their computed
+/// column, used to inline their expressions into each other, doubling the
+/// result with every level of `(x + x) / 2 AS x`, so planning a view over
+/// 200 levels never finished.
+#[test]
+fn deep_projections_plan_in_linear_size() {
+    let dir = tmpdir("deep-projections");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, x int)");
+    exec(&h, "CREATE TABLE u (k int PRIMARY KEY, y int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1), (2, -2), (3, 3), (4, 0)");
+    exec(&h, "INSERT INTO u VALUES (1, 10), (3, 30), (5, 50)");
+    // ten views of 20 levels each
+    for i in 1..=10 {
+        let below = if i == 1 { "t".to_string() } else { format!("v{}", i - 1) };
+        let q = (0..20).fold(format!("SELECT id, x FROM {below}"), |q, j| format!("SELECT id, (x + x) / 2 AS x FROM ({q}) s{j}"));
+        exec(&h, &format!("CREATE VIEW v{i} AS {q}"));
+    }
+    let q = "SELECT a.id, a.x, u.y FROM v10 a JOIN u ON a.x = u.k WHERE a.x > 0";
+    exec_within(&h, &format!("CREATE MATERIALIZED VIEW m AS {q}"), 30);
+    // (not counting the indentation of the plan's 400 levels)
+    let plan = rows(&h, &format!("EXPLAIN {q}")).concat().split_whitespace().collect::<String>();
+    assert!(plan.len() < 10_000, "{} bytes of plan", plan.len());
+    assert_eq!(rows(&h, "SELECT * FROM m ORDER BY 1"), ["1|1|10", "3|3|30"]);
+    exec_within(&h, "INSERT INTO t VALUES (5, 5), (6, 7)", 30);
+    exec_within(&h, "UPDATE t SET x = 3 WHERE id = 1", 30);
+    assert_eq!(rows(&h, "SELECT * FROM m ORDER BY 1"), ["1|3|30", "3|3|30", "5|5|50"]);
+    assert_eq!(rows(&h, &format!("{q} ORDER BY 1")), rows(&h, "SELECT * FROM m ORDER BY 1"));
+    // a correlated scalar aggregate below 20 levels (the most a query
+    // parses), as one expression or, beyond the bound, maps over the join
+    let sub = (0..20).fold("SELECT sum(u.y) AS x FROM u WHERE u.k = t.id".to_string(), |q, j| format!("SELECT (x + x) / 2 AS x FROM ({q}) s{j}"));
+    let q = format!("SELECT t.id, ({sub}) AS s FROM t");
+    exec_within(&h, &format!("CREATE MATERIALIZED VIEW c AS {q}"), 30);
+    assert_eq!(rows(&h, "SELECT * FROM c ORDER BY 1"), ["1|10", "2|", "3|30", "4|", "5|50", "6|"]);
+    exec_within(&h, "INSERT INTO u VALUES (2, 20), (6, 60)", 30);
+    assert_eq!(rows(&h, "SELECT * FROM c ORDER BY 1"), ["1|10", "2|20", "3|30", "4|", "5|50", "6|60"]);
+    assert_eq!(rows(&h, &format!("{q} ORDER BY 1")), rows(&h, "SELECT * FROM c ORDER BY 1"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Expression errors in the per-input maps of a join count once per input
 /// row, whether the view was hydrated over the row or saw it arrive: the
 /// hydration of a join used to count them only for the input it scanned

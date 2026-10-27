@@ -608,6 +608,111 @@ impl Rel {
     }
 }
 
+/// How many copies of the expressions it inlines an expression inlined by
+/// `Inliner` may hold, by size.
+pub const INLINE_COPIES: u64 = 4;
+
+/// Inlines the computed columns of a `Map` into an expression over its
+/// output (a predicate pushed below it, an expression over its result):
+/// each reference to a computed column is replaced by the column's
+/// expression, with the computed columns that one references inlined in
+/// turn. A copy per reference can grow exponentially — each level of
+/// `SELECT x + x AS x FROM (...)` doubles `x` — so an expression is inlined
+/// only if that makes it larger by at most `INLINE_COPIES` times the size of
+/// the expressions it inlines. Inlining through any number of maps then adds
+/// at most that multiple of their size: expressions stay linear in the size
+/// of the plan, and so does the work of inlining them.
+pub struct Inliner<'a> {
+    /// Arity of the map's input (columns that are not inlined).
+    n: usize,
+    exprs: &'a [Expr],
+    /// Per computed column: its size with the computed columns it references
+    /// inlined (saturating).
+    sizes: Vec<u64>,
+    /// Per computed column: whether a copy of it has the same value (no
+    /// non-immutable function, `now()`, subquery or outer reference, also in
+    /// the computed columns it references).
+    stable: Vec<bool>,
+}
+
+impl<'a> Inliner<'a> {
+    /// For a map of `exprs` over an input of arity `n` (an expression may
+    /// reference the ones before it).
+    pub fn new(n: usize, exprs: &'a [Expr]) -> Inliner<'a> {
+        let mut sizes = Vec::with_capacity(exprs.len());
+        let mut stable: Vec<bool> = Vec::with_capacity(exprs.len());
+        for e in exprs {
+            let ok = e.is_deterministic()
+                && !e.contains_now()
+                && !e.has_subquery()
+                && !e.has_outer()
+                && e.column_set().iter().all(|&c| c < n || stable[c - n]);
+            sizes.push(inlined_size(e, n, &sizes));
+            stable.push(ok);
+        }
+        Inliner { n, exprs, sizes, stable }
+    }
+
+    /// Are the computed columns `e` references stable (may be copied)?
+    pub fn stable(&self, e: &Expr) -> bool {
+        e.column_set().iter().all(|&c| c < self.n || self.stable[c - self.n])
+    }
+
+    /// `e` with the computed columns inlined, or None if that would exceed
+    /// the bound. (Stability is the caller's concern.)
+    pub fn inline(&self, e: &Expr) -> Option<Expr> {
+        // the expressions inlined: the computed columns e references,
+        // directly or through other computed columns
+        let mut need = vec![false; self.exprs.len()];
+        for c in e.column_set() {
+            if c >= self.n {
+                need[c - self.n] = true;
+            }
+        }
+        let mut bound = expr_size(e);
+        for i in (0..self.exprs.len()).rev() {
+            if need[i] {
+                bound = bound.saturating_add(INLINE_COPIES.saturating_mul(expr_size(&self.exprs[i])));
+                for c in self.exprs[i].column_set() {
+                    if c >= self.n {
+                        need[c - self.n] = true;
+                    }
+                }
+            }
+        }
+        if inlined_size(e, self.n, &self.sizes) > bound {
+            return None;
+        }
+        let mut out = e.clone();
+        self.inline_into(&mut out);
+        Some(out)
+    }
+
+    fn inline_into(&self, e: &mut Expr) {
+        while let Expr::Column(c) = *e
+            && c >= self.n
+        {
+            *e = self.exprs[c - self.n].clone();
+        }
+        for x in e.children_mut() {
+            self.inline_into(x);
+        }
+    }
+}
+
+/// Number of nodes of `e` (saturating).
+fn expr_size(e: &Expr) -> u64 {
+    e.children().iter().fold(1, |s, x| s.saturating_add(expr_size(x)))
+}
+
+/// Size of `e` with the columns from `n` on (`sizes[c - n]` large) inlined.
+fn inlined_size(e: &Expr, n: usize, sizes: &[u64]) -> u64 {
+    match e {
+        Expr::Column(c) if *c >= n => sizes[c - n],
+        _ => e.children().iter().fold(1, |s, x| s.saturating_add(inlined_size(x, n, sizes))),
+    }
+}
+
 fn merge_nullability(mut a: Vec<ColumnType>, b: &[ColumnType]) -> Vec<ColumnType> {
     for (x, y) in a.iter_mut().zip(b) {
         x.nullable |= y.nullable;

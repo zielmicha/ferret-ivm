@@ -408,7 +408,6 @@ impl<'a> Lowerer<'a> {
             if inputs[j].presence.is_some() {
                 continue;
             }
-            let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
             let mut computed = false;
             let mut extra: Vec<Expr> = Vec::new();
             for e in &edges {
@@ -417,7 +416,7 @@ impl<'a> Lowerer<'a> {
                         continue;
                     }
                     let local = ex.remapped(&|c| c - offsets[j]);
-                    if local.substitute(&defs).as_column().is_some() {
+                    if local.as_column().and_then(|c| inputs[j].mfp.output_column(c)).is_some() {
                         continue;
                     }
                     computed = true;
@@ -548,8 +547,10 @@ impl<'a> Lowerer<'a> {
                     } else if let Some(k) = extra_keys[j].iter().position(|x| same_expr(x, &local)) {
                         Expr::Column(inputs[j].width + k)
                     } else {
-                        let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
-                        local.substitute(&defs)
+                        // (every other key is a column of the input's node:
+                        // the inputs with computed keys were materialized)
+                        let c = local.as_column().and_then(|c| inputs[j].mfp.output_column(c));
+                        Expr::Column(c.ok_or_else(|| SqlError::internal("join key is not a column of its input"))?)
                     };
                     pairs.push((raw, oe.clone(), e.null_safe));
                 }
@@ -595,8 +596,7 @@ impl<'a> Lowerer<'a> {
             if pk.is_empty() {
                 return false;
             }
-            let defs: Vec<Expr> = (0..inp.width).map(|c| inp.mfp.output_expr(c)).collect();
-            let raw: Vec<Option<usize>> = keys.iter().map(|k| k.substitute(&defs).as_column()).collect();
+            let raw: Vec<Option<usize>> = keys.iter().map(|k| k.as_column().and_then(|c| inp.mfp.output_column(c))).collect();
             return pk.iter().all(|p| raw.contains(&Some(*p)));
         }
         false
