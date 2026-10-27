@@ -1,5 +1,10 @@
 # ivm — incremental view maintenance over PostgreSQL
 
+Human note: This project is fully vibe-coded based on careful initial design. 
+It seems reasonable, but isn't yet really tested or production ready.
+
+## READMe
+
 ivm replicates PostgreSQL tables through logical replication, maintains SQL
 views over them incrementally, and serves the results over the PostgreSQL
 wire protocol: point-in-time and read-your-writes reads, `SUBSCRIBE` change
