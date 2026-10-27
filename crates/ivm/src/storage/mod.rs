@@ -99,11 +99,16 @@ pub struct EnvOptions {
     pub leaf_bytes: usize,
     pub internal_bytes: usize,
     pub segment_bytes: u64,
+    /// Segment files kept open for reading at most, by the environment and
+    /// its forks and checkpoint jobs together (others are opened again when
+    /// read); None: a quarter of the process's limit on open files
+    /// (`segment::default_max_open`).
+    pub max_open_segments: Option<usize>,
 }
 
 impl Default for EnvOptions {
     fn default() -> Self {
-        EnvOptions { cache_bytes: 1 << 30, leaf_bytes: 16 << 10, internal_bytes: 16 << 10, segment_bytes: 256 << 20 }
+        EnvOptions { cache_bytes: 1 << 30, leaf_bytes: 16 << 10, internal_bytes: 16 << 10, segment_bytes: 256 << 20, max_open_segments: None }
     }
 }
 
@@ -451,7 +456,8 @@ impl Env {
         }
         let (manifest, rec) = Manifest::open(dir)?;
         let (active_seg, active_len) = rec.as_ref().map(|r| (r.active_seg, r.active_len)).unwrap_or((1, 0));
-        let segs = SegmentStore::open(dir, active_seg, active_len, opts.segment_bytes)?;
+        let max_open = opts.max_open_segments.unwrap_or_else(segment::default_max_open);
+        let segs = SegmentStore::open(dir, active_seg, active_len, opts.segment_bytes, max_open)?;
         let opts_cache = opts.cache_bytes;
         let mut env = Env {
             dir: dir.to_path_buf(),
@@ -519,13 +525,18 @@ impl Env {
                 Some(Recovered { gsn: r.gsn, app: r.app })
             }
         };
-        // remove segment files not referenced by the checkpoint (torn writes)
+        // remove the sealed segment files without live nodes in the
+        // checkpoint: those it does not mention (torn writes), and those
+        // it does, dead, that were not deleted yet (no fork of the previous
+        // run reads them any more)
+        let active = env.segs.active_id();
+        env.seg_live.retain(|id, (_, live)| *live > 0 || *id == active);
         for id in env.segs.list()? {
-            if id != env.segs.active_id() && !env.seg_live.contains_key(&id) {
+            if id != active && !env.seg_live.contains_key(&id) {
                 env.segs.delete(id)?;
             }
         }
-        env.seg_live.entry(env.segs.active_id()).or_insert((active_len, 0));
+        env.seg_live.entry(active).or_insert((active_len, 0));
         Ok((env, recovered))
     }
 
@@ -2464,8 +2475,10 @@ impl Env {
     /// garbage from the start. A node marked clean is accounted as it would
     /// have been had it been written here (`write_node`). Then delete the
     /// sealed segments dead in the committed checkpoint that are dead here
-    /// too (and not pinned by a fork): this environment may have written
-    /// to them or adopted trees with nodes in them since the job began.
+    /// too: this environment may have written to them or adopted trees with
+    /// nodes in them since the job began. (Those that a fork may still
+    /// read are deleted once it is dropped; those a fork wrote to are kept
+    /// for a later checkpoint.)
     pub fn finish_checkpoint(&mut self, done: CheckpointDone) -> Result<()> {
         self.manifest = Some(done.manifest);
         self.frozen_at = None;
@@ -2632,9 +2645,10 @@ impl Env {
     /// and cannot take checkpoints. Its pool counts only its own nodes
     /// against its target: those it loads, creates or modifies, and those
     /// it inherited that nobody else holds any more; it writes and evicts
-    /// them like any pool (the segments it writes to are pinned until it is
-    /// dropped). Trees created empty here and filled in a fork can be moved
-    /// back with `adopt_trees`.
+    /// them like any pool. Until it is dropped, the segments it may read
+    /// and those it writes to stay on disk, also once dead. Trees created
+    /// empty here and filled in a fork can be moved back with
+    /// `adopt_trees`.
     pub fn fork(&self) -> Result<Env> {
         let mut slots = self.slots.clone();
         for s in slots.iter_mut().flatten() {
@@ -2643,9 +2657,7 @@ impl Env {
         Ok(Env {
             dir: self.dir.clone(),
             opts: self.opts.clone(),
-            // (segments holding nodes: others may be gone, deleted by a
-            // checkpoint finished since they died)
-            segs: self.segs.fork(self.seg_live.iter().filter(|(_, (_, live))| *live > 0).map(|(id, _)| *id))?,
+            segs: self.segs.fork(),
             slots,
             free_slots: self.free_slots.clone(),
             mem_bytes: self.mem_bytes,

@@ -568,6 +568,8 @@ fn check_structure(env: &mut Env, legacy: bool, compacted_at: Option<Gsn>) {
     }
     let mem: usize = env.slots.iter().flatten().map(|s| s.mem).sum();
     assert_eq!(env.mem_bytes, mem, "mem_bytes");
+    let open = env.segs.open_files().0;
+    assert!(open <= env.segs.max_open(), "{open} segment files open, beyond the bound of {}", env.segs.max_open());
     let _ = env.dirty_bytes(); // debug-asserts the dirty byte count
     for (seg, (total, live)) in &env.seg_live {
         assert_eq!(*live, w.live.get(seg).copied().unwrap_or(0), "live bytes of segment {seg}");
@@ -580,7 +582,8 @@ fn check_structure(env: &mut Env, legacy: bool, compacted_at: Option<Gsn>) {
 
 /// Segment files on disk match the accounting (call when no checkpoint is in
 /// progress). `after_checkpoint`: dead segments must be gone (unless a fork
-/// that wrote to them pins them).
+/// that wrote to them pins them), or, if a fork may read them, be left to
+/// the store.
 fn check_segment_files(env: &mut Env, after_checkpoint: bool) {
     // (what forks appended, and what is still buffered)
     env.count_foreign();
@@ -602,8 +605,12 @@ fn check_segment_files(env: &mut Env, after_checkpoint: bool) {
             assert!(*live > 0, "dead segment {seg} survived a checkpoint");
         }
     }
+    let deferred = env.segs.deferred();
     for seg in files.keys() {
-        assert!(env.seg_live.contains_key(seg), "stray segment file {seg}");
+        assert!(env.seg_live.contains_key(seg) || deferred.contains(seg), "stray segment file {seg}");
+    }
+    for seg in &deferred {
+        assert!(!env.seg_live.contains_key(seg) && files.contains_key(seg), "dead segment {seg} kept for forks");
     }
 }
 
@@ -816,6 +823,9 @@ impl Harness {
             return;
         }
         self.event("check fork");
+        if !self.env().segs.deferred().is_empty() {
+            self.event("check fork: dead segments kept for forks");
+        }
         let i = self.rng.index(self.forks.len());
         let (mut f, mut model, mut frontier, now) = self.forks.remove(i);
         let legacy = self.legacy;
@@ -893,6 +903,7 @@ impl Harness {
         self.meanwhile();
         if self.rng.chance(10) {
             self.event("crash: before background checkpoint written");
+            self.env().segs.crash();
             drop(job);
             self.env = None;
             self.forks.clear();
@@ -904,6 +915,7 @@ impl Harness {
         self.since.drain(..since_freeze);
         if self.rng.chance(10) {
             self.event("crash: before background checkpoint finished");
+            self.env().segs.crash();
             drop(done);
             self.env = None;
             self.forks.clear();
@@ -1027,6 +1039,8 @@ impl Harness {
         if variant >= 4 && self.ckpt.durable {
             return self.crash_in_checkpoint(variant == 5);
         }
+        // (dead segments the forks may read are left behind)
+        self.env().segs.crash();
         self.forks.clear();
         if self.rng.chance(50) {
             self.crash_after_early_writes();
@@ -1125,6 +1139,7 @@ impl Harness {
         let (gsn, app) = (self.gsn, format!("checkpoint {} at {}", self.checkpoints, self.gsn).into_bytes());
         self.env().checkpoint(gsn, &app).unwrap();
         let after = files(&self.dir);
+        self.env().segs.crash();
         self.env = None;
         self.forks.clear();
         let mut image: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -1180,6 +1195,9 @@ impl Harness {
     fn finish(&mut self) {
         // (forks pin the segments they wrote to)
         self.forks.clear();
+        assert_eq!(self.env().segs.deferred(), Vec::<u32>::new(), "dead segments kept with no fork left");
+        let opened = self.env().segs.open_files().1;
+        *self.events.entry("segment files opened").or_default() += opened;
         for _ in 0..3 {
             self.gc_round();
         }
@@ -1213,9 +1231,11 @@ fn arb_setup() -> impl Strategy<Value = Setup> {
         select(vec![1 << 20, 64 << 10, 8 << 10, 2 << 10]),
         select(vec![10, 3, 1, 0, 50]),
         select(vec![false, true]),
+        // (segment files open at once: closed and opened again all the time)
+        select(vec![1, 2, 4]),
     )
-        .prop_map(|(cache_bytes, leaf_bytes, internal_bytes, segment_bytes, retention, legacy)| Setup {
-            opts: EnvOptions { cache_bytes, leaf_bytes, internal_bytes, segment_bytes },
+        .prop_map(|(cache_bytes, leaf_bytes, internal_bytes, segment_bytes, retention, legacy, max_open)| Setup {
+            opts: EnvOptions { cache_bytes, leaf_bytes, internal_bytes, segment_bytes, max_open_segments: Some(max_open) },
             retention,
             legacy,
         })
@@ -1466,7 +1486,13 @@ impl HistModel {
 #[test]
 fn checkpoints_do_not_record_temporary_trees() {
     let tmp = TempDir::new("storage-temp");
-    let opts = EnvOptions { cache_bytes: 64 << 10, leaf_bytes: 1024, internal_bytes: 1024, segment_bytes: 256 << 10 };
+    let opts = EnvOptions {
+        cache_bytes: 64 << 10,
+        leaf_bytes: 1024,
+        internal_bytes: 1024,
+        segment_bytes: 256 << 10,
+        ..EnvOptions::default()
+    };
     let (mut env, _) = Env::open(tmp.path(), opts.clone()).unwrap();
     let t = env.create_tree(Arc::new(CountSummarizer));
     let tmpt = env.create_temp_tree(Arc::new(CountSummarizer));
@@ -1495,7 +1521,13 @@ fn checkpoints_do_not_record_temporary_trees() {
 #[test]
 fn dirty_data_larger_than_the_cache_is_evictable() {
     let tmp = TempDir::new("storage-dirty");
-    let opts = EnvOptions { cache_bytes: 256 << 10, leaf_bytes: 2048, internal_bytes: 2048, segment_bytes: 1 << 20 };
+    let opts = EnvOptions {
+        cache_bytes: 256 << 10,
+        leaf_bytes: 2048,
+        internal_bytes: 2048,
+        segment_bytes: 1 << 20,
+        ..EnvOptions::default()
+    };
     let (mut env, _) = Env::open(tmp.path(), opts.clone()).unwrap();
     let a = env.create_tree(Arc::new(CountSummarizer));
     let b = env.create_tree(Arc::new(CountSummarizer));
@@ -1537,7 +1569,13 @@ fn dirty_data_larger_than_the_cache_is_evictable() {
 #[test]
 fn tree_builder_sorts_in_bounded_memory() {
     let tmp = TempDir::new("storage-builder");
-    let opts = EnvOptions { cache_bytes: 64 << 10, leaf_bytes: 1024, internal_bytes: 1024, segment_bytes: 256 << 10 };
+    let opts = EnvOptions {
+        cache_bytes: 64 << 10,
+        leaf_bytes: 1024,
+        internal_bytes: 1024,
+        segment_bytes: 256 << 10,
+        ..EnvOptions::default()
+    };
     let (mut env, _) = Env::open(tmp.path(), opts.clone()).unwrap();
     let t = env.create_tree(summarizer(Kind::Int));
     let mut b = TreeBuilder::with_limits(t, 7, 8 << 10, 3);
@@ -1574,7 +1612,13 @@ fn time_travel_crashes_and_gc_against_model() {
     for seed in [0x9E3779B97F4A7C15u64, 0xD1B54A32D192ED03, 0x2545F4914F6CDD1D] {
         let tmp = TempDir::new(&format!("storage-tt-{seed:x}"));
         let dir = tmp.path().to_path_buf();
-        let opts = EnvOptions { cache_bytes: 16 << 10, leaf_bytes: 400, internal_bytes: 300, segment_bytes: 16 << 10 };
+        let opts = EnvOptions {
+            cache_bytes: 16 << 10,
+            leaf_bytes: 400,
+            internal_bytes: 300,
+            segment_bytes: 16 << 10,
+            ..EnvOptions::default()
+        };
         let spec = vec![AggKind::SumNumeric, AggKind::Min, AggKind::Max, AggKind::CountNonNull];
         let summ: Arc<dyn Summarizer> = Arc::new(TextNumSummarizer { spec: spec.clone() });
         let (mut env, _) = Env::open(&dir, opts.clone()).unwrap();
@@ -2076,13 +2120,21 @@ fn dropping_a_tree_reads_nothing() {
 }
 
 /// A fork reads a tree that the environment dropped after it was taken,
-/// whose segments a checkpoint deleted since (the fork holds their files
-/// open); a segment a fork wrote to is kept while the fork lives, and a
+/// whose segments a checkpoint found dead since: they stay on disk while
+/// the fork lives (it opens their files again, one at a time) and are
+/// deleted when it is dropped, while a fork taken after they died does not
+/// keep them; a segment a fork wrote to is kept while the fork lives, and a
 /// tree it filled there is adopted with its nodes on disk.
 #[test]
 fn forks_read_dropped_trees_and_pin_what_they_write() {
     let tmp = TempDir::new("storage-fork-drop");
-    let opts = EnvOptions { cache_bytes: 128 << 10, leaf_bytes: 2048, internal_bytes: 2048, segment_bytes: 256 << 10 };
+    let opts = EnvOptions {
+        cache_bytes: 128 << 10,
+        leaf_bytes: 2048,
+        internal_bytes: 2048,
+        segment_bytes: 256 << 10,
+        max_open_segments: Some(1),
+    };
     let (mut env, _) = Env::open(tmp.path(), opts).unwrap();
     let keep = env.create_tree(Arc::new(CountSummarizer));
     let t = env.create_tree(Arc::new(CountSummarizer));
@@ -2095,7 +2147,14 @@ fn forks_read_dropped_trees_and_pin_what_they_write() {
     env.checkpoint(2, b"").unwrap();
     let left: Vec<u32> = env.stats().segments.iter().map(|s| s.0).collect();
     assert!(left.len() <= 2, "the dropped tree's segments were kept: {left:?}");
-    // the fork still reads all of it, from files deleted since
+    let dead = env.segs.deferred();
+    assert!(dead.len() >= 3, "dead segments kept for the fork: {dead:?}");
+    for s in &dead {
+        assert!(!left.contains(s) && segment::segment_path(tmp.path(), *s).exists(), "segment {s} the fork may read");
+    }
+    let late = env.fork().unwrap();
+    // the fork still reads all of it, from those files
+    let opened = env.segs.open_files().1;
     let mut n = 0;
     fork.for_each(t, Bound::Unbounded, Bound::Unbounded, &mut |_, _| {
         n += 1;
@@ -2103,6 +2162,8 @@ fn forks_read_dropped_trees_and_pin_what_they_write() {
     })
     .unwrap();
     assert_eq!(n, 40_000);
+    let (open, now) = fork.segs.open_files();
+    assert!(open == 1 && now >= opened + dead.len() as u64, "segment files open: {open}, opened {} since", now - opened);
     // a tree filled in the fork, larger than its pool: written early
     fork.apply(filled, &mut (0..30_000u64).map(|i| (key8(i, 20), 1)).collect(), 3).unwrap();
     assert!(!fork.trees[&filled].seg_live.is_empty(), "the fork wrote nothing early");
@@ -2114,6 +2175,13 @@ fn forks_read_dropped_trees_and_pin_what_they_write() {
     }
     env.adopt_trees(&mut fork, &[filled]).unwrap();
     drop(fork);
+    // (the fork taken after they died does not keep them)
+    let deferred = env.segs.deferred();
+    for s in &dead {
+        let kept = deferred.contains(s) || segment::segment_path(tmp.path(), *s).exists();
+        assert!(!kept, "dead segment {s} kept after the fork was dropped");
+    }
+    drop(late);
     assert_eq!(env.tree_count(filled), 30_000);
     check_structure(&mut env, false, None);
     env.checkpoint(5, b"").unwrap();

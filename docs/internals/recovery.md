@@ -58,8 +58,9 @@ with status 1 at once) and accepts connections only once recovery is done.
    whose CRC is valid, and truncate a torn tail. Re-open the active segment
    truncated to the recorded length, delete segment files the record does
    not list (this discards the nodes written after the record, early by the
-   buffer pool or by an interrupted checkpoint), and register every tree
-   root as *recovered but not attached*.
+   buffer pool or by an interrupted checkpoint) or lists without live bytes
+   (dead segments a fork kept, or that a crash left), and register every
+   tree root as *recovered but not attached*.
    A manifest that has contents but no valid record, or a missing manifest
    while segment files hold data, stops the start before anything is
    modified: the checkpoint may have existed, and the log may already be
@@ -239,7 +240,8 @@ Back on the engine thread, once it is written (the thread sends `Wake`):
 
 5. `Env::finish_checkpoint`: mark the written nodes that did not change
    meanwhile clean, and delete the segments dead in the checkpoint that are
-   dead in the engine's state too and that no fork pins;
+   dead in the engine's state too and that no fork pins (those a fork may
+   still read are deleted once it is dropped);
 6. send `Truncate(checkpoint GSN)` to the sequencer, which deletes log
    segments whose records all lie at or before the checkpoint: recovery
    replays the log after the checkpoint, and nothing else reads the log

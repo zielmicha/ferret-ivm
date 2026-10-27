@@ -26,6 +26,8 @@ num-integer = "0.1.47"
 mimalloc = { version = "0.1.52", default-features = false }
 # graceful shutdown of the server binary on SIGINT / SIGTERM
 signal-hook = "0.3"
+# the limit on open files (RLIMIT_NOFILE), which bounds the segment files kept open
+libc = "0.2.191"
 # web UI (--http-listen): HTTP/1.1 server on its own tokio runtime
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }

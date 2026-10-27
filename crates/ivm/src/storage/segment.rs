@@ -4,6 +4,13 @@
 //! active segment (as do early writes of dirty nodes); sealed segments never
 //! change, which makes continuous incremental backup a matter of copying
 //! new files.
+//!
+//! A store keeps a bounded number of segment files open for reading, which
+//! every version of it shares, and opens a file again when it needs it: a
+//! store of any size and any number of forks holds a fixed number of
+//! descriptors. Nothing depends on a file staying open, so a dead segment
+//! that a fork may still read stays on disk until the fork is dropped
+//! ([`SegmentStore::delete`]).
 
 use super::node::DiskLoc;
 use crate::error::{Result, SqlError};
@@ -21,21 +28,35 @@ const FRAME_HEADER: usize = 8; // u32 len, u32 crc
 /// The segment files of a store as one environment sees them: read access
 /// (`SegmentReader`) and the append side (`SharedWriter`), which every
 /// version of the store shares — the environment, its checkpoint job and
-/// its forks append to the same active segment, each frame in one piece.
+/// its forks read through the same open files and append to the same
+/// active segment, each frame in one piece.
 pub struct SegmentStore {
     reader: Arc<SegmentReader>,
     writer: Arc<SharedWriter>,
-    /// In a fork: the segments it appended to, pinned against deletion until
-    /// it is dropped (its trees may be adopted, frames and all).
-    pins: Option<BTreeSet<u32>>,
+    /// In a fork: its number among the store's forks (`SegmentWriter::forks`)
+    /// and the segments it appended to, pinned against deletion until it is
+    /// dropped (its trees may be adopted, frames and all).
+    fork: Option<(u64, BTreeSet<u32>)>,
 }
 
-/// Read access to segment files by location. Files are opened on first use
-/// and stay open, so that a fork of the environment keeps reading segments
-/// that a later checkpoint deletes (see [`SegmentStore::fork`]).
+/// Read access to segment files by location, through at most `cap` open
+/// files: a file is opened on first use and closed again, the least
+/// recently used first, to open another beyond the bound.
 struct SegmentReader {
     dir: PathBuf,
-    files: Mutex<FxHashMap<u32, Arc<File>>>,
+    files: Mutex<OpenFiles>,
+}
+
+/// The open files of a `SegmentReader`, replaced in CLOCK order.
+struct OpenFiles {
+    cap: usize,
+    /// (segment, file, used since the hand last passed it)
+    open: Vec<(u32, Arc<File>, bool)>,
+    /// Segment -> its position in `open`.
+    at: FxHashMap<u32, usize>,
+    hand: usize,
+    /// Files opened so far.
+    opened: u64,
 }
 
 /// The append side shared by every version of a store.
@@ -48,6 +69,7 @@ struct SharedWriter {
 }
 
 /// Appends node frames to the active segment and rolls over to the next.
+/// It also tracks what the forks of the store keep on disk.
 struct SegmentWriter {
     dir: PathBuf,
     active_id: u32,
@@ -57,8 +79,9 @@ struct SegmentWriter {
     /// Pending bytes not yet written.
     buf: Vec<u8>,
     max_segment_bytes: u64,
-    /// Segments rolled since the last sync that still need fsync.
-    unsynced: Vec<Arc<File>>,
+    /// Segments rolled since the last sync that still need fsync (their
+    /// files are closed: a sync opens them again).
+    unsynced: Vec<u32>,
     /// Segments forks appended to, with the number of forks pinning each.
     pinned: BTreeMap<u32, usize>,
     /// Bytes forks appended per segment, not yet counted in the totals of
@@ -66,6 +89,28 @@ struct SegmentWriter {
     foreign: BTreeMap<u32, u64>,
     /// Lengths of the segments this process sealed (rolled over from).
     sealed: BTreeMap<u32, u64>,
+    /// The live forks by number (in the order they were taken), each with
+    /// the active segment when it was taken: it may read the segments up
+    /// to that one, those that held its nodes.
+    forks: BTreeMap<u64, u32>,
+    next_fork: u64,
+    /// Dead segments that a live fork may still read, each with the number
+    /// of the next fork when it was found dead (the forks taken from then
+    /// on cannot read it): deleted once no fork before that remains whose
+    /// segments reach it.
+    deferred: Vec<(u32, u64)>,
+}
+
+/// How many segment files a store keeps open for reading unless told
+/// otherwise (`EnvOptions::max_open_segments`): a quarter of the process's
+/// limit on open files (`RLIMIT_NOFILE`, its soft limit), at least 8 and at
+/// most 65,536. The rest of the limit is left to connections, the input
+/// log and the like.
+pub fn default_max_open() -> usize {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit only writes the struct it is given.
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 { lim.rlim_cur } else { 1024 };
+    (soft / 4).clamp(8, 1 << 16) as usize
 }
 
 pub fn segment_path(dir: &Path, id: u32) -> PathBuf {
@@ -77,8 +122,9 @@ fn pack(id: u32, len: u64) -> u64 {
 }
 
 impl SegmentStore {
-    /// Open the store with `active_id` as the active segment, truncated to `active_len`.
-    pub fn open(dir: &Path, active_id: u32, active_len: u64, max_segment_bytes: u64) -> Result<SegmentStore> {
+    /// Open the store with `active_id` as the active segment, truncated to
+    /// `active_len`, reading through at most `max_open` open files.
+    pub fn open(dir: &Path, active_id: u32, active_len: u64, max_segment_bytes: u64, max_open: usize) -> Result<SegmentStore> {
         std::fs::create_dir_all(dir)?;
         let path = segment_path(dir, active_id);
         let created = !path.exists();
@@ -98,10 +144,14 @@ impl SegmentStore {
             pinned: BTreeMap::new(),
             foreign: BTreeMap::new(),
             sealed: BTreeMap::new(),
+            forks: BTreeMap::new(),
+            next_fork: 0,
+            deferred: Vec::new(),
         };
         let writer = Arc::new(SharedWriter { written: AtomicU64::new(pack(active_id, active_len)), w: Mutex::new(w) });
-        let reader = Arc::new(SegmentReader { dir: dir.to_path_buf(), files: Mutex::new(FxHashMap::default()) });
-        Ok(SegmentStore { reader, writer, pins: None })
+        let files = OpenFiles { cap: max_open.max(1), open: Vec::new(), at: FxHashMap::default(), hand: 0, opened: 0 };
+        let reader = Arc::new(SegmentReader { dir: dir.to_path_buf(), files: Mutex::new(files) });
+        Ok(SegmentStore { reader, writer, fork: None })
     }
 
     pub fn active_id(&self) -> u32 {
@@ -112,7 +162,7 @@ impl SegmentStore {
     pub fn append(&mut self, payload: &[u8]) -> Result<DiskLoc> {
         let mut w = self.writer.w.lock();
         let loc = w.append(payload, &self.writer.written)?;
-        if let Some(pins) = &mut self.pins {
+        if let Some((_, pins)) = &mut self.fork {
             *w.foreign.entry(loc.seg).or_default() += loc.len as u64;
             if pins.insert(loc.seg) {
                 *w.pinned.entry(loc.seg).or_default() += 1;
@@ -127,13 +177,16 @@ impl SegmentStore {
     /// version's appends counted). The files are synced outside the lock:
     /// others go on appending meanwhile, after that length.
     pub fn sync(&self) -> Result<(u32, u64, BTreeMap<u32, u64>)> {
-        let (files, active, durable) = {
+        let (rolled, active, durable) = {
             let mut w = self.writer.w.lock();
             w.write_buffer(&self.writer.written)?;
             (std::mem::take(&mut w.unsynced), w.active.clone(), (w.active_id, w.written_len, w.sealed.clone()))
         };
-        for f in files {
-            f.sync_data()?;
+        // (a write-back error of a file is reported to the next fsync
+        // through any descriptor that has not seen it, also one opened
+        // after the error, as on Linux since 4.13)
+        for id in rolled {
+            OpenOptions::new().write(true).open(segment_path(&self.reader.dir, id))?.sync_data()?;
         }
         active.sync_data()?;
         Ok(durable)
@@ -142,20 +195,20 @@ impl SegmentStore {
     /// Another view of this store, with its read access and append side
     /// (for a checkpoint job).
     pub fn share(&self) -> SegmentStore {
-        SegmentStore { reader: self.reader.clone(), writer: self.writer.clone(), pins: None }
+        SegmentStore { reader: self.reader.clone(), writer: self.writer.clone(), fork: None }
     }
 
-    /// The store as a fork of the environment sees it: the files of
-    /// segments `ids` stay open in it, so it can read its nodes after a
-    /// checkpoint of the environment deleted their segments, and the
-    /// segments it appends to are pinned until it is dropped.
-    pub fn fork(&self, ids: impl IntoIterator<Item = u32>) -> Result<SegmentStore> {
-        let mut files = FxHashMap::default();
-        for id in ids {
-            files.insert(id, self.reader.file(id)?);
-        }
-        let reader = Arc::new(SegmentReader { dir: self.reader.dir.clone(), files: Mutex::new(files) });
-        Ok(SegmentStore { reader, writer: self.writer.clone(), pins: Some(BTreeSet::new()) })
+    /// The store as a fork of the environment sees it: until it is
+    /// dropped, the segments it may read — those up to the active one, as
+    /// they hold every node it inherits — stay on disk once dead
+    /// (`delete`), and so do the segments it appends to.
+    pub fn fork(&self) -> SegmentStore {
+        let mut w = self.writer.w.lock();
+        let n = w.next_fork;
+        w.next_fork += 1;
+        let active = w.active_id;
+        w.forks.insert(n, active);
+        SegmentStore { reader: self.reader.clone(), writer: self.writer.clone(), fork: Some((n, BTreeSet::new())) }
     }
 
     pub fn read(&self, loc: DiskLoc) -> Result<Vec<u8>> {
@@ -185,26 +238,59 @@ impl SegmentStore {
         w.written_len + w.buf.len() as u64
     }
 
-    /// Delete sealed segment `id`, unless it is the active one or a fork
-    /// pins it; returns whether it did.
+    /// Delete sealed segment `id`, dead in the environment. Returns whether
+    /// the environment is done with it: it is deleted now, or, while a
+    /// fork that may read it lives (one taken when `id` was the active
+    /// segment or an older one), once no such fork remains. It is kept,
+    /// and the environment tries again later, if it is the active segment
+    /// or a fork appended to it: that fork's trees may still be adopted,
+    /// with nodes in it.
     pub fn delete(&self, id: u32) -> Result<bool> {
         let mut w = self.writer.w.lock();
         if id == w.active_id || w.pinned.contains_key(&id) {
             return Ok(false);
         }
         w.sealed.remove(&id);
-        self.reader.files.lock().remove(&id);
-        let p = segment_path(&self.reader.dir, id);
-        if p.exists() {
-            std::fs::remove_file(p)?;
+        w.foreign.remove(&id);
+        if w.forks.values().any(|active| *active >= id) {
+            let next = w.next_fork;
+            w.deferred.push((id, next));
+            return Ok(true);
         }
+        drop(w);
+        self.reader.unlink(id)?;
         Ok(true)
     }
 
-    /// Does a fork pin segment `id`?
+    /// Does a fork pin segment `id` (did it append to it)?
     #[cfg(test)]
     pub(super) fn pinned(&self, id: u32) -> bool {
         self.writer.w.lock().pinned.contains_key(&id)
+    }
+
+    /// Dead segments kept on disk for the forks that may read them.
+    #[cfg(test)]
+    pub(super) fn deferred(&self) -> Vec<u32> {
+        self.writer.w.lock().deferred.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// The process dies: forks dropped from now on delete nothing.
+    #[cfg(test)]
+    pub(super) fn crash(&self) {
+        self.writer.w.lock().deferred.clear();
+    }
+
+    /// Files open for reading, and opened so far.
+    #[cfg(test)]
+    pub(super) fn open_files(&self) -> (usize, u64) {
+        let f = self.reader.files.lock();
+        (f.open.len(), f.opened)
+    }
+
+    /// The bound on the files open for reading.
+    #[cfg(test)]
+    pub(super) fn max_open(&self) -> usize {
+        self.reader.files.lock().cap
     }
 
     /// Bytes that forks appended since the last call, per segment.
@@ -230,16 +316,31 @@ impl SegmentStore {
 }
 
 impl Drop for SegmentStore {
+    /// A fork releases what it kept on disk, and deletes the dead segments
+    /// no remaining fork may read.
     fn drop(&mut self) {
-        if let Some(pins) = self.pins.take().filter(|p| !p.is_empty()) {
-            let mut w = self.writer.w.lock();
+        let Some((n, pins)) = self.fork.take() else { return };
+        let gone: Vec<(u32, u64)> = {
+            let mut guard = self.writer.w.lock();
+            let w = &mut *guard;
+            w.forks.remove(&n);
             for id in pins {
-                if let Some(n) = w.pinned.get_mut(&id) {
-                    *n -= 1;
-                    if *n == 0 {
+                if let Some(c) = w.pinned.get_mut(&id) {
+                    *c -= 1;
+                    if *c == 0 {
                         w.pinned.remove(&id);
                     }
                 }
+            }
+            let forks = &w.forks;
+            let (kept, gone) = w.deferred.drain(..).partition(|(id, next)| forks.range(..*next).any(|(_, active)| active >= id));
+            w.deferred = kept;
+            gone
+        };
+        for (id, _) in gone {
+            if let Err(e) = self.reader.unlink(id) {
+                // (the next start deletes it: dead in the manifest, or not in it)
+                log::warn!("cannot delete dead segment {id}: {e}");
             }
         }
     }
@@ -273,18 +374,15 @@ impl SegmentWriter {
 
     fn roll(&mut self, written: &AtomicU64) -> Result<()> {
         self.write_buffer(written)?;
-        let old = std::mem::replace(
-            &mut self.active,
-            Arc::new(
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(segment_path(&self.dir, self.active_id + 1))?,
-            ),
+        self.active = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(segment_path(&self.dir, self.active_id + 1))?,
         );
-        self.unsynced.push(old);
+        self.unsynced.push(self.active_id);
         self.sealed.insert(self.active_id, self.written_len);
         self.active_id += 1;
         self.written_len = 0;
@@ -297,13 +395,21 @@ impl SegmentWriter {
 
 impl SegmentReader {
     fn file(&self, id: u32) -> Result<Arc<File>> {
-        if let Some(f) = self.files.lock().get(&id) {
-            return Ok(f.clone());
+        if let Some(f) = self.files.lock().get(id) {
+            return Ok(f);
         }
+        // (opened outside the lock; should another thread open it
+        // meanwhile, one of the two is closed)
         let f = Arc::new(
             File::open(segment_path(&self.dir, id)).map_err(|e| SqlError::corrupt(format!("cannot open segment {id}: {e}")))?,
         );
-        self.files.lock().insert(id, f.clone());
+        let mut files = self.files.lock();
+        if let Some(f) = files.get(id) {
+            return Ok(f);
+        }
+        let closed = files.insert(id, f.clone());
+        drop(files);
+        drop(closed);
         Ok(f)
     }
 
@@ -312,6 +418,58 @@ impl SegmentReader {
         let mut frame = vec![0u8; loc.len as usize];
         self.file(loc.seg)?.read_exact_at(&mut frame, loc.off)?;
         check_frame(frame, loc)
+    }
+
+    /// Close segment `id`'s file and delete it.
+    fn unlink(&self, id: u32) -> Result<()> {
+        let closed = self.files.lock().remove(id);
+        drop(closed);
+        let p = segment_path(&self.dir, id);
+        if p.exists() {
+            std::fs::remove_file(p)?;
+        }
+        Ok(())
+    }
+}
+
+impl OpenFiles {
+    fn get(&mut self, id: u32) -> Option<Arc<File>> {
+        let i = *self.at.get(&id)?;
+        self.open[i].2 = true;
+        Some(self.open[i].1.clone())
+    }
+
+    /// Keep `f` open as segment `id`'s file; beyond the bound, in place of
+    /// the first file the hand finds unused since it last passed, which is
+    /// returned (to be closed outside the lock; a reader still using it
+    /// keeps it open until it is done).
+    fn insert(&mut self, id: u32, f: Arc<File>) -> Option<Arc<File>> {
+        self.opened += 1;
+        if self.open.len() < self.cap {
+            self.at.insert(id, self.open.len());
+            self.open.push((id, f, true));
+            return None;
+        }
+        while std::mem::replace(&mut self.open[self.hand].2, false) {
+            self.hand = (self.hand + 1) % self.open.len();
+        }
+        let (old, closed, _) = std::mem::replace(&mut self.open[self.hand], (id, f, true));
+        self.at.remove(&old);
+        self.at.insert(id, self.hand);
+        self.hand = (self.hand + 1) % self.open.len();
+        Some(closed)
+    }
+
+    fn remove(&mut self, id: u32) -> Option<Arc<File>> {
+        let i = self.at.remove(&id)?;
+        let (_, f, _) = self.open.swap_remove(i);
+        if let Some((moved, _, _)) = self.open.get(i) {
+            self.at.insert(*moved, i);
+        }
+        if self.hand >= self.open.len() {
+            self.hand = 0;
+        }
+        Some(f)
     }
 }
 
