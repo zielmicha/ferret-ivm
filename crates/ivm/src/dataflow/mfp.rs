@@ -158,17 +158,38 @@ impl Mfp {
         }
     }
 
-    /// Expression for output column `c` in terms of input columns, if it is
-    /// computed without depending on filters (for arrangement keys).
-    pub fn output_expr(&self, c: usize) -> Expr {
-        let mut defs: Vec<Expr> = (0..self.input_arity).map(Expr::Column).collect();
-        for s in &self.steps {
-            if let MfpStep::Map(e) = s {
-                let d = e.substitute(&defs);
-                defs.push(d);
-            }
+    /// The input column that output column `c` is (a copy of), if any.
+    pub fn output_column(&self, c: usize) -> Option<usize> {
+        self.output_origin(c).ok()
+    }
+
+    /// The constant that output column `c` is (a copy of), if any.
+    pub fn output_literal(&self, c: usize) -> Option<&Datum> {
+        match self.output_origin(c) {
+            Err(Expr::Literal(d, _)) => Some(d),
+            _ => None,
         }
-        defs[self.projection[c]].clone()
+    }
+
+    /// Output column `c` followed through the maps that copy a column: the
+    /// input column it is (Ok), or the first map expression on the way that
+    /// is not a column (Err). (Expressions are not expanded into each
+    /// other: that can grow exponentially.)
+    fn output_origin(&self, c: usize) -> std::result::Result<usize, &Expr> {
+        let maps: Vec<&Expr> = self
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MfpStep::Map(e) => Some(e),
+                MfpStep::Filter(_) => None,
+            })
+            .collect();
+        let mut c = self.projection[c];
+        while c >= self.input_arity {
+            let e = maps[c - self.input_arity];
+            c = e.as_column().ok_or(e)?;
+        }
+        Ok(c)
     }
 
     /// Can evaluating the steps fail on some row of the `input` types? (No
@@ -191,22 +212,6 @@ impl Mfp {
             }
         }
         false
-    }
-
-    /// Predicates expressed over input columns.
-    pub fn predicates_over_input(&self) -> Vec<Expr> {
-        let mut defs: Vec<Expr> = (0..self.input_arity).map(Expr::Column).collect();
-        let mut out = Vec::new();
-        for s in &self.steps {
-            match s {
-                MfpStep::Map(e) => {
-                    let d = e.substitute(&defs);
-                    defs.push(d);
-                }
-                MfpStep::Filter(p) => out.push(p.substitute(&defs)),
-            }
-        }
-        out
     }
 }
 

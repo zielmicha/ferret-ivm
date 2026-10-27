@@ -945,11 +945,12 @@ impl FloatSum {
 
     /// The finite part divided by n (for AVG): the quotient on the 2^-1074
     /// grid with 128 more bits, truncated, then rounded to the nearest
-    /// double (ties to even).
+    /// double (ties to even). The exact sum is divided, so the average of
+    /// finite values is finite also where their sum overflows a double.
+    /// (With infinities or NaN, or n = 0: `value() / n`.)
     pub fn div_value(&self, n: i64) -> f64 {
-        let v = self.value();
-        if !v.is_finite() || n == 0 {
-            return v / n as f64;
+        if self.nan > 0 || self.pos_inf > 0 || self.neg_inf > 0 || n == 0 {
+            return self.value() / n as f64;
         }
         self.finite.div_to_f64(n)
     }
@@ -957,17 +958,43 @@ impl FloatSum {
     /// Variance of n values from their sum (`self`) and sum of squares:
     /// `(N·Q − S²) / (N·(N−1))` for a sample, else `/ N²`, computed exactly
     /// on the 2^-2148 grid of the squares with 128 more bits, truncated,
-    /// then rounded to the nearest double. 0 when not positive. The caller
-    /// handles special values.
+    /// then rounded to the nearest double (infinity beyond the range). 0
+    /// when not positive. The caller handles special values.
     pub fn variance(&self, sumsq: &FloatSum, n: i64, sample: bool) -> f64 {
+        match self.variance_fraction(sumsq, n, sample) {
+            Some((num, denom)) => bigint_scaled_to_f64(&((num << 128u32) / denom), -2148 - 128),
+            None => 0.0,
+        }
+    }
+
+    /// Standard deviation: the square root of `variance`, or where that is
+    /// beyond the range of a double, the square root of the exact variance
+    /// (with 128 more bits, truncated, and a sticky bit) rounded to the
+    /// nearest double, which may well be in range.
+    pub fn std_dev(&self, sumsq: &FloatSum, n: i64, sample: bool) -> f64 {
+        let v = self.variance(sumsq, n, sample);
+        if v.is_finite() {
+            return v.sqrt();
+        }
+        let Some((num, denom)) = self.variance_fraction(sumsq, n, sample) else { return 0.0 };
+        // sqrt(num / denom · 2^-2148) = sqrt(num · 2^256 / denom) · 2^(-1074-128)
+        let scaled: BigInt = num << 256u32;
+        let q = &scaled / &denom;
+        let r = q.sqrt();
+        let inexact = &q * &denom != scaled || &r * &r != q;
+        bigint_scaled_to_f64(&((r << 1u32) + BigInt::from(inexact as u8)), -1074 - 128 - 1)
+    }
+
+    /// The variance as `num / denom` units of 2^-2148, if positive.
+    fn variance_fraction(&self, sumsq: &FloatSum, n: i64, sample: bool) -> Option<(BigInt, BigInt)> {
         let (s, q) = (self.finite.to_fixed(), sumsq.finite.to_fixed());
         let nb = BigInt::from(n);
         let num: BigInt = ((&nb * &q) << 1074u32) - &s * &s;
         if !num.is_positive() {
-            return 0.0;
+            return None;
         }
         let denom = if sample { &nb * BigInt::from(n - 1) } else { &nb * &nb };
-        bigint_scaled_to_f64(&((num << 128u32) / denom), -2148 - 128)
+        Some((num, denom))
     }
 
     fn encode(&self, out: &mut Vec<u8>) {

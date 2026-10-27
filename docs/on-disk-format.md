@@ -1389,7 +1389,18 @@ whose frames reach a partition's end, which carry summaries), so such a
 data directory keeps its tables and rebuilds those arrangements once at
 its first start; so are the window operators of `ntile` whose argument is
 not a constant and of `lag` and `lead` whose offset is not a constant of
-at least 0 (see the table above).
+at least 0 (see the table above). The arrangements of views with
+aggregates with `FILTER` (their input map now computes the arguments and
+`ORDER BY` keys only for the rows that pass the filter) and of views with
+conditions over the computed columns of nested projections, or
+expressions around a correlated scalar aggregate, that inlining would make
+too large (which are no longer inlined, see
+[Planner](internals/planner.md#optimizer)) are rebuilt once in the same
+way. Results that fixes of aggregate semantics change keep their old
+values until their group changes: an `avg`, `var*` or `stddev*` of
+`double precision` values whose sum or sum of squares overflowed was
+`Infinity` (now the value, or an error where the variance or standard
+deviation itself is beyond the range).
 `crates/ivm/tests/data/format1` is a format-1 directory that the restart
 tests migrate, and `crates/ivm/tests/data/format2-history` a format-2
 directory with histories that they open.

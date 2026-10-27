@@ -129,7 +129,7 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
   is then assembled as
 
   ```
-  FROM/WHERE ─▶ Map(group keys, aggregate arguments, filters, orders)
+  FROM/WHERE ─▶ Map(group keys, per aggregate: FILTER, arguments, orders)
              ─▶ Aggregate            (or UnionAll of one Aggregate per grouping set)
              ─▶ Filter(HAVING)
              ─▶ Map(window arguments) ─▶ Window
@@ -138,6 +138,12 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
              ─▶ Distinct | TopK(DISTINCT ON)
   ```
 
+  As in PostgreSQL, an aggregate's arguments and `ORDER BY` keys are
+  evaluated only for the rows that pass its `FILTER`, after it: in the map
+  they are `CASE WHEN filter THEN expr END` over the filter's column (a
+  column or constant, which cannot fail, as it is), and the aggregate skips
+  the rows that do not pass by the filter column, so
+  `sum(10 / x) FILTER (WHERE x <> 0)` does not divide by zero.
   Expressions after the aggregation are rewritten to refer to the
   aggregation's output (grouping expressions are matched by fingerprint);
   ungrouped column references fail with SQLSTATE `42803`. Grouping sets are
@@ -191,7 +197,12 @@ rejected. `LATERAL` items are bound directly as `Apply(Lateral)`.
   and one over outer columns only: the aggregate is grouped by the inner
   expressions and left-joined with the same equalities, operators and casts
   as written (so `u.d = t.ts::date` keeps comparing dates); a `count` of a
-  missing group becomes 0.
+  missing group becomes 0. Expressions around the aggregate
+  (`(SELECT coalesce(sum(x), 0) + 1 FROM ...)`, also over nested
+  subqueries) are inlined into one expression over its value, within the
+  bound of the [optimizer](#optimizer)'s push-down; where that would
+  exceed it or copy an expression that may change, they stay maps over the
+  joined row.
 - Everything else uses the general **dependent join**: `D = DISTINCT` of the
   outer columns the subquery references is pushed down through the subquery
   plan (`push_dep`), so that the subquery is computed once for every value of
@@ -226,11 +237,24 @@ If an outer reference survives, the query fails with
    constant NULL argument to its first argument.
 2. **Predicate push-down** (`push`): filter conjuncts move below `Project`,
    `Distinct`, `UnionAll`, `SetOp`, `Negate`; below `Map` — a conjunct over
-   computed columns with their expressions substituted, as PostgreSQL
-   pushes conditions into subqueries, unless an expression may change from
-   one evaluation to the next (a non-immutable function, `now()`, a
-   subquery, an outer reference), so the other columns are only computed
-   for rows that pass; below `Aggregate` if they only use group columns and
+   computed columns with their expressions inlined (`plan::Inliner`), as
+   PostgreSQL pushes conditions into subqueries, unless an expression may
+   change from one evaluation to the next (a non-immutable function,
+   `now()`, a subquery, an outer reference), so the other columns are only
+   computed for rows that pass. Inlining copies an expression into each
+   reference to its column, which nested projections can make exponential
+   (each level of `SELECT x + x AS x FROM (...)` doubles a condition on
+   `x`), so a conjunct is inlined only if that makes it larger by at most
+   four times the size (in expression nodes) of the expressions it inlines
+   (`INLINE_COPIES`): pushed through any number of maps, a conjunct grows
+   by at most four times their total size, and the work of inlining is
+   proportional to that. Otherwise the conjunct stays at the map, which is
+   split (`split_map`): the columns the conjunct needs (directly or through
+   other columns) are computed, then the conjunct is checked, then the
+   other columns are computed for the rows that pass. (Unlike an inlined
+   condition, it computes those columns before it is checked, also where
+   it would not reach them, such as the second operand of an `OR`.)
+   Conjuncts move below `Aggregate` if they only use group columns and
    there is a `GROUP BY` (without one the aggregate yields a row even for an
    empty input, so `HAVING false` stays above it); below `TopK` if they only
    use the group columns, below `Window` if they only use columns that

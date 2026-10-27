@@ -84,33 +84,29 @@ fn push(rel: Rel, preds: Vec<Expr>) -> Result<Rel> {
         Rel::Map { input, exprs } => {
             let n = input.arity();
             // A predicate over computed columns moves below the map with
-            // their expressions substituted, as PostgreSQL pushes quals into
+            // their expressions inlined, as PostgreSQL pushes quals into
             // subqueries: the other columns are then computed only for the
             // rows that pass, and raise errors only where PostgreSQL does.
             // (Not through expressions whose value may change from one
-            // evaluation to the next.)
-            let mut all: Vec<Expr> = (0..n).map(Expr::Column).collect();
-            for e in &exprs {
-                let expanded = e.substitute(&all);
-                all.push(expanded);
-            }
-            let inlinable = |p: &Expr| {
-                cols_of(p).iter().all(|&c| {
-                    c < n || (all[c].is_deterministic() && !all[c].contains_now() && !all[c].has_subquery() && !all[c].has_outer())
-                })
-            };
-            let (mut down, mut up) = (Vec::new(), Vec::new());
+            // evaluation to the next.) Where inlining would copy expressions
+            // too often (`Inliner`), the predicate stays at the map, which
+            // computes the columns it needs before it and the others after.
+            let (mut down, mut up, mut at) = (Vec::new(), Vec::new(), Vec::new());
+            let inliner = Inliner::new(n, &exprs);
             for p in preds {
                 if all_below(&p, n) {
                     down.push(p);
-                } else if inlinable(&p) {
-                    down.push(p.substitute(&all));
-                } else {
+                } else if !inliner.stable(&p) {
                     up.push(p);
+                } else if let Some(q) = inliner.inline(&p) {
+                    down.push(q);
+                } else {
+                    at.push(p);
                 }
             }
             let input = push(*input, down)?;
-            Ok(finish(Rel::Map { input: Box::new(input), exprs }, up))
+            let rel = if at.is_empty() { Rel::Map { input: Box::new(input), exprs } } else { split_map(input, exprs, at) };
+            Ok(finish(rel, up))
         }
         Rel::Project { input, cols } => {
             let down: Vec<Expr> = preds.into_iter().map(|p| p.remapped(&|c| cols[c])).collect();
@@ -182,6 +178,45 @@ fn push(rel: Rel, preds: Vec<Expr>) -> Result<Rel> {
             Ok(finish(other, preds))
         }
     }
+}
+
+/// `Map(exprs)` over `input` with `preds` (over its output) checked after
+/// the computed columns they need, directly or through others, and before
+/// the other ones, which are computed only for the rows that pass.
+fn split_map(input: Rel, exprs: Vec<Expr>, preds: Vec<Expr>) -> Rel {
+    let n = input.arity();
+    let k = exprs.len();
+    let mut need = vec![false; k];
+    for c in preds.iter().flat_map(|p| p.column_set()) {
+        if c >= n {
+            need[c - n] = true;
+        }
+    }
+    for i in (0..k).rev() {
+        if need[i] {
+            for c in exprs[i].column_set() {
+                if c >= n {
+                    need[c - n] = true;
+                }
+            }
+        }
+    }
+    // where each column goes: the input's, the needed ones, the others (an
+    // expression still follows those it references)
+    let mut pos: Vec<usize> = (0..n).collect();
+    let (mut a, mut b) = (n, n + need.iter().filter(|x| **x).count());
+    for &nd in &need {
+        let slot = if nd { &mut a } else { &mut b };
+        pos.push(*slot);
+        *slot += 1;
+    }
+    let (mut first, mut rest) = (Vec::new(), Vec::new());
+    for (e, nd) in exprs.iter().zip(&need) {
+        let e = e.remapped(&|c| pos[c]);
+        if *nd { first.push(e) } else { rest.push(e) }
+    }
+    let preds = preds.iter().map(|p| p.remapped(&|c| pos[c])).collect();
+    input.map(first).filter(preds).map(rest).project(pos)
 }
 
 fn push_join(left: Rel, right: Rel, mut kind: JoinKind, on: Vec<Expr>, preds: Vec<Expr>) -> Result<Rel> {

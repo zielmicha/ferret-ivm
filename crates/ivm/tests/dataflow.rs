@@ -425,6 +425,49 @@ fn computed_join_keys() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Plans of deeply nested projections are as large as the query: pushing a
+/// predicate below them, and finding the keys of a join on their computed
+/// column, used to inline their expressions into each other, doubling the
+/// result with every level of `(x + x) / 2 AS x`, so planning a view over
+/// 200 levels never finished.
+#[test]
+fn deep_projections_plan_in_linear_size() {
+    let dir = tmpdir("deep-projections");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, x int)");
+    exec(&h, "CREATE TABLE u (k int PRIMARY KEY, y int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1), (2, -2), (3, 3), (4, 0)");
+    exec(&h, "INSERT INTO u VALUES (1, 10), (3, 30), (5, 50)");
+    // ten views of 20 levels each
+    for i in 1..=10 {
+        let below = if i == 1 { "t".to_string() } else { format!("v{}", i - 1) };
+        let q = (0..20).fold(format!("SELECT id, x FROM {below}"), |q, j| format!("SELECT id, (x + x) / 2 AS x FROM ({q}) s{j}"));
+        exec(&h, &format!("CREATE VIEW v{i} AS {q}"));
+    }
+    let q = "SELECT a.id, a.x, u.y FROM v10 a JOIN u ON a.x = u.k WHERE a.x > 0";
+    exec_within(&h, &format!("CREATE MATERIALIZED VIEW m AS {q}"), 30);
+    // (not counting the indentation of the plan's 400 levels)
+    let plan = rows(&h, &format!("EXPLAIN {q}")).concat().split_whitespace().collect::<String>();
+    assert!(plan.len() < 10_000, "{} bytes of plan", plan.len());
+    assert_eq!(rows(&h, "SELECT * FROM m ORDER BY 1"), ["1|1|10", "3|3|30"]);
+    exec_within(&h, "INSERT INTO t VALUES (5, 5), (6, 7)", 30);
+    exec_within(&h, "UPDATE t SET x = 3 WHERE id = 1", 30);
+    assert_eq!(rows(&h, "SELECT * FROM m ORDER BY 1"), ["1|3|30", "3|3|30", "5|5|50"]);
+    assert_eq!(rows(&h, &format!("{q} ORDER BY 1")), rows(&h, "SELECT * FROM m ORDER BY 1"));
+    // a correlated scalar aggregate below 20 levels (the most a query
+    // parses), as one expression or, beyond the bound, maps over the join
+    let sub = (0..20).fold("SELECT sum(u.y) AS x FROM u WHERE u.k = t.id".to_string(), |q, j| format!("SELECT (x + x) / 2 AS x FROM ({q}) s{j}"));
+    let q = format!("SELECT t.id, ({sub}) AS s FROM t");
+    exec_within(&h, &format!("CREATE MATERIALIZED VIEW c AS {q}"), 30);
+    assert_eq!(rows(&h, "SELECT * FROM c ORDER BY 1"), ["1|10", "2|", "3|30", "4|", "5|50", "6|"]);
+    exec_within(&h, "INSERT INTO u VALUES (2, 20), (6, 60)", 30);
+    assert_eq!(rows(&h, "SELECT * FROM c ORDER BY 1"), ["1|10", "2|20", "3|30", "4|", "5|50", "6|60"]);
+    assert_eq!(rows(&h, &format!("{q} ORDER BY 1")), rows(&h, "SELECT * FROM c ORDER BY 1"));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Expression errors in the per-input maps of a join count once per input
 /// row, whether the view was hydrated over the row or saw it arrive: the
 /// hydration of a join used to count them only for the input it scanned
@@ -526,6 +569,113 @@ fn numeric_aggregates_beyond_the_numeric_range() {
     assert_eq!(rows(&h, check), ["1|t|t|t", "2|t|t|t", "3|t|t|t"]);
     exec(&h, "DELETE FROM t WHERE id IN (3, 4)");
     assert_eq!(rows(&h, "SELECT g, s FROM s WHERE g < 3 ORDER BY g"), ["1|3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An aggregate's arguments and ORDER BY keys are evaluated only for the
+/// rows that pass its FILTER, after it, maintained and ad hoc: they used to
+/// be computed for every row, so `sum(10 / x) FILTER (WHERE x <> 0)` failed
+/// with a division by zero. Expected results and errors are PostgreSQL's.
+#[test]
+fn aggregate_filter_guards_arguments() {
+    let dir = tmpdir("filter-guard");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, x int)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 0), (2, 1, 1), (3, 2, 2)");
+    let queries = [
+        "SELECT sum(10 / x) FILTER (WHERE x <> 0) AS s FROM t",
+        "SELECT g, count(DISTINCT 10 / x) FILTER (WHERE x <> 0) AS c, string_agg((10 / x)::text, ',' ORDER BY 10 / x) FILTER (WHERE x <> 0) AS s, \
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY 10 / x) FILTER (WHERE x <> 0) AS p FROM t GROUP BY g",
+        "SELECT count(*) FILTER (WHERE 10 / x > 1) AS n FROM t",
+        // the FILTER's own error, not its argument's (the rows of x = 0 pass)
+        "SELECT sum((x::text || 'a')::int) FILTER (WHERE 1 / (x - 1) > 0) AS s FROM t WHERE x < 2",
+    ];
+    for (i, q) in queries.iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    let check = |want: [Result<Vec<&str>, &str>; 4]| {
+        for (i, (q, want)) in queries.iter().zip(want).enumerate() {
+            let want = want.map(|w| w.iter().map(|s| s.to_string()).collect::<Vec<_>>()).map_err(|e| e.to_string());
+            assert_eq!(rows_of(&h, &format!("{q} ORDER BY 1")), want, "{q}");
+            assert_eq!(rows_of(&h, &format!("SELECT * FROM v{i} ORDER BY 1")), want, "view {i}: {q}");
+        }
+    };
+    let div0 = "22012 division by zero";
+    check([Ok(vec!["15"]), Ok(vec!["1|1|10|10", "2|1|5|5"]), Err(div0), Err(div0)]);
+    exec(&h, "INSERT INTO t VALUES (4, 2, 0), (5, 2, 5)");
+    check([Ok(vec!["17"]), Ok(vec!["1|1|10|10", "2|2|2,5|2"]), Err(div0), Err(div0)]);
+    exec(&h, "DELETE FROM t WHERE x = 0");
+    check([Ok(vec!["17"]), Ok(vec!["1|1|10|10", "2|2|2,5|2"]), Ok(vec!["3"]), Err(div0)]);
+    exec(&h, "UPDATE t SET x = 2 WHERE id = 2");
+    check([Ok(vec!["12"]), Ok(vec!["1|1|5|5", "2|2|2,5|2"]), Ok(vec!["3"]), Ok(vec![""])]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FILTERed aggregates of every kind over arguments that fail on the rows
+/// the filter excludes follow random changes.
+#[test]
+fn filtered_aggregates_follow_random_changes() {
+    let queries = [
+        "SELECT g, sum(10 / v) FILTER (WHERE v <> 0) AS s, count(*) FILTER (WHERE v > 2) AS c, avg(100 / v) FILTER (WHERE v > 0) AS a, \
+         max(10 / v) FILTER (WHERE v <> 0) AS m FROM t GROUP BY g",
+        "SELECT g, string_agg((10 / v)::text, ',' ORDER BY 10 / v, id) FILTER (WHERE v <> 0) AS s, \
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY 10 / v) FILTER (WHERE v <> 0) AS p FROM t GROUP BY g",
+        "SELECT g, count(DISTINCT 10 / v) FILTER (WHERE v <> 0) AS c, sum(DISTINCT 6 / v) FILTER (WHERE v <> 0) AS d FROM t GROUP BY g",
+        "SELECT sum(10 / v) FILTER (WHERE v <> 0) AS s, array_agg(DISTINCT 12 / v) FILTER (WHERE v > 1) AS a, count(*) AS n FROM t",
+    ];
+    random_changes_keep_views_equal("filter-random", &queries, 40, 11);
+}
+
+/// Floating-point averages and standard deviations are computed from the
+/// exact sums, so they overflow only if the result does (PostgreSQL fails
+/// as soon as its running sum or sum of squares overflows); a variance
+/// beyond the range overflows. The average of two 1e308 used to be
+/// Infinity, and so were variances and standard deviations whose sum of
+/// squares overflowed.
+#[test]
+fn float_aggregates_beyond_the_range_of_their_sums() {
+    let dir = tmpdir("float-range");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE f (id int PRIMARY KEY, g int, x float8)");
+    exec(
+        &h,
+        "INSERT INTO f VALUES (1, 1, 1e308), (2, 1, 1e308), (3, 2, 1.7e308), (4, 2, 1.7e308), (5, 2, -1e308), \
+         (6, 3, 1e300), (7, 3, -1e300), (8, 3, 0), (9, 4, 5e-324), (10, 4, 0), (11, 5, 1e-320), (12, 5, 3e-320)",
+    );
+    let fits = "SELECT g, avg(x) AS a, stddev_pop(x) AS sp, stddev_samp(x) AS ss FROM f GROUP BY g";
+    let sum = "SELECT g, sum(x) AS s FROM f GROUP BY g";
+    let var = "SELECT g, var_samp(x) AS v FROM f GROUP BY g";
+    for (i, q) in [fits, sum, var].iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    let check = |q: &str, i: usize, want: Result<Vec<&str>, &str>| {
+        let want = want.map(|w| w.iter().map(|s| s.to_string()).collect::<Vec<_>>()).map_err(|e| e.to_string());
+        assert_eq!(rows_of(&h, &format!("{q} ORDER BY g")), want, "{q}");
+        assert_eq!(rows_of(&h, &format!("SELECT * FROM v{i} ORDER BY g")), want, "view {i}: {q}");
+    };
+    let overflow = "22003 value out of range: overflow";
+    check(
+        fits,
+        0,
+        Ok(vec![
+            "1|1e+308|0|0",
+            "2|8e+307|1.2727922061357855e+308|1.5588457268119896e+308",
+            "3|0|8.164965809277261e+299|1e+300",
+            "4|0|0|0",
+            "5|2e-320|0|0",
+        ]),
+    );
+    check(sum, 1, Err(overflow));
+    check(var, 2, Err(overflow));
+    exec(&h, "DELETE FROM f WHERE g IN (1, 2)");
+    check(sum, 1, Ok(vec!["3|0", "4|5e-324", "5|4e-320"]));
+    check(var, 2, Err(overflow));
+    exec(&h, "DELETE FROM f WHERE g = 3");
+    check(var, 2, Ok(vec!["4|0", "5|0"]));
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

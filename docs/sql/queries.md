@@ -228,7 +228,11 @@ agg( fraction ) WITHIN GROUP ( ORDER BY sort_expr )      -- ordered-set aggregat
 | `any_value(x)` | any | same as argument |
 
 - `DISTINCT`, `FILTER (WHERE ...)` and `ORDER BY` inside the call are
-  supported for all aggregates. With `DISTINCT`, the `ORDER BY` expressions
+  supported for all aggregates. As in PostgreSQL, the arguments and the
+  `ORDER BY` expressions are evaluated only for the rows that pass the
+  `FILTER`, after it: `sum(10 / x) FILTER (WHERE x <> 0)` does not divide
+  by zero, and an error of the filter itself is raised before any of its
+  arguments'. With `DISTINCT`, the `ORDER BY` expressions
   must be arguments (`in an aggregate with DISTINCT, ORDER BY expressions
   must appear in argument list`, as in PostgreSQL). A materialized view with
   several different `DISTINCT` argument sets (or filters), `DISTINCT` and
@@ -239,11 +243,19 @@ agg( fraction ) WITHIN GROUP ( ORDER BY sort_expr )      -- ordered-set aggregat
   Without an `ORDER BY`, the input is ordered by the argument values, so the
   result is deterministic (PostgreSQL uses an arbitrary input order).
 - Floating-point `sum`, `avg`, `stddev*` and `var*` are computed exactly
-  (the sum of the exact binary values) and rounded once at the end; the
+  (the sum of the exact binary values) and rounded once at the end (a
+  standard deviation is the square root of the rounded variance); the
   result is independent of the order of the inputs, and may differ from
   PostgreSQL's sequential summation in the last digits. A `sum` of
   `double precision` or `real` values that overflows its type fails with
-  `value out of range: overflow` (infinite inputs give `Infinity`).
+  `value out of range: overflow` (infinite inputs give `Infinity`), and so
+  do a `var*` and a `stddev*` beyond the range of `double precision`. An
+  `avg` divides the exact sum, and `var*` and `stddev*` use the exact sum
+  of squares, so they succeed when their result is in range even where the
+  sum or the sum of squares is not; PostgreSQL fails with `value out of
+  range: overflow` as soon as its running sum or sum of squares overflows:
+  `avg` of `1e308` and `1e308` is `1e+308`, and `avg`, `stddev_pop` of
+  `1e300` and `-1e300` are `0`, `1e+300`, where PostgreSQL fails.
 - `numeric` sums keep NaN and infinities apart from the finite sum (like
   PostgreSQL), use the largest display scale among the inputs, and are exact
   without numeric's range limit; only the result is checked. A `sum` beyond

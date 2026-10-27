@@ -561,7 +561,7 @@ impl Gen<'_> {
     fn aggregate(&mut self, srcs: &[Src]) -> String {
         let (c, ty) = self.col_of(srcs, |_| true).unwrap();
         let ids = Self::ids(srcs);
-        match self.rng.below(22) {
+        match self.rng.below(25) {
             0 => "count(*)".to_string(),
             1 => format!("count({c})"),
             2 if ty.is_num() => format!("sum({c})"),
@@ -599,6 +599,17 @@ impl Gen<'_> {
                 format!("max({c}) FILTER (WHERE {p})")
             }
             21 if ty == Ty::Text => format!("string_agg(DISTINCT {c}, '|' ORDER BY {c})"),
+            // arguments and orders that fail on the rows the FILTER excludes
+            // (they are evaluated only for the rows that pass)
+            22 if ty.is_int() || ty == Ty::Numeric => format!("sum(100 / {c}) FILTER (WHERE {c} <> 0)"),
+            23 if ty.is_int() || ty == Ty::Numeric => {
+                format!("string_agg((100 / {c})::text, ',' ORDER BY 100 / {c}, {ids}) FILTER (WHERE {c} <> 0)")
+            }
+            24 if ty.is_int() => match self.rng.below(3) {
+                0 => format!("count(DISTINCT 100 / {c}) FILTER (WHERE {c} > 0)"),
+                1 => format!("percentile_disc(0.5) WITHIN GROUP (ORDER BY 100 / {c}) FILTER (WHERE {c} <> 0)"),
+                _ => format!("max(100 / {c}) FILTER (WHERE {c} < 0)"),
+            },
             _ => format!("count({c})"),
         }
     }
@@ -630,9 +641,11 @@ impl Gen<'_> {
         // projection
         let n = 1 + self.rng.below(4) as usize;
         let mut sel = Vec::new();
+        let mut ty0 = None;
         for _ in 0..n {
-            let (e, _) = self.expr(&srcs, 0);
+            let (e, ty) = self.expr(&srcs, 0);
             sel.push(e);
+            ty0.get_or_insert(ty);
         }
         let mut window_clause = String::new();
         if shape == 4 {
@@ -655,6 +668,30 @@ impl Gen<'_> {
             } else {
                 format!("SELECT d.*, 1 AS one FROM ({inner}) d WHERE d.x0 IS NOT NULL")
             };
+        }
+        if shape == 13 {
+            // nested projections, each using the first column twice, under a
+            // condition on it (inlined into the condition only up to a size
+            // bound, above which the projection is split around it)
+            let mut inner = q;
+            for k in 0..(2 + self.rng.below(7)) {
+                let x0 = format!("d{k}.x0");
+                let dup = match self.rng.below(3) {
+                    0 => format!("CASE WHEN {x0} IS NOT NULL THEN {x0} END"),
+                    1 => format!("coalesce({x0}, {x0})"),
+                    _ => format!("CASE WHEN {x0} IS NULL THEN NULL ELSE {x0} END"),
+                };
+                let rest: String = (1..sel.len()).map(|i| format!(", d{k}.x{i}")).collect();
+                inner = format!("SELECT {dup} AS x0{rest} FROM ({inner}) d{k}");
+            }
+            let p = match ty0.unwrap() {
+                Ty::Bool => "d.x0".to_string(),
+                ty if ty.minmax() && ty != Ty::Big => {
+                    format!("d.x0 {} {}", self.rng.pick(&["=", "<>", "<", ">="]), literal(self.rng, ty))
+                }
+                _ => "d.x0 IS NOT NULL".to_string(),
+            };
+            return format!("SELECT d.* FROM ({inner}) d WHERE {p}");
         }
         if shape == 9 {
             // LATERAL: the next row (top-1), or an aggregate over related rows
