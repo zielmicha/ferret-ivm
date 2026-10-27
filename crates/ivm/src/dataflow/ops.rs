@@ -1,8 +1,7 @@
 //! Operator step / snapshot implementations (except join, reduce, window).
 
-use super::delta::{DeltaBuf, EntryDeltas, KeySet, Keys, NodeDelta, StepOut, Version as Weights};
+use super::delta::{DeltaBuf, EntryDeltas, KeySet, Keys, NodeDelta, Overlay, StepOut, Version as Weights};
 use super::*;
-use crate::storage::History;
 use crate::types::Datum;
 use std::ops::Bound;
 
@@ -502,27 +501,32 @@ fn affected_prefixes(env: &mut Env, layout: &Layout, delta: &NodeDelta, gsn: Gsn
     affected_keys(env, delta, gsn, &|row| Ok(layout.encode_prefix(&layout.key_values(row)?)))
 }
 
-/// First entry with positive weight (as of `at`) under `prefix`, and the total.
-fn representative(env: &mut Env, tree: TreeId, layout: &Layout, prefix: &[u8], at: ReadAt) -> Result<(Option<Row>, i64)> {
-    let mut rep = None;
-    let mut total = 0;
-    env.for_each_prefix(tree, prefix, &mut |k, h| {
-        let w = h.weight(at);
-        if w > 0 && rep.is_none() {
-            rep = Some(layout.decode_row(k)?);
+/// The first entry with positive weight under `prefix` (the
+/// representative) and the total weight, before the step and now: the
+/// entries of `tree` with the overlay of the step's changes to them, so
+/// that an entry the step removed is seen before it.
+fn representatives(env: &mut Env, changes: &Overlay, tree: TreeId, layout: &Layout, prefix: &[u8]) -> Result<[(Option<Row>, i64); 2]> {
+    let mut v = [(None, 0), (None, 0)];
+    let hi = crate::types::encoding::prefix_successor(prefix);
+    let hi = hi.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+    changes.for_each_versioned(env, tree, Bound::Included(prefix), hi, &mut |k, now, before| {
+        for ((rep, total), w) in v.iter_mut().zip([before, now]) {
+            if w > 0 && rep.is_none() {
+                *rep = Some(layout.decode_row(k)?);
+            }
+            *total += w;
         }
-        total += w;
         Ok(true)
     })?;
-    Ok((rep, total))
+    Ok(v)
 }
 
 fn distinct_step(g: &Graph, env: &mut Env, arr: ArrId, delta: &NodeDelta, gsn: Gsn, out: &mut StepOut) -> Result<()> {
     let a = g.arr(arr);
     let layout = a.layout.clone();
+    let changes = delta.overlay(arr)?;
     affected_prefixes(env, &layout, delta, gsn)?.for_each(env, &mut |env, p| {
-        let (old, oc) = representative(env, a.tree, &layout, p, ReadAt::Before(gsn))?;
-        let (new, nc) = representative(env, a.tree, &layout, p, ReadAt::Latest)?;
+        let [(old, oc), (new, nc)] = representatives(env, &changes, a.tree, &layout, p)?;
         if oc > 0
             && let Some(o) = old
         {
@@ -597,11 +601,10 @@ fn setop_step(
             return Err(e);
         }
     }
+    let (lc, rc) = (ld.overlay(la)?, rd.overlay(ra)?);
     prefixes.finish(env)?.for_each(env, &mut |env, p| {
-        let (lrep_old, a_old) = representative(env, l.tree, &ll, p, ReadAt::Before(gsn))?;
-        let (lrep_new, a_new) = representative(env, l.tree, &ll, p, ReadAt::Latest)?;
-        let (rrep_old, b_old) = representative(env, r.tree, &rl, p, ReadAt::Before(gsn))?;
-        let (rrep_new, b_new) = representative(env, r.tree, &rl, p, ReadAt::Latest)?;
+        let [(lrep_old, a_old), (lrep_new, a_new)] = representatives(env, &lc, l.tree, &ll, p)?;
+        let [(rrep_old, b_old), (rrep_new, b_new)] = representatives(env, &rc, r.tree, &rl, p)?;
         let m_old = setop_mult(op, all, a_old, b_old);
         let m_new = setop_mult(op, all, a_new, b_new);
         if m_old > 0
@@ -712,13 +715,15 @@ impl TopKGroup<'_> {
         }
     }
 
-    /// Visit the entries from `from` up to `to` (within the group).
-    fn for_each(&self, env: &mut Env, from: &[u8], to: &Bound<Vec<u8>>, f: &mut dyn FnMut(&[u8], &History) -> Result<bool>) -> Result<()> {
+    /// Visit the entries from `from` up to `to` (within the group) with
+    /// their weights now and before the step whose changes to the group's
+    /// entries are `deltas` (also the entries the step removed).
+    fn for_each_versioned(&self, env: &mut Env, deltas: &EntryDeltas, from: &[u8], to: &Bound<Vec<u8>>, f: &mut super::delta::VersionedFn) -> Result<()> {
         let to = match to {
             Bound::Unbounded => self.hi(),
             b => b.as_ref().map(|k| k.as_slice()),
         };
-        env.for_each(self.tree, Bound::Included(from), to, f)
+        deltas.for_each_versioned(env, self.tree, Bound::Included(from), to, f)
     }
 
     /// Rows of the group before `key` (current weights).
@@ -949,7 +954,11 @@ fn topk_rows(env: &mut Env, g: &TopKGroup, p: &TopKPlan) -> Result<Delta> {
     let w = Window::of(env, g, Version { changed: &[], before: false }, total, p)?;
     let Some((from, to)) = w.range() else { return Ok(out) };
     let mut pos = g.rank(env, &from)?;
-    g.for_each(env, &from, &to, &mut |k, h| {
+    let to = match &to {
+        Bound::Unbounded => g.hi(),
+        b => b.as_ref().map(|k| k.as_slice()),
+    };
+    env.for_each(g.tree, Bound::Included(&from), to, &mut |k, h| {
         visited(1);
         let n = h.total();
         let take = w.rows(k, pos, n);
@@ -1086,10 +1095,8 @@ fn topk_group(env: &mut Env, g: &TopKGroup, p: &TopKPlan, deltas: &EntryDeltas, 
     for (from, to) in merge_ranges(ranges) {
         let mut pos_new = g.rank(env, &from)?;
         let mut pos_old = pos_new - old_v.shift(&from);
-        g.for_each(env, &from, &to, &mut |k, h| {
+        g.for_each_versioned(env, deltas, &from, &to, &mut |k, wn, wo| {
             visited(1);
-            let wn = h.total();
-            let wo = deltas.before(k, wn);
             let d = new.rows(k, pos_new, wn) - old.rows(k, pos_old, wo);
             if d != 0 {
                 out.push((g.layout.decode_row(k)?, d));
@@ -1249,9 +1256,4 @@ fn recursive_step(g: &Graph, env: &mut Env, node: &Node, p: &RecursivePlan, gsn:
         Err(e) => return Err(e),
     }
     Ok(())
-}
-
-/// Sum of weights in a history as of `at` (helper for operators).
-pub fn weight_at(h: &History, at: ReadAt) -> i64 {
-    h.weight(at)
 }

@@ -383,42 +383,73 @@ impl Overlay<'_> {
                 Some((k, _)) if more => Bound::Included(k.as_slice()),
                 _ => hi,
             };
-            let (mut i, mut stopped) = (0, false);
-            env.for_each(tree, lo.as_ref().map(|k| k.as_slice()), upto, &mut |k, h| {
-                while i < changes.len() && changes[i].0.as_slice() < k {
-                    i += 1;
-                    if !f(&changes[i - 1].0, 0, -changes[i - 1].1)? {
-                        stopped = true;
-                        return Ok(false);
-                    }
-                }
-                let now = h.total();
-                let before = if i < changes.len() && changes[i].0.as_slice() == k {
-                    i += 1;
-                    now - changes[i - 1].1
-                } else {
-                    now
-                };
-                if !f(k, now, before)? {
-                    stopped = true;
-                    return Ok(false);
-                }
-                Ok(true)
-            })?;
-            if stopped {
-                return Ok(());
-            }
-            for (k, w) in &changes[i..] {
-                if !f(k, 0, -w)? {
-                    return Ok(());
-                }
-            }
-            if !more {
+            if !merge_versioned(env, tree, lo.as_ref().map(|k| k.as_slice()), upto, &changes, f)? || !more {
                 return Ok(());
             }
             lo = Bound::Excluded(changes.pop().expect("a chunk of changes").0);
         }
     }
+
+    /// Hand the changes to `f` in key order, at most `OVERLAY_CHUNK` at a
+    /// time (for consumers that read other trees as they go).
+    pub fn for_each_chunk(&self, env: &mut Env, f: &mut dyn FnMut(&mut Env, &[(Vec<u8>, i64)]) -> Result<()>) -> Result<()> {
+        let mut lo: Option<Vec<u8>> = None;
+        loop {
+            let mut changes: Vec<(Vec<u8>, i64)> = Vec::new();
+            self.for_each(env, lo.as_deref().map_or(Bound::Unbounded, Bound::Excluded), Bound::Unbounded, &mut |k, w| {
+                changes.push((k.to_vec(), w));
+                Ok(changes.len() < OVERLAY_CHUNK)
+            })?;
+            if changes.is_empty() {
+                return Ok(());
+            }
+            f(env, &changes)?;
+            if changes.len() < OVERLAY_CHUNK {
+                return Ok(());
+            }
+            lo = changes.pop().map(|(k, _)| k);
+        }
+    }
+}
+
+/// Visit the entries of `tree` from `lo` while below `hi`, in key order,
+/// merged with `changes` (sorted, all within the range: a step's changes to
+/// the tree's entries), with each entry's weight now and before the step,
+/// until `f` returns false. An entry the step removed from the tree is
+/// visited with its weight before the step and none now. False if `f`
+/// stopped the walk.
+fn merge_versioned(env: &mut Env, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, changes: &[(Vec<u8>, i64)], f: &mut VersionedFn) -> Result<bool> {
+    let (mut i, mut stopped) = (0, false);
+    env.for_each(tree, lo, hi, &mut |k, h| {
+        while i < changes.len() && changes[i].0.as_slice() < k {
+            i += 1;
+            if !f(&changes[i - 1].0, 0, -changes[i - 1].1)? {
+                stopped = true;
+                return Ok(false);
+            }
+        }
+        let now = h.total();
+        let before = if i < changes.len() && changes[i].0.as_slice() == k {
+            i += 1;
+            now - changes[i - 1].1
+        } else {
+            now
+        };
+        if !f(k, now, before)? {
+            stopped = true;
+            return Ok(false);
+        }
+        Ok(true)
+    })?;
+    if stopped {
+        return Ok(false);
+    }
+    for (k, w) in &changes[i..] {
+        if !f(k, 0, -w)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The changes of a step to the entries of a key range of an arrangement
@@ -446,12 +477,24 @@ impl EntryDeltas {
         &self.0
     }
 
-    /// An entry's weight before the step, given its current weight.
-    pub fn before(&self, key: &[u8], current: i64) -> i64 {
-        match self.0.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-            Ok(i) => current - self.0[i].1,
-            Err(_) => current,
-        }
+    /// Visit the entries of `tree` (the arrangement whose changes these
+    /// are) from `lo` while below `hi`, in key order, with their weights now
+    /// and before the step, until `f` returns false: the entries merged with
+    /// the changes in the range (an entry the step removed from the tree is
+    /// visited with its weight before the step and none now).
+    pub fn for_each_versioned(&self, env: &mut Env, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: &mut VersionedFn) -> Result<()> {
+        let start = match lo {
+            Bound::Unbounded => 0,
+            Bound::Included(k) => self.0.partition_point(|(c, _)| c.as_slice() < k),
+            Bound::Excluded(k) => self.0.partition_point(|(c, _)| c.as_slice() <= k),
+        };
+        let end = start
+            + self.0[start..].partition_point(|(c, _)| match hi {
+                Bound::Unbounded => true,
+                Bound::Included(h) => c.as_slice() <= h,
+                Bound::Excluded(h) => c.as_slice() < h,
+            });
+        merge_versioned(env, tree, lo, hi, &self.0[start..end], f).map(|_| ())
     }
 }
 
@@ -467,12 +510,12 @@ pub enum Version<'a> {
 
 impl Version<'_> {
     /// Visit the entries of `tree` from `lo` while below `hi` with their
-    /// weights in this version (also those of weight zero), until `f`
-    /// returns false.
+    /// weights in this version (also those of weight zero: entries of the
+    /// other version), until `f` returns false.
     pub fn for_each(&self, env: &mut Env, tree: TreeId, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: &mut dyn FnMut(&[u8], i64) -> Result<bool>) -> Result<()> {
         match self {
             Version::Now => env.for_each(tree, lo, hi, &mut |k, h| f(k, h.total())),
-            Version::Before(d) => env.for_each(tree, lo, hi, &mut |k, h| f(k, d.before(k, h.total()))),
+            Version::Before(d) => d.for_each_versioned(env, tree, lo, hi, &mut |k, _, before| f(k, before)),
             Version::BeforeStep(o) => o.for_each_versioned(env, tree, lo, hi, &mut |k, _, before| f(k, before)),
         }
     }

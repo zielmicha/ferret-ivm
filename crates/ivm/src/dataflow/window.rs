@@ -935,12 +935,11 @@ fn step_partition(env: &mut Env, p: &WindowPlan, part: &Part, deltas: &EntryDelt
         }
     }
     // read the run: rows with their weights before and after the step
+    // (also the rows the step removed)
     let layout = part.layout;
     let mut entries: Vec<(Row, i64, i64, bool)> = Vec::new();
-    env.for_each(part.tree, Bound::Included(&lo_key), Bound::Included(&hi_key), &mut |k, h| {
+    deltas.for_each_versioned(env, part.tree, Bound::Included(&lo_key), Bound::Included(&hi_key), &mut |k, after, before| {
         visited(1);
-        let after = h.total();
-        let before = deltas.before(k, after);
         if before > 0 || after > 0 {
             let in_region = k >= reg_lo_key.as_slice() && k <= reg_hi_key.as_slice();
             entries.push((layout.decode_row(k)?, before, after, in_region));
