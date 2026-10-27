@@ -64,6 +64,15 @@ impl ColumnType {
         self.nullable = n;
         self
     }
+    /// How `=` relates to the identity of the column's values: as for its
+    /// type, except that `character(n)` values are all padded to n
+    /// characters, so none differ in trailing spaces alone.
+    pub fn equality(&self) -> Equality {
+        match self.ty.equality() {
+            Equality::TrailingSpaces if self.typmod >= 0 => Equality::Identity,
+            e => e,
+        }
+    }
 }
 
 /// Named column in a relation schema.
@@ -291,15 +300,50 @@ impl SqlType {
         }
     }
 
+    /// How `=` relates to the identity of this type's values (an array's
+    /// is its elements'). Every type is listed: a new one must say.
+    pub fn equality(&self) -> Equality {
+        use SqlType::*;
+        match self {
+            Numeric | Interval | Float4 | Float8 | Jsonb => Equality::Representation,
+            Bpchar => Equality::TrailingSpaces,
+            Json | JsonPath => Equality::None,
+            Array(e) => e.equality(),
+            Bool | Int2 | Int4 | Int8 | Oid | Text | Varchar | Name | Bytea | Date | Time | Timestamp | TimestampTz | Uuid | Unknown => {
+                Equality::Identity
+            }
+        }
+    }
+
     /// Whether values of this type need a fidelity suffix in key encodings
     /// (equal-comparing values with distinct representations).
     pub fn needs_fidelity(&self) -> bool {
-        match self {
-            SqlType::Numeric | SqlType::Interval | SqlType::Float4 | SqlType::Float8 | SqlType::Jsonb => true,
-            SqlType::Array(e) => e.needs_fidelity(),
-            _ => false,
-        }
+        self.equality() == Equality::Representation
     }
+}
+
+/// How SQL equality (`=`) relates to the identity of a type's values. Said
+/// once (`SqlType::equality`) for everything that depends on it: key
+/// encodings (fidelity suffixes), decorrelation, and sinks (which target
+/// row a retraction deletes, which columns can key a target).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Equality {
+    /// Equal values are identical.
+    Identity,
+    /// Equal values can differ in representation: numeric scale (`1.0 =
+    /// 1.00`), the sign of zero (`-0 = 0`), interval fields (`'1 mon' =
+    /// '30 days'`, which differ in date arithmetic), numbers in jsonb. Key
+    /// encodings group them by equality, and keep the representation in a
+    /// fidelity suffix.
+    Representation,
+    /// Equal values can differ in trailing spaces (`character`: `'a' =
+    /// 'a  '`). Comparisons ignore them, while key encodings keep them, so
+    /// grouping, DISTINCT and keys tell such values apart (unlike
+    /// PostgreSQL). The values of a `character(n)` column are all padded
+    /// to n characters (`ColumnType::equality`).
+    TrailingSpaces,
+    /// There is no equality operator (json, jsonpath).
+    None,
 }
 
 impl fmt::Display for SqlType {

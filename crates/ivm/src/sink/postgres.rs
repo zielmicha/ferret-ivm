@@ -17,7 +17,7 @@ use crate::dataflow::Delta;
 use crate::error::{Result, SqlError};
 use crate::storage::Gsn;
 use crate::types::text::format_datum;
-use crate::types::{format_type, Column, Datum, Row};
+use crate::types::{format_type, Column, Datum, Equality, Row};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -49,16 +49,28 @@ fn lit(d: &Datum, c: &Column) -> String {
     format!("'{}'::{}", format_datum(d).replace('\'', "''"), format_type(&c.ty.ty, c.ty.typmod))
 }
 
-/// Columns a retraction must match by text: types PostgreSQL has no
-/// equality for (json, jsonpath), and types whose equal values differ in
-/// representation (numeric scales, -0, jsonb numbers), where equality could
-/// delete a row holding another representation than the retracted one.
-fn compare_as_text(ty: &crate::types::SqlType) -> bool {
-    use crate::types::SqlType;
-    match ty {
-        SqlType::Json | SqlType::JsonPath | SqlType::Jsonb | SqlType::Numeric | SqlType::Float4 | SqlType::Float8 => true,
-        SqlType::Array(e) => compare_as_text(e),
-        _ => false,
+/// A condition that a target row's column `c` holds `d` itself, not just a
+/// value equal to it: a keyless sink deletes one row matching every column
+/// per retracted row, and one holding another representation of an equal
+/// value (`'30 days'` for `'1 mon'`, `1.0` for `1.00`, `-0` for `0`) would
+/// leave the retracted representation behind. Values are compared with `=`
+/// (NULL with IS NULL), which an index on the column can serve (IS NOT
+/// DISTINCT FROM cannot), and where `=` is coarser than identity or missing
+/// (`ColumnType::equality`) by their text as well, which tells the
+/// representations apart under any session settings.
+fn same_value(c: &Column, d: &Datum) -> String {
+    let col = qident(&c.name);
+    if d.is_null() {
+        return format!("{col} IS NULL");
+    }
+    let v = lit(d, c);
+    match c.ty.equality() {
+        Equality::Identity => format!("{col} = {v}"),
+        // (the cast of a character value to text drops its trailing
+        // spaces; that of an array of them keeps them)
+        Equality::TrailingSpaces if c.ty.ty.elem().is_none() => format!("{col} = {v} AND octet_length({col}) = octet_length({v})"),
+        Equality::Representation | Equality::TrailingSpaces => format!("{col} = {v} AND {col}::text = ({v})::text"),
+        Equality::None => format!("{col}::text = ({v})::text"),
     }
 }
 
@@ -310,6 +322,10 @@ impl Writer {
 
     fn delete_sql(&self, r: &Row) -> String {
         match &self.key {
+            // Keys are unique as `=` compares them (the target's primary
+            // key), which only the retracted row's own key matches: the
+            // engine keys by `=` too, and CREATE SINK refuses columns whose
+            // values it tells apart where `=` does not (`check_sink`).
             Some(k) => {
                 let cond = k
                     .iter()
@@ -319,21 +335,7 @@ impl Writer {
                 format!("DELETE FROM {} WHERE {cond}", self.table)
             }
             None => {
-                // (no index can serve this: each deletion scans the target)
-                let cond = self
-                    .columns
-                    .iter()
-                    .zip(r)
-                    .map(|(c, d)| {
-                        if compare_as_text(&c.ty.ty) {
-                            // the text identifies the value exactly
-                            format!("{}::text IS NOT DISTINCT FROM ({})::text", qident(&c.name), lit(d, c))
-                        } else {
-                            format!("{} IS NOT DISTINCT FROM {}", qident(&c.name), lit(d, c))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" AND ");
+                let cond = self.columns.iter().zip(r).map(|(c, d)| same_value(c, d)).collect::<Vec<_>>().join(" AND ");
                 format!("DELETE FROM {0} WHERE ctid = (SELECT ctid FROM {0} WHERE {cond} LIMIT 1)", self.table)
             }
         }
@@ -780,6 +782,39 @@ impl Sink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retraction matches a column by `=` or IS NULL, which an index can
+    /// serve, and where `=` is coarser than identity or missing, by the
+    /// column's text too (`ColumnType::equality`).
+    #[test]
+    fn retractions_match_exact_values() {
+        use crate::types::{text::parse_datum, ColumnType, SqlType as T};
+        let arr = |t: T| T::Array(Box::new(t));
+        let cases = [
+            (T::Int4, -1, "5", r#""c" = '5'::integer"#),
+            (T::Int4, -1, "", r#""c" IS NULL"#),
+            (T::Text, -1, "it's", r#""c" = 'it''s'::text"#),
+            (T::Bpchar, 7, "a", r#""c" = 'a  '::character(3)"#),
+            (T::TimestampTz, -1, "2024-01-01 05:45:00+05:45", r#""c" = '2024-01-01 00:00:00+00'::timestamp with time zone"#),
+            (T::Interval, -1, "1 mon", r#""c" = '1 mon'::interval AND "c"::text = ('1 mon'::interval)::text"#),
+            (T::Numeric, -1, "1.50", r#""c" = '1.50'::numeric AND "c"::text = ('1.50'::numeric)::text"#),
+            (T::Float8, -1, "-0", r#""c" = '-0'::double precision AND "c"::text = ('-0'::double precision)::text"#),
+            (T::Jsonb, -1, "[1.0]", r#""c" = '[1.0]'::jsonb AND "c"::text = ('[1.0]'::jsonb)::text"#),
+            (T::Bpchar, -1, "a  ", r#""c" = 'a  '::bpchar AND octet_length("c") = octet_length('a  '::bpchar)"#),
+            (T::Json, -1, "[1]", r#""c"::text = ('[1]'::json)::text"#),
+            (T::JsonPath, -1, "$.a", r#""c"::text = ('$."a"'::jsonpath)::text"#),
+            (arr(T::Int4), -1, "{1,NULL}", r#""c" = '{1,NULL}'::integer[]"#),
+            (arr(T::Interval), -1, "{{1 mon},{NULL}}", r#""c" = '{{"1 mon"},{NULL}}'::interval[] AND "c"::text = ('{{"1 mon"},{NULL}}'::interval[])::text"#),
+            (arr(T::Bpchar), -1, "{\"a \"}", r#""c" = '{"a "}'::bpchar[] AND "c"::text = ('{"a "}'::bpchar[])::text"#),
+            (arr(T::Bpchar), 7, "{a}", r#""c" = '{"a  "}'::character(3)[]"#),
+            (arr(T::Json), -1, "{1}", r#""c"::text = ('{1}'::json[])::text"#),
+        ];
+        for (ty, typmod, v, want) in cases {
+            let c = Column::new("c", ColumnType::with_typmod(ty.clone(), typmod));
+            let d = if v.is_empty() { Datum::Null } else { parse_datum(v, &ty, typmod).unwrap() };
+            assert_eq!(same_value(&c, &d), want, "{ty:?} {v}");
+        }
+    }
 
     /// A transaction is sent in messages of at most the configured size
     /// (a resynchronization used to be one SQL string with every row, and

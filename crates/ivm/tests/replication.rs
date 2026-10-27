@@ -1205,6 +1205,192 @@ fn keyless_sink_with_json_columns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Wait until sink `name` has committed progress at or after the engine's
+/// current GSN (in `target`, its target's database): its target then has
+/// every change made so far.
+fn sink_caught_up(ivm: &mut Ivm, target: &mut Client, name: &str) {
+    let gsn: i64 = ivm.rows("SHOW GSN")[0].parse().unwrap();
+    let q = format!("SELECT gsn FROM ivm_sink_progress WHERE sink = '{name}'");
+    eventually("the sink's progress", || {
+        target.query(&q).ok().and_then(|r| r.rows.first()?.first()?.clone()).and_then(|g| g.parse::<i64>().ok()).is_some_and(|g| g >= gsn)
+    });
+}
+
+/// Sorted rows, for comparing multisets.
+fn sorted(mut rows: Vec<String>) -> Vec<String> {
+    rows.sort();
+    rows
+}
+
+/// A keyless sink deletes a retracted row by matching every column, and
+/// PostgreSQL's equality takes `'1 mon'` for `'30 days'`, which the engine
+/// keeps apart (they differ in date arithmetic): retracting one deleted
+/// whichever the target found first, and the target kept the retracted
+/// interval while the view kept the other, with the sink's progress past the
+/// retraction. Likewise for interval arrays.
+#[test]
+fn keyless_sinks_retract_the_interval_retracted() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-interval");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, iv interval, ivs interval[])");
+    ivm.exec(
+        "INSERT INTO t VALUES (1, '30 days', NULL), (2, '1 mon', NULL), \
+         (3, NULL, '{30 days, 24:00:00}'), (4, NULL, '{1 mon, 1 day}'), \
+         (5, NULL, '{{1 mon, NULL}, {30 days, 1 day}}'), (6, NULL, '{{30 days, NULL}, {1 mon, 24:00:00}}')",
+    );
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT iv, ivs FROM t");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy'", up.conninfo));
+    sink_caught_up(&mut ivm, &mut up.client, "sk");
+    // (the target has each pair's other value first)
+    ivm.exec("DELETE FROM t WHERE id IN (2, 4, 5)");
+    sink_caught_up(&mut ivm, &mut up.client, "sk");
+    let want = ["30 days|NULL", "NULL|{\"30 days\",24:00:00}", "NULL|{{\"30 days\",NULL},{\"1 mon\",24:00:00}}"];
+    assert_eq!(sorted(ivm.rows("SELECT iv, ivs FROM v")), want);
+    assert_eq!(sorted(up.rows("SELECT iv, ivs FROM v_copy")), want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A keyless sink deletes a retracted row by the target row that holds the
+/// same values, among those equal to it: for every type, a value kept and
+/// one retracted that PostgreSQL's `=` takes for it (or that is alike in
+/// text, or the same value), the kept one written first, where a match by
+/// `=` or by text alone finds it first. The target's sessions have settings
+/// that change the text of floats (`0.1` and `0.1000000000000001` print
+/// alike), intervals and timestamps, and a linguistic collation, under which
+/// `=` is still identity (it is deterministic). The deletions can use an
+/// index of the target (IS NOT DISTINCT FROM could not).
+#[test]
+fn keyless_sinks_retract_exact_values_of_every_type() {
+    let mut up = Upstream::start_with(&["shared_preload_libraries = 'pg_stat_statements'"]);
+    up.exec("CREATE DATABASE target TEMPLATE template0 LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C.UTF-8'");
+    for s in ["extra_float_digits = 0", "IntervalStyle = iso_8601", "TimeZone = 'Asia/Kathmandu'", "DateStyle = 'SQL, DMY'"] {
+        up.exec(&format!("ALTER DATABASE target SET {s}"));
+    }
+    let conninfo = up._pg.conninfo("target");
+    let mut target = connect(&conninfo);
+    target.simple_query("CREATE EXTENSION pg_stat_statements").unwrap();
+    // (to read the target as the engine prints values)
+    target.simple_query("SET extra_float_digits = 1; SET IntervalStyle = postgres; SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'").unwrap();
+    // column, type, the value kept, the one retracted
+    let cases = [
+        ("iv", "interval", "30 days", "1 mon"),
+        ("iv", "interval", "24:00:00", "1 day"),
+        ("n", "numeric", "1.5", "1.50"),
+        ("n", "numeric", "0", "0.000"),
+        ("n", "numeric", "NaN", "NaN"),
+        ("f4", "real", "0", "-0"),
+        ("f4", "real", "NaN", "NaN"),
+        ("f8", "double precision", "0", "-0"),
+        ("f8", "double precision", "0.1000000000000001", "0.1"),
+        ("jb", "jsonb", r#"{"a": 1}"#, r#"{"a": 1.0}"#),
+        ("j", "json", r#"{"a": 1}"#, r#"{"a":1}"#),
+        ("jp", "jsonpath", "$.a", r#"$."a""#),
+        ("b", "bpchar", "a", "a  "),
+        ("c", "character(3)", "a", "a  "),
+        ("tx", "text", "\u{e4}", "a\u{308}"),
+        ("ts", "timestamp", "2024-01-01 00:00:00", "2024-01-01 00:00:00.000001"),
+        ("tz", "timestamptz", "2024-01-01 05:45:00+05:45", "2024-01-01 00:00:00+00"),
+        ("ivs", "interval[]", "{30 days,NULL}", "{1 mon,NULL}"),
+        ("ivs", "interval[]", "{{30 days},{24:00:00}}", "{{1 mon},{1 day}}"),
+        ("ivs", "interval[]", "[0:0]={30 days}", "{1 mon}"),
+        ("ns", "numeric[]", "{1.5,NULL}", "{1.50,NULL}"),
+        ("f8s", "double precision[]", "{0,NaN}", "{-0,NaN}"),
+        ("jbs", "jsonb[]", r#"{"{\"a\": 1}"}"#, r#"{"{\"a\": 1.0}"}"#),
+        ("js", "json[]", r#"{"{\"a\": 1}"}"#, r#"{"{\"a\":1}"}"#),
+        ("bs", "bpchar[]", "{a}", r#"{"a  "}"#),
+        ("txs", "text[]", "{\u{e4}}", "{a\u{308}}"),
+    ];
+    let mut cols: Vec<(&str, &str)> = Vec::new();
+    for (c, ty, _, _) in cases {
+        if !cols.iter().any(|(x, _)| *x == c) {
+            cols.push((c, ty));
+        }
+    }
+    let names = cols.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(", ");
+    let dir = tmpdir("sink-exact");
+    let mut ivm = Ivm::start(&dir);
+    let defs = cols.iter().map(|(c, ty)| format!("{c} {ty}")).collect::<Vec<_>>().join(", ");
+    ivm.exec(&format!("CREATE TABLE t (id int PRIMARY KEY, {defs})"));
+    ivm.exec(&format!("CREATE MATERIALIZED VIEW v AS SELECT {names} FROM t"));
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{conninfo}' TABLE 'v_copy'"));
+    eventually("the target", || target.query("SELECT FROM v_copy").is_ok());
+    target.simple_query("CREATE INDEX ON v_copy (iv)").unwrap();
+    let insert = |ivm: &mut Ivm, first: usize, value: &dyn Fn(usize) -> &'static str| {
+        let rows = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (c, ..))| {
+                let vals = cols.iter().map(|(x, ty)| if x == c { format!("'{}'::{ty}", value(i)) } else { "NULL".into() });
+                format!("({}, {})", first + i, vals.collect::<Vec<_>>().join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ivm.exec(&format!("INSERT INTO t VALUES {rows}"));
+    };
+    insert(&mut ivm, 0, &|i| cases[i].2);
+    insert(&mut ivm, cases.len(), &|i| cases[i].3);
+    sink_caught_up(&mut ivm, &mut target, "sk");
+    target.simple_query("SELECT pg_stat_statements_reset()").unwrap();
+    ivm.exec(&format!("DELETE FROM t WHERE id >= {}", cases.len()));
+    sink_caught_up(&mut ivm, &mut target, "sk");
+    let kept = sorted(ivm.rows(&format!("SELECT {names} FROM v")));
+    assert_eq!(kept.len(), cases.len());
+    let got = target.query(&format!("SELECT {names} FROM v_copy")).unwrap().rows;
+    let got = got.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join("|"));
+    assert_eq!(sorted(got.collect()), kept);
+    // every deletion can find its row through the index (with sequential
+    // scans off, a plan that needs one shows a Seq Scan anyway)
+    let deletes = target.query(r#"SELECT query FROM pg_stat_statements WHERE query LIKE 'DELETE FROM "v_copy"%'"#).unwrap().rows;
+    assert!(deletes.len() > 1, "{deletes:?}");
+    for q in deletes {
+        let q = q[0].clone().unwrap();
+        let plan = target.simple_query(&format!("SET enable_seqscan = off; EXPLAIN (GENERIC_PLAN) {q}")).unwrap();
+        let plan = plan.iter().flat_map(|r| &r.rows).map(|r| r[0].clone().unwrap()).collect::<Vec<_>>().join("\n");
+        assert!(plan.contains("Index Scan using v_copy_iv_idx") && !plan.contains("Seq Scan"), "{q}:\n{plan}");
+    }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A keyed sink deletes by `=` on the key, which also matches other
+/// representations of an equal key (`'1 mon'` for `'30 days'`, `1.5` for
+/// `1.50`). That is right: keys are unique as `=` compares them (the
+/// target's primary key), and the engine keys rows and groups by `=` too,
+/// so the one row with an equal key is the one the retracted row wrote. A
+/// primary key and a group key whose representation changes are rewritten
+/// in the target.
+#[test]
+fn keyed_sinks_follow_changes_of_key_representation() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-keyed");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (k interval PRIMARY KEY, n numeric, f float8, x int)");
+    ivm.exec("INSERT INTO t VALUES ('1 mon', 1.5, 0, 1), ('1 day', 2.50, '-0', 2), ('2 days', 2.5, 0, 3)");
+    ivm.exec("CREATE MATERIALIZED VIEW g AS SELECT n, f, count(*) AS c, sum(x) AS s FROM t GROUP BY n, f");
+    ivm.exec(&format!("CREATE SINK st FROM t INTO POSTGRES CONNECTION '{}' TABLE 't_copy' KEY (k)", up.conninfo));
+    ivm.exec(&format!("CREATE SINK sg FROM g INTO POSTGRES CONNECTION '{}' TABLE 'g_copy' KEY (n, f)", up.conninfo));
+    let synced = |ivm: &mut Ivm, up: &mut Upstream| {
+        for (sink, view, copy) in [("st", "t", "t_copy"), ("sg", "g", "g_copy")] {
+            sink_caught_up(ivm, &mut up.client, sink);
+            assert_eq!(sorted(up.rows(&format!("SELECT * FROM {copy}"))), sorted(ivm.rows(&format!("SELECT * FROM {view}"))), "{view}");
+        }
+    };
+    synced(&mut ivm, &mut up);
+    // the same primary keys in other representations
+    ivm.exec("UPDATE t SET k = '30 days' WHERE x = 1");
+    ivm.exec("UPDATE t SET k = '24:00:00', n = 2.500, f = 0 WHERE x = 2");
+    // the groups' only rows in other representations
+    ivm.exec("DELETE FROM t WHERE x = 3");
+    ivm.exec("UPDATE t SET n = 1.50, f = '-0' WHERE x = 1");
+    synced(&mut ivm, &mut up);
+    assert_eq!(sorted(up.rows("SELECT k, n, f FROM t_copy")), ["24:00:00|2.500|0", "30 days|1.50|-0"]);
+    assert_eq!(sorted(up.rows("SELECT n, f, c FROM g_copy")), ["1.50|-0|1", "2.500|0|1"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A sink's target table has its view's columns: a replacement changing
 /// them is rejected (the sink used to go on writing the new rows under the
 /// old column names); one keeping them is delivered.

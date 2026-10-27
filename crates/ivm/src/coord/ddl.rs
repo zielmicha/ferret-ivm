@@ -11,7 +11,7 @@ use crate::sql::binder_expr::sql_type_of;
 use crate::sql::parser::{parse_statement, Statement};
 use crate::sql_bail;
 use crate::types::encoding::SortSpec;
-use crate::types::{Column, ColumnType};
+use crate::types::{Column, ColumnType, Equality};
 use sqlparser::ast;
 
 /// Upstream table discovered by CREATE SOURCE (logged in the DDL record).
@@ -419,20 +419,23 @@ impl Engine {
             if key[..i].contains(k) {
                 sql_bail!(codes::DUPLICATE_COLUMN, "column \"{k}\" appears twice in the sink key");
             }
-            fn has_equality(t: &crate::types::SqlType) -> bool {
-                use crate::types::SqlType as T;
-                match t {
-                    T::Json | T::JsonPath => false,
-                    T::Array(e) => has_equality(e),
-                    _ => true,
+            // The target's primary key compares keys with `=`: keys the
+            // engine tells apart must differ by it. Equal values in other
+            // representations (1.0 and 1.00) are one key in the engine too;
+            // character values differing in trailing spaces are not.
+            let ty = crate::types::format_type(&c.ty.ty, c.ty.typmod);
+            match c.ty.equality() {
+                Equality::None => {
+                    sql_bail!(codes::FEATURE_NOT_SUPPORTED, "sink key column \"{k}\" has type {ty}, which cannot be part of a primary key")
                 }
-            }
-            if !has_equality(&c.ty.ty) {
-                sql_bail!(
-                    codes::FEATURE_NOT_SUPPORTED,
-                    "sink key column \"{k}\" has type {}, which cannot be part of a primary key",
-                    crate::types::format_type(&c.ty.ty, c.ty.typmod)
-                );
+                Equality::TrailingSpaces => {
+                    return Err(SqlError::new(
+                        codes::FEATURE_NOT_SUPPORTED,
+                        format!("sink key column \"{k}\" has type {ty}, whose values differing only in trailing spaces would be one key in the target"),
+                    )
+                    .with_hint("Give the column a length (character(n)) or cast it to text."));
+                }
+                Equality::Identity | Equality::Representation => {}
             }
         }
         Ok(v)
