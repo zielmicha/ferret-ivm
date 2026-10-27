@@ -432,7 +432,8 @@ header. Reading a node reads exactly `len` bytes at `off` and checks that
   `fsync`ed), and resized to the checkpoint's `active_len` (0 for a new
   store) — discarding nodes written after the checkpoint (early, or by an
   interrupted checkpoint). Every other `seg-*.dat` that the checkpoint's
-  segment table does not list is deleted (segments started since).
+  segment table does not list (segments started since, and dead segments
+  kept for forks) or lists with `live_bytes` 0 is deleted.
 
 ### Leaf node
 
@@ -714,7 +715,9 @@ segments each tree has nodes in).
    engine has taken the checkpoint as written, and only those that hold no
    live node for it either (it may have written to them, or adopted a fork's
    tree with nodes in them, since the checkpoint was begun) and that no
-   fork still writing to them pins.
+   fork still writing to them pins. One that a fork of the engine may still
+   read (a hydration or a large read that began before it died) is deleted
+   when that fork ends instead; later records no longer list it.
 
 Creating a segment file (the first one, and each new active segment) is
 followed by an `fsync` of the store directory, so that a checkpoint never
@@ -1228,7 +1231,9 @@ checkpoint of a running engine).
   when its node is modified (dirty), dropped, or released with its tree.
 - **Deletion**: after each checkpoint, sealed segments with zero live bytes
   in it are deleted, unless the running engine still holds live nodes in
-  them or a fork pins them (see [Checkpoint procedure](#checkpoint-procedure)).
+  them or a fork pins them, or once the forks that may read them end (see
+  [Checkpoint procedure](#checkpoint-procedure)); at the latest on the next
+  open.
   The active segment is never deleted or collected.
 - **Removed entries**: an entry whose weight a change makes 0 is removed
   from its leaf at once, a leaf left without entries from its parent, and a

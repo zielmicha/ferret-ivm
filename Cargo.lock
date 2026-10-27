@@ -682,6 +682,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "libc",
  "log",
  "mimalloc",
  "num-bigint",

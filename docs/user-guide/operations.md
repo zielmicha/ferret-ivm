@@ -22,6 +22,7 @@ Fixed internal parameters (not configurable):
 |---|---|
 | target size of index leaf and internal nodes | 16 KiB |
 | storage segment size (roll-over threshold) | 256 MiB |
+| storage segment files kept open for reading (by the engine, checkpoints, hydrations and large reads together) | a quarter of the limit on open files (below), at least 8 and at most 65,536 |
 | input-log segment size (roll-over threshold) | 64 MiB |
 | maximum records per sequencer batch (group commit) | 4096 |
 | records waiting to be applied, before sources stop reading their streams | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
@@ -70,6 +71,20 @@ Things to keep in mind when sizing:
   and each session, source and sink thread has its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
+- **Open files**: the storage keeps at most a quarter of the process's
+  limit on open files (the soft limit, `ulimit -n`, as it is when the server
+  starts) of its segment files open for reading, however large the store
+  (a segment per 256 MiB) and however many hydrations and large reads run
+  on it; it opens the others again as it reads them. Besides those the
+  server holds about a dozen files and sockets of its own (the input log,
+  the manifest, the active segment, the lock file, the listening sockets),
+  one socket per client session and one per connection to PostgreSQL (a
+  source's replication connection, and one more while it copies tables; a
+  sink's connection). The common default limit of 1,024 leaves 256 for
+  segment files and the rest for connections. Raise it (`ulimit -n`,
+  `LimitNOFILE=` under systemd) for many connections, or for a store much
+  larger than 64 GiB whose reads miss the buffer pool all over it, to save
+  reopening files.
 
 ### Memory
 
@@ -243,7 +258,9 @@ step of a requested shutdown. It:
 4. appends a checkpoint record (tree roots, segment usage, a small header
    naming the metadata tree) to the manifest and `fsync`s it — this is the
    atomic commit point;
-5. deletes sealed segment files with no live nodes;
+5. deletes sealed segment files with no live nodes (one that a hydration
+   or a large read begun before it died may still read is deleted when
+   that ends);
 6. asks the sequencer to delete input-log segments whose records all lie at
    or before the checkpoint's GSN (only recovery reads the log, and it
    starts after the checkpoint).
@@ -263,12 +280,15 @@ left nearly empty with a neighbour. Its work on nodes not already in memory
 or modified is bounded per pass by the budget in the table above: it keeps
 pace with the rate at which updates create garbage, and the next pass
 continues what does not fit. A segment with no live bytes is deleted at the
-checkpoint. The active segment is never collected, so up to one segment
-(256 MiB) of dead space can accumulate before it is sealed. Dropping an
-index or view releases its space without reading it. (A data directory
-written by a version that kept each row's history of changes for `AS OF`
-reads keeps the old versions in its leaves on disk until a change or the
-maintenance pass rewrites them; reads skip them.)
+checkpoint, or, while a hydration or a large read begun before it died may
+still read it, when that ends: a long hydration (or a read whose client is
+slow) keeps the segments that die meanwhile on disk until it is done. The
+active segment is never collected, so up to one segment (256 MiB) of dead
+space can accumulate before it is sealed. Dropping an index or view
+releases its space without reading it. (A data directory written by a
+version that kept each row's history of changes for `AS OF` reads keeps the
+old versions in its leaves on disk until a change or the maintenance pass
+rewrites them; reads skip them.)
 
 `SHOW FRONTIERS` shows `checkpoint_gsn` and the number of segments.
 

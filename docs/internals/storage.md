@@ -425,12 +425,13 @@ prefix. `EXPLAIN MAINTENANCE` and `SHOW` use tree counts.
 
 `Env::fork` returns an independent environment holding every tree as it is
 at that moment, for another thread: it shares the loaded nodes (each side
-copies a shared node before modifying it, see above) and holds the segment
-files with live nodes open, so that it can still read nodes whose segments a
-later checkpoint deletes. It can be modified, and it shares the store's
-append side, so its buffer pool works like any other: it writes dirty nodes
-early and evicts them, and a large hydration in a fork stays within its
-pool. Its pool counts only the fork's own nodes against its target — those
+copies a shared node before modifying it, see above) and the store's open
+segment files, and the segments it may read stay on disk until it is
+dropped, also once checkpoints find them dead
+([below](#segments-and-checkpoints)). It can be modified, and it shares
+the store's append side, so its buffer pool works like any other: it
+writes dirty nodes early and evicts them, and a large hydration in a fork
+stays within its pool. Its pool counts only the fork's own nodes against its target — those
 it loads, creates, copies or modifies, and the ones it inherited that
 nobody else holds any more (the environment modified or evicted its
 version): the nodes still shared with the environment cost the fork
@@ -461,8 +462,27 @@ are clean): the frame counts as live bytes of its segment and of its tree,
 and towards the next maintenance pass's budget unless that pass dirtied
 the node; the child entry above the node gets its exact `min_seg`, and the
 entries above that (and the tree's) get a `min_seg` lowered to it where
-they were higher. A checkpoint has three parts, which can run on
-different threads:
+they were higher.
+
+Segment files are read through one set of open files, which the
+environment shares with its checkpoint jobs and forks: at most
+`EnvOptions::max_open_segments`, by default a quarter of the process's
+limit on open files (the soft `RLIMIT_NOFILE`; at least 8, at most 65,536).
+A file is opened when a node in it is read and stays open for later reads;
+beyond the bound, opening another closes the one the CLOCK hand finds
+unused since it last passed (a read still using it keeps it open until it
+is done). A store of any size, with any number of forks, thus holds that
+many descriptors, plus the active segment (open for appending), the
+manifest, and one file at a time opened to be synced; reading from more
+segments than the bound in turn costs an `open` per read of a node at
+worst. Nothing depends on a file staying open: a segment is deleted only
+once nothing may read it (below). The append side keeps only
+the active segment open; a checkpoint opens the segments sealed since the
+last one again to `fsync` them (a write-back error is reported to the next
+`fsync` through any descriptor that has not seen it, also one opened after
+the error, as on Linux since 4.13).
+
+A checkpoint has three parts, which can run on different threads:
 
 1. `Env::begin_checkpoint(gsn)` freezes a version of the dirty nodes: a
    checkpoint job holds them (shared, with their modification stamps), the
@@ -497,23 +517,32 @@ different threads:
    towards the next maintenance pass. A written node that was modified (or
    freed) since the job began stays dirty (or gone): its image is garbage
    from the start, counted in its segment's total but not as live. Then the
-   segments dead in the committed state are deleted if they are dead here
-   too — the environment may have written live frames to them, or adopted a
-   fork's tree with nodes in them, since the job began — and no fork pins
-   them.
+   segments dead in the committed state that are dead here too — the
+   environment may have written live frames to them, or adopted a fork's
+   tree with nodes in them, since the job began — are deleted
+   (`SegmentStore::delete`), with two exceptions. A segment a fork appended
+   to stays while that fork lives, since its trees may still be adopted
+   with nodes there, and the next checkpoint tries again. A segment that a
+   live fork may read — a fork taken while the segment was the active one
+   or an older one, as every node a fork inherits lies in such a segment —
+   is left to the store, which deletes it when the last such fork taken
+   before it died is dropped (a fork taken since cannot read it); the
+   environment forgets it, and the next record no longer lists it.
 
 `Env::checkpoint(gsn, app)` does the three in a row.
 
 On open, the last valid manifest record defines the state: the active
-segment is truncated to the recorded length, and segment files the record
-does not mention are deleted. This discards every frame written after the
-record — by an interrupted checkpoint, or early by the buffer pool, in the
-active segment beyond its recorded length or in segments started since —
-and nothing durable refers to those frames. Without a valid record, a
-store that may have had a checkpoint — a non-empty manifest, or no
-manifest but segment files with data — is refused instead, and nothing is
-modified (an empty manifest, left by a crash during the very first
-checkpoint, opens as a new store).
+segment is truncated to the recorded length, and the other segment files
+the record does not mention, or mentions without live bytes, are deleted.
+This discards every frame written after the record — by an interrupted
+checkpoint, or early by the buffer pool, in the active segment beyond its
+recorded length or in segments started since — and nothing durable refers
+to those frames; and the dead segments the previous run had not deleted
+(a crash came first, or a fork could still read them), which no fork reads
+now. Without a valid record, a store that may have had a checkpoint — a
+non-empty manifest, or no manifest but segment files with data — is
+refused instead, and nothing is modified (an empty manifest, left by a
+crash during the very first checkpoint, opens as a new store).
 
 Creating the store directory, the manifest or a segment file is followed by
 an `fsync` of the directory that holds it, so that a crash cannot lose the
@@ -569,8 +598,9 @@ target, writing the rest early). What does not fit waits for the next pass:
 the pass reports that it left work (`MaintStats::unfinished`), which makes
 the engine's next checkpoint due even if nothing else changes.
 `maintain_with` takes an explicit budget (a zero budget does nothing but
-report the work it found). Once a segment has no live bytes it is deleted at the end of a
-checkpoint. The active segment itself is never evacuated.
+report the work it found). Once a segment has no live bytes it is deleted
+at the end of a checkpoint, or once the forks that may read it are
+dropped. The active segment itself is never evacuated.
 
 Dropping a tree (`drop_tree`) reads nothing: it frees the tree's loaded
 nodes and subtracts its live bytes per segment from the segments'.
