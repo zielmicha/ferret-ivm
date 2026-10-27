@@ -237,7 +237,7 @@ target/release/ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [
 | `--rounds N` | 20 | rounds of random upstream changes |
 | `--restarts N` | 0 | restart the engine N times in random rounds, before or right after the round's changes: a clean shutdown, or (mostly) a crash that skips the final checkpoint, so that recovery replays the log |
 | `--kill` | off | run the engine as a child process (the `ivm` binary next to `ivm-difftest`) and SIGKILL it for the restarts (3 unless `--restarts` says otherwise): while it applies changes, during a checkpoint, or during the initial snapshot |
-| `--sinks N` | 3 | write the first N views that can be read back to PostgreSQL (database `sinks`) with sinks |
+| `--sinks N` | 3 | write the first N views that can be read back to PostgreSQL (database `sinks`) with sinks, and with N > 0 also the views of `reps` (below) |
 | `--schema-changes N` | 1 | add N columns to replicated tables upstream in random rounds |
 | `--keep` | off | keep the PostgreSQL cluster and the engine's data directory |
 
@@ -292,7 +292,23 @@ What a run does:
    <query>` for those the engine rejects (at most 20 × `--views` attempts),
    then adds views over views (grouping, `DISTINCT`, or a join of an
    existing view with an aggregate of itself), which read the materialized
-   view in the engine and inline its query in PostgreSQL. Then the sinks.
+   view in the engine and inline its query in PostgreSQL. Then the sinks,
+   into a database with an ICU collation (`en-US`) whose sessions print
+   values differently (`extra_float_digits = 0`, under which `0.1` and
+   `0.1000000000000001` print alike; `IntervalStyle = iso_8601`, a time
+   zone of +05:45, `DateStyle = 'SQL, DMY'`). With `--sinks` above 0, a
+   table `reps` (with its own random generator, so that the seed's other
+   choices stay the same) holds 120 rows, most with a value in just one of
+   19 columns, drawn from values in several representations of equal values
+   (`1 mon`, `30 days` and `29 days 24:00:00`; `1.5` and `1.50`; `-0` and
+   `0`; jsonb numbers; `bpchar` trailing spaces; arrays of them, nested and
+   with NULL elements), values alike in text (json, and floats under the
+   sinks' settings) and one value written differently (jsonpath, timestamptz
+   in other time zones, `char(3)`); no generated view reads it. Sinks write
+   `reps_all`, all its columns without the id (keyless: a removed row must
+   delete the very representation removed), and `reps_iv` and `reps_n`,
+   grouped by `interval`, and by `numeric` and `float8`, with those as
+   `KEY` (the representation a group shows changes).
 5. Round 0 compares the initial state. Each later round first applies the
    round's schema changes, if any (`ALTER TABLE ... ADD COLUMN`, sometimes
    with a default, which existing rows get without a replicated change, so
@@ -304,7 +320,9 @@ What a run does:
    deleted) again or deleted and inserted again within the transaction,
    upserts (`ON CONFLICT DO UPDATE`), and occasionally `TRUNCATE` (a failing
    transaction is rolled back and reported as ignored); sometimes a
-   `CHECKPOINT`; and the round's restart, if any.
+   `CHECKPOINT`; with `--sinks` above 0, 1–2 transactions on `reps`
+   (inserts, values changed to another representation, deletes); and the
+   round's restart, if any.
 6. It then reads `pg_current_wal_lsn()` upstream and compares every view,
    read with `AS OF AT LEAST LSN '<lsn>'`, with the same query run by
    PostgreSQL, and every replicated table with its upstream contents.
@@ -316,8 +334,10 @@ What a run does:
    match, because PostgreSQL keeps whichever representation it meets
    first. A view over a view that fails in the engine is not compared (it
    fails with its source, while PostgreSQL need not compute the failing
-   column). Each sink's table must converge to its view's contents within
-   20 seconds.
+   column). `reps` is compared with its upstream contents exactly (no
+   rounding: representations count). Each sink's table must converge within
+   20 seconds to its view's contents in the engine, exactly, representations
+   included (the views are compared with PostgreSQL as above).
 7. Prints `round <n>: <m>/<k> views match (<rows> rows, <e> both-error), <s> sinks (<r> rows), in <time>`
    (and each schema change and restart as it happens).
    For a mismatch it prints the view and its query, both row counts, up to
@@ -325,7 +345,8 @@ What a run does:
    only the multiplicities differ), and whether the same query run ad hoc
    in the engine agrees with PostgreSQL (a maintenance bug) or with the view
    (a query semantics bug); likewise for tables (`TABLE MISMATCH`) and sinks
-   (`SINK MISMATCH`, with the sink's status). A view that fails in both
+   (`SINK MISMATCH`: rows only in the view and only in the sink's table,
+   differing multiplicities, and the sink's status). A view that fails in both
    systems counts as both-error; a view that fails only in the engine is a
    failure; one that fails only in PostgreSQL is reported but not counted.
    After any round but round 0 that had failures, the run stops.
@@ -336,10 +357,10 @@ Exit status: 0 with `OK (seed N)`, 1 with
 ```
 $ ivm-difftest --seed 7 --views 6 --rounds 2
 created 7 views (0 rejected)
-round 0: 7/7 views match (146 rows, 0 both-error), 3 sinks (105 rows), in 160.445808ms
+round 0: 7/7 views match (146 rows, 0 both-error), 6 sinks (236 rows), in 109.484031ms
 round 1: ALTER TABLE t2 ADD COLUMN s6 text DEFAULT 'ü'; UPDATE t2 SET id = id WHERE id % 3 = 0 OR id = (SELECT min(id) FROM t2);
-round 1: 7/7 views match (146 rows, 0 both-error), 3 sinks (105 rows), in 8.111596ms
-round 2: 7/7 views match (146 rows, 0 both-error), 3 sinks (105 rows), in 11.88653ms
+round 1: 7/7 views match (146 rows, 0 both-error), 6 sinks (228 rows), in 110.167108ms
+round 2: 7/7 views match (146 rows, 0 both-error), 6 sinks (212 rows), in 110.277864ms
 OK (seed 7)
 ```
 
