@@ -435,3 +435,18 @@ proptest! {
         }
     }
 }
+
+/// An array type's modifier is its elements': a `bpchar[]` without one is
+/// not `character[]`, which PostgreSQL reads as `character(1)[]` (a sink
+/// created its target column and wrote its literals so, truncating every
+/// element to one character).
+#[test]
+fn array_types_are_formatted_with_their_elements_modifier() {
+    use super::format_type;
+    let arr = |t: SqlType| SqlType::Array(Box::new(t));
+    assert_eq!(format_type(&arr(SqlType::Bpchar), -1), "bpchar[]");
+    assert_eq!(format_type(&arr(SqlType::Bpchar), 7), "character(3)[]");
+    assert_eq!(format_type(&arr(SqlType::Varchar), -1), "character varying[]");
+    assert_eq!(format_type(&arr(SqlType::Numeric), -1), "numeric[]");
+    assert_eq!(format_type(&arr(SqlType::TimestampTz), -1), "timestamp with time zone[]");
+}

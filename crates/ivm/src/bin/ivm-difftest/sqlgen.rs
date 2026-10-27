@@ -277,6 +277,85 @@ pub fn transaction(rng: &mut Rng, tables: &mut [Table], local: bool) -> Vec<Stri
     out
 }
 
+/// Columns of `reps`, a table for sinks (no generated view reads it) whose
+/// values come in several representations of equal values, besides values
+/// alike in text and the same value written differently: name, type, values.
+pub const REPS: &[(&str, &str, &[&str])] = &[
+    ("iv", "interval", &["1 mon", "30 days", "29 days 24:00:00", "1 day", "24:00:00"]),
+    ("ivs", "interval[]", &["{1 mon,NULL}", "{30 days,NULL}", "{{1 mon},{1 day}}", "{{30 days},{24:00:00}}", "[0:0]={1 mon}"]),
+    ("n", "numeric", &["1.5", "1.50", "0", "0.000", "NaN"]),
+    ("ns", "numeric[]", &["{1.5,NULL}", "{1.50,NULL}", "{{0},{NaN}}"]),
+    ("f4", "real", &["0", "-0", "NaN", "1.5"]),
+    ("f8", "float8", &["0", "-0", "NaN", "0.1", "0.1000000000000001"]),
+    ("f8s", "float8[]", &["{0,NaN}", "{-0,NaN}", "{NULL,-0}"]),
+    ("jb", "jsonb", &[r#"{"a": 1}"#, r#"{"a": 1.0}"#, "[1.50]", "[1.5]"]),
+    ("jbs", "jsonb[]", &[r#"{"{\"a\": 1}"}"#, r#"{"{\"a\": 1.0}"}"#]),
+    ("j", "json", &[r#"{"a": 1}"#, r#"{"a":1}"#, r#"{"a": 1.0}"#]),
+    ("js", "json[]", &[r#"{"{\"a\": 1}"}"#, r#"{"{\"a\":1}"}"#]),
+    ("jp", "jsonpath", &["$.a", r#"$."a""#, "$.b"]),
+    ("b", "bpchar", &["a", "a ", "a  "]),
+    ("bs", "bpchar[]", &["{a}", r#"{"a "}"#, r#"{"a  ",NULL}"#]),
+    ("c", "char(3)", &["a", "a  ", "ab"]),
+    ("tx", "text", &["\u{e4}", "a\u{308}", "A", "a"]),
+    ("txs", "text[]", &["{\u{e4}}", "{a\u{308}}", "{{A},{a}}"]),
+    ("ts", "timestamp", &["2024-01-01 00:00:00", "2024-01-01 00:00:00.000001"]),
+    ("tz", "timestamptz", &["2024-01-01 05:45:00+05:45", "2024-01-01 00:00:00+00", "2024-01-01 00:00:00+01"]),
+];
+
+/// Materialized views over `reps` and the key of their sinks (keys of
+/// several representations: the group shows one of them, which changes).
+pub const REP_VIEWS: &[(&str, &str, Option<&str>)] = &[
+    ("reps_all", "SELECT iv, ivs, n, ns, f4, f8, f8s, jb, jbs, j, js, jp, b, bs, c, tx, txs, ts, tz FROM reps", None),
+    ("reps_iv", "SELECT iv, count(*) AS cnt, sum(id) AS ids FROM reps WHERE iv IS NOT NULL GROUP BY iv", Some("iv")),
+    ("reps_n", "SELECT n, f8, count(*) AS cnt FROM reps WHERE n IS NOT NULL AND f8 IS NOT NULL GROUP BY n, f8", Some("n, f8")),
+];
+
+pub fn reps_table_sql() -> String {
+    let cols: Vec<String> = REPS.iter().map(|(c, ty, _)| format!("{c} {ty}")).collect();
+    format!("CREATE TABLE reps (id int PRIMARY KEY, {})", cols.join(", "))
+}
+
+fn rep_value(rng: &mut Rng, col: usize) -> String {
+    let (_, ty, vals) = REPS[col];
+    format!("'{}'::{ty}", rng.pick(vals))
+}
+
+/// An INSERT of a row of `reps` with one value (rows of one column make
+/// equal rows of different representations common), or values of `n` and
+/// `f8` (the key of `reps_n`).
+pub fn reps_insert(rng: &mut Rng, id: i64) -> String {
+    let mut vals = vec!["NULL".to_string(); REPS.len()];
+    let cols = if rng.chance(25) { vec![2, 5] } else { vec![rng.below(REPS.len() as u64) as usize] };
+    for c in cols {
+        vals[c] = rep_value(rng, c);
+    }
+    format!("INSERT INTO reps VALUES ({id}, {});", vals.join(", "))
+}
+
+/// Statements of a random transaction on `reps`: rows inserted, values
+/// changed to another representation, rows deleted.
+pub fn reps_transaction(rng: &mut Rng, next_id: &mut i64) -> Vec<String> {
+    let mut out = Vec::new();
+    for _ in 0..(1 + rng.below(5)) {
+        match rng.below(4) {
+            0 | 1 => {
+                for _ in 0..(1 + rng.below(4)) {
+                    *next_id += 1;
+                    out.push(reps_insert(rng, *next_id));
+                }
+            }
+            2 => {
+                let c = rng.below(REPS.len() as u64) as usize;
+                let (v, name) = (rep_value(rng, c), REPS[c].0);
+                out.push(format!("UPDATE reps SET {name} = {v} WHERE {name} IS NOT NULL AND id % {} = {};", 2 + rng.below(3), rng.below(2)));
+            }
+            // (a few rows: as many as inserted, on average)
+            _ => out.push(format!("DELETE FROM reps WHERE id % {} = {};", 8 + rng.below(8), rng.below(8))),
+        }
+    }
+    out
+}
+
 /// Whether `q` deduplicates equal values, where an implementation may keep
 /// any of their representations.
 pub fn dedups(q: &str) -> bool {

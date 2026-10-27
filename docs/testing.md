@@ -59,7 +59,7 @@ created with `keep: true`.
 | self-differential test (`tests/selfdiff.rs`, proptest) | random schemas of local tables and random views from `ivm-difftest`'s generator, then random actions: DML (also primary key changes and rows changed several times), checkpoints, clean restarts, crashes (sometimes with a torn record at the end of the log), views created, replaced and dropped, and statements rewriting a column of every row of a table (every operator then reads the state before that GSN from a delta that removed all of the table's entries). After every action each view must equal its query run ad hoc (non-incrementally), and every view, and the queries of some, are subscribed to: the changes streamed must add up to their contents. A failure shrinks to a minimal case |
 | dataflow tests (`tests/dataflow.rs`) | operator regression tests: maintained views equal a recompute (an ad hoc query or a freshly hydrated copy) after every change. Reads of an input as it was before a step see the rows the step removed (Distinct representatives deleted, self-joins and joins of two views over one table, semijoins, top-k, windows, set operations), with deltas in memory and spilled, and `ntile`'s first row with an argument moved past the next one changes the buckets of the whole partition. Window frames past the partition end and `RANGE` offsets that overflow, `DISTINCT` aggregates with `FILTER` (maintained and ad hoc), percentiles over `NULLS FIRST` orders, top-k windows (`LIMIT`, `OFFSET`, `WITH TIES`, per group) and window functions of every kind and frame (`ROWS`, `RANGE` with offsets, `GROUPS`) following random changes with multiplicities, ties, NULLs and errors (also with arguments that differ between rows: `ntile` reading its first non-NULL one, `lag` and `lead` offsets of either sign), and statements changing thousands of rows of one group at once; window frames reaching a partition's end over `min`/`max` values sharing long prefixes and float sums whose terms cancel, general semijoins keeping representations of equal values apart, joins on computed keys, `bigint` variance and `numeric` sums beyond `numeric`'s range, float `avg` and `stddev*` beyond the range of their sums, aggregates whose `FILTER` excludes the rows their arguments fail on, the plans of deeply nested projections; error records of shared nodes, of aggregate groups across recovery, of recursive queries, and of join inputs at hydration |
 | recovery tests (`tests/recovery.rs`) | recovery building views after the views they read (a replaced view may read a newer one); a commit larger than a log frame replayed from its parts after a crash; views and indexes following a replaced view's new definition, and replacements rejected when they would invalidate a dependent view or make it non-deterministic; a log tail lost behind a checkpoint (no reused GSNs); views sharing a dataflow sharing its error records; dependencies as the relations a view reads; DML racing a `DROP` of its table; `bigint` variance; checkpoints writing what changed (the manifest record and the bytes written by a checkpoint after one `INSERT` do not grow with 2,000 more DDL statements in the history and 2,000 error records of a view), an idle engine taking no checkpoints, and the error state (node error records and groups in error, also of views dropped and created again) surviving crashes and restarts exactly |
-| DDL tests (`tests/ddl.rs`) | validation of definitions (at most one primary key, view column lists, `CREATE SINK` keys); `DROP` taking a relation's indexes along; atomic multi-name `DROP`; `SUBSCRIBE` to a view naming its columns like reads of it; stored definitions with parameter placeholders of earlier versions; the bounded catalog history |
+| DDL tests (`tests/ddl.rs`) | validation of definitions (at most one primary key, view column lists, `CREATE SINK` keys, refusing `bpchar` without a length); `DROP` taking a relation's indexes along; atomic multi-name `DROP`; `SUBSCRIBE` to a view naming its columns like reads of it; stored definitions with parameter placeholders of earlier versions; the bounded catalog history |
 | lifecycle tests (`tests/lifecycle.rs`) | `AS OF AT LEAST LSN` without sources (also when the last source is dropped while a read waits); subscriptions ending when a relation they read is dropped, and not when an error record is retracted; query subscriptions ending when a materialized view they read (also through other views) is replaced; `DROP SINK`, `DROP SOURCE` and shutdown not blocked by a sink or source stuck connecting to a server that never answers; a subscription that is not read ending at its memory limit, and a sink that cannot write no longer being sent changes at its limit, falling behind and dropping what it held |
 | descriptor test (`tests/descriptors.rs`) | under a limit of 64 open files (the binary's own): a store of thousands of 16 KiB segments, hundreds of them live, with forks reading old versions and dropped trees while checkpoints and maintenance passes kill segments, holds no more than a quarter of the limit open for reading, and keeps the dead segments a fork may read until it is dropped; a child process killed while forks keep dead segments: the next open deletes them and recovers the last checkpoint |
 | memory tests (`tests/memory.rs`) | with a counting allocator (per thread, and for the whole process while one test holds the binary to itself): the buffer pool's accounting against the allocations it makes, for narrow entries (about 40 bytes each in memory, however often they changed), wide entries with wide summaries (held as prefixes) and exact float sums whose magnitudes spill out of their inline limbs; a full scan of a tree larger than the pool staying within the pool, and leaving the nodes of another tree in it; hydrating views over a table ten times the buffer pool, and views larger still (a filter, joins with fan-out, aggregates over a table and over a join), peaks within the pool plus 40 MiB; a commit ten times the pool into a table with views (a filter, a join, an aggregate) costs at most the pool plus 40 MiB more than the same commit into a table without views; the changes of such a commit reach a subscriber in chunks, which ends at its limit; replacing a view with a subscriber by one 120,000 rows larger stays within the pool plus 12 MiB, the change delivered in chunks; such a commit, logged as parts, replayed after a crash within the pool plus 40 MiB (its rows take about 70 MiB) |
@@ -67,7 +67,7 @@ created with `keep: true`.
 | process tests (`tests/process.rs`) | the `ivm` binary: exit status 1 when the listen address cannot be bound or the data directory is in use; `SIGTERM`, `SIGINT` and the stop file shut down after a final checkpoint with status 0 |
 | SQL and protocol tests (`tests/sql_semantics.rs`, `tests/server_protocol.rs`) | results checked against PostgreSQL 17 (also of maintained views: `ntile` reading its argument at the partition's first row where it is not NULL) and inputs that must fail instead of crashing the engine, and an ignored test of an open bug (window function arguments computed at rows PostgreSQL does not compute them for); the wire protocol with raw messages against an in-process server (portals and `Bind`, parameter inference, `SUBSCRIBE` through the extended protocol, session commands and settings, cancellation and disconnects of waiting reads, a subscriber that stops reading ended and its queue released, and cancelled while the session's write waits, large results streamed, with an error after the first rows and through portals) |
 | HTTP tests (`tests/http.rs`) | the web UI's HTTP server and JSON API against a real engine (also: catalog dependencies are the relations views name, as the binder resolves them) |
-| replication tests (`tests/replication.rs`) | against a private PostgreSQL: snapshots and streaming; text keys under an ICU collation copied through the key index (every chunk query's plan checked with `pg_stat_statements` and `EXPLAIN (GENERIC_PLAN)`) while the table changes all over its key space; keyless tables copied in pieces; chunk reads holding up neither the stream nor the session (`wal_sender_timeout`), and a failed snapshot connection retried; snapshots resuming after a restart in the middle; an upstream transaction larger than the source's memory spooled and logged with its parts (also replayed after a crash); upstream schema changes (views over views, views a change invalidates and the virtual views over them, `SELECT *` views, DDL and DML in one transaction); `REPLICA IDENTITY USING INDEX` keys and detection of key and replica-identity changes; re-snapshots (deletes during them, keyless tables, a crash before they log progress, a restart before the truncate a key change needs, key changes of TOASTed rows in a chunk's window, rows added after a truncate the chunk saw); chunks waiting for transactions decoded before them (with an unreachable synchronous standby); a table that cannot be read not stopping the others; dropped and invalidated slots re-created; slots of dropped sources dropped after an outage and across restarts; default slot names differing between engines; `SQL_ASCII` upstreams rejected; reconnect backoff reset after a working session; TOASTed values across key changes, keyless tables truncated within a transaction, tables keyed by text-replicated types, `ALTER SOURCE REFRESH`; query subscriptions over a materialized view ending when a table under it changes upstream; sinks: exactly once across restarts, transactions in bounded messages and a backlog beyond the sink's memory limit replaced by one resynchronising transaction, rejected batches retried with a growing delay while the status keeps the error, a sink thread outliving its sink not undoing the new one, no resynchronisation on restarts, keyless targets with json and with equal values of different representations, view replacements, unreachable targets, a sink whose writes block falling behind and resynchronising from a snapshot, a sink over a relation too large to snapshot on the engine thread synchronising from a snapshot read off it as it writes it, without losing the commits made meanwhile |
+| replication tests (`tests/replication.rs`) | against a private PostgreSQL: snapshots and streaming; text keys under an ICU collation copied through the key index (every chunk query's plan checked with `pg_stat_statements` and `EXPLAIN (GENERIC_PLAN)`) while the table changes all over its key space; keyless tables copied in pieces; chunk reads holding up neither the stream nor the session (`wal_sender_timeout`), and a failed snapshot connection retried; snapshots resuming after a restart in the middle; an upstream transaction larger than the source's memory spooled and logged with its parts (also replayed after a crash); upstream schema changes (views over views, views a change invalidates and the virtual views over them, `SELECT *` views, DDL and DML in one transaction); `REPLICA IDENTITY USING INDEX` keys and detection of key and replica-identity changes; re-snapshots (deletes during them, keyless tables, a crash before they log progress, a restart before the truncate a key change needs, key changes of TOASTed rows in a chunk's window, rows added after a truncate the chunk saw); chunks waiting for transactions decoded before them (with an unreachable synchronous standby); a table that cannot be read not stopping the others; dropped and invalidated slots re-created; slots of dropped sources dropped after an outage and across restarts; default slot names differing between engines; `SQL_ASCII` upstreams rejected; reconnect backoff reset after a working session; TOASTed values across key changes, keyless tables truncated within a transaction, tables keyed by text-replicated types, `ALTER SOURCE REFRESH`; query subscriptions over a materialized view ending when a table under it changes upstream; sinks: exactly once across restarts, transactions in bounded messages and a backlog beyond the sink's memory limit replaced by one resynchronising transaction, rejected batches retried with a growing delay while the status keeps the error, a sink thread outliving its sink not undoing the new one, no resynchronisation on restarts, keyless targets with json, keyless targets retracting the very value retracted among those equal to it (intervals `1 mon` and `30 days` as reported, interval arrays, nested and with NULL elements, numeric scales and NaN, `-0`, jsonb numbers, `bpchar` trailing spaces, json, jsonpath, timestamps, text under a linguistic collation) while the target's sessions print floats, intervals and timestamps differently, every deletion able to use an index of the target, keyed targets following primary and group keys whose representation changes, view replacements, unreachable targets, a sink whose writes block falling behind and resynchronising from a snapshot, a sink over a relation too large to snapshot on the engine thread synchronising from a snapshot read off it as it writes it, without losing the commits made meanwhile |
 
 The in-process engine tests start the engine with `sync: false` and
 `tick: None` and, where time matters, log clock ticks themselves
@@ -238,7 +238,7 @@ target/release/ivm-difftest [--seed N] [--views N] [--rounds N] [--restarts N] [
 | `--rounds N` | 20 | rounds of random upstream changes |
 | `--restarts N` | 0 | restart the engine N times in random rounds, before or right after the round's changes: a clean shutdown, or (mostly) a crash that skips the final checkpoint, so that recovery replays the log |
 | `--kill` | off | run the engine as a child process (the `ivm` binary next to `ivm-difftest`) and SIGKILL it for the restarts (3 unless `--restarts` says otherwise): while it applies changes, during a checkpoint, or during the initial snapshot |
-| `--sinks N` | 3 | write the first N views that can be read back to PostgreSQL (database `sinks`) with sinks |
+| `--sinks N` | 3 | write the first N views that can be read back to PostgreSQL (database `sinks`) with sinks, and with N > 0 also the views of `reps` (below) |
 | `--schema-changes N` | 1 | add N columns to replicated tables upstream in random rounds |
 | `--keep` | off | keep the PostgreSQL cluster and the engine's data directory |
 
@@ -297,7 +297,23 @@ What a run does:
    <query>` for those the engine rejects (at most 20 × `--views` attempts),
    then adds views over views (grouping, `DISTINCT`, or a join of an
    existing view with an aggregate of itself), which read the materialized
-   view in the engine and inline its query in PostgreSQL. Then the sinks.
+   view in the engine and inline its query in PostgreSQL. Then the sinks,
+   into a database with an ICU collation (`en-US`) whose sessions print
+   values differently (`extra_float_digits = 0`, under which `0.1` and
+   `0.1000000000000001` print alike; `IntervalStyle = iso_8601`, a time
+   zone of +05:45, `DateStyle = 'SQL, DMY'`). With `--sinks` above 0, a
+   table `reps` (with its own random generator, so that the seed's other
+   choices stay the same) holds 120 rows, most with a value in just one of
+   19 columns, drawn from values in several representations of equal values
+   (`1 mon`, `30 days` and `29 days 24:00:00`; `1.5` and `1.50`; `-0` and
+   `0`; jsonb numbers; `bpchar` trailing spaces; arrays of them, nested and
+   with NULL elements), values alike in text (json, and floats under the
+   sinks' settings) and one value written differently (jsonpath, timestamptz
+   in other time zones, `char(3)`); no generated view reads it. Sinks write
+   `reps_all`, all its columns without the id (keyless: a removed row must
+   delete the very representation removed), and `reps_iv` and `reps_n`,
+   grouped by `interval`, and by `numeric` and `float8`, with those as
+   `KEY` (the representation a group shows changes).
 5. Round 0 compares the initial state. Each later round first applies the
    round's schema changes, if any (`ALTER TABLE ... ADD COLUMN`, sometimes
    with a default, which existing rows get without a replicated change, so
@@ -309,7 +325,9 @@ What a run does:
    deleted) again or deleted and inserted again within the transaction,
    upserts (`ON CONFLICT DO UPDATE`), and occasionally `TRUNCATE` (a failing
    transaction is rolled back and reported as ignored); sometimes a
-   `CHECKPOINT`; and the round's restart, if any.
+   `CHECKPOINT`; with `--sinks` above 0, 1–2 transactions on `reps`
+   (inserts, values changed to another representation, deletes); and the
+   round's restart, if any.
 6. It then reads `pg_current_wal_lsn()` upstream and compares every view,
    read with `AS OF AT LEAST LSN '<lsn>'`, with the same query run by
    PostgreSQL, and every replicated table with its upstream contents.
@@ -321,8 +339,10 @@ What a run does:
    match, because PostgreSQL keeps whichever representation it meets
    first. A view over a view that fails in the engine is not compared (it
    fails with its source, while PostgreSQL need not compute the failing
-   column). Each sink's table must converge to its view's contents within
-   20 seconds.
+   column). `reps` is compared with its upstream contents exactly (no
+   rounding: representations count). Each sink's table must converge within
+   20 seconds to its view's contents in the engine, exactly, representations
+   included (the views are compared with PostgreSQL as above).
 7. Prints `round <n>: <m>/<k> views match (<rows> rows, <e> both-error), <s> sinks (<r> rows), in <time>`
    (and each schema change and restart as it happens).
    For a mismatch it prints the view and its query, both row counts, up to
@@ -330,7 +350,8 @@ What a run does:
    only the multiplicities differ), and whether the same query run ad hoc
    in the engine agrees with PostgreSQL (a maintenance bug) or with the view
    (a query semantics bug); likewise for tables (`TABLE MISMATCH`) and sinks
-   (`SINK MISMATCH`, with the sink's status). A view that fails in both
+   (`SINK MISMATCH`: rows only in the view and only in the sink's table,
+   differing multiplicities, and the sink's status). A view that fails in both
    systems counts as both-error; a view that fails only in the engine is a
    failure; one that fails only in PostgreSQL is reported but not counted.
    After any round but round 0 that had failures, the run stops.
@@ -341,10 +362,10 @@ Exit status: 0 with `OK (seed N)`, 1 with
 ```
 $ ivm-difftest --seed 7 --views 6 --rounds 2
 created 7 views (0 rejected)
-round 0: 7/7 views match (146 rows, 0 both-error), 3 sinks (105 rows), in 160.445808ms
+round 0: 7/7 views match (146 rows, 0 both-error), 6 sinks (236 rows), in 109.484031ms
 round 1: ALTER TABLE t2 ADD COLUMN s6 text DEFAULT 'ü'; UPDATE t2 SET id = id WHERE id % 3 = 0 OR id = (SELECT min(id) FROM t2);
-round 1: 7/7 views match (146 rows, 0 both-error), 3 sinks (105 rows), in 8.111596ms
-round 2: 7/7 views match (146 rows, 0 both-error), 3 sinks (105 rows), in 11.88653ms
+round 1: 7/7 views match (146 rows, 0 both-error), 6 sinks (228 rows), in 110.167108ms
+round 2: 7/7 views match (146 rows, 0 both-error), 6 sinks (212 rows), in 110.277864ms
 OK (seed 7)
 ```
 

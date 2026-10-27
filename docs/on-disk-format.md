@@ -1013,7 +1013,8 @@ They are kept in a *fidelity suffix* written after **all** key columns of an
 entry, so that key prefixes still group equal values together. For each key
 column in order whose value is not NULL and whose type has fidelity
 (`numeric`, `real`, `double precision`, `interval`, `jsonb`, and arrays of
-those):
+those: the types whose equal values can differ in representation,
+`SqlType::equality` in `crates/ivm/src/types/mod.rs`):
 
 | Type | Fidelity bytes |
 |---|---|

@@ -40,14 +40,22 @@ CREATE SINK events_out FROM events INTO POSTGRES
 - `TABLE` names the target table. A dotted name (`schema.table`) is split at
   the dots and each part is quoted as an identifier, so names are
   case-sensitive and not lowercased.
-- `KEY` lists columns of `relation` that are unique in it. With a key, rows
-  are upserted and deleted by key; without one, the target is maintained as a
-  multiset. The key is checked before the statement is logged (and again
-  when it is applied): an unknown column fails with SQLSTATE `42703`
-  (`sink key column "x" does not exist in "v"`), a repeated one with `42701`,
-  and a column of a type that cannot be part of a primary key (`json`,
-  `jsonpath`, or arrays of them) with `0A000`. Whether the key columns are
-  unique is not checked (see
+- `KEY` lists columns of `relation` that are unique in it, as `=` compares
+  them (as the target's primary key does: `1.0` and `1.00`, or `'1 mon'`
+  and `'30 days'`, are one key). With a key, rows are upserted and deleted
+  by key; without one, the target is maintained as a multiset. The key is
+  checked before the statement is logged (and again when it is applied): an
+  unknown column fails with SQLSTATE `42703` (`sink key column "x" does not
+  exist in "v"`), a repeated one with `42701`, and a column of a type that
+  cannot be part of a primary key (`json`, `jsonpath`, or arrays of them)
+  with `0A000`, as does one of type `bpchar` (`character` without a length)
+  or an array of it (`sink key column "c" has type bpchar, whose values
+  differing only in trailing spaces would be one key in the target`): `=`
+  ignores trailing spaces, while the engine's keys and groups do not
+  ([Known problems](troubleshooting.md#known-problems)), so keys unique in
+  the engine could be one in the target. Give such a column a length (the
+  values of a `character(n)` all have n characters) or cast it to `text`.
+  Whether the key columns are unique is not checked (see
   [Requirements on the target](#requirements-on-the-target)).
 
 The sink starts as soon as the statement is applied, and again after every
@@ -162,7 +170,12 @@ progress row itself never moves backwards.
 
 With `KEY`:
 
-- a removed row is `DELETE FROM <target> WHERE k1 = <v1> AND ...`;
+- a removed row is `DELETE FROM <target> WHERE k1 = <v1> AND ...`. This
+  also matches another representation of an equal key (`'30 days'` for
+  `'1 mon'`, `1.5` for `1.50`), which is right: keys are unique as `=`
+  compares them, so the one row with an equal key is the one the removed
+  row wrote (the engine keys rows and groups by `=` as well; a key whose
+  representation changes is removed and added again);
 - added rows are `INSERT ... ON CONFLICT (<key>) DO UPDATE SET <other
   columns> = EXCLUDED.<column>` (`DO NOTHING` if every column is a key
   column). An update of a view row is a removal followed by an addition with
@@ -170,19 +183,35 @@ With `KEY`:
 
 Without `KEY`:
 
-- a removed row deletes one matching row:
-  `DELETE FROM <target> WHERE ctid = (SELECT ctid FROM <target> WHERE c1 IS NOT DISTINCT FROM <v1> AND ... LIMIT 1)`.
-  Columns of type `json`, `jsonb`, `jsonpath`, `numeric`, `real` or
-  `double precision` (and arrays of them) are matched by their text
-  (`c::text IS NOT DISTINCT FROM (<v>)::text`): PostgreSQL has no equality
-  for `json` and `jsonpath`, and for the others equality would also match
-  another representation of an equal value (`1.5` and `1.50`, `-0` and
-  `0`), deleting a row the view still has;
+- a removed row deletes one row holding the same values:
+  `DELETE FROM <target> WHERE ctid = (SELECT ctid FROM <target> WHERE <c1 holds v1> AND ... LIMIT 1)`.
+  A column holds NULL if `c IS NULL`, and another value `<v>` if
+  `c = <v>`, except where `=` is coarser than identity: for types whose
+  equal values can differ in representation, `=` would also match another
+  representation than the removed one and delete a row the view still has,
+  leaving the removed one in the target for good. Such columns are matched
+  by their text as well, `c = <v> AND c::text = (<v>)::text`: `numeric`
+  (`1.5` and `1.50`), `real` and `double precision` (`-0` and `0`),
+  `interval` (`'1 mon'` and `'30 days'`, which differ in date arithmetic),
+  `jsonb` (`{"a": 1}` and `{"a": 1.0}`), `bpchar` (`character` without a
+  length: `'a'` and `'a  '`; by `octet_length(c) = octet_length(<v>)`
+  instead, as its cast to text drops trailing spaces), and arrays of these. `json`, `jsonpath` and arrays of them, which have no `=`, are
+  matched by their text alone. Together with `=`, the text tells the
+  representations apart whatever the session's settings
+  (`extra_float_digits`, `IntervalStyle`). The other types, `text` under
+  any deterministic collation included, have `=` only for identical values.
+  Which types are which is said in one place, `SqlType::equality`
+  (`crates/ivm/src/types/mod.rs`), which also decides which values have a
+  [fidelity suffix](../on-disk-format.md#fidelity-suffix) in the engine's
+  keys;
 - added rows are plain `INSERT`s.
 
-No index can answer such a condition, so every removed row costs a scan of
-the target table: a keyless sink of a large relation that changes often is
-slow. Give the sink a `KEY` when the relation has unique columns.
+`=` and `IS NULL` can be answered from an index, so an index on a column of
+the target that tells its rows apart well makes a removal a lookup (the
+sink creates none). Without one, every removed row costs a scan of the
+target table: a keyless sink of a large relation that changes often is
+slow. Give the sink a `KEY` when the relation has unique columns, or index
+the target.
 
 Values are written as typed literals, `'<text output>'::<type>`, or `NULL`.
 
@@ -225,10 +254,16 @@ written when the engine stopped are written when it stops.
   there must be a unique index or constraint on exactly the key columns
   (`ON CONFLICT (<key>)` needs one); the table created by the sink has a
   primary key.
-- The key columns must be unique in the relation. Duplicate keys make the
-  upsert fail (`ON CONFLICT DO UPDATE command cannot affect row a second
-  time`), which stops delivery (the batch is retried until it succeeds),
-  or silently merge rows.
+- The key columns must be unique in the relation, as `=` compares them
+  (the engine's primary keys, `GROUP BY` and `DISTINCT` are). Duplicate
+  keys make the upsert fail (`ON CONFLICT DO UPDATE command cannot affect
+  row a second time`), which stops delivery (the batch is retried until it
+  succeeds), or silently merge rows.
+- Text columns of a target created beforehand must have deterministic
+  collations (a database's default collation is always one): under a
+  nondeterministic one (`CREATE COLLATION ... (deterministic = false)`,
+  such as a case-insensitive collation) `=` matches strings other than the
+  removed one, and a key column takes different strings for one key.
 - Sink names must be unique among all engines writing into the same database:
   the progress row is keyed by the sink name only.
 - The role needs `CREATE` on the schema (the `CREATE TABLE IF NOT EXISTS`

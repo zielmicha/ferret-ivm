@@ -15,8 +15,12 @@
 //!   this one) and SIGKILL it for the restarts, at random moments: while it
 //!   applies changes, during a checkpoint, or during the initial snapshot.
 //! - `--sinks N` (default 3): the first N views are also written back to
-//!   PostgreSQL (another database) by sinks; every round each sink table must
-//!   converge to the view's contents (exactly once, also across restarts).
+//!   PostgreSQL (another database, with a linguistic collation and session
+//!   settings that change how values print) by sinks, and so are views of
+//!   `reps`, a table of values in several representations (`1 mon` and
+//!   `30 days`, `1.5` and `1.50`, `-0` and `0`, ...); every round each sink
+//!   table must converge to its view's contents exactly, representations
+//!   included (exactly once, also across restarts).
 //! - `--schema-changes N` (default 1): add N columns to replicated tables
 //!   upstream at random rounds (some with a default, which existing rows
 //!   get without a replicated change: the source must snapshot the table
@@ -90,6 +94,14 @@ fn normalize_with(types: &[u32], mut rows: Vec<Vec<Option<String>>>, trim_numeri
             }
         }
     }
+    let mut out: Vec<String> =
+        rows.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "∅".into())).collect::<Vec<_>>().join("|")).collect();
+    out.sort();
+    out
+}
+
+/// Rows as text, sorted, without normalizing anything.
+fn exact(rows: Vec<Vec<Option<String>>>) -> Vec<String> {
     let mut out: Vec<String> =
         rows.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "∅".into())).collect::<Vec<_>>().join("|")).collect();
     out.sort();
@@ -269,6 +281,17 @@ fn main() {
             up.simple_query(&sql).unwrap();
         }
     }
+    // a table of values in several representations, for sinks only (with
+    // its own random generator: the seed's other choices stay as they were)
+    let mut rep_rng = Rng::new(seed ^ 0x5245_5053);
+    let mut rep_id = 0;
+    if args.sinks > 0 {
+        up.execute(&sqlgen::reps_table_sql()).unwrap();
+        for _ in 0..120 {
+            rep_id += 1;
+            up.simple_query(&sqlgen::reps_insert(&mut rep_rng, rep_id)).unwrap();
+        }
+    }
     up.execute("CREATE PUBLICATION difftest FOR ALL TABLES").unwrap();
     ivm.execute(&format!("CREATE SOURCE src FROM POSTGRES CONNECTION '{pg_conn}' PUBLICATION 'difftest'")).expect("create source");
     if args.kill && args.restarts > 0 && rng.chance(30) {
@@ -336,9 +359,16 @@ fn main() {
     }
     println!("created {} views ({unsupported} rejected)", views.len());
     // sinks write views back into another database (not in the publication)
-    up.execute("CREATE DATABASE sinks").unwrap();
+    // (with a linguistic collation, and settings that change how the sinks'
+    // sessions print floats, intervals and timestamps)
+    up.execute("CREATE DATABASE sinks TEMPLATE template0 LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C.UTF-8'").unwrap();
+    for set in ["extra_float_digits = 0", "IntervalStyle = iso_8601", "TimeZone = 'Asia/Kathmandu'", "DateStyle = 'SQL, DMY'"] {
+        up.execute(&format!("ALTER DATABASE sinks SET {set}")).unwrap();
+    }
     let sink_conn = pg.conninfo("sinks");
     let mut sinkdb = connect(&sink_conn);
+    // (read as the engine prints values)
+    sinkdb.simple_query("SET extra_float_digits = 1; SET IntervalStyle = postgres; SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'").unwrap();
     let mut sinks: Vec<(String, String)> = Vec::new();
     for (name, q) in &views {
         if sinks.len() >= args.sinks {
@@ -351,6 +381,15 @@ fn main() {
         match ivm.execute(&format!("CREATE SINK s_{name} FROM {name} INTO POSTGRES (CONNECTION '{sink_conn}', TABLE 'sink_{name}')")) {
             Ok(_) => sinks.push((name.clone(), q.clone())),
             Err(e) => println!("sink on {name} rejected: {}", e.message),
+        }
+    }
+    if args.sinks > 0 {
+        for (name, q, key) in sqlgen::REP_VIEWS {
+            ivm.execute(&format!("CREATE MATERIALIZED VIEW {name} AS {q}")).unwrap_or_else(|e| panic!("{name}: {}", e.message));
+            let key = key.map(|k| format!(", KEY ({k})")).unwrap_or_default();
+            ivm.execute(&format!("CREATE SINK s_{name} FROM {name} INTO POSTGRES (CONNECTION '{sink_conn}', TABLE 'sink_{name}'{key})"))
+                .unwrap_or_else(|e| panic!("sink on {name}: {}", e.message));
+            sinks.push((name.to_string(), q.to_string()));
         }
     }
 
@@ -407,6 +446,15 @@ fn main() {
                     if verbose {
                         println!("upstream batch failed (ignored): {}", e.message);
                     }
+                }
+            }
+            if args.sinks > 0 {
+                for _ in 0..(1 + rep_rng.below(2)) {
+                    let sql = format!("BEGIN;{}COMMIT;", sqlgen::reps_transaction(&mut rep_rng, &mut rep_id).concat());
+                    if verbose {
+                        println!("round {round} upstream: {sql}");
+                    }
+                    up.simple_query(&sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
                 }
             }
             if rng.chance(20) {
@@ -511,18 +559,32 @@ fn main() {
                 _ => {}
             }
         }
-        // sink tables converge to the views (polled: progress is written with data)
+        if args.sinks > 0 {
+            // (exactly: the representations count)
+            let q = "SELECT * FROM reps";
+            match (rows(&mut up, q), rows(&mut ivm, &format!("{q} AS OF AT LEAST LSN '{lsn}'"))) {
+                (Ok((_, er)), Ok((_, gr))) if exact(er.clone()) == exact(gr.clone()) => {}
+                (er, gr) => {
+                    failures += 1;
+                    println!("TABLE MISMATCH round {round} reps");
+                    println!("  postgres: {:?}", er.map(|(_, r)| exact(r)));
+                    println!("  ivm:      {:?}", gr.map(|(_, r)| exact(r)));
+                }
+            }
+        }
+        // sink tables converge to the views, exactly (polled: progress is
+        // written with data); the views are compared with PostgreSQL above
         let mut sink_rows = 0;
         for (name, q) in &sinks {
-            let Ok((et, er)) = rows(&mut up, q) else { continue };
-            let want = normalize(&et, er.clone());
-            let want_trim = normalize_with(&et, er, true);
             let deadline = Instant::now() + Duration::from_secs(20);
-            let mut last = Vec::new();
+            let (mut want, mut last) = (Vec::new(), Vec::new());
             let converged = loop {
+                // (a view failing now has nothing to converge to)
+                let Ok((_, vr)) = rows(&mut ivm, &format!("SELECT * FROM {name} AS OF AT LEAST LSN '{lsn}'")) else { break true };
+                want = exact(vr);
                 if let Ok((_, gr)) = rows(&mut sinkdb, &format!("SELECT * FROM sink_{name}")) {
-                    last = normalize(&et, gr.clone());
-                    if last == want || (sqlgen::dedups(q) && normalize_with(&et, gr, true) == want_trim) {
+                    last = exact(gr);
+                    if last == want {
                         break true;
                     }
                 }
@@ -535,8 +597,8 @@ fn main() {
             if !converged {
                 failures += 1;
                 println!("SINK MISMATCH round {round} view {name}: {q}");
-                println!("  postgres rows {} / sink rows {}", want.len(), last.len());
-                println!("  only in postgres: {:?}", want.iter().filter(|x| !last.contains(x)).take(5).collect::<Vec<_>>());
+                println!("  view rows {} / sink rows {}", want.len(), last.len());
+                println!("  only in the view: {:?}", want.iter().filter(|x| !last.contains(x)).take(5).collect::<Vec<_>>());
                 println!("  only in the sink: {:?}", last.iter().filter(|x| !want.contains(x)).take(5).collect::<Vec<_>>());
                 let (cw, cl) = (counts(&want), counts(&last));
                 let diff: Vec<String> = cw
@@ -546,7 +608,7 @@ fn main() {
                     .into_iter()
                     .filter(|k| cw.get(*k) != cl.get(*k))
                     .take(5)
-                    .map(|k| format!("{k}: postgres x{} sink x{}", cw.get(k).unwrap_or(&0), cl.get(k).unwrap_or(&0)))
+                    .map(|k| format!("{k}: view x{} sink x{}", cw.get(k).unwrap_or(&0), cl.get(k).unwrap_or(&0)))
                     .collect();
                 println!("  multiplicities: {diff:?}");
                 if let Ok((_, st)) = rows(&mut ivm, "SHOW SINKS") {
