@@ -434,8 +434,10 @@ of the storage taken at once — every tree as it is after the last applied
 record ([Storage](storage.md#forks)) — and a copy of the part of the graph
 it reads (`Graph::fork_of`): the same read point and plan, hence the same
 result, while the engine goes on applying records and answering other
-statements. The reader thread streams the rows to the session as they are
-found, waiting for it to take them: at most two chunks are in flight
+statements. (The engine's statistics count the entries reads visited on
+the engine thread and those handed off, `EngineStats::reads`.) The reader
+thread streams the rows to the session as they are found, waiting for it
+to take them: at most two chunks are in flight
 (`coord::stream`), so a large result reaches a slow client in bounded
 memory; the reader stops when the session drops the stream (the client
 went away, or a portal was closed) or the statement is cancelled while it
