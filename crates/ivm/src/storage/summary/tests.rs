@@ -21,6 +21,44 @@ fn float_sum_exact() {
     assert_eq!(s.div_value(3), 5e-324);
 }
 
+/// Averages and standard deviations whose sums (of squares) overflow a
+/// double are computed from the exact sums: they overflow only if the
+/// result does.
+#[test]
+fn float_aggregates_beyond_the_range_of_their_sums() {
+    let of = |xs: &[f64]| {
+        let (mut s, mut q) = (FloatSum::default(), FloatSum::default());
+        for x in xs {
+            s.add(*x, 1);
+            q.add_square(*x, 1);
+        }
+        (s, q)
+    };
+    let (s, _) = of(&[1e308, 1e308]);
+    assert_eq!(s.value(), f64::INFINITY);
+    assert_eq!(s.div_value(2), 1e308);
+    let (s, _) = of(&[f64::MAX, f64::MAX, f64::MAX]);
+    assert_eq!(s.div_value(3), f64::MAX);
+    let (s, _) = of(&[-f64::MAX, -f64::MAX, f64::MAX]);
+    assert_eq!(s.div_value(-3), f64::MAX / 3.0);
+    // the sum of squares (1e600) overflows, the variance may too
+    let (s, q) = of(&[1e300, -1e300]);
+    assert_eq!(s.variance(&q, 2, false), f64::INFINITY);
+    assert_eq!(s.std_dev(&q, 2, false), 1e300);
+    let (s, q) = of(&[1e300, -1e300, 0.0]);
+    assert_eq!(s.variance(&q, 3, true), f64::INFINITY);
+    assert_eq!(s.std_dev(&q, 3, true), 1e300);
+    let (s, q) = of(&[f64::MAX, -f64::MAX]);
+    assert_eq!(s.std_dev(&q, 2, false), f64::MAX);
+    assert_eq!(s.std_dev(&q, 2, true), f64::INFINITY);
+    // in range, the square root of the rounded variance (as before)
+    let (s, q) = of(&[1.0, 2.0, 4.0]);
+    assert_eq!(s.std_dev(&q, 3, true), s.variance(&q, 3, true).sqrt());
+    // squares below 2^-1074 count as 0
+    let (s, q) = of(&[5e-324, 0.0]);
+    assert_eq!((s.div_value(2), s.variance(&q, 2, true), s.std_dev(&q, 2, true)), (0.0, 0.0, 0.0));
+}
+
 /// The float sum as it was before the dyadic representation: the finite
 /// part as an integer multiple of 2^-1074. Results must stay bit-identical
 /// (maintained views hold values computed with it, which later changes
@@ -75,10 +113,11 @@ impl FixedSum {
         bigint_scaled_to_f64(&self.fixed, -1074)
     }
 
+    /// (Corrected since: the average of finite values divides their exact
+    /// sum also where it overflows a double, which gave an infinity.)
     fn div_value(&self, n: i64) -> f64 {
-        let v = self.value();
-        if !v.is_finite() || n == 0 {
-            return v / n as f64;
+        if self.nan > 0 || self.pos_inf > 0 || self.neg_inf > 0 || n == 0 {
+            return self.value() / n as f64;
         }
         let scaled: BigInt = &self.fixed << 128usize;
         bigint_scaled_to_f64(&(scaled / BigInt::from(n)), -1074 - 128)

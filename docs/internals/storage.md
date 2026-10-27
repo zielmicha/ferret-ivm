@@ -388,11 +388,17 @@ node's summary is next recomputed.
   rounded, a correctly rounded division of the limbs gives the same result.
   Variance is computed from the exact sums as `(N·Q − S²) / (N·(N−1))` (or
   `N²`) on the 2^-2148 grid of the squares, with 128 extra bits, truncated
-  and rounded. (These results are
-  those of the earlier representation, an integer multiple of 2^-1074 in a
-  big integer, bit for bit: maintained views hold values computed with it.)
-  A finite sum whose rounded value overflows (for `sum(real)`, overflows
-  `real`) fails with `value out of range: overflow`.
+  and rounded; standard deviation is the square root of that double. (These
+  results are those of the earlier representation, an integer multiple of
+  2^-1074 in a big integer, bit for bit: maintained views hold values
+  computed with it.) A finite sum whose rounded value overflows (for
+  `sum(real)`, overflows `real`) fails with `value out of range: overflow`,
+  and so does a variance or standard deviation beyond the range. Both
+  divide the exact sums, not their rounded values: an average of finite
+  values is finite also where their sum overflows (it used to be
+  infinite), and where the variance overflows, the standard deviation is
+  the square root of the exact variance (with 128 extra bits, truncated, and
+  a sticky bit for the rest), rounded once.
 
 ## Loading unordered entries
 

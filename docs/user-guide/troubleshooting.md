@@ -294,7 +294,11 @@ See [Queries](../sql/queries.md) for the full list. Notable:
   be deterministic), not in an arbitrary scan order.
 - Floating-point `sum`, `avg`, `variance` and `stddev` are computed exactly
   and rounded once, so results can differ from PostgreSQL's sequential
-  summation in the last bits.
+  summation in the last bits. Near the overflow boundary, an `avg`,
+  `variance` or `stddev` of `double precision` values whose sum or sum of
+  squares overflows succeeds when the result fits (`avg` of `1e308` and
+  `1e308` is `1e+308`), where PostgreSQL fails with `value out of range:
+  overflow`.
 - When equal values have different representations (`1.0` and `1.00` in a
   `numeric` group key, `DISTINCT`, `min`/`max`), materialized views and
   `DISTINCT` return the one that sorts first in the index, while ad hoc

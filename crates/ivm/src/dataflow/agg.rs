@@ -381,8 +381,12 @@ fn finalize_var(sum: &AggState, sumsq: &AggState, n: i64, arg: &SqlType, varianc
             if s.nan > 0 || s.pos_inf > 0 || s.neg_inf > 0 {
                 return Ok(Datum::Float8(f64::NAN));
             }
-            let var = s.variance(q, n, sample);
-            Ok(Datum::Float8(if variance { var } else { var.sqrt() }))
+            let v = if variance { s.variance(q, n, sample) } else { s.std_dev(q, n, sample) };
+            // (finite values: as float8 arithmetic, an infinite result overflows)
+            if v.is_infinite() {
+                return Err(crate::expr::ops_overflow());
+            }
+            Ok(Datum::Float8(v))
         }
         _ => Ok(Datum::Null),
     }

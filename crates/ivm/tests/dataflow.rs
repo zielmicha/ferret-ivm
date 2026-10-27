@@ -629,6 +629,57 @@ fn filtered_aggregates_follow_random_changes() {
     random_changes_keep_views_equal("filter-random", &queries, 40, 11);
 }
 
+/// Floating-point averages and standard deviations are computed from the
+/// exact sums, so they overflow only if the result does (PostgreSQL fails
+/// as soon as its running sum or sum of squares overflows); a variance
+/// beyond the range overflows. The average of two 1e308 used to be
+/// Infinity, and so were variances and standard deviations whose sum of
+/// squares overflowed.
+#[test]
+fn float_aggregates_beyond_the_range_of_their_sums() {
+    let dir = tmpdir("float-range");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE f (id int PRIMARY KEY, g int, x float8)");
+    exec(
+        &h,
+        "INSERT INTO f VALUES (1, 1, 1e308), (2, 1, 1e308), (3, 2, 1.7e308), (4, 2, 1.7e308), (5, 2, -1e308), \
+         (6, 3, 1e300), (7, 3, -1e300), (8, 3, 0), (9, 4, 5e-324), (10, 4, 0), (11, 5, 1e-320), (12, 5, 3e-320)",
+    );
+    let fits = "SELECT g, avg(x) AS a, stddev_pop(x) AS sp, stddev_samp(x) AS ss FROM f GROUP BY g";
+    let sum = "SELECT g, sum(x) AS s FROM f GROUP BY g";
+    let var = "SELECT g, var_samp(x) AS v FROM f GROUP BY g";
+    for (i, q) in [fits, sum, var].iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW v{i} AS {q}"));
+    }
+    let check = |q: &str, i: usize, want: Result<Vec<&str>, &str>| {
+        let want = want.map(|w| w.iter().map(|s| s.to_string()).collect::<Vec<_>>()).map_err(|e| e.to_string());
+        assert_eq!(rows_of(&h, &format!("{q} ORDER BY g")), want, "{q}");
+        assert_eq!(rows_of(&h, &format!("SELECT * FROM v{i} ORDER BY g")), want, "view {i}: {q}");
+    };
+    let overflow = "22003 value out of range: overflow";
+    check(
+        fits,
+        0,
+        Ok(vec![
+            "1|1e+308|0|0",
+            "2|8e+307|1.2727922061357855e+308|1.5588457268119896e+308",
+            "3|0|8.164965809277261e+299|1e+300",
+            "4|0|0|0",
+            "5|2e-320|0|0",
+        ]),
+    );
+    check(sum, 1, Err(overflow));
+    check(var, 2, Err(overflow));
+    exec(&h, "DELETE FROM f WHERE g IN (1, 2)");
+    check(sum, 1, Ok(vec!["3|0", "4|5e-324", "5|4e-320"]));
+    check(var, 2, Err(overflow));
+    exec(&h, "DELETE FROM f WHERE g = 3");
+    check(var, 2, Ok(vec!["4|0", "5|0"]));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A small deterministic random generator (xorshift64*).
 struct Rng(u64);
 

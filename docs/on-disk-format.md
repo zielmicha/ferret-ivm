@@ -1360,7 +1360,12 @@ the rows that pass the filter) and of views with conditions over the
 computed columns of nested projections, or expressions around a
 correlated scalar aggregate, that inlining would make too large (which
 are no longer inlined, see [Planner](internals/planner.md#optimizer)) are
-rebuilt once in the same way.
+rebuilt once in the same way. Results that fixes of
+aggregate semantics change keep their old values until their group
+changes: an `avg`, `var*` or `stddev*` of `double precision` values whose
+sum or sum of squares overflowed was `Infinity` (now the value, or an
+error where the variance or standard deviation itself is beyond the
+range).
 `crates/ivm/tests/data/format1` is a format-1 directory that the restart
 tests migrate.
 
