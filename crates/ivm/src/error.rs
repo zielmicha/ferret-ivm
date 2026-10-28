@@ -142,6 +142,7 @@ pub mod codes {
     pub const IO_ERROR: &str = "58030";
     pub const DATA_CORRUPTED: &str = "XX001";
     pub const INTERNAL_ERROR: &str = "XX000";
+    pub const INSUFFICIENT_RESOURCES: &str = "53000";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
     pub const TOO_MANY_ARGUMENTS: &str = "54023";
     pub const STATEMENT_TOO_COMPLEX: &str = "54001";

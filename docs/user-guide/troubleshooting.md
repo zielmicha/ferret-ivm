@@ -9,7 +9,7 @@
   initial snapshot, and during a re-snapshot after an upstream schema or
   key change, a lost replication slot or `ALTER SOURCE ... REFRESH`.
   `SHOW SOURCES` shows `snapshotting <schema>.<table>`. Use
-  `SET read_mode = latest` or `AS OF LATEST` to read the partial state.
+  `SET read_mode = latest` to read the partial state.
 - **A table that cannot be copied** (`error: cannot copy table ...` in
   `SHOW SOURCES`): fresh reads of it wait until it can be read; reads of
   the other tables do not.
@@ -17,12 +17,19 @@
   passes the LSN: as long as any source is copying a table (or cannot copy
   one), disconnected (`error: ...`) or behind. Without any source it fails
   at once.
-- **`AS OF <gsn>` in the future** waits until the engine reaches that GSN.
 - **The engine thread is busy.** All statements run on one thread: while it
-  hydrates a large new view (`CREATE MATERIALIZED VIEW`, `CREATE INDEX`,
-  `SUBSCRIBE (query)`), applies a large upstream transaction or takes a
-  checkpoint, every other statement waits.
-- **DML** is serialized: a statement waits for the one before it.
+  applies a large upstream transaction, every other statement waits. (New
+  and replaced views, indexes, tables rebuilt after upstream schema changes
+  and subscriptions are hydrated, checkpoints written and large reads run
+  on threads of their own.)
+- **A view is being hydrated.** Statements that read a view that is still
+  being hydrated wait until it is maintained; a new view or index created
+  meanwhile is hydrated after it; `CREATE OR REPLACE` of an existing view or
+  `CREATE SINK` logged meanwhile waits for it, and so do the changes logged
+  after it.
+- **DML** that reads rows a statement logged before it writes (the same
+  primary key, or any row of a table it scans) waits for that statement to
+  be applied.
 - **`SUBSCRIBE` in psql** never prints anything: psql waits for the end of
   the result. Use `COPY (SUBSCRIBE ...) TO STDOUT`.
 
@@ -83,12 +90,9 @@ stayed connected for 10 s.
   view, or a view it reads, could not be rebuilt at the last start. Drop it
   or repair it with `CREATE OR REPLACE MATERIALIZED VIEW`
   ([Recovery](operations.md#recovery)).
-- **`AS OF g is before the history of a relation it reads, which starts at
-  h`** (`55000`): an index the read needs was built after `g` (the relation
-  was created or replaced, or the index was rebuilt at a restart). Read at
-  `h` or later.
-- **`AS OF g is before the retention frontier f`** (`55000`): the history
-  before `f` is gone; raise `--retention-gsns` if older reads are needed.
+- **`AS OF <gsn> is not supported`, `AS OF LATEST is not supported`**
+  (`0A000`): there is no time travel; reads see the latest state. Use
+  `SET read_mode = latest` for what `AS OF LATEST` did.
 
 ### A statement is rejected
 
@@ -124,11 +128,11 @@ view or index that can no longer be built does not stop the start: it is
 marked broken ([Recovery](operations.md#recovery)). What still keeps a data
 directory from starting: a missing or damaged manifest or segment file, a
 damaged or deleted input-log segment holding records after the last
-checkpoint, a checkpoint written by an incompatible version
-([Compatibility](../on-disk-format.md#compatibility)), and a log record
-other than DDL that fails to apply again during replay (a bug: such a
-record was skipped while the engine ran, and fails again on replay unless
-a checkpoint was taken after it).
+checkpoint, a data directory or checkpoint written by an incompatible (or
+newer) version ([Compatibility](../on-disk-format.md#compatibility)), and a
+log record other than DDL that fails to apply again during replay (a bug:
+such a record was skipped while the engine ran, and fails again on replay
+unless a checkpoint was taken after it).
 
 Either restore a copy of the data directory taken before the problem, or
 start over with an empty data directory (and drop the old replication slots
@@ -187,21 +191,25 @@ Grouped `count`, `sum`, `avg`, `min`, `max`, `bool_and/or`, `stddev` and
 same query also has an ordered aggregate: then all of its aggregates are
 computed by one operator that rescans each changed group.
 
-When the engine cannot keep up, the backlog stays bounded: once 10,000
-logged records wait to be applied, sources stop reading the replication
-stream until it catches up (`SHOW FRONTIERS`: `durable_gsn` −
-`processed_gsn`).
+When the engine cannot keep up, the backlog stays bounded: once the records
+waiting to be applied take an eighth of `--memory-mb` (in bytes of memory),
+sources stop reading the replication stream until it catches up (`SHOW
+FRONTIERS`: `durable_gsn` − `processed_gsn`; `/api/overview`'s
+`input_queue_bytes`, see [Memory](operations.md#memory)).
 
 ### Disk usage grows
 
-- The input log keeps segments back to `checkpoint GSN − --retention-gsns`
-  (and always the current 64 MiB segment).
+- The input log keeps the segments holding records after the last checkpoint
+  (and always the current 64 MiB segment). An engine that applies nothing
+  but clock ticks checkpoints only every 3,600 ticks, so its log segment
+  fills slowly (25 bytes per tick) and is deleted once it is sealed and
+  covered by a checkpoint.
 - Dead index nodes are reclaimed only in sealed segments that are less than
-  half live, one segment at a time after each checkpoint (at most 1000 nodes
-  relocated per pass); up to half of any other sealed segment can stay
-  garbage, and the active segment (up to 256 MiB) is not collected until it
-  is full.
-- Large `--retention-gsns` keeps more versions in the indexes.
+  half live: the maintenance pass before each checkpoint relocates their
+  live nodes, within its budget
+  ([Operations](operations.md#checkpoints-and-garbage-collection)); up to
+  half of any other sealed segment can stay garbage, and the active segment
+  (up to 256 MiB) is not collected until it is full.
 
 ### Upstream WAL grows
 
@@ -239,10 +247,12 @@ background, retried until the upstream answers. Check
   postgres, encoding UTF-8; string comparison is by code point (the
   `C.UTF-8` collation); `COLLATE` only accepts `C`, `default`, `ucs_basic`,
   `pg_c_utf8` and `C.UTF-8`.
-- `AS OF` reads use the current catalog, and only read indexes whose
-  history covers the requested GSN.
-- Changes queued for a subscription or a sink are kept in memory without a
-  bound (see [Known problems](#known-problems)).
+- There is no time travel: reads see the latest state (the indexes keep
+  the current weights of their rows only).
+- Changes queued for a subscription or a sink are bounded in memory: a
+  subscription whose client does not keep up ends with `53000`, a sink that
+  does not keep up resynchronises its target from a snapshot (see
+  [Operations](operations.md#memory)).
 - Upstream: PostgreSQL 14+, not `SQL_ASCII`; tables need a primary key,
   `REPLICA IDENTITY USING INDEX` or `REPLICA IDENTITY FULL`; publication row
   filters and column lists are not supported; unknown types replicate as
@@ -279,7 +289,11 @@ See [Queries](../sql/queries.md) for the full list. Notable:
   be deterministic), not in an arbitrary scan order.
 - Floating-point `sum`, `avg`, `variance` and `stddev` are computed exactly
   and rounded once, so results can differ from PostgreSQL's sequential
-  summation in the last bits.
+  summation in the last bits. Near the overflow boundary, an `avg`,
+  `variance` or `stddev` of `double precision` values whose sum or sum of
+  squares overflows succeeds when the result fits (`avg` of `1e308` and
+  `1e308` is `1e+308`), where PostgreSQL fails with `value out of range:
+  overflow`.
 - When equal values have different representations (`1.0` and `1.00` in a
   `numeric` group key, `DISTINCT`, `min`/`max`), materialized views and
   `DISTINCT` return the one that sorts first in the index, while ad hoc
@@ -315,24 +329,17 @@ test, with workarounds.
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| `character` (`bpchar`) values that differ only in trailing spaces — a `bpchar` without length, or `char(n)` columns of different lengths mixed — are distinct in primary keys, `GROUP BY`, `DISTINCT` and set operations (comparisons, joins and `IN` ignore the spaces, as in PostgreSQL) | `'x'` and `'x '` are two primary keys (PostgreSQL: a duplicate key) and two groups; `char(3) UNION char(5)` keeps `'ab '` and `'ab   '` apart | use `char(n)` of one length, or `rtrim()` / cast to `text` before grouping |
+| `character` (`bpchar`) values that differ only in trailing spaces — a `bpchar` without length, or `char(n)` columns of different lengths mixed — are distinct in primary keys, `GROUP BY`, `DISTINCT` and set operations (comparisons, joins and `IN` ignore the spaces, as in PostgreSQL) | `'x'` and `'x '` are two primary keys (PostgreSQL: a duplicate key) and two groups; `char(3) UNION char(5)` keeps `'ab '` and `'ab   '` apart; a sink refuses such a column as its `KEY` | use `char(n)` of one length, or `rtrim()` / cast to `text` before grouping |
 | Errors in join conditions of maintained views — a non-equality condition, the non-equality part of a join condition (`ON a.id = b.id AND a.x / b.y > 1`), `WHERE` conditions the optimizer moves into a join, and such conditions of `EXISTS`/`IN` subqueries — count as "no match" | the joined row is missing (in an outer join: NULL-padded) and no error record is created, where PostgreSQL fails; the same query ad hoc fails | guard the expression (`CASE WHEN b.y <> 0 THEN ... END`, `NULLIF`) |
 | `real` compared with an integer or `numeric` value is compared in `real` (there are no cross-type comparison operators; arithmetic is done in `double precision`, as in PostgreSQL) | `0.1::real = 0.1` is true (PostgreSQL: false) | cast to `double precision` |
 | A string literal continued on the next line (`'foo'` newline `'bar'`) | in a select list the second literal becomes a column alias (`foo` in a column `bar`; PostgreSQL returns `foobar`), elsewhere a syntax error | use `\|\|` |
+| Window function arguments are computed for every row of the partition, before the window functions; PostgreSQL computes them only where the function reads them: `ntile`'s at the partition's first rows up to the first that is not NULL, the value of `lag`, `lead`, `first_value`, `last_value` and `nth_value` at the rows they return, the default of `lag`/`lead` where the offset leaves the partition, an aggregate's at the rows of some frame (test `window_arguments_are_computed_only_where_read`, ignored) | an error in an argument at a row PostgreSQL does not compute it for (`ntile(10 / (i - 3)) OVER (ORDER BY i DESC)`, `first_value(1 / x) OVER (ORDER BY i)` with `x = 0` after the first row) fails the query, and is an error record of a maintained view, where PostgreSQL returns rows | write the argument so that it cannot fail (`CASE WHEN x <> 0 THEN 1 / x END`) |
 
 ### SQL and protocol
 
 | Problem | Effect | Workaround |
 |---|---|---|
 | `set_config()` changes nothing (it returns its value) | `SELECT set_config('read_mode', 'latest', false)` leaves the session's settings as they were | use `SET` |
-
-### Time travel
-
-| Problem | Effect | Workaround |
-|---|---|---|
-| Error records are not versioned | a read of a materialized view `AS OF g` fails if the view has error records *now*, and succeeds (without the failing rows) if it has none now, whatever it held at `g` | none |
-| Recovery re-plans joins from the current table sizes | when the sizes changed enough since a join view was created, a restart rebuilds its indexes, whose history then starts at the restart: reads `AS OF` a GSN before it fail with `AS OF g is before the history of a relation it reads` (test `as_of_history_survives_restart_after_table_sizes_change`, ignored) | none; read older history before restarting |
-| An upgrade that changes plan fingerprints (new functions renumber later ones; planner fixes) rebuilds the affected indexes at the first start ([Compatibility](../on-disk-format.md#compatibility)) | as above: `AS OF` reads before that start fail for those views | none |
 
 ### Replication and sinks
 
@@ -346,4 +353,4 @@ test, with workarounds.
 
 | Problem | Effect | Workaround |
 |---|---|---|
-| Changes for subscriptions and sinks are queued in memory without a bound (the engine never waits for a client or a sink target) | a subscriber that reads slowly, or a sink whose target is unreachable for long (or whose batches keep failing), makes the server's memory grow | watch `SHOW SINKS`; drop a sink whose target is gone for long and create it again later (it resynchronises the target) |
+| The engine never waits for a client or a sink target: changes queue in memory up to each consumer's limit (a sixteenth of `--memory-mb`) | a subscriber that reads slowly ends with `53000`; a sink whose target is unreachable for long (or whose batches keep failing) stops receiving changes and rewrites the whole target once it can write again | subscribe again; give the server more memory if consumers are merely bursty |

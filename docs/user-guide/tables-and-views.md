@@ -132,9 +132,12 @@ DELETE FROM table [ [ AS ] alias ] [ WHERE condition ]
 - `now()` and related functions in DML return the **wall-clock time when the
   statement runs**, not the logical clock used by reads; the computed values
   are logged.
-- DML statements are serialized: one is in flight at a time, and the client
-  gets its reply after the change has been applied, so a following read sees
-  it.
+- DML statements from different sessions are logged together (sharing the
+  log's appends and `fsync`s) unless one read rows another, logged before
+  it, writes: it then waits for that one to be applied and is evaluated
+  again. The outcome is that of running the statements one after another in
+  the order they were logged. The client gets its reply after the change
+  has been applied, so a following read sees it.
 - A statement planned while a `DROP` of its table was already logged (but
   not yet applied) applies nothing and fails with SQLSTATE `42P01`
   (`the table of this statement was dropped before it could be applied`).
@@ -155,7 +158,7 @@ CREATE [ OR REPLACE ] [ MATERIALIZED ] VIEW [ IF NOT EXISTS ] name
 |---|---|---|
 | Stored | the query text | the query text, a dataflow and an index of the results |
 | Work on change | none | incremental maintenance of the dataflow at every GSN that touches its inputs |
-| Read | the query is expanded inline and evaluated against current (or historical) state | served from the view's index |
+| Read | the query is expanded inline and evaluated against the current state | served from the view's index |
 | `SUBSCRIBE` | yes (a private dataflow is built for the subscription) | yes |
 | `CREATE INDEX` on it, sink from it | no | yes |
 | `now()`, `random()`, other non-deterministic functions | allowed | only `now()` family in [temporal filters](temporal-filters-and-errors.md); see [Maintained views](../sql/maintained-views.md) |
@@ -176,8 +179,16 @@ Column types are derived from the query; an untyped literal column (such as
 operators, reuses every operator and index that an existing view already has
 (identical sub-plans are shared), and **hydrates** the new parts at the
 statement's GSN by reading existing indexes — the upstream is never
-contacted. Maintenance continues from the next GSN. The statement returns
-after hydration, so a large view takes as long as one scan of its inputs.
+contacted. Hydration runs on a thread of its own, on a version of the
+indexes as of that GSN, and then catches up with the changes applied since;
+meanwhile the engine goes on maintaining the other views, applying changes
+and answering other statements. The statement returns once the view is
+maintained like the others, so a large view takes about as long as one scan
+of its inputs. Until then the view is listed (with no rows) and statements
+reading it wait for it. Views and indexes created meanwhile are hydrated
+after it (their statements return then); `CREATE OR REPLACE` of an
+existing view and `CREATE SINK` logged meanwhile wait for it, and so do the
+changes logged after them. `CREATE INDEX` works the same way.
 
 Errors found while binding and planning the query (unknown columns,
 unsupported constructs, non-deterministic functions, a column list that is
@@ -218,7 +229,15 @@ Otherwise:
   modifiers) are unchanged, subscriptions to the view and sinks from it
   receive the difference between the old and the new contents as one change
   at that GSN; otherwise subscriptions to the view end with
-  `materialized view "x" changed its columns` (SQLSTATE `55000`).
+  `materialized view "x" changed its columns` (SQLSTATE `55000`). The new
+  version is hydrated off the engine thread, as a new view is: reads of the
+  view wait for it, its subscribers and sinks get the difference and then
+  the new version's changes once it is hydrated, and the statement returns
+  then. The difference is only computed for such subscriptions and sinks
+  (merging the two versions' indexes when they are keyed alike, so that only
+  the rows that differ are decoded), and not at all when the new version is
+  the old dataflow (the same definition, or one that plans the same):
+  replacing a large view then reads none of its rows.
 - **Every other combination** (virtual by materialized, materialized by
   virtual, virtual by virtual): the old object is dropped and the new one is
   created under the same id. Subscriptions reading the old object end as for
@@ -227,7 +246,8 @@ Otherwise:
 - In both cases the materialized views that read the replaced view —
   directly, through other materialized views, or through virtual views they
   expand — are re-planned at the same GSN, in dependency order, so that they
-  read the new definition, as a restart would plan them.
+  read the new definition, as a restart would plan them. (Only they are
+  planned; finding them binds every view's definition once.)
 - A subscription to a query (`SUBSCRIBE (query)`) that reads the replaced
   materialized view — directly, through virtual views or through other
   materialized views — has a dataflow built over the old version: it ends
@@ -284,11 +304,9 @@ What indexes are used for:
   lookups on `t(c)` uses the existing index on `t(c)` instead of building
   another one, and vice versa.
 
-An `AS OF` read uses only indexes whose history covers its GSN
-([Time travel](reads.md#time-travel-as-of-gsn)): an index created after
-that GSN is not used for it. Indexes do not make joins in maintained views
-possible or impossible — the planner creates the arrangements it needs —
-they only avoid duplicates and speed up reads.
+Indexes do not make joins in maintained views possible or impossible — the
+planner creates the arrangements it needs — they only avoid duplicates and
+speed up reads.
 
 ## DROP
 

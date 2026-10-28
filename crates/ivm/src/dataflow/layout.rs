@@ -238,6 +238,18 @@ impl Layout {
         Ok((vals, pos))
     }
 
+    /// Decode the first `n` key values of a key prefix (canonical).
+    pub fn decode_prefix(&self, buf: &[u8], n: usize) -> Result<Vec<Datum>> {
+        let mut pos = 0;
+        let mut vals = Vec::with_capacity(n);
+        for (t, spec) in self.key_types[..n].iter().zip(&self.specs) {
+            let (d, len) = encoding::decode_key(buf.get(pos..).ok_or_else(|| SqlError::corrupt("truncated key"))?, t, *spec)?;
+            pos += len;
+            vals.push(d);
+        }
+        Ok(vals)
+    }
+
     /// Decode an entry back into a row.
     pub fn decode_row(&self, buf: &[u8]) -> Result<Row> {
         let (mut vals, mut pos) = self.decode_key_values(buf)?;

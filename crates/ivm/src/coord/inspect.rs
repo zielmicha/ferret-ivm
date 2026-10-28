@@ -12,7 +12,7 @@ use crate::dataflow::mfp::MfpStep;
 use crate::dataflow::{operator_arrangements, Arrangement, Node, NodeCounters, NodeKind};
 use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, Statement};
 use crate::sql_bail;
-use crate::storage::{ReadAt, TreeResidency};
+use crate::storage::TreeResidency;
 use crate::types::text::format_datum;
 use crate::types::{ColumnType, Datum, Row};
 use rustc_hash::FxHashSet;
@@ -72,7 +72,6 @@ pub enum InspectReply {
 pub struct EngineStats {
     pub processed_gsn: Gsn,
     pub durable_gsn: Gsn,
-    pub retention_frontier: Gsn,
     pub checkpoint_gsn: Gsn,
     pub records_since_checkpoint: u64,
     /// Wall clock (Unix ms) of the last checkpoint, or of the engine start.
@@ -80,8 +79,20 @@ pub struct EngineStats {
     /// Logical clock (latest logged tick) as Unix ms.
     pub clock_ms: Option<f64>,
     pub cache_used_bytes: usize,
+    /// The buffer pool's current share of the memory budget.
     pub cache_capacity_bytes: usize,
     pub dirty_bytes: usize,
+    /// The other parts of the memory budget: group caches, records waiting
+    /// to be applied, changes queued for subscriptions and sinks (with the
+    /// snapshots and query results in flight to consumers), the
+    /// dataflow's transient working memory in use, the buffer pools of forks
+    /// of the storage, changes forwarded to a hydration.
+    pub group_cache_bytes: usize,
+    pub input_queue_bytes: usize,
+    pub output_queue_bytes: usize,
+    pub work_bytes: usize,
+    pub fork_pool_bytes: usize,
+    pub forwarded_bytes: usize,
     pub nodes: usize,
     pub arrangements: usize,
     /// Monotonic: change whenever nodes or arrangements are created.
@@ -91,9 +102,22 @@ pub struct EngineStats {
     pub catalog_version: usize,
     /// Dataflow activity since start (monotonic).
     pub steps: NodeCounters,
+    /// Ad hoc reads and snapshots since start (monotonic).
+    pub reads: ReadCounters,
     pub subscriptions: usize,
     pub parked_reads: usize,
     pub view_errors: i64,
+}
+
+/// What ad hoc reads and the snapshots of subscriptions and sinks cost the
+/// engine thread (`coord::reader`).
+#[derive(Serialize, Clone, Copy, Debug, Default)]
+pub struct ReadCounters {
+    /// Index entries they visited on the engine thread, within their
+    /// budget there.
+    pub inline_entries: u64,
+    /// Those that exceeded the budget and went to a reader thread.
+    pub offloaded: u64,
 }
 
 #[derive(Serialize, Debug)]
@@ -110,9 +134,8 @@ pub struct Overview {
 #[derive(Serialize, Debug)]
 pub struct ConfigInfo {
     pub data_dir: String,
-    pub cache_bytes: usize,
+    pub memory_bytes: usize,
     pub checkpoint_interval_secs: f64,
-    pub retention_gsns: u64,
     pub sync: bool,
     pub tick_ms: Option<u64>,
 }
@@ -292,6 +315,10 @@ pub struct NodeInfo {
 pub struct ArrInfo {
     pub id: ArrId,
     pub node: NodeId,
+    /// The storage tree holding its entries: an arrangement that recovery
+    /// matched by fingerprint keeps the tree of the checkpoint, one rebuilt
+    /// by hydration has a new one.
+    pub tree: crate::storage::TreeId,
     /// "index" (of the node's output) or "state" (operator-private).
     pub role: &'static str,
     pub key: Vec<String>,
@@ -678,7 +705,6 @@ impl Engine {
         EngineStats {
             processed_gsn: self.processed,
             durable_gsn: self.shared.durable(),
-            retention_frontier: self.env.frontier(),
             checkpoint_gsn: self.env.checkpoint_gsn(),
             records_since_checkpoint: self.records_since_checkpoint,
             last_checkpoint_ms: unix_ms(SystemTime::now()) - since.as_secs_f64() * 1000.0,
@@ -686,12 +712,19 @@ impl Engine {
             cache_used_bytes: self.env.resident_bytes(),
             cache_capacity_bytes: self.env.cache_capacity(),
             dirty_bytes: self.env.dirty_bytes(),
+            group_cache_bytes: self.graph.group_caches.used(),
+            input_queue_bytes: self.shared.mem.input.used(),
+            output_queue_bytes: self.shared.mem.outputs.used(),
+            work_bytes: self.shared.mem.work.used(),
+            fork_pool_bytes: self.shared.mem.forks.used(),
+            forwarded_bytes: self.shared.mem.forwarded.used(),
             nodes: self.graph.live_nodes().count(),
             arrangements: self.graph.live_arrangements().count(),
             nodes_created: self.graph.node_count(),
             arrangements_created: self.graph.arr_count(),
             catalog_version: self.catalog.history.len(),
             steps: self.graph.step_totals,
+            reads: self.reads,
             subscriptions: self.subs.len(),
             parked_reads: self.parked.len(),
             view_errors: self.rt.views.values().flat_map(|v| v.errors.values()).filter(|w| **w > 0).sum(),
@@ -720,9 +753,8 @@ impl Engine {
             stats: self.inspect_stats(),
             config: ConfigInfo {
                 data_dir: self.cfg.data_dir.display().to_string(),
-                cache_bytes: self.cfg.cache_bytes,
+                memory_bytes: self.cfg.memory_bytes,
                 checkpoint_interval_secs: self.cfg.checkpoint_interval.as_secs_f64(),
-                retention_gsns: self.cfg.retention_gsns,
                 sync: self.cfg.sync,
                 tick_ms: self.cfg.tick.map(|d| d.as_millis() as u64),
             },
@@ -765,7 +797,10 @@ impl Engine {
     pub(crate) fn sink_status(&self, id: ObjectId) -> String {
         match self.rt.broken.get(&id) {
             Some(reason) => format!("error: broken: {reason}"),
-            None => self.sink_handles.get(&id).map(|h| h.status()).unwrap_or_else(|| "stopped".into()),
+            None => match self.sink_handles.get(&id) {
+                Some(h) => h.status(),
+                None => "stopped".into(),
+            },
         }
     }
 
@@ -804,8 +839,7 @@ impl Engine {
         let ObjectKind::Source(def) = &o.kind else { return None };
         // drop gauges of sources that no longer exist
         self.shared.source_gauges.lock().retain(|k, _| self.catalog.objects.contains_key(k));
-        let state: crate::source::postgres::SourceState =
-            self.source_states.get(&id).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+        let state = self.source_states.get(&id).cloned().unwrap_or_default();
         let frontier = self.shared.source_lsn.lock().get(&id).copied().unwrap_or(0);
         let last_commit = self.source_lsns.get(&id).copied().unwrap_or(0);
         let gauges = self.shared.source_gauges.lock().get(&id).cloned();
@@ -1107,6 +1141,7 @@ impl Engine {
         ArrInfo {
             id: a.id,
             node: a.node,
+            tree: a.tree,
             role: if owned_index { "index" } else { "state" },
             key: a
                 .layout
@@ -1288,7 +1323,7 @@ impl Engine {
         }
         let mut c = self.env.cursor(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
         while out.scanned < MAX_SCAN {
-            let (k, h) = match self.env.cursor_next(&mut c) {
+            let (k, w) = match self.env.cursor_next(&mut c) {
                 Ok(Some(e)) => e,
                 Ok(None) => return out,
                 Err(e) => {
@@ -1297,10 +1332,6 @@ impl Engine {
                 }
             };
             out.scanned += 1;
-            let w = h.weight(ReadAt::Latest);
-            if w == 0 {
-                continue;
-            }
             if out.rows.len() >= limit {
                 out.truncated = true;
                 return out;
@@ -1674,14 +1705,14 @@ impl Engine {
             .map(|p| {
                 let (wait, gsn) = match p.wait {
                     Wait::Gsn(g) => ("gsn", Some(g)),
-                    Wait::Lsn => ("lsn", None),
-                    Wait::Snapshot => ("snapshot", None),
+                    Wait::Lsn(_) => ("lsn", None),
+                    Wait::Snapshot { .. } => ("snapshot", None),
+                    Wait::Hydration(_) => ("hydration", None),
                 };
                 let sql = match &p.req {
                     Request::Execute { stmt, .. } => match &**stmt {
                         Statement::Select { query, as_of, .. } => {
                             let suffix = match as_of {
-                                AsOf::Gsn(g) => format!(" AS OF {g}"),
                                 AsOf::AtLeastLsn(l) => format!(" AS OF AT LEAST LSN '{l}'"),
                                 _ => String::new(),
                             };
@@ -1721,7 +1752,7 @@ impl Engine {
             parked,
             pending_requests: self.pending.len(),
             dml_queued: self.dml_queue.len(),
-            dml_inflight: self.dml_inflight.is_some(),
+            dml_inflight: !self.dml_pending.is_empty(),
             sinks,
         }
     }

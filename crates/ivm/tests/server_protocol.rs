@@ -29,8 +29,13 @@ impl Running {
 
 /// Start an engine and a server on an ephemeral port.
 fn start(name: &str) -> (Running, u16) {
+    start_with(name, |_| {})
+}
+
+fn start_with(name: &str, configure: impl FnOnce(&mut coord::Config)) -> (Running, u16) {
     let dir = tmpdir(name);
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    let mut cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
+    configure(&mut cfg);
     let engine = coord::start(cfg).expect("engine starts");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -659,12 +664,16 @@ fn error_code(msgs: &[Msg]) -> Option<String> {
     b.split(|c| *c == 0).find(|f| f.first() == Some(&b'C')).map(|f| String::from_utf8_lossy(&f[1..]).into_owned())
 }
 
-/// Reads waiting in the engine.
-fn parked_reads(running: &Running) -> usize {
+fn stats(running: &Running) -> ivm::coord::inspect::EngineStats {
     match running.engine.handle.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
-        ivm::coord::inspect::InspectReply::Stats(s) => s.parked_reads,
+        ivm::coord::inspect::InspectReply::Stats(s) => s,
         other => panic!("unexpected reply {other:?}"),
     }
+}
+
+/// Reads waiting in the engine.
+fn parked_reads(running: &Running) -> usize {
+    stats(running).parked_reads
 }
 
 /// Wait until `n` reads wait in the engine.
@@ -676,14 +685,21 @@ fn until_parked(running: &Running, n: usize) {
     }
 }
 
-/// A read waiting in the engine (here for a GSN that never comes) ends
-/// with 57014 on a CancelRequest, and is dropped when its client
-/// disconnects; it used to wait forever (only SUBSCRIBE was cancellable).
+/// A read waiting in the engine (here for an LSN that no source reaches:
+/// the only one connects nowhere) ends with 57014 on a CancelRequest, and
+/// is dropped when its client disconnects; it used to wait forever (only
+/// SUBSCRIBE was cancellable).
 #[test]
 fn waiting_reads_are_cancelled_and_dropped() {
     let (running, port) = start("cancel-parked");
+    // (created through the engine, with the upstream tables it discovered
+    // given: none)
+    let sql = "CREATE SOURCE s FROM POSTGRES CONNECTION 'host=127.0.0.1 port=1 connect_timeout=1' PUBLICATION 'p'";
+    let stmt = ivm::sql::parse_statement(sql).unwrap();
+    running.engine.handle.execute(stmt, vec![], ivm::coord::api::SessionVars::default(), "[]".into()).unwrap();
+    let read = "SELECT 1 AS OF AT LEAST LSN '0/16B3748'";
     let (mut c, pid, secret) = connect_with_key(port);
-    let mut b = b"SELECT 1 AS OF 1000000".to_vec();
+    let mut b = read.as_bytes().to_vec();
     b.push(0);
     // simple query
     c.send(b'Q', &b);
@@ -697,7 +713,7 @@ fn waiting_reads_are_cancelled_and_dropped() {
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(first_values(&c.query("SELECT 7")), ["7"]);
     // extended protocol
-    c.parse("", "SELECT 1 AS OF 1000000", &[]);
+    c.parse("", read, &[]);
     c.bind("", "", &[], 0);
     c.execute("", 0);
     c.send(b'S', &[]);
@@ -711,5 +727,122 @@ fn waiting_reads_are_cancelled_and_dropped() {
     until_parked(&running, 1);
     drop(c2);
     until_parked(&running, 0);
+    running.shutdown();
+}
+
+/// Wait until `cond` holds for the engine's stats.
+fn until_stats(running: &Running, what: &str, cond: impl Fn(&ivm::coord::inspect::EngineStats) -> bool) {
+    let t0 = std::time::Instant::now();
+    loop {
+        let st = stats(running);
+        if cond(&st) {
+            return;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "{what}: {st:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Insert `n` rows of about 1 KB into `t` (id, s).
+fn insert_kb_rows(c: &mut Conn, from: i64, n: i64) {
+    let mut i = from;
+    while i < from + n {
+        let msgs = c.query(&format!("INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series({i}, {}) g", i + 999));
+        assert_eq!(error_message(&msgs), None);
+        i += 1000;
+    }
+}
+
+/// A client that subscribes and then stops reading, keeping its connection:
+/// the server's writes to it block, but the engine stops queueing changes
+/// at the subscription's limit and ends it (53000), the session drops what
+/// was queued while it waits for the client, and when the client reads
+/// again it gets what was written, the error and ReadyForQuery. The session
+/// used to block in its write for good while the engine queued every change
+/// (+530 MB, never released).
+#[test]
+fn a_subscriber_that_stops_reading_is_ended_and_its_queue_released() {
+    let (running, port) = start_with("stalled-subscriber", |c| c.memory_bytes = 16 << 20);
+    let mut w = Conn::connect(port);
+    w.query("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    let mut c = Conn::connect(port);
+    c.send(b'Q', b"SUBSCRIBE TO t\0");
+    until_stats(&running, "the subscription starts", |s| s.subscriptions == 1);
+    // far more than the socket buffers and the 4 MiB limit take
+    insert_kb_rows(&mut w, 0, 40_000);
+    until_stats(&running, "the subscription is ended and its queue released", |s| s.subscriptions == 0 && s.output_queue_bytes == 0);
+    let mut rows = 0;
+    let error = loop {
+        let m = c.recv();
+        match m.0 {
+            b'D' => rows += 1,
+            b'E' => break error_code(&[m]),
+            _ => {}
+        }
+    };
+    assert_eq!(error.as_deref(), Some("53000"));
+    assert!((1..40_000).contains(&rows), "{rows} rows before the error");
+    assert_eq!(c.recv().0, b'Z');
+    assert_eq!(first_values(&c.query("SELECT 7")), ["7"]);
+    running.shutdown();
+}
+
+/// A cancel request reaches a subscription whose client does not read: the
+/// session ends it while its write waits (dropping the queued changes) and
+/// reports 57014 when the client reads again.
+#[test]
+fn a_subscription_blocked_on_its_client_can_be_cancelled() {
+    let (running, port) = start_with("stalled-cancel", |c| c.memory_bytes = 256 << 20);
+    let mut w = Conn::connect(port);
+    w.query("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    let (mut c, pid, secret) = connect_with_key(port);
+    c.send(b'Q', b"SUBSCRIBE TO t\0");
+    until_stats(&running, "the subscription starts", |s| s.subscriptions == 1);
+    // more than the socket buffers take, less than the 16 MiB limit
+    insert_kb_rows(&mut w, 0, 15_000);
+    until_stats(&running, "changes are queued", |s| s.output_queue_bytes > 0);
+    cancel(port, pid, secret);
+    until_stats(&running, "the subscription is ended and its queue released", |s| s.subscriptions == 0 && s.output_queue_bytes == 0);
+    let msgs = c.until_ready();
+    assert_eq!(error_code(&msgs).as_deref(), Some("57014"));
+    assert_eq!(first_values(&c.query("SELECT 7")), ["7"]);
+    running.shutdown();
+}
+
+/// A large result goes out as the engine finds it, in order; an error
+/// after its first rows ends them with an ErrorResponse (as in PostgreSQL),
+/// while a result of one chunk fails before any row, as before; and a
+/// portal over a streamed result is fetched in batches across Executes.
+#[test]
+fn large_results_are_streamed() {
+    let (running, port) = start("streamed");
+    let mut c = Conn::connect(port);
+    c.query("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    c.query("INSERT INTO t SELECT g, repeat('x', 100) FROM generate_series(1, 30000) g");
+    let msgs = c.query("SELECT id, s FROM t ORDER BY id");
+    let vals = first_values(&msgs);
+    assert_eq!((vals.len(), vals[0].as_str(), vals[29999].as_str()), (30000, "1", "30000"));
+    assert_eq!(command_tags(&msgs), vec!["SELECT 30000"]);
+    // division by zero at the 20,000th row (in key order)
+    let msgs = c.query("SELECT 1 / (id - 20000) FROM t");
+    let t = tags(&msgs);
+    assert!(t.starts_with("TD") && t.ends_with("DEZ"), "{t}");
+    assert_eq!(error_code(&msgs).as_deref(), Some("22012"));
+    let sent = first_values(&msgs).len();
+    assert!((1024..20000).contains(&sent), "{sent} rows before the error");
+    let msgs = c.query("SELECT 1 / (id - 2) FROM t ORDER BY id LIMIT 5");
+    assert_eq!(tags(&msgs), "EZ");
+    // batches across Executes
+    c.parse("", "SELECT id FROM t ORDER BY id", &[]);
+    c.bind("", "", &[], 0);
+    c.execute("", 5000);
+    c.execute("", 5000);
+    c.execute("", 0);
+    let msgs = c.sync();
+    let vals = first_values(&msgs);
+    assert_eq!((vals.len(), vals[10000].as_str()), (30000, "10001"));
+    assert_eq!(msgs.iter().filter(|m| m.0 == b's').count(), 2);
+    assert_eq!(command_tags(&msgs), vec!["SELECT 20000"]);
+    assert_eq!(first_values(&c.query("SELECT count(*) FROM t")), vec!["30000"]);
     running.shutdown();
 }

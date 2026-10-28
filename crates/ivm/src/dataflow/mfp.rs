@@ -158,32 +158,90 @@ impl Mfp {
         }
     }
 
-    /// Expression for output column `c` in terms of input columns, if it is
-    /// computed without depending on filters (for arrangement keys).
-    pub fn output_expr(&self, c: usize) -> Expr {
-        let mut defs: Vec<Expr> = (0..self.input_arity).map(Expr::Column).collect();
-        for s in &self.steps {
-            if let MfpStep::Map(e) = s {
-                let d = e.substitute(&defs);
-                defs.push(d);
-            }
-        }
-        defs[self.projection[c]].clone()
+    /// The input column that output column `c` is (a copy of), if any.
+    pub fn output_column(&self, c: usize) -> Option<usize> {
+        self.output_origin(c).ok()
     }
 
-    /// Predicates expressed over input columns.
-    pub fn predicates_over_input(&self) -> Vec<Expr> {
-        let mut defs: Vec<Expr> = (0..self.input_arity).map(Expr::Column).collect();
-        let mut out = Vec::new();
+    /// The constant that output column `c` is (a copy of), if any.
+    pub fn output_literal(&self, c: usize) -> Option<&Datum> {
+        match self.output_origin(c) {
+            Err(Expr::Literal(d, _)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Output column `c` followed through the maps that copy a column: the
+    /// input column it is (Ok), or the first map expression on the way that
+    /// is not a column (Err). (Expressions are not expanded into each
+    /// other: that can grow exponentially.)
+    fn output_origin(&self, c: usize) -> std::result::Result<usize, &Expr> {
+        let maps: Vec<&Expr> = self
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MfpStep::Map(e) => Some(e),
+                MfpStep::Filter(_) => None,
+            })
+            .collect();
+        let mut c = self.projection[c];
+        while c >= self.input_arity {
+            let e = maps[c - self.input_arity];
+            c = e.as_column().ok_or(e)?;
+        }
+        Ok(c)
+    }
+
+    /// Can evaluating the steps fail on some row of the `input` types? (No
+    /// only when every step provably evaluates without error.)
+    pub fn may_fail(&self, input: &[ColumnType]) -> bool {
+        let mut ext: Vec<ColumnType> = input.to_vec();
         for s in &self.steps {
             match s {
                 MfpStep::Map(e) => {
-                    let d = e.substitute(&defs);
-                    defs.push(d);
+                    if !cannot_fail(e, &ext) {
+                        return true;
+                    }
+                    ext.push(e.column_type(&ext));
                 }
-                MfpStep::Filter(p) => out.push(p.substitute(&defs)),
+                MfpStep::Filter(e) => {
+                    if !cannot_fail(e, &ext) {
+                        return true;
+                    }
+                }
             }
         }
-        out
+        false
+    }
+}
+
+/// Does `e` evaluate without error on every row of `types`? Conservative:
+/// columns, constants, comparisons of two values of the same (scalar) type,
+/// and null tests, boolean connectives, CASE and COALESCE over those.
+fn cannot_fail(e: &Expr, types: &[ColumnType]) -> bool {
+    use crate::types::SqlType as T;
+    let ok = |x: &Expr| cannot_fail(x, types);
+    // comparing values of one type cannot fail (no casts, no overflow)
+    let comparable = |xs: &[&Expr]| {
+        let t = xs[0].ty(types);
+        matches!(
+            t,
+            T::Bool | T::Int2 | T::Int4 | T::Int8 | T::Float4 | T::Float8 | T::Numeric | T::Text | T::Bytea | T::Date | T::Time
+                | T::Timestamp | T::TimestampTz | T::Interval | T::Uuid | T::Oid
+        ) && xs.iter().all(|x| x.ty(types) == t && ok(x))
+    };
+    match e {
+        Expr::Column(_) | Expr::Literal(..) => true,
+        Expr::Not(x) | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::BoolTest(x, _) => ok(x),
+        Expr::And(xs) | Expr::Or(xs) | Expr::Coalesce(xs, _) => xs.iter().all(ok),
+        Expr::Case(c) => c.whens.iter().all(|(w, t)| ok(w) && ok(t)) && ok(&c.else_),
+        Expr::IsDistinct(a, b, _) | Expr::NullIf(a, b) => comparable(&[a, b]),
+        Expr::InList(x, list, _) => comparable(&std::iter::once(&**x).chain(list).collect::<Vec<_>>()),
+        Expr::Call(c) => {
+            matches!(crate::expr::func::func_def(c.func).name, "=" | "<>" | "<" | "<=" | ">" | ">=")
+                && c.args.len() == 2
+                && comparable(&[&c.args[0], &c.args[1]])
+        }
+        _ => false,
     }
 }

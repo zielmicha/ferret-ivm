@@ -9,8 +9,10 @@
 //! actions: random DML (also primary key changes and rows changed several
 //! times), checkpoints, clean restarts, crash restarts (no final checkpoint,
 //! so recovery replays the log; sometimes the log ends in a torn record),
-//! views created, replaced and dropped on the way, and reads AS OF earlier GSNs, which
-//! must return what the views held then. Every view is also subscribed to
+//! views created, replaced and dropped on the way, and statements rewriting
+//! every row of a table at once (every operator then reads the state before
+//! that GSN from a delta that removed all of a table's entries). Every view
+//! is also subscribed to
 //! (some views' queries too, which builds their own dataflow): the stream of
 //! changes must add up to the view's (query's) contents. All views are
 //! compared after every action.
@@ -53,8 +55,8 @@ enum Action {
     DropView(usize),
     /// CREATE OR REPLACE a view with another query.
     ReplaceView(usize, u64),
-    /// Reads AS OF an earlier GSN must return what the views held then.
-    AsOf(usize),
+    /// One statement changing a column of every row of a table.
+    Rewrite(u64),
 }
 
 fn arb_action() -> impl Strategy<Value = Action> {
@@ -66,27 +68,21 @@ fn arb_action() -> impl Strategy<Value = Action> {
         5 => any::<u64>().prop_map(Action::CreateView),
         2 => any::<usize>().prop_map(Action::DropView),
         3 => (any::<usize>(), any::<u64>()).prop_map(|(i, s)| Action::ReplaceView(i, s)),
-        6 => any::<usize>().prop_map(Action::AsOf),
+        6 => any::<u64>().prop_map(Action::Rewrite),
     ]
 }
 
 type Rows = Result<Vec<String>, String>;
 
-/// Whether reads AS OF a GSN before a restart are checked. Off while
-/// recovery re-plans joins from current table sizes and re-hydrates views
-/// whose plan changed, losing their history (engine test
-/// `as_of_history_survives_restart_after_table_sizes_change`).
-const AS_OF_ACROSS_RESTARTS: bool = false;
-
-fn config(dir: &Path, cache_bytes: usize) -> coord::Config {
+fn config(dir: &Path, memory_bytes: usize) -> coord::Config {
     coord::Config {
         data_dir: dir.to_path_buf(),
         sync: false,
         tick: None,
         // checkpoints only on request or under memory pressure: reproducible
         checkpoint_interval: Duration::from_secs(24 * 3600),
-        cache_bytes,
-        retention_gsns: 100_000,
+        memory_bytes,
+        ..Default::default()
     }
 }
 
@@ -154,7 +150,14 @@ impl Sub {
     fn drain(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
-                SubEvent::Data { rows, .. } => {
+                ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                    let rows = match ev.rows() {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            self.failed = Some(e.message);
+                            continue;
+                        }
+                    };
                     for (r, w) in rows {
                         let k: Vec<String> = r.iter().zip(&self.columns).map(|(d, c)| datum_text(d, &c.ty, false)).collect();
                         let e = self.rows.entry(k.clone()).or_default();
@@ -197,19 +200,16 @@ struct View {
     /// What it must equal: its query, with views it reads inlined.
     query: String,
     trim: bool,
-    created: u64,
 }
 
 struct Case {
     _tmp: TempDir,
     dir: PathBuf,
-    cache_bytes: usize,
+    memory_bytes: usize,
     running: Option<coord::Running>,
     tables: Vec<sqlgen::Table>,
     views: Vec<View>,
     next_view: usize,
-    /// (gsn, view name -> rows) after each action
-    history: Vec<(u64, BTreeMap<String, Rows>)>,
     subs: Vec<Sub>,
     log: Vec<String>,
 }
@@ -248,7 +248,7 @@ impl Case {
             let created = self.gsn();
             self.note(format!("{name} (gsn {created}): {def}"));
             let to_query = rng.chance(30);
-            self.views.push(View { name, reads, trim: sqlgen::dedups(&q), query: q, created });
+            self.views.push(View { name, reads, trim: sqlgen::dedups(&q), query: q });
             self.subscribe(self.views.len() - 1, to_query);
         }
     }
@@ -285,14 +285,11 @@ impl Case {
             data.extend_from_slice(&[200, 0, 0, 0, 1, 2, 3, 4, 9, 9, 9]);
             std::fs::write(last, data).unwrap();
         }
-        if !AS_OF_ACROSS_RESTARTS {
-            self.history.clear();
-        }
         // subscriptions end with the engine: subscribe again
         let resubscribe: Vec<(usize, bool)> =
             (0..self.views.len()).map(|i| (i, self.subs.iter().any(|s| s.to_query.is_some() && s.view == self.views[i].name))).collect();
         self.subs.clear();
-        self.running = Some(coord::start(config(&self.dir, self.cache_bytes)).expect("engine restarts"));
+        self.running = Some(coord::start(config(&self.dir, self.memory_bytes)).expect("engine restarts"));
         for (i, q) in resubscribe {
             self.subscribe(i, q);
         }
@@ -304,8 +301,6 @@ impl Case {
     /// while the inlined query need not compute the failing column).
     fn check(&mut self, what: &str) {
         let h = self.h();
-        let gsn = self.gsn();
-        let mut state = BTreeMap::new();
         let mut notes = Vec::new();
         for v in &self.views {
             let got = query(&h, &format!("SELECT * FROM {}", v.name), v.trim);
@@ -335,39 +330,11 @@ impl Case {
                 }
                 sub.failed = None;
             }
-            state.insert(v.name.clone(), got);
         }
+        // (one the engine ended gets nothing more: an error was its last event)
+        self.subs.retain(|s| !s.cancel.load(std::sync::atomic::Ordering::Acquire));
         for n in notes {
             self.note(n);
-        }
-        self.history.push((gsn, state));
-        if self.history.len() > 30 {
-            self.history.remove(rng_index(gsn, 30));
-        }
-    }
-
-    fn check_as_of(&mut self, pick: usize) {
-        if self.history.is_empty() {
-            return;
-        }
-        let (gsn, state) = self.history[pick % self.history.len()].clone();
-        let h = self.h();
-        for v in &self.views {
-            // (error records are not versioned: reads AS OF g check the
-            // view's current ones)
-            let Some(Ok(then)) = state.get(&v.name) else { continue };
-            let then = &Ok(then.clone());
-            if v.created > gsn {
-                continue;
-            }
-            let got = query(&h, &format!("SELECT * FROM {} AS OF {gsn}", v.name), v.trim);
-            if got.is_ok() && &got != then {
-                self.fail(&format!("view {} AS OF {gsn}\n  now reads: {got:?}\n  held then: {then:?}", v.name));
-            }
-            let adhoc = query(&h, &format!("{} AS OF {gsn}", v.query), v.trim);
-            if adhoc.is_ok() && &adhoc != then {
-                self.fail(&format!("query of view {} AS OF {gsn} = {}\n  now reads: {adhoc:?}\n  held then: {then:?}", v.name, v.query));
-            }
         }
     }
 
@@ -376,19 +343,14 @@ impl Case {
     }
 }
 
-/// A deterministic index below `n` (which history entry to forget).
-fn rng_index(seed: u64, n: usize) -> usize {
-    Rng::new(seed).index(n)
-}
-
 fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
     let mut rng = Rng::new(schema_seed);
     let tmp = TempDir::new(name);
     let dir = tmp.path().join("data");
-    let cache_bytes = if rng.chance(30) { 256 << 10 } else { 1 << 30 };
-    let running = coord::start(config(&dir, cache_bytes)).expect("engine starts");
+    let memory_bytes = if rng.chance(30) { 1 << 20 } else { 1 << 30 };
+    let running = coord::start(config(&dir, memory_bytes)).expect("engine starts");
     let tables = sqlgen::gen_schema(&mut rng);
-    let mut case = Case { _tmp: tmp, dir, cache_bytes, running: Some(running), tables, views: vec![], next_view: 0, history: vec![], subs: vec![], log: vec![] };
+    let mut case = Case { _tmp: tmp, dir, memory_bytes, running: Some(running), tables, views: vec![], next_view: 0, subs: vec![], log: vec![] };
     let h = case.h();
     for sql in case.tables.iter().map(sqlgen::create_table_sql).collect::<Vec<_>>() {
         execute(&h, &sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -464,20 +426,13 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
                         v.trim = sqlgen::dedups(&q);
                         v.query = q;
                         v.reads = None;
-                        // (its history before the replacement is gone)
-                        v.created = created;
                         // Subscriptions to the view continue with the change to
                         // the new contents; their result columns cannot change,
-                        // so subscribe again if the replacement's did.
-                        let Ok(ExecResult::Query { columns, .. }) = execute(&case.h(), &format!("SELECT * FROM {name}")) else { continue };
-                        let same = |a: &[ResultColumn]| {
-                            a.len() == columns.len() && a.iter().zip(&columns).all(|(x, y)| x.name == y.name && x.ty == y.ty && x.typmod == y.typmod)
-                        };
-                        let changed = case.subs.iter().any(|s| s.view == name && s.to_query.is_none() && !same(&s.columns));
-                        if changed {
-                            for sub in case.subs.iter().filter(|s| s.view == name && s.to_query.is_none()) {
-                                sub.cancel.store(true, std::sync::atomic::Ordering::Release);
-                            }
+                        // so the engine ends them (an error, and cancelled) if
+                        // the replacement's did: subscribe again then. (Not
+                        // judged by reading the view, which may fail.)
+                        let ended = case.subs.iter().any(|s| s.view == name && s.to_query.is_none() && s.cancel.load(std::sync::atomic::Ordering::Acquire));
+                        if ended {
                             case.subs.retain(|s| !(s.view == name && s.to_query.is_none()));
                             case.note(format!("-- {name}: columns changed, subscribing again"));
                             case.subscribe(i, false);
@@ -485,9 +440,19 @@ fn run(schema_seed: u64, view_seeds: &[u64], actions: &[Action], name: &str) {
                     }
                 }
             }
-            Action::AsOf(pick) => {
-                case.note(format!("-- as of history entry {pick}"));
-                case.check_as_of(*pick);
+            Action::Rewrite(seed) => {
+                // every entry of the table's indexes (and of much downstream)
+                // removed and another added in one GSN
+                let mut rng = Rng::new(*seed);
+                let t = &case.tables[rng.index(case.tables.len())];
+                let c = rng.pick(&t.cols[1..]).clone();
+                let v = sqlgen::value(&mut rng, &c, &case.tables);
+                let sql = format!("UPDATE {} SET {} = {v};", t.name, c.name);
+                let r = execute(&case.h(), &sql);
+                case.note(match r {
+                    Ok(_) => sql,
+                    Err(e) => format!("{sql} -- {e}"),
+                });
             }
         }
         case.check(&format!("{a:?}"));

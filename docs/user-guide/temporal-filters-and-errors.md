@@ -19,8 +19,8 @@ gets a GSN.
 - The engine's **logical clock** is the time of the latest applied tick. It
   never goes backwards: a tick older than the current clock (wall clock
   stepped back, or a restart) leaves it unchanged.
-- The clock is saved with every checkpoint and rebuilt from the log on
-  recovery, so it survives restarts.
+- The clock's ticks are part of the checkpointed state and rebuilt from the
+  log on recovery, so the clock survives restarts.
 - With `--tick-ms 0` no ticks are written: the clock stays at the last logged
   tick, which is 2000-01-01 00:00:00+00 on a data directory that never had
   one.
@@ -34,7 +34,7 @@ Where the clock is used:
 | Context | `now()` (and `current_timestamp`, `transaction_timestamp()`, `statement_timestamp()`, `localtimestamp`, `current_date`) |
 |---|---|
 | materialized views, `SUBSCRIBE (query)` | only in temporal filters (below), evaluated against the logical clock |
-| `SELECT` (ad hoc, virtual views) | the logical clock as of the read's GSN — repeatable for a given GSN, also across restarts (the checkpoint keeps the last 100,000 clock ticks of the retention window; a read as of an older GSN after a restart sees the oldest kept tick's clock) |
+| `SELECT` (ad hoc, virtual views) | the logical clock: the time of the state the read sees, also after a restart (checkpoints keep the last tick) |
 | `INSERT`/`UPDATE`/`DELETE` | the wall clock when the statement runs (the resulting values are logged) |
 
 `clock_timestamp()` always returns the wall clock and is rejected in
@@ -81,13 +81,13 @@ row_expression    op  clock_expression
 where `op` is `<`, `<=`, `>`, `>=` or `=` (equality holds during an
 interval), and
 
-- `clock_expression` is a non-decreasing function of the clock alone:
+- `clock_expression` is a function of the clock alone:
   `now()`, `current_timestamp`, `transaction_timestamp()`,
   `statement_timestamp()`, `localtimestamp` or `current_date`, optionally
   cast to `timestamp`, `timestamptz` or `date`, plus or minus a constant
   (`clock - c`, `clock + c`, `c + clock`), or `date_trunc(c, clock)`, nested
   arbitrarily. A *constant* uses no columns and only immutable functions
-  (`interval '1 hour'`, `2 * interval '1 day'`);
+  (`interval '1 hour'`, `2 * interval '1 day'`, `interval '1 month'`);
 - `row_expression` uses no clock function (it may be constant). It may use
   any deterministic expression of the row.
 
@@ -105,28 +105,52 @@ Rejected, with
   that cannot be pushed into the nullable input (a condition on the
   preserved side, or any condition of a `FULL JOIN`);
 - conditions combining the clock with `OR`, `NOT` or `<>`;
-- clock expressions that are not monotone (`extract(hour from now()) = 3`)
-  or that mix the clock with columns (`now() - ts < interval '1 minute'`; write
+- other functions of the clock (`extract(hour from now()) = 3`) and clock
+  expressions that mix the clock with columns
+  (`now() - ts < interval '1 minute'`; write
   `ts > now() - interval '1 minute'` instead).
 
 Virtual views and ad hoc queries may use `now()` anywhere.
 
 ### How temporal filters are maintained
 
-For each row, the operator computes the interval of logical time
-`[lo, hi)` during which every temporal conjunct holds, by bisecting the
-condition over clock values between 1900-01-01 and 2200-01-01: a row whose
+For each row, the operator computes when every temporal conjunct holds,
+as a set of intervals of logical time, by evaluating the condition (and
+parts of it) at clock values between 1900-01-01 and 2200-01-01. A row whose
 validity starts before 1900 is valid from the beginning, and one whose
 validity ends after 2200 never expires, but a row that would only become
-valid after 2200, or that expired before 1900, is never valid. Because the clock side is
-non-decreasing, each conjunct changes value at most once, and bisection keeps
-calendar arithmetic (months, time zones, `date_trunc`) exact.
+valid after 2200, or that expired before 1900, is never valid. Within that range the result is exact: the view holds the
+rows the query returns at every clock reading.
+
+Without month arithmetic, the clock expression is non-decreasing, so each
+conjunct changes value at most once. It is found by evaluating the
+condition first at the time where the clock expression reaches the row
+expression's value (for `ts > now() - interval '1 hour'`, one microsecond
+after `ts + 1 hour`), which is taken if the condition changes exactly
+there; otherwise by bisecting the range. Evaluating the condition itself
+keeps calendar arithmetic (time zones, `date_trunc`) exact.
+
+Adding or subtracting an interval with months clamps the day to the end of
+a shorter month: `now() - interval '1 month'` is February 28th from March
+28th to 31st, at each time of day, so on each of March 29th, 30th and 31st
+it goes back to February 28th at midnight. Near a month's end such a
+conjunct can hold, stop holding and hold again: a row with
+`ts = '2026-02-28 12:00'` is in `WHERE ts > now() - interval '1 month'` on
+March 28th, 29th, 30th and 31st until noon, and leaves it for good at noon
+on March 31st. The operator finds every such change from the calendar
+(the values the clock expression has before the months are added that
+reach the row's value form at most four ranges) and from the condition
+evaluated around it, so a row can be valid over several intervals, each
+scheduled as below. It costs about as much as a conjunct without months.
 
 - A row valid now is emitted at once.
 - A row that becomes valid in the future, or expires, is scheduled: the
   operator stores `(time, kind, row)` events in an index ordered by time.
-- At every step in which the clock has moved, the events that are due are
-  released: rows enter (`kind 0`) or leave (`kind 1`) the output.
+- At every step in which the clock has moved, the events that became due
+  since the previous step are released: rows enter (`kind 0`) or leave
+  (`kind 1`) the output. Released events are not looked at again, so the
+  cost of a clock tick does not grow with the number of rows that expired
+  before it.
 - Changes to the input are filtered at the current clock: a deleted row
   retracts both its output and its pending events.
 
@@ -213,5 +237,3 @@ Known deviations (see [Troubleshooting](troubleshooting.md#known-problems)):
   example `ON a.id = b.id AND a.x / b.y > 1` with `b.y = 0`. Errors in
   expressions over a single input (including computed join keys such as
   `ON a.v = 100 / b.x`) are error records as usual.
-- Error records are **not versioned**: an `AS OF` read checks the view's
-  current error records, whatever they were at the read's GSN.

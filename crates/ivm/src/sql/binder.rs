@@ -818,23 +818,35 @@ impl<'a> Binder<'a> {
                 }
             }
             let base = rel.arity();
+            let input_types = rel.schema();
             let mut pre: Vec<Expr> = all_group.clone();
             let mut calls = Vec::with_capacity(aggs.len());
             for a in &aggs {
-                let mut args = Vec::new();
-                for e in &a.args {
-                    pre.push(e.clone());
-                    args.push(base + pre.len() - 1);
-                }
+                // As in PostgreSQL, an aggregate's arguments and ORDER BY
+                // keys are evaluated only for the rows that pass its FILTER,
+                // after it: they are NULL for the other rows, which the
+                // aggregate skips (columns and constants, which cannot fail,
+                // are left as they are).
                 let filter = a.filter.as_ref().map(|f| {
                     pre.push(f.clone());
                     base + pre.len() - 1
                 });
-                let mut order = Vec::new();
-                for (e, spec) in &a.order {
-                    pre.push(e.clone());
-                    order.push(SortKey { col: base + pre.len() - 1, spec: *spec });
-                }
+                let mut guarded = |e: &Expr| -> usize {
+                    pre.push(match filter {
+                        Some(f) if !matches!(e, Expr::Column(_) | Expr::Literal(..)) => {
+                            let ty = e.ty(&input_types);
+                            Expr::Case(Box::new(crate::expr::CaseExpr {
+                                whens: vec![(Expr::Column(f), e.clone())],
+                                else_: Expr::null(ty.clone()),
+                                ty,
+                            }))
+                        }
+                        _ => e.clone(),
+                    });
+                    base + pre.len() - 1
+                };
+                let args: Vec<usize> = a.args.iter().map(&mut guarded).collect();
+                let order: Vec<SortKey> = a.order.iter().map(|(e, spec)| SortKey { col: guarded(e), spec: *spec }).collect();
                 calls.push(AggCall {
                     func: a.func,
                     args,
@@ -1260,7 +1272,7 @@ impl<'a> Binder<'a> {
         match tf {
             ast::TableFactor::Table { name, alias, args, version, with_ordinality, .. } => {
                 if version.is_some() {
-                    sql_bail!(codes::FEATURE_NOT_SUPPORTED, "table versions are not supported; use AS OF on the query");
+                    sql_bail!(codes::FEATURE_NOT_SUPPORTED, "table versions are not supported: reads see the latest state");
                 }
                 if let Some(args) = args {
                     let (_, fname) = object_name(name)?;

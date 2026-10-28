@@ -377,12 +377,10 @@ pub fn encode_fidelity(d: &Datum, out: &mut Vec<u8>) {
     }
 }
 
-/// Whether a value of this type has a fidelity suffix.
+/// Whether a value of this type has a fidelity suffix: whether its equal
+/// values can differ in representation (`SqlType::equality`).
 pub fn has_fidelity(ty: &SqlType) -> bool {
-    matches!(
-        ty,
-        SqlType::Numeric | SqlType::Float4 | SqlType::Float8 | SqlType::Interval | SqlType::Jsonb
-    ) || matches!(ty, SqlType::Array(e) if has_fidelity(e))
+    ty.needs_fidelity()
 }
 
 /// Restore `d` (decoded canonically) using its fidelity suffix. Returns bytes consumed.

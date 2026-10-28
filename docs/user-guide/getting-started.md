@@ -73,19 +73,20 @@ Every flag is parsed in `crates/ivm/src/main.rs`; defaults come from
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--data-dir DIR` | `ivm-data` (relative to the working directory) | Data directory: input log, storage segments, manifest, lock file. Created if missing. See [Operations](operations.md#the-data-directory). |
+| `--data-dir DIR` | `ivm-data` (relative to the working directory) | Data directory: input log, storage segments, manifest, format version, lock file. Created if missing. See [Operations](operations.md#the-data-directory). |
 | `--listen ADDR` | `127.0.0.1:6875` | TCP address of the PostgreSQL-protocol server (`host:port`, passed to `TcpListener::bind`). There is no Unix-socket listener. |
 | `--password PW` | none | If given, every client must send this password (cleartext password authentication; the user name is not checked). Without it, any user name and password are accepted. |
-| `--cache-mb N` | `1024` | Target size of the node cache (buffer pool) in MiB. Clean tree nodes are evicted above it; a checkpoint is also forced when dirty nodes exceed half of it. See [Configuration and tuning](operations.md#configuration-and-tuning). |
-| `--checkpoint-secs N` | `10` | Seconds between checkpoints (a checkpoint is only taken if records were applied since the last one). |
-| `--retention-gsns N` | `1000` | Number of GSNs of history kept for `AS OF` reads. Older versions are consolidated, and older input-log segments may be deleted. |
+| `--memory-mb N` | `2048` | Memory budget in MiB: the buffer pool of index nodes, aggregation caches, queued records and changes, the dataflow's working memory and the buffer pools of hydrations and large reads together (`--cache-mb` is an older name). Tree nodes are evicted beyond the pool's share (modified ones after writing them to the segment files). See [Memory](operations.md#memory). |
+| `--checkpoint-secs N` | `10` | Seconds between checkpoints (a checkpoint is only taken if something other than clock ticks was applied since the last one; ticks alone make one due after 3,600 of them). See [Checkpoints](operations.md#checkpoints-and-garbage-collection). |
 | `--tick-ms N` | `1000` | Interval of logged wall-clock ticks, which define `now()`. `0` disables ticks; `now()` then stays at the last logged tick (2000-01-01 00:00:00 UTC on a data directory that never had one). |
 | `--no-sync` | off (fsync on) | Do not `fsync` the input log after each commit batch. Faster, but an operating-system crash or power loss can lose changes that were already acknowledged to sources and clients; see [Operations](operations.md#durability-and---no-sync). |
 | `--http-listen ADDR` | off | Serve the [web UI](../web-ui.md) and its JSON API on `ADDR` (`host:port`, e.g. `127.0.0.1:6876`). With `--password`, every HTTP request needs Basic authentication with that password (any user name). |
 | `-h`, `--help` | | Print usage and exit with status 2. |
 
 Any unknown flag, a missing value or an unparsable number also prints the
-usage text and exits with status 2.
+usage text and exits with status 2. `--retention-gsns`, a flag of earlier
+versions (the history kept for `AS OF <gsn>` reads), exits with status 2 and
+says that it was removed: the engine keeps no history.
 
 Exit statuses and start-up failures:
 

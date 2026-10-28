@@ -52,8 +52,9 @@ Materialized views have additional restrictions
 | `a JOIN LATERAL (...) l ON ...`, `LEFT JOIN LATERAL (...) l ON true` | only inner and left lateral joins; a left lateral join needs `ON true` |
 | `( a JOIN b ... ) [AS alias]` | parenthesised joins; the alias names the join's output columns |
 
-Not supported: `ROWS FROM (...)`, table versions (`FOR SYSTEM_TIME`; use
-`AS OF`). `TABLESAMPLE` is accepted and **ignored** (all rows are returned).
+Not supported: `ROWS FROM (...)`, table versions (`FOR SYSTEM_TIME`: reads
+see the latest state). `TABLESAMPLE` is accepted and **ignored** (all rows
+are returned).
 
 ### WHERE, GROUP BY, HAVING
 
@@ -98,6 +99,14 @@ start/end: UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | UNBOU
   `lead(x [, offset [, default]])`, `first_value(x)`, `last_value(x)`,
   `nth_value(x, n)` (NULL for a NULL `n`), and every
   [aggregate](#aggregate-functions) except with `DISTINCT` or `FILTER`.
+- As in PostgreSQL, `ntile` reads `n` at the partition's first row where it
+  is not NULL: that value is the number of buckets for every row (an `n`
+  that is not positive there fails with `argument of ntile must be greater
+  than zero`, SQLSTATE `22014`; later rows' `n` are ignored), the rows
+  before it are NULL, and the buckets are counted from it. The `offset` of
+  `lag`/`lead` and the `n` of `nth_value` are read at every row. The
+  arguments are computed for every row, also where PostgreSQL does not
+  compute them ([Known problems](../user-guide/troubleshooting.md#known-problems)).
 - Default frame: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 - `ROWS` and `GROUPS` offsets are integer constants. `RANGE` offsets need
   exactly one `ORDER BY` column of a numeric type (offset of the same type)
@@ -219,7 +228,11 @@ agg( fraction ) WITHIN GROUP ( ORDER BY sort_expr )      -- ordered-set aggregat
 | `any_value(x)` | any | same as argument |
 
 - `DISTINCT`, `FILTER (WHERE ...)` and `ORDER BY` inside the call are
-  supported for all aggregates. With `DISTINCT`, the `ORDER BY` expressions
+  supported for all aggregates. As in PostgreSQL, the arguments and the
+  `ORDER BY` expressions are evaluated only for the rows that pass the
+  `FILTER`, after it: `sum(10 / x) FILTER (WHERE x <> 0)` does not divide
+  by zero, and an error of the filter itself is raised before any of its
+  arguments'. With `DISTINCT`, the `ORDER BY` expressions
   must be arguments (`in an aggregate with DISTINCT, ORDER BY expressions
   must appear in argument list`, as in PostgreSQL). A materialized view with
   several different `DISTINCT` argument sets (or filters), `DISTINCT` and
@@ -230,11 +243,19 @@ agg( fraction ) WITHIN GROUP ( ORDER BY sort_expr )      -- ordered-set aggregat
   Without an `ORDER BY`, the input is ordered by the argument values, so the
   result is deterministic (PostgreSQL uses an arbitrary input order).
 - Floating-point `sum`, `avg`, `stddev*` and `var*` are computed exactly
-  (the sum of the exact binary values) and rounded once at the end; the
+  (the sum of the exact binary values) and rounded once at the end (a
+  standard deviation is the square root of the rounded variance); the
   result is independent of the order of the inputs, and may differ from
   PostgreSQL's sequential summation in the last digits. A `sum` of
   `double precision` or `real` values that overflows its type fails with
-  `value out of range: overflow` (infinite inputs give `Infinity`).
+  `value out of range: overflow` (infinite inputs give `Infinity`), and so
+  do a `var*` and a `stddev*` beyond the range of `double precision`. An
+  `avg` divides the exact sum, and `var*` and `stddev*` use the exact sum
+  of squares, so they succeed when their result is in range even where the
+  sum or the sum of squares is not; PostgreSQL fails with `value out of
+  range: overflow` as soon as its running sum or sum of squares overflows:
+  `avg` of `1e308` and `1e308` is `1e+308`, and `avg`, `stddev_pop` of
+  `1e300` and `-1e300` are `0`, `1e+300`, where PostgreSQL fails.
 - `numeric` sums keep NaN and infinities apart from the finite sum (like
   PostgreSQL), use the largest display scale among the inputs, and are exact
   without numeric's range limit; only the result is checked. A `sum` beyond

@@ -119,8 +119,9 @@ One row per base table that the view depends on:
 The estimate starts at 1 and follows the first consumer at each step: a
 delta join multiplies it by `1 + lookups`, where `lookups` sums the expected
 number of index probes along the table's delta path (each probe's fan-out is
-the average number of entries per key in a sample of up to 2000 entries of
-the probed index); a `Reduce` adds 2 (two range summaries); a `TopK` adds
+the average number of current entries per key of the probed index, sampled
+from 16 runs of up to 128 entries spread evenly over it, or from its start
+when it holds at most 2,048 entries); a `Reduce` adds 2 (two range summaries); a `TopK` adds
 its limit (100 without one); a `Window` multiplies by 10. It is a rough
 guide, not a cost model — the planner does not use it.
 
@@ -146,7 +147,7 @@ All results are text columns, except `SHOW GSN`.
 | `SHOW INDEXES` | `name`, `on` (relation), `columns` (0-based column positions, e.g. `[2]`) |
 | `SHOW SINKS` | `name`, `from`, `table`, `status` ([Sinks](sinks.md#monitoring-and-drop-sink)); a sink of a broken view shows `error: broken: <reason>` |
 | `SHOW ARRANGEMENTS` | `arrangement` (id), `node` (dataflow node id), `operator` (the node's operator), `key` (key expressions, `#n` = column n), `rows` (sum of multiplicities), `refs` (references: operators and pins using it) |
-| `SHOW FRONTIERS` | rows of `frontier`, `value`: `durable_gsn` (last GSN made durable by the sequencer), `processed_gsn` (last GSN applied), `checkpoint_gsn` (GSN of the last checkpoint), `retention_frontier` (oldest GSN readable with `AS OF`), `cache_bytes` (bytes of tree nodes in memory), `segments` (number of storage segments), and one `source <name> lsn` row per source that has reported a frontier |
+| `SHOW FRONTIERS` | rows of `frontier`, `value`: `durable_gsn` (last GSN made durable by the sequencer), `processed_gsn` (last GSN applied), `checkpoint_gsn` (GSN of the last checkpoint), `cache_bytes` (bytes of tree nodes in memory), `segments` (number of storage segments), and one `source <name> lsn` row per source that has reported a frontier |
 | `SHOW GSN` | `gsn` (`bigint`): last applied GSN |
 | `SHOW COLUMNS FROM t` | `name`, `type` (as `format_type` prints it), `nullable` (`true`/`false`), `key` (`true` for primary-key columns of a table) |
 | `SHOW CREATE VIEW name` | `name`, `create_sql`: the stored statement of **any** object named `name` (table, view, index, source, sink); for a replicated table a comment `-- table <schema>.<table> replicated by source <id>` |
@@ -172,8 +173,7 @@ SELECT * FROM ivm.objects;
 | `ivm.catalog_history` | `gsn bigint`, `statement text` | every DDL statement that was applied successfully, with its GSN, in order — including statements of objects that have since been dropped; the most recent 10,000 (up to 11,000) are kept. A statement that fails (for example a multi-name `DROP` with one unknown name) changes nothing and is not listed. "What did the catalog look like at GSN g?" is a query over it, with one gap: upstream schema changes rewrite table definitions without an entry. |
 | `ivm.objects` | `oid oid`, `name text`, `kind text`, `created_gsn bigint`, `definition text` | the current catalog objects: OID (`16384 + id`), name, kind (`table`, `view`, `materialized view`, `index`, `source`, `sink`), the GSN of the statement that created (or last replaced) the object, and its stored statement |
 
-Both are computed from the catalog when a query is planned; they are not
-versioned, so `AS OF` returns their current contents.
+Both are computed from the catalog when a query is planned.
 
 ## PostgreSQL system catalogs
 

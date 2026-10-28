@@ -1,7 +1,7 @@
 # Operations
 
 Running `ivm` in practice: configuration and tuning, the data directory,
-recovery, checkpoints, retention, durability, and cleaning up. The byte-level
+recovery, checkpoints, space reclamation, durability, and cleaning up. The byte-level
 formats are in [On-disk format](../on-disk-format.md); the mechanisms in
 [Recovery and snapshots](../internals/recovery.md).
 
@@ -11,9 +11,8 @@ All configuration is on the command line ([flags](getting-started.md#command-lin
 
 | Knob | Default | Trade-off |
 |---|---|---|
-| `--cache-mb` | 1024 | Target size of the node cache. Clean index nodes beyond it are evicted (CLOCK) and re-read from segment files on demand; dirty nodes stay until the next checkpoint, and a checkpoint is forced when dirty nodes exceed half of it. Working sets that fit run from memory; larger ones degrade gradually. |
-| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash, and more dirty memory. The engine thread is busy during a checkpoint, so reads and maintenance pause while it runs. |
-| `--retention-gsns` | 1000 | History kept for `AS OF`, in GSNs (every logged input, including each clock tick, is one GSN). More retention keeps more versions in the indexes, more input-log segments on disk, and more clock ticks in each checkpoint. `0` keeps no history beyond the previous GSN. |
+| `--memory-mb` | 2048 | The memory budget: the buffer pool of index nodes, the aggregation group caches, the records waiting to be applied, the changes queued for subscriptions and sinks, the dataflow's transient working memory and the buffer pools of hydrations and large reads together ([Memory](#memory)). The buffer pool gets what the others leave; index nodes beyond its share are evicted (CLOCK) and re-read from segment files on demand — modified (dirty) nodes are written to the segment files first, and are also written once they exceed half of the pool's share, ahead of the next checkpoint (which makes them durable). Working sets that fit run from memory; larger ones degrade gradually — also large transactions and view hydration, which build their results through the pool. `--cache-mb` is an older name of this flag (it used to size the buffer pool alone, counted in serialized bytes: about a quarter of the memory it took). |
+| `--checkpoint-secs` | 10 | Longer intervals mean less checkpoint I/O but longer log replay after a crash (dirty memory stays within half of the pool's share either way). A checkpoint writes what changed since the previous one, and none is taken while only the clock ticks. Checkpoints are written by a thread of their own: reads and maintenance go on meanwhile (nodes modified meanwhile are copied, once each, and the buffer pool goes on writing dirty nodes early, except those the checkpoint is writing). |
 | `--tick-ms` | 1000 | Granularity of `now()` for temporal filters. Each tick is one log record and one GSN (about 25 bytes of log per tick). `0` disables ticks and freezes `now()`. |
 | `--no-sync` | off | Skips `fsync` of the input log. Only for tests and benchmarks; see [Durability](#durability-and---no-sync). |
 
@@ -23,16 +22,27 @@ Fixed internal parameters (not configurable):
 |---|---|
 | target size of index leaf and internal nodes | 16 KiB |
 | storage segment size (roll-over threshold) | 256 MiB |
+| storage segment files kept open for reading (by the engine, checkpoints, hydrations and large reads together) | a quarter of the limit on open files (below), at least 8 and at most 65,536 |
 | input-log segment size (roll-over threshold) | 64 MiB |
 | maximum records per sequencer batch (group commit) | 4096 |
-| durable records the engine may lag behind before the sequencer stops taking appends | 10,000 |
-| unacknowledged commits per source | 10,000 |
-| initial-snapshot chunk | 10,000 rows |
-| groups cached in memory per aggregation | 2^18 (half evicted when full) |
-| nodes relocated per garbage-collection pass | 1000 |
+| records waiting to be applied, before sources stop reading their streams | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
+| changes queued per subscription or sink | a sixteenth of `--memory-mb` (at least 4 MiB), in bytes of memory |
+| aggregation group caches, all together | an eighth of `--memory-mb` |
+| transient working memory of the dataflow (below) | an eighth of `--memory-mb` |
+| buffer pool of a fork of the storage (a hydration, a large read), each while it lives | a sixteenth of `--memory-mb` (at least 1 MiB) |
+| changes forwarded to a hydration that it has not applied yet | an eighth of `--memory-mb` (at least 4 MiB), in bytes of memory |
+| buffer pool | what the above leave of `--memory-mb`, at least a quarter of it |
+| records a source has in flight to the input log before it stops reading the stream until they are durable | 10,000 |
+| initial-snapshot chunk (and piece of a table without a key) | 10,000 rows |
+| maintenance pass budget (relocation and merges) | 8 MiB plus the bytes checkpoints wrote for updates since the previous pass |
+| sort buffer when building or updating an index in bulk (hydration, large changes) | half the working memory, within 1 MiB and 64 MiB |
+| change (delta) of a view or operator kept in memory per GSN, and changes of a table applied at once | half the working memory, within 1 MiB and 256 MiB (larger ones go to temporary trees) |
+| rows per hydration batch | 1,024 (or 1 MiB of index entries) |
+| join rows looked up at once | about half the working memory, within 256 KiB and 8 MiB |
 | manifest rewrite threshold | 8 MiB |
 | DDL statements kept in the catalog history | 10,000 (trimmed back to 10,000 once there are more than 11,000) |
-| clock ticks saved in a checkpoint | the retention window, at most 100,000 |
+| clock ticks kept | the last one |
+| clock ticks that make a checkpoint due without other changes | 3,600 |
 | source reconnect delay | 200 ms, doubling up to 10 s |
 | retry of a table that cannot be copied | 1 s, doubling up to 60 s |
 | sink reconnect delay | 100 ms, doubling up to 10 s |
@@ -42,23 +52,75 @@ Fixed internal parameters (not configurable):
 
 Things to keep in mind when sizing:
 
-- **One dataflow thread.** All maintenance and all reads run on the engine
-  thread, so the engine uses about one core for its work (plus the
-  sequencer, one thread per source, sink and client session, and three
-  threads for the web UI when it is enabled).
-- **Memory outside the cache**: hydration of a new view holds snapshots of
-  intermediate results; aggregation group caches; subscription and sink
-  queues are unbounded. The queue of logged records the engine has yet to
-  apply is bounded: when the engine is 10,000 records behind, the log stops
-  taking new records until it catches up (sources then pause reading the
-  replication stream, and the upstream keeps the WAL).
+- **One dataflow thread.** All maintenance and most reads run on the engine
+  thread, so the engine uses about one core for its work; the hydration of
+  new views, indexes and subscriptions, reads too large for the engine
+  thread (up to four at a time) and writing checkpoints run on threads of
+  their own, as do the sequencer, one thread per source, sink and client
+  session, and three threads for the web UI when it is enabled.
+- **Memory**: see [below](#memory). Outside the budget: the nodes a fork
+  of the storage (a hydration, a large read) shares with the engine's
+  buffer pool stay in memory while the fork lives, also once the engine has
+  evicted or modified its own copies (up to the pool's contents when the
+  fork was taken); a hydration holds a few batches of rows and join rows in
+  flight (sized from the working memory, but not counted in it), and the
+  snapshot and changes of a query it hydrates for `SUBSCRIBE`; a window
+  partition or a recursive query's result is computed whole; a large
+  commit's log record itself, and the rows delivered to subscriptions and
+  sinks, are in memory whole; an ad-hoc query's result is built in memory,
+  and each session, source and sink thread has its own buffers.
 - **Shared work**: identical sub-plans and identical indexes are shared
   between views; `SHOW ARRANGEMENTS` shows the reference counts.
+- **Open files**: the storage keeps at most a quarter of the process's
+  limit on open files (the soft limit, `ulimit -n`, as it is when the server
+  starts) of its segment files open for reading, however large the store
+  (a segment per 256 MiB) and however many hydrations and large reads run
+  on it; it opens the others again as it reads them. Besides those the
+  server holds about a dozen files and sockets of its own (the input log,
+  the manifest, the active segment, the lock file, the listening sockets),
+  one socket per client session and one per connection to PostgreSQL (a
+  source's replication connection, and one more while it copies tables; a
+  sink's connection). The common default limit of 1,024 leaves 256 for
+  segment files and the rest for connections. Raise it (`ulimit -n`,
+  `LimitNOFILE=` under systemd) for many connections, or for a store much
+  larger than 64 GiB whose reads miss the buffer pool all over it, to save
+  reopening files.
+
+### Memory
+
+`--memory-mb` is one budget for the memory the server keeps data in. Every
+part is counted in bytes of memory — the sizes of the structures and of the
+heap blocks they own — not in serialized bytes or numbers of records, so
+the limits mean the same for narrow and wide rows:
+
+| Part | Limit | When it is reached |
+|---|---|---|
+| records logged (or submitted to the log) that the engine has not applied yet (a large upstream transaction, which a source spools to the log directory, counts at the size of its small commit record) | an eighth (at least 4 MiB) | sources stop reading the replication stream for a while (keeping their sessions; the upstream keeps the WAL), and log what they decoded already without waiting; the engine never waits, so it always catches up |
+| changes queued for one subscription (and the chunks of its snapshot in flight) | a sixteenth (at least 4 MiB) | the subscription ends with `53000` and its queue is dropped ([Reads](reads.md#ending-a-subscription)) |
+| rows of query results on their way to sessions | the rows of a read on the engine thread (at most 50,000, 8 MiB), two chunks of about 256 KB per read on a reader thread | a read too large for the engine thread runs on a reader thread, which waits for its client |
+| changes queued for one sink and not written yet (and the chunks of its snapshot in flight) | a sixteenth (at least 4 MiB) | the sink falls behind: it is sent nothing more, drops what it holds and resynchronises its target from a snapshot ([Sinks](sinks.md#delivering-changes)) |
+| aggregation group caches (all of them) | an eighth | the group is not cached; after the record every cache drops the groups not used since the last time this happened, and at least half of its size, so idle aggregations give way |
+| transient working memory: the changes of views and operators kept in memory for one GSN (until their consumers have run), the sets of groups or keys they affect, and the sort buffers of indexes built or updated in bulk (hydration, large changes) | an eighth, set aside | each buffer holds at most half of it (within the bounds [above](#configuration-and-tuning)), and spills what it holds to temporary trees (or applies it to its index) sooner, from a sixteenth of that, while the buffers together exceed the share |
+| the buffer pool of a fork of the storage — a hydration of a new view, index or subscription, a read or snapshot too large for the engine thread — while it lives | a sixteenth each (at least 1 MiB) | the fork writes and evicts its own nodes like the engine's pool (the nodes it still shares with the engine are not counted) |
+| table changes forwarded to a hydration that it has not applied yet | an eighth (at least 4 MiB) | the engine waits for the hydration to catch up |
+| buffer pool (index nodes) | the rest, at least a quarter | clean nodes are evicted (also between the leaves of a scan); dirty nodes are written to the segment files, and then evicted like clean ones, beyond the pool's share, or beyond half of it ahead of the next checkpoint |
+
+Queued changes are shared: a change delivered to several subscriptions and
+sinks is held once (each consumer's queue still counts it). The web UI's
+`/api/overview` reports each part (`cache_used_bytes` against
+`cache_capacity_bytes`, `group_cache_bytes`, `input_queue_bytes`,
+`output_queue_bytes`, `work_bytes`, `fork_pool_bytes`, `forwarded_bytes`;
+[Web UI](../web-ui.md#get-apioverview)).
+
+Subscriptions and sinks can queue a sixteenth each, so many slow consumers
+can together exceed the budget; the buffer pool then shrinks to its
+quarter.
 
 ## The data directory
 
 ```
 <data-dir>/
+├── FORMAT                            the data directory's format version
 ├── LOCK                              exclusive lock while a process uses the directory
 ├── log/
 │   └── log-<first GSN, 20 digits>.ivl   input-log segments
@@ -73,9 +135,13 @@ Things to keep in mind when sizing:
   checksum. It is the source of truth: everything else can be recomputed
   from it plus the last checkpoint.
 - **Store** (`store/`): the persistent indexes (copy-on-write B+trees) in
-  append-only segment files, and the manifest, whose last valid record names
-  the tree roots of the last checkpoint together with the catalog and the
-  engine's state.
+  append-only segment files, among them the metadata tree, which holds the
+  catalog with its DDL history and the engine's state, and the manifest,
+  whose last valid record names the tree roots of the last checkpoint.
+- **Format** (`FORMAT`): the version of the on-disk formats the directory is
+  written in ([Compatibility](../on-disk-format.md#compatibility)). A
+  directory written by an older version is migrated at its first start; one
+  written in a newer format is refused untouched.
 
 The stop file `.ivm-stop` lives in the process's working directory, not in
 the data directory ([Stopping](getting-started.md#stopping-the-server)).
@@ -97,7 +163,8 @@ file, lock it, and run on the same directory concurrently.
 Every start is a recovery (the listen address is bound before it, so
 clients that connect meanwhile wait):
 
-1. Lock the data directory.
+1. Lock the data directory and read its format version (`FORMAT`): a
+   directory of a newer format is refused before anything in it is opened.
 2. Open the input log: scan the last segment, truncate a torn tail (a frame
    whose length or checksum does not match), and determine the last GSN.
 3. Open the store: read the manifest, take its last valid record as the
@@ -105,7 +172,8 @@ clients that connect meanwhile wait):
    delete segment files the checkpoint does not reference (written after
    it). A store whose manifest is missing (while segment files hold data)
    or has no valid record stops the start, untouched.
-4. Restore the catalog and engine state from the checkpoint, rebuild the
+4. Restore the catalog and engine state from the checkpoint (its metadata
+   tree), rebuild the
    dataflow from the catalog (tables first, then materialized views and
    indexes, each after what it reads), and attach every index whose
    structure matches one in the checkpoint. A table whose primary index is
@@ -125,7 +193,11 @@ clients that connect meanwhile wait):
    checkpoint's GSN (a lost unsynced tail, see
    [Durability](#durability-and---no-sync)), numbering continues after the
    checkpoint.
-6. Restart sources (from their logged progress) and the retries of pending
+6. A directory of format 1 (written before formats were recorded) is
+   migrated: a checkpoint writes its state into a metadata tree, then
+   `FORMAT` is written (a crash in between migrates again at the next
+   start; see [Compatibility](../on-disk-format.md#migrating-format-1)).
+   Restart sources (from their logged progress) and the retries of pending
    slot drops, start the sequencer and engine threads, and accept
    connections.
 
@@ -138,7 +210,8 @@ Startup failures and what they mean:
 | Message | Cause |
 |---|---|
 | `data directory ... is in use by another ivm process` | another process holds `LOCK` |
-| `cannot decode checkpoint state: ...` | the checkpoint was written by an incompatible version ([Compatibility](../on-disk-format.md#compatibility)) |
+| `the data directory has format <n>, which this version of ivm cannot read ...` | the directory was written by a newer version ([Compatibility](../on-disk-format.md#compatibility)); nothing was modified |
+| `cannot decode checkpoint state: ...`, `bad metadata entry (...)` | the checkpoint was written by an incompatible version ([Compatibility](../on-disk-format.md#compatibility)) or is damaged |
 | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | the table's primary index cannot be found by its structural fingerprint — usually an incompatible version |
 | `node checksum mismatch at ...`, `cannot open segment ...` | damaged or missing store files |
 | `input log segment ... is corrupt at byte ...`, `input log is missing records: expected gsn ..., found ...` | a damaged or deleted input-log segment holding records after the checkpoint; those records exist nowhere else. Restore the data directory from a backup |
@@ -162,41 +235,62 @@ view).
 
 ## Checkpoints and garbage collection
 
-A checkpoint is taken every `--checkpoint-secs` seconds if anything was
-applied since the last one, when dirty index nodes exceed half of
-`--cache-mb` (also only if something was applied), on the `CHECKPOINT`
-statement, and as the final step of a requested shutdown. It:
+A checkpoint is taken every `--checkpoint-secs` seconds, or as soon as the
+memory of dirty index nodes exceeds half of the buffer pool's share of
+`--memory-mb`, if something durable changed since the last one: anything
+applied but clock ticks that changed nothing but the clock (a tick that
+changes a view through a temporal filter counts), or space the last
+maintenance pass (below) could not reclaim within its budget. Clock ticks
+alone make one due only after 3,600 of them (an hour at the default
+`--tick-ms`), so an idle engine writes nothing but its ticks to the log
+once its space is reclaimed, and a restart replays at most that many. A
+checkpoint is also taken on the `CHECKPOINT` statement and as the final
+step of a requested shutdown. It:
 
-1. serialises the engine state (the catalog and its DDL history, index
-   fingerprints → tree ids and the GSN each index's history starts at,
-   view error counts and the error records of operators, source states and
-   LSNs, the logical clock and the recent clock ticks, pending slot drops)
-   as JSON;
-2. writes all dirty index nodes bottom-up to the active segment and `fsync`s
-   the segment files;
-3. appends a checkpoint record (tree roots, segment usage, the JSON state) to
-   the manifest and `fsync`s it — this is the atomic commit point;
-4. deletes sealed segment files with no live nodes;
-5. runs one garbage-collection pass;
+1. writes what changed in the catalog and the engine state since the last
+   one (DDL history entries, source states and LSNs, index fingerprints →
+   tree ids, error records, the last clock tick, pending slot drops) into
+   the metadata tree, a tree like the indexes (DDL statements write their
+   catalog changes into it right away);
+2. runs one maintenance pass (below);
+3. writes all dirty nodes bottom-up to the active segment and `fsync`s the
+   segment files;
+4. appends a checkpoint record (tree roots, segment usage, a small header
+   naming the metadata tree) to the manifest and `fsync`s it — this is the
+   atomic commit point;
+5. deletes sealed segment files with no live nodes (one that a hydration
+   or a large read begun before it died may still read is deleted when
+   that ends);
 6. asks the sequencer to delete input-log segments whose records all lie at
-   or before `checkpoint GSN − retention`.
+   or before the checkpoint's GSN (only recovery reads the log, and it
+   starts after the checkpoint).
 
-Space reclamation: a node rewritten after a checkpoint makes its old copy
-dead. Garbage collection picks the oldest sealed segment that is less than
-half live and rewrites up to 1000 of its live nodes (they are written again
-at the next checkpoint); a segment with no live bytes is deleted at the next
-checkpoint. The active segment is never collected, so up to one segment
-(256 MiB) of dead space can accumulate before it is sealed.
+What a checkpoint writes is what changed since the previous one: its cost
+does not grow with the catalog, its DDL history or the error records that
+stay the same.
+
+Space reclamation: the indexes hold the current rows only — a deleted row
+(or the old version of an updated one) leaves its index leaf with the change
+that removes it, and a leaf or inner node a change leaves nearly empty is
+merged with a neighbour — but a node rewritten after a checkpoint makes its
+old copy in a segment file dead. The maintenance pass rewrites the live
+nodes of the sealed segments that are less than half live, preferring the
+emptiest and oldest, so that they can be deleted, and merges those of them
+left nearly empty with a neighbour. Its work on nodes not already in memory
+or modified is bounded per pass by the budget in the table above: it keeps
+pace with the rate at which updates create garbage, and the next pass
+continues what does not fit. A segment with no live bytes is deleted at the
+checkpoint, or, while a hydration or a large read begun before it died may
+still read it, when that ends: a long hydration (or a read whose client is
+slow) keeps the segments that die meanwhile on disk until it is done. The
+active segment is never collected, so up to one segment (256 MiB) of dead
+space can accumulate before it is sealed. Dropping an index or view
+releases its space without reading it. (A data directory written by a
+version that kept each row's history of changes for `AS OF` reads keeps the
+old versions in its leaves on disk until a change or the maintenance pass
+rewrites them; reads skip them.)
 
 `SHOW FRONTIERS` shows `checkpoint_gsn` and the number of segments.
-
-## Retention and time travel
-
-Each index entry keeps a history of (GSN, weight) changes. Changes at or
-before the *retention frontier* (`last applied GSN − --retention-gsns`) are
-merged into one when an index leaf is next rewritten, and `AS OF` reads
-before the frontier are refused. The same bound decides which input-log
-segments a checkpoint may delete. See [Reads](reads.md#time-travel-as-of-gsn).
 
 ## Durability and --no-sync
 
@@ -237,6 +331,8 @@ While it is stopped:
 | File | Safe to delete? |
 |---|---|
 | `LOCK` | yes (it is re-created) |
+| `FORMAT.new` | yes — a leftover of an interrupted write of `FORMAT`; it is never read |
+| `FORMAT` | do not: the next start takes the directory for one of format 1 and goes through the migration again (harmlessly: it reads the current checkpoint, takes a checkpoint and writes `FORMAT`) |
 | `store/MANIFEST.new` | yes — a leftover of an interrupted manifest rewrite; it is never read |
 | `store/seg-*.dat` not referenced by the last checkpoint | they are deleted automatically on the next start |
 | other `store/` files | **no** — the checkpoint refers to them |
@@ -265,7 +361,9 @@ slot; a slot whose engine is gone retains WAL indefinitely.
 ## Monitoring checklist
 
 - `SHOW FRONTIERS`: `durable_gsn` − `processed_gsn` is the apply backlog;
-  `checkpoint_gsn` should advance every `--checkpoint-secs`.
+  `checkpoint_gsn` should advance every `--checkpoint-secs` while anything
+  but clock ticks is applied (an idle engine checkpoints once per 3,600
+  ticks).
 - `SHOW SOURCES`: `status` (`streaming`, `snapshotting ...`, `error: ...`,
   `error: cannot copy table ...`) and `lsn`; upstream,
   `pg_replication_slots.confirmed_flush_lsn` should track

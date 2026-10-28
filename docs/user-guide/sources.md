@@ -29,9 +29,9 @@ protocol and replication client).
   logical slot and one walsender connection while running.
 - Each source additionally opens ordinary connections: one while
   `CREATE SOURCE` / `ALTER SOURCE ... REFRESH` discovers tables (from the
-  session that runs the statement) and one for snapshot queries, opened
-  when the source has a table to copy and then kept open (idle between
-  chunks) while the source runs.
+  session that runs the statement) and one for snapshot queries, opened by
+  the source's copy thread when the source has a table to copy and then
+  kept open (idle between chunks) while the source runs.
 - Consider **`max_slot_wal_keep_size`**: if the engine is stopped (or cannot
   start), its slot retains WAL without bound. With the limit, PostgreSQL
   invalidates a slot that falls too far behind; the source then re-creates
@@ -269,33 +269,50 @@ engine is stopped, after it fails to start, or while the source cannot
 stream (it keeps reconnecting with `error: ...`), the slot holds back WAL
 removal indefinitely. (A table the source cannot copy does not stop the
 stream, see [below](#tables-added-to-or-removed-from-the-publication).)
-When the engine falls 10,000 logged records behind in applying them, the
-input log stops taking records until it catches up: sources then stop
-reading the replication stream, and the upstream keeps the WAL meanwhile.
+When the records waiting to be applied fill their part of the memory budget
+(an eighth of `--memory-mb`, in bytes of memory), sources stop reading the
+replication stream until the engine catches up (also each one with 10,000
+of its records waiting to be durable), and the upstream keeps the WAL
+meanwhile. Their sessions stay up: they go on sending status updates.
 
 ## Initial snapshot
 
-After the slot is created, the source streams changes and, in between,
-copies each table that has not been snapshotted yet, one table at a time
-(lowest catalog object id first, which is discovery order: by schema, then
-table name):
+After the slot is created, the source streams changes and, at the same
+time, copies each table that has not been snapshotted yet, one table at a
+time (lowest catalog object id first, which is discovery order: by schema,
+then table name). The copy runs on a thread of its own (`ivm-copy-<source
+id>`), on the snapshot connection, while the replication connection keeps
+streaming:
 
-- **Tables with a key** are read in chunks of 10,000 rows in key order:
-  `SELECT <columns> FROM <schema>.<table> [WHERE (key) > (<last key>)] ORDER BY <key> LIMIT 10000`
-  inside a `REPEATABLE READ` transaction. String key columns, and key
-  columns of upstream types replicated as text (enums, `inet`, ...), are
-  compared as `col::text COLLATE "C"`: the byte order of their text, which
-  is how the engine orders them. Chunks are ordered against the change
-  stream with DBLog watermarks (`pg_logical_emit_message` low and high
-  markers), so the result equals a consistent copy; a chunk is only read
-  once its snapshot contains every transaction the stream has already
-  decoded (otherwise it is retried 100 ms later). Every chunk becomes one
-  logged commit; progress (the last copied key) is logged too, so a
-  restart resumes with the next chunk. The algorithm is described in
+- **Tables with a key** are read in chunks of 10,000 rows in the order of
+  their key index (the primary key's, or the replica identity index's):
+  `SELECT <columns> FROM <schema>.<table> [WHERE (<key>) > ('<last key value>', ...)] ORDER BY <key> LIMIT 10000`
+  inside a `REPEATABLE READ` transaction. The key columns are compared as
+  they are, under their own collation, so the index serves every chunk as
+  a range scan, also for text keys under a linguistic collation and for
+  types replicated as text (enums, `inet`, ...). (Chunks used to be ordered
+  by `col::text COLLATE "C"`, which no index serves unless the collation is
+  C: every chunk scanned and sorted the whole table.) Chunks are ordered
+  against the change stream with DBLog watermarks
+  (`pg_logical_emit_message` low and high markers), so the result equals a
+  consistent copy; a chunk is only read once its snapshot contains every
+  transaction the stream has already decoded (otherwise it is retried
+  100 ms later). Every chunk becomes one logged commit; progress (the last
+  copied key) is logged too, so a restart resumes with the next chunk. The
+  algorithm is described in
   [Recovery and snapshots](../internals/recovery.md#the-dblog-snapshot-algorithm).
-- **Tables with `REPLICA IDENTITY FULL`** (no key) are read in one query,
-  whose rows replace the table's contents (a truncate followed by the
-  rows, in one commit).
+- **Tables with `REPLICA IDENTITY FULL`** (no key) are read in one
+  `REPEATABLE READ` transaction through a cursor, in pieces of 10,000 rows.
+  The copy replaces the table's contents: a commit truncating the table,
+  then a commit per piece as it arrives. Changes the copy's snapshot does
+  not contain (made while it is read) apply after its last piece.
+
+A chunk that takes long, or waits upstream (for a lock, say), holds up
+neither the other tables' changes nor the replication session: the source
+goes on streaming and sending status updates. If the snapshot connection
+fails, no chunk is read for 1 s, doubling up to 60 s while it keeps
+failing; the stream goes on, and `SHOW SOURCES` shows `error: cannot read
+snapshot chunks: <message>; retrying every <n>s, streaming`.
 
 While a table's snapshot is incomplete:
 
@@ -304,8 +321,9 @@ While a table's snapshot is incomplete:
   the upstream ever had.
 - **`AS OF AT LEAST LSN`** reads wait as well: the source's LSN frontier does
   not advance until all of its tables are complete.
-- **`read_mode = latest`** and **`AS OF <gsn>`** reads do not wait and see the
-  partial contents.
+- **`read_mode = latest`** reads do not wait and see the partial contents:
+  the rows copied so far, and the rows the stream changed since the table's
+  copy started.
 - Materialized views over the table are maintained throughout; they show the
   partial contents too.
 
@@ -331,7 +349,11 @@ Unchanged TOASTed values (`pgoutput` sends a placeholder for large values
 that an update did not touch) are filled from the stored row — for an
 update that changes the key, from the row stored under the old key; while
 a snapshot chunk holding the row is in flight, from the chunk's copy. If
-there is no such row, they become NULL (with a warning in the log).
+there is no such row, they become NULL (with a warning in the log); while
+the table is being copied, such an update of a row that has not been
+copied yet changes nothing instead, as the row's copy brings all of it (a
+key change whose new key may have been copied already has that key read
+again before the table counts as copied).
 
 Upstream transactions are applied atomically: all changes of a transaction
 get one GSN and are consolidated before any view sees them. Different
@@ -378,7 +400,11 @@ different key — the source:
    are matched **by name**; existing values are cast to the new type (a
    failing cast gives NULL); new columns are NULL; a row whose new key
    would contain a NULL (a new key column) is left to the re-snapshot. The
-   table's version is incremented;
+   table's version is incremented. The rebuild, and the hydration of the
+   re-planned views, run off the engine thread: other tables' changes go on
+   being applied, reads of the table and of the re-planned views wait for
+   it, and no checkpoint is taken until it is done (the table's rows would
+   be in neither version alone);
 4. at the same GSN: indexes on the table move to its new version, following
    their columns by name (an index whose column is gone is dropped, one that
    cannot be built is marked broken; both are logged); subscriptions that
@@ -491,10 +517,11 @@ exists counts as dropped). Failed attempts — the upstream is unreachable,
 the slot still in use, also by the stopping source's own session — are
 retried with a delay doubling from 250 ms up to 10 s, with a warning in the
 log at attempts 1, 2, 4, 8, ..., until the drop succeeds.
-Pending drops are saved in checkpoints (and re-derived from a `DROP SOURCE`
-replayed from the log), so a drop that has not succeeded when the engine
-stops is retried after the next start. Creating a source whose slot has the
-name of a slot still to be dropped (an explicit `SLOT`) cancels that drop.
+Pending drops are part of the checkpointed state (and re-derived from a
+`DROP SOURCE` replayed from the log), so a drop that has not succeeded when
+the engine stops is retried after the next start. Creating a source whose
+slot has the name of a slot still to be dropped (an explicit `SLOT`)
+cancels that drop.
 
 ## Monitoring
 
@@ -507,7 +534,7 @@ name of a slot still to be dropped (an explicit `SLOT`) cancels that drop.
 | `slot` | replication slot name |
 | `tables` | number of replicated tables |
 | `lsn` | the source's LSN frontier (`X/Y`): every upstream commit at or below it has been logged. It stays `0/0` until all of the source's tables have completed their initial snapshot (and, after a restart, until the source has reported it again), and does not advance during a re-snapshot. |
-| `status` | `starting`, `streaming`, `snapshotting <schema>.<table>`, `error: <message>` (while reconnecting), `error: cannot copy table <schema>.<table>: ...` (a table that cannot be read, retried while the rest streams; further failing tables are counted as `(and <n> more tables)`), or `stopped` (the source thread could not be started) |
+| `status` | `starting`, `streaming`, `snapshotting <schema>.<table>`, `error: <message>` (while reconnecting), `error: cannot copy table <schema>.<table>: ...` (a table that cannot be read, retried while the rest streams; further failing tables are counted as `(and <n> more tables)`), `error: cannot read snapshot chunks: ...` (the snapshot connection failed; retried while the source streams), or `stopped` (the source thread could not be started) |
 
 `SHOW FRONTIERS` repeats the frontier per source; `SHOW TABLES` shows each
 table's source and row count. Source warnings and errors are written to the

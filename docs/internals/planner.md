@@ -37,7 +37,9 @@ empty statement when nothing else is left.
 - The `AS OF` suffix is the last `AS OF` (two words separated by any
   whitespace and followed by more text) outside parentheses, string literals
   (`E''` escapes included), quoted identifiers, comments and dollar quotes,
-  found on an ASCII-lowercased copy so that byte offsets stay valid.
+  found on an ASCII-lowercased copy so that byte offsets stay valid. It is
+  `FRESH` or `AT LEAST LSN '...'`; `AS OF <gsn>` and `AS OF LATEST`, time
+  travel of earlier versions, are refused with `0A000`.
 - Before parsing, the statement's text is checked for chains of more than
   50,000 operators at one nesting level (`MAX_OPERATOR_CHAIN`), which are
   refused with `54001 stack depth limit exceeded`: the parser builds such a
@@ -127,7 +129,7 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
   is then assembled as
 
   ```
-  FROM/WHERE ─▶ Map(group keys, aggregate arguments, filters, orders)
+  FROM/WHERE ─▶ Map(group keys, per aggregate: FILTER, arguments, orders)
              ─▶ Aggregate            (or UnionAll of one Aggregate per grouping set)
              ─▶ Filter(HAVING)
              ─▶ Map(window arguments) ─▶ Window
@@ -136,6 +138,12 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
              ─▶ Distinct | TopK(DISTINCT ON)
   ```
 
+  As in PostgreSQL, an aggregate's arguments and `ORDER BY` keys are
+  evaluated only for the rows that pass its `FILTER`, after it: in the map
+  they are `CASE WHEN filter THEN expr END` over the filter's column (a
+  column or constant, which cannot fail, as it is), and the aggregate skips
+  the rows that do not pass by the filter column, so
+  `sum(10 / x) FILTER (WHERE x <> 0)` does not divide by zero.
   Expressions after the aggregation are rewritten to refer to the
   aggregation's output (grouping expressions are matched by fingerprint);
   ungrouped column references fail with SQLSTATE `42803`. Grouping sets are
@@ -189,7 +197,12 @@ rejected. `LATERAL` items are bound directly as `Apply(Lateral)`.
   and one over outer columns only: the aggregate is grouped by the inner
   expressions and left-joined with the same equalities, operators and casts
   as written (so `u.d = t.ts::date` keeps comparing dates); a `count` of a
-  missing group becomes 0.
+  missing group becomes 0. Expressions around the aggregate
+  (`(SELECT coalesce(sum(x), 0) + 1 FROM ...)`, also over nested
+  subqueries) are inlined into one expression over its value, within the
+  bound of the [optimizer](#optimizer)'s push-down; where that would
+  exceed it or copy an expression that may change, they stay maps over the
+  joined row.
 - Everything else uses the general **dependent join**: `D = DISTINCT` of the
   outer columns the subquery references is pushed down through the subquery
   plan (`push_dep`), so that the subquery is computed once for every value of
@@ -224,11 +237,24 @@ If an outer reference survives, the query fails with
    constant NULL argument to its first argument.
 2. **Predicate push-down** (`push`): filter conjuncts move below `Project`,
    `Distinct`, `UnionAll`, `SetOp`, `Negate`; below `Map` — a conjunct over
-   computed columns with their expressions substituted, as PostgreSQL
-   pushes conditions into subqueries, unless an expression may change from
-   one evaluation to the next (a non-immutable function, `now()`, a
-   subquery, an outer reference), so the other columns are only computed
-   for rows that pass; below `Aggregate` if they only use group columns and
+   computed columns with their expressions inlined (`plan::Inliner`), as
+   PostgreSQL pushes conditions into subqueries, unless an expression may
+   change from one evaluation to the next (a non-immutable function,
+   `now()`, a subquery, an outer reference), so the other columns are only
+   computed for rows that pass. Inlining copies an expression into each
+   reference to its column, which nested projections can make exponential
+   (each level of `SELECT x + x AS x FROM (...)` doubles a condition on
+   `x`), so a conjunct is inlined only if that makes it larger by at most
+   four times the size (in expression nodes) of the expressions it inlines
+   (`INLINE_COPIES`): pushed through any number of maps, a conjunct grows
+   by at most four times their total size, and the work of inlining is
+   proportional to that. Otherwise the conjunct stays at the map, which is
+   split (`split_map`): the columns the conjunct needs (directly or through
+   other columns) are computed, then the conjunct is checked, then the
+   other columns are computed for the rows that pass. (Unlike an inlined
+   condition, it computes those columns before it is checked, also where
+   it would not reach them, such as the second operand of an `OR`.)
+   Conjuncts move below `Aggregate` if they only use group columns and
    there is a `GROUP BY` (without one the aggregate yields a row even for an
    empty input, so `HAVING false` stays above it); below `TopK` if they only
    use the group columns, below `Window` if they only use columns that
@@ -348,34 +374,84 @@ view its root's error records.
 
 Ad hoc queries (and the evaluation of DML statements) do not build dataflow.
 `exec::ExecCtx` evaluates the optimised `Rel` directly against the
-arrangements at a given `ReadAt`:
+arrangements as they are (their current state):
 
-- `Get` scans the node's first arrangement whose history covers the read
-  (`Arrangement::covers`); a read as of a GSN before the history of every
-  arrangement of the relation fails with `55000` (`AS OF g is before the
-  history of a relation it reads, which starts at s`);
+- `Get` scans the node's first hydrated arrangement (a node without one is
+  computed from its inputs' snapshots);
 - a base relation read — a `Get` under filters and projections — reads one
   arrangement: equalities with constants on a key prefix, optionally
   followed by a range (`<`, `<=`, `>`, `>=`, `BETWEEN`) on the next key
   column, select a key range of the arrangement they narrow most (ascending
-  keys only; constants of exactly the column's type; only arrangements that
-  cover the read). Only the columns the projection and the predicates use
+  keys only; constants of exactly the column's type; only hydrated
+  arrangements). Only the columns the projection and the predicates use
   are decoded, and every predicate is still checked on every row;
 - joins are hash joins on the equality conditions (all join kinds), except
   that an inner, left, semi or anti join whose right side is a base relation
   read, and whose left side is small compared to an arrangement of that
-  relation keyed by equated columns and covering the read (less than 1/64 of
-  its entries), looks each left row's key up in the arrangement instead;
+  relation keyed by equated columns (less than 1/64 of its entries), looks
+  each left row's key up in the arrangement instead;
 - aggregation is hash aggregation using the same aggregate definitions and
   summary arithmetic as `Reduce`, window functions the same partition
   computation as `Window`, `WITH RECURSIVE` semi-naive iteration;
-- results are consolidated; the engine then sorts, applies
-  `OFFSET`/`LIMIT`/`WITH TIES` and projects the visible columns.
+- a query's result is produced by `ExecCtx::run_query`, which streams:
+  base relation reads, filters, projections, maps, set-returning functions,
+  `UNION ALL` and the probe side of joins hand each row on as it is found
+  (`ExecCtx::stream`, with a sink that returns false once it has what it
+  needs), and aggregation consumes its input as it is read; the other
+  operators compute their result first. Without `ORDER BY`, rows are
+  handed on as they come and the scan stops once `OFFSET` + `LIMIT` rows
+  are out. With `ORDER BY`, a read whose plan is a base relation read
+  under maps, filters and projections, by an arrangement whose key order —
+  after the key columns its equalities fix — is the `ORDER BY` (same
+  columns, direction, null placement and key type; a computed copy of a
+  column counts as the column), scans that arrangement in order and stops
+  the same way (`ordered_read`; an equality that narrows another
+  arrangement wins, and that one is read and sorted). Otherwise the rows go
+  through `TopN`, which keeps the first `OFFSET` + `LIMIT` (and their
+  ties), pruning whenever it holds twice that, and sorts at the end (all
+  rows without `LIMIT`). A plan with `Negate` is consolidated before its
+  rows are read. Multiplicities are expanded, `OFFSET`/`LIMIT`/`WITH TIES`
+  applied and the hidden sort columns truncated as the rows go out
+  (`Emitter`). They go to the session in chunks of 1,024 rows or about
+  256 KB (`coord/read.rs`, `ChunkedReply`: a result of one chunk as
+  `ExecResult::Query`, a larger one as `ExecResult::Rows`, whose later
+  chunks follow on a stream, `coord::stream`; a closed stream ends the
+  read).
 
-Before a read runs, `now()` and its relatives are bound to the logical clock
-as of the read's GSN, and the read fails if it touches a broken view
+Before a read runs, `now()` and its relatives are bound to the logical clock,
+and the read fails if it touches a broken view
 (`55000`) or a materialized view with error records. Expression errors fail
-the query, as in PostgreSQL.
+the query, as in PostgreSQL (after the chunks already sent, if any).
+
+A read runs on the engine thread with a budget of 50,000 entries that its
+scans may visit (`Env::set_read_budget`; DML is evaluated without one), and
+of 50,000 rows or 8 MiB that it may return: it keeps its rows until it is
+done (it sends nothing before, so that it can still go elsewhere), and
+then hands them to the session at once, counted in the outputs' memory. A
+read that exceeds either is abandoned there and run again on a reader thread
+(`coord/reader.rs`, four of them, started when first needed) against a fork
+of the storage taken at once — every tree as it is after the last applied
+record ([Storage](storage.md#forks)) — and a copy of the part of the graph
+it reads (`Graph::fork_of`): the same read point and plan, hence the same
+result, while the engine goes on applying records and answering other
+statements. (The engine's statistics count the entries reads visited on
+the engine thread and those handed off, `EngineStats::reads`.) The reader
+thread streams the rows to the session as they are found, waiting for it
+to take them: at most two chunks are in flight
+(`coord::stream`), so a large result reaches a slow client in bounded
+memory; the reader stops when the session drops the stream (the client
+went away, or a portal was closed) or the statement is cancelled while it
+waits (the session then reports `57014`). A small read costs no fork; a
+large one costs the engine thread its budget and the fork (one
+reference-count increment per loaded node), and holds a reader thread
+while its client reads. The snapshots that a `SUBSCRIBE ... WITH SNAPSHOT`
+starts with and that a sink resynchronises its target from are read the
+same way (`Engine::snapshot_stream`): within the budget on the engine
+thread, else on a reader thread from a fork as of the GSN the subscription
+or snapshot starts at, as the consumer takes them. The consumer gets the
+snapshot as one event in its queue at that GSN (`SubEvent::Snapshot`,
+`SinkMsg::Snapshot`), before the changes after it, which the engine
+delivers as usual meanwhile: it keeps nothing for the snapshot.
 
 Because the executor and the dataflow share the aggregate, window and
 expression code, a maintained view and the same query run ad hoc compute

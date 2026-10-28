@@ -117,7 +117,7 @@ export default {
         tile('Buffer pool', fmt.bytes(cache), e ? `of ${fmt.bytes(cap)} · dirty ${fmt.bytes(e.dirty_bytes)}` : '', { meter: cap ? meter(cache / cap) : null }),
         tile('Process', proc && proc.rss_bytes ? fmt.bytes(last && last.rss_bytes ? last.rss_bytes : proc.rss_bytes) : '–',
           `CPU ${last && last.cpu_percent !== null && last.cpu_percent !== undefined ? fmt.pct(last.cpu_percent, 1) : '–'}${proc && proc.threads ? ` · ${proc.threads} threads` : ''}`),
-        tile('Logical clock', e && e.clock_ms ? fmt.clock(e.clock_ms) : 'no ticks', e ? `retention from GSN ${fmt.int(e.retention_frontier)}` : ''),
+        tile('Logical clock', e && e.clock_ms ? fmt.clock(e.clock_ms) : 'no ticks', 'now() of reads and temporal filters'),
         tile('Disk', ov ? fmt.bytes(ov.server.store_bytes + ov.server.log_bytes) : '–', ov ? `store ${fmt.bytes(ov.server.store_bytes)} · log ${fmt.bytes(ov.server.log_bytes)}` : ''),
       );
     }
@@ -142,9 +142,8 @@ export default {
       const config = card('Engine', h('dl.kv',
         h('dt', 'Version'), h('dd', ov.version),
         h('dt', 'Data directory'), h('dd.mono', cfg.data_dir),
-        h('dt', 'Buffer pool'), h('dd', fmt.bytes(cfg.cache_bytes)),
+        h('dt', 'Memory budget'), h('dd', fmt.bytes(cfg.memory_bytes)),
         h('dt', 'Checkpoints'), h('dd', `every ${fmt.duration(cfg.checkpoint_interval_secs)} (or when half the pool is dirty)`),
-        h('dt', 'Retention'), h('dd', `${fmt.int(cfg.retention_gsns)} GSNs readable with AS OF`),
         h('dt', 'Log sync'), h('dd', cfg.sync ? 'fsync per commit batch' : 'off (--no-sync)'),
         h('dt', 'Clock ticks'), h('dd', cfg.tick_ms ? `every ${fmt.duration(cfg.tick_ms / 1000)}` : 'off'),
         h('dt', 'Storage'), h('dd', `${fmt.int(st.trees)} trees · ${fmt.int(st.loaded_nodes)} nodes in memory (${fmt.int(st.dirty_nodes)} dirty) · ${fmt.int(st.segments)} segments, ${fmt.bytes(st.live_bytes)} live of ${fmt.bytes(st.segment_bytes)}`),

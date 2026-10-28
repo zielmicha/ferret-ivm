@@ -277,6 +277,85 @@ pub fn transaction(rng: &mut Rng, tables: &mut [Table], local: bool) -> Vec<Stri
     out
 }
 
+/// Columns of `reps`, a table for sinks (no generated view reads it) whose
+/// values come in several representations of equal values, besides values
+/// alike in text and the same value written differently: name, type, values.
+pub const REPS: &[(&str, &str, &[&str])] = &[
+    ("iv", "interval", &["1 mon", "30 days", "29 days 24:00:00", "1 day", "24:00:00"]),
+    ("ivs", "interval[]", &["{1 mon,NULL}", "{30 days,NULL}", "{{1 mon},{1 day}}", "{{30 days},{24:00:00}}", "[0:0]={1 mon}"]),
+    ("n", "numeric", &["1.5", "1.50", "0", "0.000", "NaN"]),
+    ("ns", "numeric[]", &["{1.5,NULL}", "{1.50,NULL}", "{{0},{NaN}}"]),
+    ("f4", "real", &["0", "-0", "NaN", "1.5"]),
+    ("f8", "float8", &["0", "-0", "NaN", "0.1", "0.1000000000000001"]),
+    ("f8s", "float8[]", &["{0,NaN}", "{-0,NaN}", "{NULL,-0}"]),
+    ("jb", "jsonb", &[r#"{"a": 1}"#, r#"{"a": 1.0}"#, "[1.50]", "[1.5]"]),
+    ("jbs", "jsonb[]", &[r#"{"{\"a\": 1}"}"#, r#"{"{\"a\": 1.0}"}"#]),
+    ("j", "json", &[r#"{"a": 1}"#, r#"{"a":1}"#, r#"{"a": 1.0}"#]),
+    ("js", "json[]", &[r#"{"{\"a\": 1}"}"#, r#"{"{\"a\":1}"}"#]),
+    ("jp", "jsonpath", &["$.a", r#"$."a""#, "$.b"]),
+    ("b", "bpchar", &["a", "a ", "a  "]),
+    ("bs", "bpchar[]", &["{a}", r#"{"a "}"#, r#"{"a  ",NULL}"#]),
+    ("c", "char(3)", &["a", "a  ", "ab"]),
+    ("tx", "text", &["\u{e4}", "a\u{308}", "A", "a"]),
+    ("txs", "text[]", &["{\u{e4}}", "{a\u{308}}", "{{A},{a}}"]),
+    ("ts", "timestamp", &["2024-01-01 00:00:00", "2024-01-01 00:00:00.000001"]),
+    ("tz", "timestamptz", &["2024-01-01 05:45:00+05:45", "2024-01-01 00:00:00+00", "2024-01-01 00:00:00+01"]),
+];
+
+/// Materialized views over `reps` and the key of their sinks (keys of
+/// several representations: the group shows one of them, which changes).
+pub const REP_VIEWS: &[(&str, &str, Option<&str>)] = &[
+    ("reps_all", "SELECT iv, ivs, n, ns, f4, f8, f8s, jb, jbs, j, js, jp, b, bs, c, tx, txs, ts, tz FROM reps", None),
+    ("reps_iv", "SELECT iv, count(*) AS cnt, sum(id) AS ids FROM reps WHERE iv IS NOT NULL GROUP BY iv", Some("iv")),
+    ("reps_n", "SELECT n, f8, count(*) AS cnt FROM reps WHERE n IS NOT NULL AND f8 IS NOT NULL GROUP BY n, f8", Some("n, f8")),
+];
+
+pub fn reps_table_sql() -> String {
+    let cols: Vec<String> = REPS.iter().map(|(c, ty, _)| format!("{c} {ty}")).collect();
+    format!("CREATE TABLE reps (id int PRIMARY KEY, {})", cols.join(", "))
+}
+
+fn rep_value(rng: &mut Rng, col: usize) -> String {
+    let (_, ty, vals) = REPS[col];
+    format!("'{}'::{ty}", rng.pick(vals))
+}
+
+/// An INSERT of a row of `reps` with one value (rows of one column make
+/// equal rows of different representations common), or values of `n` and
+/// `f8` (the key of `reps_n`).
+pub fn reps_insert(rng: &mut Rng, id: i64) -> String {
+    let mut vals = vec!["NULL".to_string(); REPS.len()];
+    let cols = if rng.chance(25) { vec![2, 5] } else { vec![rng.below(REPS.len() as u64) as usize] };
+    for c in cols {
+        vals[c] = rep_value(rng, c);
+    }
+    format!("INSERT INTO reps VALUES ({id}, {});", vals.join(", "))
+}
+
+/// Statements of a random transaction on `reps`: rows inserted, values
+/// changed to another representation, rows deleted.
+pub fn reps_transaction(rng: &mut Rng, next_id: &mut i64) -> Vec<String> {
+    let mut out = Vec::new();
+    for _ in 0..(1 + rng.below(5)) {
+        match rng.below(4) {
+            0 | 1 => {
+                for _ in 0..(1 + rng.below(4)) {
+                    *next_id += 1;
+                    out.push(reps_insert(rng, *next_id));
+                }
+            }
+            2 => {
+                let c = rng.below(REPS.len() as u64) as usize;
+                let (v, name) = (rep_value(rng, c), REPS[c].0);
+                out.push(format!("UPDATE reps SET {name} = {v} WHERE {name} IS NOT NULL AND id % {} = {};", 2 + rng.below(3), rng.below(2)));
+            }
+            // (a few rows: as many as inserted, on average)
+            _ => out.push(format!("DELETE FROM reps WHERE id % {} = {};", 8 + rng.below(8), rng.below(8))),
+        }
+    }
+    out
+}
+
 /// Whether `q` deduplicates equal values, where an implementation may keep
 /// any of their representations.
 pub fn dedups(q: &str) -> bool {
@@ -561,7 +640,7 @@ impl Gen<'_> {
     fn aggregate(&mut self, srcs: &[Src]) -> String {
         let (c, ty) = self.col_of(srcs, |_| true).unwrap();
         let ids = Self::ids(srcs);
-        match self.rng.below(22) {
+        match self.rng.below(25) {
             0 => "count(*)".to_string(),
             1 => format!("count({c})"),
             2 if ty.is_num() => format!("sum({c})"),
@@ -599,6 +678,17 @@ impl Gen<'_> {
                 format!("max({c}) FILTER (WHERE {p})")
             }
             21 if ty == Ty::Text => format!("string_agg(DISTINCT {c}, '|' ORDER BY {c})"),
+            // arguments and orders that fail on the rows the FILTER excludes
+            // (they are evaluated only for the rows that pass)
+            22 if ty.is_int() || ty == Ty::Numeric => format!("sum(100 / {c}) FILTER (WHERE {c} <> 0)"),
+            23 if ty.is_int() || ty == Ty::Numeric => {
+                format!("string_agg((100 / {c})::text, ',' ORDER BY 100 / {c}, {ids}) FILTER (WHERE {c} <> 0)")
+            }
+            24 if ty.is_int() => match self.rng.below(3) {
+                0 => format!("count(DISTINCT 100 / {c}) FILTER (WHERE {c} > 0)"),
+                1 => format!("percentile_disc(0.5) WITHIN GROUP (ORDER BY 100 / {c}) FILTER (WHERE {c} <> 0)"),
+                _ => format!("max(100 / {c}) FILTER (WHERE {c} < 0)"),
+            },
             _ => format!("count({c})"),
         }
     }
@@ -630,9 +720,11 @@ impl Gen<'_> {
         // projection
         let n = 1 + self.rng.below(4) as usize;
         let mut sel = Vec::new();
+        let mut ty0 = None;
         for _ in 0..n {
-            let (e, _) = self.expr(&srcs, 0);
+            let (e, ty) = self.expr(&srcs, 0);
             sel.push(e);
+            ty0.get_or_insert(ty);
         }
         let mut window_clause = String::new();
         if shape == 4 {
@@ -655,6 +747,30 @@ impl Gen<'_> {
             } else {
                 format!("SELECT d.*, 1 AS one FROM ({inner}) d WHERE d.x0 IS NOT NULL")
             };
+        }
+        if shape == 13 {
+            // nested projections, each using the first column twice, under a
+            // condition on it (inlined into the condition only up to a size
+            // bound, above which the projection is split around it)
+            let mut inner = q;
+            for k in 0..(2 + self.rng.below(7)) {
+                let x0 = format!("d{k}.x0");
+                let dup = match self.rng.below(3) {
+                    0 => format!("CASE WHEN {x0} IS NOT NULL THEN {x0} END"),
+                    1 => format!("coalesce({x0}, {x0})"),
+                    _ => format!("CASE WHEN {x0} IS NULL THEN NULL ELSE {x0} END"),
+                };
+                let rest: String = (1..sel.len()).map(|i| format!(", d{k}.x{i}")).collect();
+                inner = format!("SELECT {dup} AS x0{rest} FROM ({inner}) d{k}");
+            }
+            let p = match ty0.unwrap() {
+                Ty::Bool => "d.x0".to_string(),
+                ty if ty.minmax() && ty != Ty::Big => {
+                    format!("d.x0 {} {}", self.rng.pick(&["=", "<>", "<", ">="]), literal(self.rng, ty))
+                }
+                _ => "d.x0 IS NOT NULL".to_string(),
+            };
+            return format!("SELECT d.* FROM ({inner}) d WHERE {p}");
         }
         if shape == 9 {
             // LATERAL: the next row (top-1), or an aggregate over related rows
@@ -768,20 +884,44 @@ impl Gen<'_> {
             3 => ("count(*)".to_string(), ""),
             4 => (format!("sum({v})"), *self.rng.pick(&["", " ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING", whole])),
             5 => (format!("lag({v})"), ""),
-            6 => (format!("lead({v}, 2)"), ""),
+            6 => (format!("lead({v}, {})", self.window_int_arg(srcs, 1, true)), ""),
             7 => (format!("first_value({v})"), ""),
             8 => (format!("max({v})"), *self.rng.pick(&["", " ROWS BETWEEN 2 PRECEDING AND CURRENT ROW", whole])),
             9 => (format!("min({v})"), *self.rng.pick(&["", " ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING", whole])),
-            10 => (format!("ntile({})", 2 + self.rng.below(3)), ""),
+            // (a first argument below 1 fails, later ones are not read)
+            10 => (format!("ntile({})", self.window_int_arg(srcs, 2, true)), ""),
             11 => (format!("last_value({v})"), whole),
-            12 => (format!("nth_value({v}, 2)"), whole),
-            13 => (format!("lag({v}, 1, 0)"), ""),
+            // (a position below 1 fails at any row)
+            12 => (format!("nth_value({v}, {})", self.window_int_arg(srcs, 1, false)), *self.rng.pick(&["", whole])),
+            13 => {
+                let default = match self.col_of(srcs, |c| c.ty.is_int()) {
+                    Some((c, _)) if self.rng.chance(50) => c,
+                    _ => "0".to_string(),
+                };
+                (format!("lag({v}, {}, {default})", self.window_int_arg(srcs, 1, true)), "")
+            }
             _ => ("percent_rank()".to_string(), ""),
         };
         if self.rng.chance(20) {
             return (format!("{f} OVER w"), format!(" WINDOW w AS ({part}ORDER BY {order}{frame})"));
         }
         (format!("{f} OVER ({part}ORDER BY {order}{frame})"), String::new())
+    }
+
+    /// An `int` argument of a window function: a constant from `lo` to
+    /// `lo + 2`, or a value of an integer column of the sources from `lo` to
+    /// `lo + 4` (from `lo - 2` with `below`), NULL where the column is (and
+    /// in some rows where it is not), so that it differs between the rows of
+    /// a partition. PostgreSQL reads `ntile`'s at the partition's first row
+    /// where it is not NULL, the others at every row.
+    fn window_int_arg(&mut self, srcs: &[Src], lo: i64, below: bool) -> String {
+        let (c, _) = self.col_of(srcs, |c| c.ty.is_int()).unwrap_or_else(|| (format!("{}.id", srcs[0].alias), Ty::Int));
+        match self.rng.below(if below { 4 } else { 3 }) {
+            0 => (lo + self.rng.range(0, 2)).to_string(),
+            1 => format!("({c} % 3 + {})::int", lo + 2),
+            2 => format!("CASE WHEN {c} > {} THEN ({c} % 3 + {})::int END", self.rng.range(-5, 30), lo + 2),
+            _ => format!("({c} % 3 + {lo})::int"),
+        }
     }
 
     fn select_list_subqueries(&mut self, srcs: &[Src], sel: &mut Vec<String>) {

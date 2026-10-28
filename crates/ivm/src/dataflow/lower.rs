@@ -7,7 +7,7 @@
 //! outer joins and NOT EXISTS are built from semijoins.
 
 use super::agg::AggSpec;
-use super::join::{DeltaPath, JoinInput, JoinPlan, LookupStep};
+use super::join::{DeltaPath, JoinInput, JoinPlan, JoinTracker, LookupStep};
 use super::mfp::Mfp;
 use super::ops::{RecursivePlan, TopKPlan};
 use super::reduce::ReducePlan;
@@ -15,7 +15,7 @@ use super::window::{WinSpec, WindowPlan};
 use super::*;
 use crate::error::codes;
 use crate::expr::func::func_def;
-use crate::sql::plan::{AggCall, AggFunc, JoinKind, Rel, SetOpKind, SortKey};
+use crate::sql::plan::{AggCall, AggFunc, JoinKind, Rel, SetOpKind, SortKey, WindowFunc};
 use crate::sql_bail;
 use crate::types::{Datum, SqlType};
 
@@ -197,6 +197,18 @@ impl<'a> Lowerer<'a> {
             Rel::Window { input, funcs } => {
                 let l = self.lower(input)?;
                 let mut cur_schema = l.schema.clone();
+                // ntile's number of buckets and lag's and lead's offsets
+                // that are constants (computed by the input's pending MFP)
+                let constant = |c: usize| l.mfp.output_literal(c).cloned();
+                let constant_args: Vec<Option<Datum>> = funcs
+                    .iter()
+                    .map(|f| match (f.func, f.args.get(1)) {
+                        (WindowFunc::Ntile, _) => constant(f.args[0]),
+                        (WindowFunc::Lag | WindowFunc::Lead, Some(c)) => constant(*c),
+                        (WindowFunc::Lag | WindowFunc::Lead, None) => Some(Datum::Int4(1)),
+                        _ => None,
+                    })
+                    .collect();
                 let mut node = self.materialize(l);
                 let mut i = 0;
                 while i < funcs.len() {
@@ -211,21 +223,24 @@ impl<'a> Lowerer<'a> {
                         key.push(Expr::Column(k.col));
                         specs.push(k.spec);
                     }
-                    let arr = self.arrange(node, key, specs, vec![]);
                     let specs_w: Vec<WinSpec> = funcs[i..j]
                         .iter()
-                        .map(|f| WinSpec {
+                        .zip(&constant_args[i..j])
+                        .map(|(f, constant_arg)| WinSpec {
                             func: f.func,
                             args: f.args.clone(),
                             frame: f.frame,
                             arg_types: f.args.iter().map(|a| cur_schema[*a].ty.clone()).collect(),
                             ret: f.ret.clone(),
                             range: f.range.clone(),
+                            constant_arg: constant_arg.clone(),
                         })
                         .collect();
+                    // (summaries for the parts of frames up to the partitions' ends)
+                    let arr = self.arrange(node, key, specs, super::window::input_summaries(&specs_w));
                     let mut schema = cur_schema.clone();
                     schema.extend(funcs[i..j].iter().map(|f| f.ret.clone()));
-                    let plan = WindowPlan { partition: part.clone(), order: order.clone(), funcs: specs_w, input_arr: arr };
+                    let plan = WindowPlan::new(part.clone(), order.clone(), specs_w, arr);
                     node = self.g.add_node(NodeKind::Window(plan), vec![node], schema.clone());
                     cur_schema = schema;
                     i = j;
@@ -407,7 +422,6 @@ impl<'a> Lowerer<'a> {
             if inputs[j].presence.is_some() {
                 continue;
             }
-            let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
             let mut computed = false;
             let mut extra: Vec<Expr> = Vec::new();
             for e in &edges {
@@ -416,7 +430,7 @@ impl<'a> Lowerer<'a> {
                         continue;
                     }
                     let local = ex.remapped(&|c| c - offsets[j]);
-                    if local.substitute(&defs).as_column().is_some() {
+                    if local.as_column().and_then(|c| inputs[j].mfp.output_column(c)).is_some() {
                         continue;
                     }
                     computed = true;
@@ -440,6 +454,29 @@ impl<'a> Lowerer<'a> {
             mfp.project(&(0..width).collect::<Vec<_>>());
             inputs[j] = JoinInputSpec { node, mfp, width, schema, presence: None, exact: false };
             extra_keys[j] = extra;
+        }
+        // Expression errors of an input's MFP count once per input row. An
+        // input whose MFP can fail gets an error tracker: an Mfp node that
+        // evaluates the MFP on the input's rows and keeps none (its
+        // arrangement stays empty). As an arranged node, its error records
+        // are maintained by its steps, checkpointed, and read rather than
+        // recomputed when a join over it hydrates; they reach the join as an
+        // input's do.
+        let mut trackers = Vec::new();
+        for (j, s) in inputs.iter().enumerate() {
+            if s.presence.is_some() {
+                continue;
+            }
+            let input_schema = self.node_schema(s.node);
+            if !s.mfp.may_fail(&input_schema) {
+                continue;
+            }
+            let mut mfp = s.mfp.clone();
+            mfp.add_filter(Expr::Literal(Datum::Bool(false), SqlType::Bool));
+            let schema = mfp.schema(&input_schema);
+            let node = self.g.add_node(NodeKind::Mfp { mfp }, vec![s.node], schema);
+            let arr = self.arrange(node, vec![], vec![], vec![]);
+            trackers.push(JoinTracker { input: j, node, arr });
         }
         let mut join_inputs = Vec::with_capacity(n);
         let mut nodes = Vec::with_capacity(n);
@@ -524,8 +561,10 @@ impl<'a> Lowerer<'a> {
                     } else if let Some(k) = extra_keys[j].iter().position(|x| same_expr(x, &local)) {
                         Expr::Column(inputs[j].width + k)
                     } else {
-                        let defs: Vec<Expr> = (0..inputs[j].width).map(|c| inputs[j].mfp.output_expr(c)).collect();
-                        local.substitute(&defs)
+                        // (every other key is a column of the input's node:
+                        // the inputs with computed keys were materialized)
+                        let c = local.as_column().and_then(|c| inputs[j].mfp.output_column(c));
+                        Expr::Column(c.ok_or_else(|| SqlError::internal("join key is not a column of its input"))?)
                     };
                     pairs.push((raw, oe.clone(), e.null_safe));
                 }
@@ -561,7 +600,8 @@ impl<'a> Lowerer<'a> {
             }
             paths.push(DeltaPath { source: src, source_filters, steps });
         }
-        Ok((JoinPlan { inputs: join_inputs, paths, width }, nodes, schema))
+        nodes.extend(trackers.iter().map(|t| t.node));
+        Ok((JoinPlan { inputs: join_inputs, paths, width, trackers }, nodes, schema))
     }
 
     /// Is the set of j-side key expressions a superset of a unique key of j?
@@ -570,8 +610,7 @@ impl<'a> Lowerer<'a> {
             if pk.is_empty() {
                 return false;
             }
-            let defs: Vec<Expr> = (0..inp.width).map(|c| inp.mfp.output_expr(c)).collect();
-            let raw: Vec<Option<usize>> = keys.iter().map(|k| k.substitute(&defs).as_column()).collect();
+            let raw: Vec<Option<usize>> = keys.iter().map(|k| k.as_column().and_then(|c| inp.mfp.output_column(c))).collect();
             return pk.iter().all(|p| raw.contains(&Some(*p)));
         }
         false

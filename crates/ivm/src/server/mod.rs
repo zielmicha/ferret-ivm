@@ -1,9 +1,10 @@
 //! PostgreSQL wire protocol server: simple and extended query protocols,
 //! streaming SUBSCRIBE (as rows or COPY), cancellation.
 
-use crate::coord::api::{ExecResult, Interrupts, ResultColumn, SessionVars, SubEvent};
+use crate::coord::api::{ExecResult, Interrupts, ResultColumn, RowStream, SessionVars, SubEvent};
 use crate::coord::{EngineHandle, EngineMsg};
 use crate::error::{codes, Result, SqlError};
+use crate::memory::Charge;
 use crate::sql::parser::{parse_statement, split_statements, AsOf, ShowKind, Statement, SubscribeTarget};
 use crate::sql::ParamSlot;
 use crate::types::text::{format_datum, parse_datum, recv_datum, send_datum};
@@ -81,13 +82,48 @@ struct Portal {
     params: Vec<ParamSlot>,
     result_formats: Vec<i16>,
     /// Remaining rows of a partially fetched (or exhausted) result.
-    pending: Option<(Vec<ResultColumn>, std::vec::IntoIter<Row>)>,
+    pending: Option<(Vec<ResultColumn>, PortalRows)>,
+}
+
+/// The rows of a portal's result not sent yet.
+struct PortalRows {
+    chunk: std::vec::IntoIter<Row>,
+    /// The chunk's memory in the budget, held while the portal holds it.
+    _charge: Charge,
+    /// The chunks still to come (a streamed result).
+    stream: Option<RowStream>,
+    interrupts: Arc<Interrupts>,
+}
+
+impl PortalRows {
+    fn next(&mut self) -> Option<Result<Row>> {
+        loop {
+            if let Some(r) = self.chunk.next() {
+                return Some(Ok(r));
+            }
+            match self.stream.as_mut()?.next_chunk() {
+                Some(Ok(c)) => {
+                    let (rows, charge) = c.into_parts();
+                    (self.chunk, self._charge) = (rows.into_iter(), charge);
+                }
+                Some(Err(e)) => {
+                    self.stream = None;
+                    return Some(Err(e));
+                }
+                None => {
+                    self.stream = None;
+                    // (a reader stopped by a cancel ends the rows early)
+                    return self.interrupts.cancelled().then(|| Err(crate::coord::stream::cancelled()));
+                }
+            }
+        }
+    }
 }
 
 struct Session {
     engine: EngineHandle,
     reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    writer: BufWriter<Conn>,
     out: BackendWriter,
     vars: SessionVars,
     prepared: HashMap<String, Prepared>,
@@ -135,6 +171,52 @@ fn encode_value(d: &Datum, ty: &SqlType, binary: bool) -> Option<Vec<u8>> {
     if binary { send_datum(d, ty) } else { Some(format_datum(d).into_bytes()) }
 }
 
+/// How long a write to a client waits before it checks whether the client
+/// is still there (and runs `Conn::on_stall`), then goes on waiting.
+const WRITE_POLL: Duration = Duration::from_millis(200);
+
+/// The session's socket for writing. A write that the client does not take
+/// (it stopped reading but keeps the connection) times out every
+/// `WRITE_POLL` and is retried, so that the session notices a client that
+/// went away and can react to a cancellation instead of blocking in the
+/// write for good.
+struct Conn {
+    stream: TcpStream,
+    /// Run whenever a write made no progress for `WRITE_POLL`; an error
+    /// abandons the write (the connection is then unusable).
+    on_stall: Option<Box<dyn FnMut() -> std::io::Result<()>>>,
+}
+
+impl Conn {
+    fn new(stream: TcpStream) -> std::io::Result<Conn> {
+        stream.set_write_timeout(Some(WRITE_POLL))?;
+        Ok(Conn { stream, on_stall: None })
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            match self.stream.write(buf) {
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    if client_gone(&self.stream) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"));
+                    }
+                    if let Some(f) = &mut self.on_stall {
+                        f()?;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                r => return r,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 /// Has the client closed the connection (or did it reset)? Peeks without
 /// blocking; pending messages (a pipelining client) mean it is there.
 fn client_gone(stream: &TcpStream) -> bool {
@@ -167,7 +249,7 @@ fn copy_escape(s: &str) -> String {
 impl Session {
     fn run(stream: TcpStream, cfg: ServerConfig, engine: EngineHandle, cancels: CancelMap, pid: u32) -> Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = BufWriter::new(stream.try_clone()?);
+        let mut writer = BufWriter::new(Conn::new(stream.try_clone()?)?);
         let mut out = BackendWriter::new();
         // startup (SSL / GSS negotiation refused)
         let params = loop {
@@ -626,25 +708,46 @@ impl Session {
                 Ok(true)
             }
             ExecResult::Query { columns, rows } => {
-                let fmt = |i: usize| result_format(formats, i);
                 if describe {
-                    let fields: Vec<FieldDescription> = columns.iter().enumerate().map(|(i, c)| field(c, fmt(i))).collect();
-                    self.out.row_description(&fields);
+                    self.row_description(&columns, formats);
                 }
                 let n = rows.len();
                 for r in rows {
-                    let vals: Vec<Option<Vec<u8>>> = r.iter().enumerate().map(|(i, d)| encode_value(d, &columns[i].ty, fmt(i) == 1)).collect();
-                    let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
-                    self.out.data_row(&refs);
-                    if self.out.len() > 1 << 20 {
-                        self.flush()?;
+                    self.data_row(&r, &columns, formats)?;
+                }
+                self.out.command_complete(&format!("SELECT {n}"));
+                Ok(true)
+            }
+            // rows sent as the engine finds them (an error ends them)
+            ExecResult::Rows { columns, mut rows } => {
+                if describe {
+                    self.row_description(&columns, formats);
+                }
+                let mut n = 0;
+                while let Some(chunk) = rows.next_chunk() {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.error(&e);
+                            return Ok(false);
+                        }
+                    };
+                    for r in chunk.iter() {
+                        self.data_row(r, &columns, formats)?;
+                        n += 1;
                     }
+                }
+                // (a reader stopped by a cancel ends the rows early)
+                if self.interrupts.cancelled() {
+                    self.error(&crate::coord::stream::cancelled());
+                    return Ok(false);
                 }
                 self.out.command_complete(&format!("SELECT {n}"));
                 Ok(true)
             }
             ExecResult::Subscribe { columns, rx, cancel, progress } => {
                 let r = self.stream_subscription(&columns, rx, &cancel, progress, formats, describe);
+                self.writer.get_mut().on_stall = None;
                 cancel.store(true, Ordering::Release);
                 match r {
                     Ok(()) => Ok(true),
@@ -658,18 +761,61 @@ impl Session {
         }
     }
 
+    fn row_description(&mut self, columns: &[ResultColumn], formats: &[i16]) {
+        let fields: Vec<FieldDescription> = columns.iter().enumerate().map(|(i, c)| field(c, result_format(formats, i))).collect();
+        self.out.row_description(&fields);
+    }
+
+    /// Add a DataRow; the output goes out once 1 MiB is buffered.
+    fn data_row(&mut self, r: &Row, columns: &[ResultColumn], formats: &[i16]) -> Result<()> {
+        let vals: Vec<Option<Vec<u8>>> = r.iter().enumerate().map(|(i, d)| encode_value(d, &columns[i].ty, result_format(formats, i) == 1)).collect();
+        let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
+        self.out.data_row(&refs);
+        if self.out.len() > 1 << 20 {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
     /// Stream a subscription's rows: as DataRows in the portal's result
     /// formats (text without a Bind, as for any statement), or as COPY data
     /// in text format.
+    ///
+    /// While the client does not take what is written, the subscription
+    /// can end: by a cancel request, or by the engine (its queue reached
+    /// its limit, or the relation was replaced or dropped). The session
+    /// then drops the queued events at once, releasing their memory, and
+    /// ends with the error once the client has taken what was written.
     fn stream_subscription(
         &mut self,
         columns: &[ResultColumn],
         rx: crossbeam_channel::Receiver<SubEvent>,
-        _cancel: &Arc<AtomicBool>,
+        cancel: &Arc<AtomicBool>,
         progress: bool,
         formats: &[i16],
         describe: bool,
     ) -> Result<()> {
+        let ended: Arc<Mutex<Option<SqlError>>> = Arc::default();
+        {
+            let (ended, interrupts, cancel, rx) = (ended.clone(), self.interrupts.clone(), cancel.clone(), rx.clone());
+            self.writer.get_mut().on_stall = Some(Box::new(move || {
+                let cancelled = interrupts.cancelled();
+                let mut ended = ended.lock();
+                if ended.is_none() && (cancelled || cancel.load(Ordering::Acquire)) {
+                    // the engine stops queueing (or already has)
+                    cancel.store(true, Ordering::Release);
+                    let mut err = None;
+                    while let Ok(ev) = rx.try_recv() {
+                        if let SubEvent::Error(e) = ev {
+                            err.get_or_insert(e);
+                        }
+                    }
+                    let canceled = || SqlError::new(codes::QUERY_CANCELED, "canceling statement due to user request");
+                    *ended = Some(if cancelled { canceled() } else { err.unwrap_or_else(canceled) });
+                }
+                Ok(())
+            }));
+        }
         let copy = self.pending_copy;
         let mut cols = vec![ResultColumn { name: "gsn".into(), ty: SqlType::Int8, typmod: -1 }];
         if progress {
@@ -687,6 +833,13 @@ impl Session {
         self.flush()?;
         let ncols = columns.len();
         loop {
+            // (ended while a write waited for the client)
+            if let Some(e) = ended.lock().take() {
+                if copy {
+                    self.out.copy_done();
+                }
+                return Err(e);
+            }
             if self.interrupts.cancelled() {
                 if copy {
                     self.out.copy_done();
@@ -711,18 +864,26 @@ impl Session {
                 }
             };
             match ev {
-                SubEvent::Data { gsn, rows } => {
-                    for (r, diff) in rows {
-                        let mut vals = vec![Datum::Int8(gsn as i64)];
-                        if progress {
-                            vals.push(Datum::Bool(false));
+                SubEvent::Data { gsn, rows } => self.emit_sub_rows(gsn, &rows, progress, copy, &cols, &binary, &ended)?,
+                // read as it comes, a chunk at a time (its reader waits for
+                // them to be taken)
+                SubEvent::Snapshot { gsn, rows } => {
+                    for chunk in rows {
+                        match chunk {
+                            Ok(c) => self.emit_sub_rows(gsn, &c, progress, copy, &cols, &binary, &ended)?,
+                            Err(e) => {
+                                if copy {
+                                    self.out.copy_done();
+                                }
+                                return Err(e);
+                            }
                         }
-                        vals.push(Datum::Int8(diff));
-                        vals.extend(r);
-                        self.emit_sub_row(copy, &cols, &binary, &vals);
+                        if self.interrupts.cancelled() || cancel.load(Ordering::Acquire) {
+                            break;
+                        }
                     }
                 }
-                SubEvent::Progress { gsn } => {
+                SubEvent::Progress { gsn, .. } => {
                     if progress {
                         let mut vals = vec![Datum::Int8(gsn as i64), Datum::Bool(true), Datum::Null];
                         vals.extend(std::iter::repeat_n(Datum::Null, ncols));
@@ -736,9 +897,52 @@ impl Session {
                     return Err(e);
                 }
             }
-            if let Err(e) = self.flush() {
-                return Err(SqlError::new(codes::IO_ERROR, format!("client disconnected: {e}")));
+            self.flush_subscription(&ended, copy)?;
+        }
+    }
+
+    /// Emit the rows of a subscription's change (or snapshot chunk) at
+    /// `gsn`; a large one is written as it is encoded.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_sub_rows(
+        &mut self,
+        gsn: u64,
+        rows: &[(Row, i64)],
+        progress: bool,
+        copy: bool,
+        cols: &[ResultColumn],
+        binary: &[bool],
+        ended: &Mutex<Option<SqlError>>,
+    ) -> Result<()> {
+        for (r, diff) in rows {
+            let mut vals = vec![Datum::Int8(gsn as i64)];
+            if progress {
+                vals.push(Datum::Bool(false));
             }
+            vals.push(Datum::Int8(*diff));
+            vals.extend(r.iter().cloned());
+            self.emit_sub_row(copy, cols, binary, &vals);
+            if self.out.len() > 1 << 20 {
+                self.flush_subscription(ended, copy)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush a subscription's output; fails with the error that ended the
+    /// subscription while the write waited for the client, if one did.
+    fn flush_subscription(&mut self, ended: &Mutex<Option<SqlError>>, copy: bool) -> Result<()> {
+        if let Err(e) = self.flush() {
+            return Err(SqlError::new(codes::IO_ERROR, format!("client disconnected: {e}")));
+        }
+        match ended.lock().take() {
+            Some(e) => {
+                if copy {
+                    self.out.copy_done();
+                }
+                Err(e)
+            }
+            None => Ok(()),
         }
     }
 
@@ -887,7 +1091,14 @@ impl Session {
             self.pending_copy = matches!(stmt, Statement::Subscribe { copy: true, .. });
             let res = self.run_statement(stmt, portal.params.clone())?;
             match res {
-                ExecResult::Query { columns, rows } => portal.pending = Some((columns, rows.into_iter())),
+                ExecResult::Query { columns, rows } => {
+                    let rows = PortalRows { chunk: rows.into_iter(), _charge: Charge::none(), stream: None, interrupts: self.interrupts.clone() };
+                    portal.pending = Some((columns, rows))
+                }
+                ExecResult::Rows { columns, rows } => {
+                    let rows = PortalRows { chunk: Vec::new().into_iter(), _charge: Charge::none(), stream: Some(rows), interrupts: self.interrupts.clone() };
+                    portal.pending = Some((columns, rows))
+                }
                 other => {
                     self.send_result(other, &portal.result_formats, max_rows, false)?;
                     return Ok(());
@@ -895,21 +1106,21 @@ impl Session {
             }
         }
         let formats = portal.result_formats.clone();
-        let (cols, iter) = portal.pending.as_mut().unwrap();
+        let (cols, rows) = portal.pending.as_mut().unwrap();
         let limit = if max_rows <= 0 { usize::MAX } else { max_rows as usize };
         let mut sent = 0;
-        for r in iter.by_ref() {
-            let vals: Vec<Option<Vec<u8>>> = r
-                .iter()
-                .enumerate()
-                .map(|(i, d)| encode_value(d, &cols[i].ty, result_format(&formats, i) == 1))
-                .collect();
-            let refs: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
-            self.out.data_row(&refs);
+        while sent < limit
+            && let Some(r) = rows.next()
+        {
+            let r = match r {
+                Ok(r) => r,
+                Err(e) => {
+                    self.portals.insert(name.to_string(), portal);
+                    return Err(e);
+                }
+            };
+            self.data_row(&r, cols, &formats)?;
             sent += 1;
-            if sent >= limit {
-                break;
-            }
         }
         // as in PostgreSQL: suspended whenever max_rows rows were sent, and
         // the count is that of this Execute; an exhausted portal stays (until

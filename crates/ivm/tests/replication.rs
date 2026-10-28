@@ -6,7 +6,7 @@ use ivm::server::{self, ServerConfig};
 use pgproto::testutil::{ClusterOptions, TempCluster};
 use pgproto::{Client, Config as PgConfig};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn tmpdir(name: &str) -> PathBuf {
@@ -29,7 +29,12 @@ struct Ivm {
 
 impl Ivm {
     fn start(dir: &PathBuf) -> Ivm {
-        let cfg = Config { data_dir: dir.clone(), sync: false, ..Default::default() };
+        Ivm::start_with(dir, |_| {})
+    }
+
+    fn start_with(dir: &Path, configure: impl FnOnce(&mut Config)) -> Ivm {
+        let mut cfg = Config { data_dir: dir.to_path_buf(), sync: false, ..Default::default() };
+        configure(&mut cfg);
         let running = coord::start(cfg).expect("engine starts");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -290,6 +295,198 @@ fn text_replicated_keys_snapshot_in_chunks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Upstream changes to `t` (keyed by `k text, n int`) spread over its key
+/// space, from a thread of their own until `stop` is set; returns how many
+/// transactions it made.
+fn churn(conninfo: String, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<u64> {
+    std::thread::spawn(move || {
+        let mut c = connect(&conninfo);
+        let mut i = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let (k, n) = (KEY_PREFIXES[(i % 7) as usize], (i * 7919) % 5000);
+            c.simple_query(&match i % 4 {
+                0 => format!("UPDATE t SET a = a + 1 WHERE k = '{k}{n}' AND n = {}", n % 7),
+                1 => format!("DELETE FROM t WHERE k = '{k}{}' AND n = {}", n + 1, (n + 1) % 7),
+                2 => format!("INSERT INTO t VALUES ('{k}x{i}', 0, -1) ON CONFLICT DO NOTHING"),
+                _ => format!("UPDATE t SET k = k || 'y', a = 0 WHERE k = '{k}{}' AND n = {}", n + 2, (n + 2) % 7),
+            })
+            .unwrap();
+            i += 1;
+        }
+        i
+    })
+}
+
+/// First characters of `t`'s keys: their order under a linguistic collation
+/// differs from their byte order.
+const KEY_PREFIXES: [&str; 7] = ["a", "B", "c", "D", "é", "f", "Z"];
+
+/// The rows of `t` in byte order (as the engine orders text).
+const T_ROWS: &str = "SELECT k, n, a FROM t ORDER BY k COLLATE \"C\", n";
+
+/// A table keyed by text under a linguistic collation (ICU) is copied in the
+/// order of its primary key index, whose order and comparison with the
+/// last copied key upstream compute: chunks used to be ordered and filtered
+/// by `k::text COLLATE "C"`, the engine's byte order, which no index serves,
+/// so that every chunk was a scan and sort of the whole table (quadratic).
+/// The copy stays exact while the table changes all over its key space.
+#[test]
+fn collated_text_keys_are_copied_through_the_key_index() {
+    let mut up = Upstream::start_with(&["shared_preload_libraries = 'pg_stat_statements'"]);
+    up.exec("CREATE EXTENSION pg_stat_statements");
+    up.exec(r#"CREATE TABLE t (k text COLLATE "und-x-icu", n int, a int, PRIMARY KEY (k, n))"#);
+    let keys = KEY_PREFIXES.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ");
+    up.exec(&format!("INSERT INTO t SELECT (ARRAY[{keys}])[1 + g % 7] || (g / 7), g / 7 % 7, g FROM generate_series(0, 34999) g"));
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    up.exec("SELECT pg_stat_statements_reset()");
+    let dir = tmpdir("collation");
+    let mut ivm = Ivm::start(&dir);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = churn(up.conninfo.clone(), stop.clone());
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    eventually("the snapshot", || ivm.rows("SHOW SOURCES")[0].split('|').nth(4) != Some("0/0"));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(writer.join().unwrap() > 20, "changes during the snapshot");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT k, n, a FROM t ORDER BY k, n"), up.rows(T_ROWS));
+    // every chunk query can be answered from the index alone, in its order
+    // (with sorts and sequential scans off, a plan that needs them shows a
+    // Sort or a Seq Scan anyway)
+    let chunks = up.rows(r#"SELECT query FROM pg_stat_statements WHERE query LIKE 'SELECT %FROM "public"."t"%'"#);
+    assert!(chunks.len() >= 2, "{chunks:?}");
+    for q in chunks {
+        let plan = up.rows(&format!("SET enable_seqscan = off; SET enable_sort = off; EXPLAIN (GENERIC_PLAN) {q}")).join("\n");
+        assert!(plan.contains("Index Scan using t_pkey") && !plan.contains("Sort") && !plan.contains("Seq Scan"), "{q}:\n{plan}");
+    }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A table without a key (REPLICA IDENTITY FULL) is read in one snapshot in
+/// pieces of 10,000 rows, logged as they arrive; it used to be read in one
+/// query and logged as one commit of the whole table. Changes during the
+/// copy apply after it when its snapshot does not contain them.
+#[test]
+fn keyless_tables_are_copied_in_pieces() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE m (a int, b text)");
+    up.exec("ALTER TABLE m REPLICA IDENTITY FULL");
+    up.exec("INSERT INTO m SELECT g % 9000, 'x' FROM generate_series(1, 25000) g");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("keyless-pieces");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    for i in 0..30 {
+        up.exec(&format!("UPDATE m SET b = 'y{i}' WHERE a = {}", i * 300));
+        up.exec(&format!("DELETE FROM m WHERE ctid = (SELECT min(ctid) FROM m WHERE a = {})", i * 300 + 1));
+        up.exec(&format!("INSERT INTO m VALUES ({i}, 'z')"));
+    }
+    let q = "SELECT a, b, count(*) FROM m GROUP BY a, b ORDER BY a, b";
+    assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    ivm.shutdown();
+    let mut inserts = Vec::new();
+    for r in ivm::log::read_from(&dir.join("log"), 0).unwrap() {
+        if let (_, ivm::log::LogRecord::Commit { source: 1000, changes, .. }) = r.unwrap() {
+            let n = changes.iter().filter(|(_, c)| matches!(c, ivm::dataflow::TableChange::Insert { .. })).count();
+            if n > 0 {
+                inserts.push(n);
+            }
+        }
+    }
+    assert!(inserts.iter().filter(|n| **n >= 1000).count() >= 3 && inserts.iter().all(|n| *n <= 10_000), "{inserts:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Snapshot chunks are read by a thread of their own: a chunk that waits
+/// upstream (here for a lock) holds up neither the other tables' changes nor
+/// the replication session. The chunk query used to run on the replication
+/// thread, which sent no status meanwhile: the stream stood still, and the
+/// session was dropped after wal_sender_timeout (and again after every
+/// reconnection). A failure of the copy connection does not end the session
+/// either: the chunk is retried after a delay.
+#[test]
+fn chunk_reads_do_not_hold_up_the_stream() {
+    let mut up = Upstream::start_with(&["wal_sender_timeout = '2s'"]);
+    up.exec("CREATE TABLE a (id int PRIMARY KEY)");
+    up.exec("CREATE TABLE z (id int PRIMARY KEY, v int)");
+    up.exec("INSERT INTO z SELECT g, g FROM generate_series(1, 100) g");
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("chunk-thread");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    let _ = caught_up(&mut ivm, &mut up, "SELECT count(*) FROM z");
+    ivm.shutdown();
+    // z is copied again (a new column) after a restart, and its chunk waits
+    // for this lock
+    up.exec("ALTER TABLE z ADD COLUMN w int; UPDATE z SET v = -1 WHERE id = 1");
+    let mut locker = connect(&up.conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE z IN ACCESS EXCLUSIVE MODE").unwrap();
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("SET read_mode = latest");
+    let blocked = |up: &mut Upstream| up.rows("SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND application_name = 'ivm'");
+    eventually("the chunk to wait for the lock", || !blocked(&mut up).is_empty());
+    let session = walsenders(&mut up);
+    up.exec("INSERT INTO a VALUES (1)");
+    eventually("a's change", || ivm.rows("SELECT count(*) FROM a") == ["1"]);
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(walsenders(&mut up), session, "the replication session outlived wal_sender_timeout");
+    // the copy connection fails
+    for pid in blocked(&mut up) {
+        up.exec(&format!("SELECT pg_terminate_backend({pid})"));
+    }
+    eventually("the failure in the status", || ivm.rows("SHOW SOURCES")[0].contains("cannot read snapshot chunks"));
+    up.exec("INSERT INTO a VALUES (2)");
+    eventually("a's change", || ivm.rows("SELECT count(*) FROM a") == ["2"]);
+    assert_eq!(walsenders(&mut up), session);
+    locker.simple_query("COMMIT").unwrap();
+    for q in ["SELECT * FROM z ORDER BY id", "SELECT * FROM a ORDER BY id"] {
+        assert_eq!(caught_up(&mut ivm, &mut up, q), up.rows(q));
+    }
+    assert_eq!(ivm.rows("SHOW SOURCES")[0].split('|').nth(5), Some("streaming"));
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The engine restarts in the middle of a snapshot (a chunk waits for a
+/// lock, after earlier chunks were logged), with changes before and after
+/// the restart: the copy resumes after the logged boundary, in the key
+/// index's order, and ends equal to the upstream table.
+#[test]
+fn snapshots_resume_after_a_restart() {
+    let mut up = Upstream::start();
+    up.exec(r#"CREATE TABLE t (k text COLLATE "und-x-icu", n int, a int, PRIMARY KEY (k, n))"#);
+    let keys = KEY_PREFIXES.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ");
+    up.exec(&format!("INSERT INTO t SELECT (ARRAY[{keys}])[1 + g % 7] || (g / 7), g / 7 % 7, g FROM generate_series(0, 199999) g"));
+    up.exec("CREATE PUBLICATION p FOR ALL TABLES");
+    let dir = tmpdir("snapshot-restart");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("SET read_mode = latest");
+    ivm.exec(&format!("CREATE SOURCE s FROM POSTGRES CONNECTION '{}' PUBLICATION 'p'", up.conninfo));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = churn(up.conninfo.clone(), stop.clone());
+    eventually("some chunks", || ivm.rows("SELECT count(*) >= 20000 FROM t") == ["t"]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    // the next chunk waits for the lock, whose transaction changes rows too
+    let mut locker = connect(&up.conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE t IN ACCESS EXCLUSIVE MODE; UPDATE t SET a = -a WHERE n = 3 AND a % 1000 = 0").unwrap();
+    eventually("the chunk to wait for the lock", || {
+        !up.rows("SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND application_name = 'ivm'").is_empty()
+    });
+    assert_eq!(ivm.rows("SHOW SOURCES")[0].split('|').nth(5), Some("snapshotting public.t"));
+    ivm.shutdown();
+    locker.simple_query("COMMIT").unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = churn(up.conninfo.clone(), stop.clone());
+    std::thread::sleep(Duration::from_millis(300));
+    let mut ivm = Ivm::start(&dir);
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT k, n, a FROM t ORDER BY k, n"), up.rows(T_ROWS));
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Changes to a table added by ALTER SOURCE REFRESH are replicated even when
 /// PostgreSQL announced the table (a Relation message, sent once per
 /// session) before the source knew it; they used to be ignored for good.
@@ -331,6 +528,31 @@ fn ddl_and_dml_in_one_upstream_transaction() {
     ivm.shutdown();
     let mut ivm = Ivm::start(&dir);
     assert_eq!(caught_up(&mut ivm, &mut up, "SELECT * FROM t ORDER BY id"), want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upstream transaction larger than what the source holds in memory (6
+/// MB here) is spooled to the log directory as it arrives and logged as
+/// one commit with its parts; it applies as one transaction, also when it
+/// is replayed after a crash.
+#[test]
+fn large_upstream_transactions_are_spooled() {
+    let (mut up, mut ivm, dir) = setup("large-txn", &["CREATE TABLE t (id int PRIMARY KEY, s text)", "INSERT INTO t VALUES (0, 'x')"]);
+    ivm.exec("CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n, sum(length(s)) AS l FROM t");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["1|1"]);
+    ivm.exec("CHECKPOINT");
+    up.exec("BEGIN; INSERT INTO t SELECT g, repeat('y', 1000) FROM generate_series(1, 6000) g; UPDATE t SET s = 'zz' WHERE id = 0; COMMIT");
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["6001|6000002"]);
+    let files = |prefix: &str| std::fs::read_dir(dir.join("log")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(prefix)).count();
+    assert_eq!(files("parts-"), 1, "logged as one commit with its parts");
+    assert_eq!(files("spool-"), 0);
+    // replayed from the log after a crash (no checkpoint since the commit)
+    ivm.running.take().unwrap().crash();
+    drop(ivm);
+    let mut ivm = Ivm::start(&dir);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT n, l FROM c"), ["6001|6000002"]);
+    assert_eq!(caught_up(&mut ivm, &mut up, "SELECT s FROM t WHERE id = 0"), ["zz"]);
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -880,6 +1102,40 @@ fn sink_delivers_exactly_once_across_restarts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sink whose writes block (here on a lock held on its target) stops
+/// receiving changes once its unwritten ones reach their memory limit, and
+/// once it can write again it drops them and resynchronises the target
+/// from a snapshot: memory stays bounded and the target ends up equal to
+/// the relation. (Its queue used to grow with every change.)
+#[test]
+fn a_sink_that_falls_behind_resynchronises_from_a_snapshot() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-behind");
+    let mut ivm = Ivm::start_with(&dir, |c| c.memory_bytes = 16 << 20);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    ivm.exec("INSERT INTO t VALUES (0, 'first')");
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 't_copy' KEY (id)", up.conninfo));
+    let count = |up: &mut Upstream| up.client.query("SELECT count(*) FROM t_copy").ok().map(|r| r.rows[0][0].clone().unwrap());
+    eventually("the sink's first write", || count(&mut up).as_deref() == Some("1"));
+    let first_xmin = up.rows("SELECT xmin FROM t_copy WHERE id = 0");
+    let mut locker = connect(&up.conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE t_copy IN ACCESS EXCLUSIVE MODE").unwrap();
+    // about 12 MB of changes, three times the sink's limit
+    for i in 0..12 {
+        ivm.exec(&format!("INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series({}, {}) g", 1 + i * 1000, (i + 1) * 1000));
+    }
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    eventually("the sink to fall behind", || status(&mut ivm).starts_with("behind"));
+    locker.simple_query("ROLLBACK").unwrap();
+    eventually("the sink to catch up", || count(&mut up).as_deref() == Some("12001") && status(&mut ivm).starts_with("running"));
+    // the resynchronisation rewrote the target
+    assert_ne!(up.rows("SELECT xmin FROM t_copy WHERE id = 0"), first_xmin);
+    ivm.exec("UPDATE t SET s = 'changed' WHERE id = 0");
+    eventually("a change after the resynchronisation", || up.rows("SELECT s FROM t_copy WHERE id = 0") == ["changed"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An engine restart does not rewrite a sink's target that is up to date:
 /// every restart used to resynchronize every sink (DELETE and INSERT of the
 /// whole table), because the progress row only recorded GSNs at which the
@@ -949,6 +1205,192 @@ fn keyless_sink_with_json_columns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Wait until sink `name` has committed progress at or after the engine's
+/// current GSN (in `target`, its target's database): its target then has
+/// every change made so far.
+fn sink_caught_up(ivm: &mut Ivm, target: &mut Client, name: &str) {
+    let gsn: i64 = ivm.rows("SHOW GSN")[0].parse().unwrap();
+    let q = format!("SELECT gsn FROM ivm_sink_progress WHERE sink = '{name}'");
+    eventually("the sink's progress", || {
+        target.query(&q).ok().and_then(|r| r.rows.first()?.first()?.clone()).and_then(|g| g.parse::<i64>().ok()).is_some_and(|g| g >= gsn)
+    });
+}
+
+/// Sorted rows, for comparing multisets.
+fn sorted(mut rows: Vec<String>) -> Vec<String> {
+    rows.sort();
+    rows
+}
+
+/// A keyless sink deletes a retracted row by matching every column, and
+/// PostgreSQL's equality takes `'1 mon'` for `'30 days'`, which the engine
+/// keeps apart (they differ in date arithmetic): retracting one deleted
+/// whichever the target found first, and the target kept the retracted
+/// interval while the view kept the other, with the sink's progress past the
+/// retraction. Likewise for interval arrays.
+#[test]
+fn keyless_sinks_retract_the_interval_retracted() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-interval");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, iv interval, ivs interval[])");
+    ivm.exec(
+        "INSERT INTO t VALUES (1, '30 days', NULL), (2, '1 mon', NULL), \
+         (3, NULL, '{30 days, 24:00:00}'), (4, NULL, '{1 mon, 1 day}'), \
+         (5, NULL, '{{1 mon, NULL}, {30 days, 1 day}}'), (6, NULL, '{{30 days, NULL}, {1 mon, 24:00:00}}')",
+    );
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT iv, ivs FROM t");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy'", up.conninfo));
+    sink_caught_up(&mut ivm, &mut up.client, "sk");
+    // (the target has each pair's other value first)
+    ivm.exec("DELETE FROM t WHERE id IN (2, 4, 5)");
+    sink_caught_up(&mut ivm, &mut up.client, "sk");
+    let want = ["30 days|NULL", "NULL|{\"30 days\",24:00:00}", "NULL|{{\"30 days\",NULL},{\"1 mon\",24:00:00}}"];
+    assert_eq!(sorted(ivm.rows("SELECT iv, ivs FROM v")), want);
+    assert_eq!(sorted(up.rows("SELECT iv, ivs FROM v_copy")), want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A keyless sink deletes a retracted row by the target row that holds the
+/// same values, among those equal to it: for every type, a value kept and
+/// one retracted that PostgreSQL's `=` takes for it (or that is alike in
+/// text, or the same value), the kept one written first, where a match by
+/// `=` or by text alone finds it first. The target's sessions have settings
+/// that change the text of floats (`0.1` and `0.1000000000000001` print
+/// alike), intervals and timestamps, and a linguistic collation, under which
+/// `=` is still identity (it is deterministic). The deletions can use an
+/// index of the target (IS NOT DISTINCT FROM could not).
+#[test]
+fn keyless_sinks_retract_exact_values_of_every_type() {
+    let mut up = Upstream::start_with(&["shared_preload_libraries = 'pg_stat_statements'"]);
+    up.exec("CREATE DATABASE target TEMPLATE template0 LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C.UTF-8'");
+    for s in ["extra_float_digits = 0", "IntervalStyle = iso_8601", "TimeZone = 'Asia/Kathmandu'", "DateStyle = 'SQL, DMY'"] {
+        up.exec(&format!("ALTER DATABASE target SET {s}"));
+    }
+    let conninfo = up._pg.conninfo("target");
+    let mut target = connect(&conninfo);
+    target.simple_query("CREATE EXTENSION pg_stat_statements").unwrap();
+    // (to read the target as the engine prints values)
+    target.simple_query("SET extra_float_digits = 1; SET IntervalStyle = postgres; SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'").unwrap();
+    // column, type, the value kept, the one retracted
+    let cases = [
+        ("iv", "interval", "30 days", "1 mon"),
+        ("iv", "interval", "24:00:00", "1 day"),
+        ("n", "numeric", "1.5", "1.50"),
+        ("n", "numeric", "0", "0.000"),
+        ("n", "numeric", "NaN", "NaN"),
+        ("f4", "real", "0", "-0"),
+        ("f4", "real", "NaN", "NaN"),
+        ("f8", "double precision", "0", "-0"),
+        ("f8", "double precision", "0.1000000000000001", "0.1"),
+        ("jb", "jsonb", r#"{"a": 1}"#, r#"{"a": 1.0}"#),
+        ("j", "json", r#"{"a": 1}"#, r#"{"a":1}"#),
+        ("jp", "jsonpath", "$.a", r#"$."a""#),
+        ("b", "bpchar", "a", "a  "),
+        ("c", "character(3)", "a", "a  "),
+        ("tx", "text", "\u{e4}", "a\u{308}"),
+        ("ts", "timestamp", "2024-01-01 00:00:00", "2024-01-01 00:00:00.000001"),
+        ("tz", "timestamptz", "2024-01-01 05:45:00+05:45", "2024-01-01 00:00:00+00"),
+        ("ivs", "interval[]", "{30 days,NULL}", "{1 mon,NULL}"),
+        ("ivs", "interval[]", "{{30 days},{24:00:00}}", "{{1 mon},{1 day}}"),
+        ("ivs", "interval[]", "[0:0]={30 days}", "{1 mon}"),
+        ("ns", "numeric[]", "{1.5,NULL}", "{1.50,NULL}"),
+        ("f8s", "double precision[]", "{0,NaN}", "{-0,NaN}"),
+        ("jbs", "jsonb[]", r#"{"{\"a\": 1}"}"#, r#"{"{\"a\": 1.0}"}"#),
+        ("js", "json[]", r#"{"{\"a\": 1}"}"#, r#"{"{\"a\":1}"}"#),
+        ("bs", "bpchar[]", "{a}", r#"{"a  "}"#),
+        ("txs", "text[]", "{\u{e4}}", "{a\u{308}}"),
+    ];
+    let mut cols: Vec<(&str, &str)> = Vec::new();
+    for (c, ty, _, _) in cases {
+        if !cols.iter().any(|(x, _)| *x == c) {
+            cols.push((c, ty));
+        }
+    }
+    let names = cols.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(", ");
+    let dir = tmpdir("sink-exact");
+    let mut ivm = Ivm::start(&dir);
+    let defs = cols.iter().map(|(c, ty)| format!("{c} {ty}")).collect::<Vec<_>>().join(", ");
+    ivm.exec(&format!("CREATE TABLE t (id int PRIMARY KEY, {defs})"));
+    ivm.exec(&format!("CREATE MATERIALIZED VIEW v AS SELECT {names} FROM t"));
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{conninfo}' TABLE 'v_copy'"));
+    eventually("the target", || target.query("SELECT FROM v_copy").is_ok());
+    target.simple_query("CREATE INDEX ON v_copy (iv)").unwrap();
+    let insert = |ivm: &mut Ivm, first: usize, value: &dyn Fn(usize) -> &'static str| {
+        let rows = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (c, ..))| {
+                let vals = cols.iter().map(|(x, ty)| if x == c { format!("'{}'::{ty}", value(i)) } else { "NULL".into() });
+                format!("({}, {})", first + i, vals.collect::<Vec<_>>().join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ivm.exec(&format!("INSERT INTO t VALUES {rows}"));
+    };
+    insert(&mut ivm, 0, &|i| cases[i].2);
+    insert(&mut ivm, cases.len(), &|i| cases[i].3);
+    sink_caught_up(&mut ivm, &mut target, "sk");
+    target.simple_query("SELECT pg_stat_statements_reset()").unwrap();
+    ivm.exec(&format!("DELETE FROM t WHERE id >= {}", cases.len()));
+    sink_caught_up(&mut ivm, &mut target, "sk");
+    let kept = sorted(ivm.rows(&format!("SELECT {names} FROM v")));
+    assert_eq!(kept.len(), cases.len());
+    let got = target.query(&format!("SELECT {names} FROM v_copy")).unwrap().rows;
+    let got = got.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join("|"));
+    assert_eq!(sorted(got.collect()), kept);
+    // every deletion can find its row through the index (with sequential
+    // scans off, a plan that needs one shows a Seq Scan anyway)
+    let deletes = target.query(r#"SELECT query FROM pg_stat_statements WHERE query LIKE 'DELETE FROM "v_copy"%'"#).unwrap().rows;
+    assert!(deletes.len() > 1, "{deletes:?}");
+    for q in deletes {
+        let q = q[0].clone().unwrap();
+        let plan = target.simple_query(&format!("SET enable_seqscan = off; EXPLAIN (GENERIC_PLAN) {q}")).unwrap();
+        let plan = plan.iter().flat_map(|r| &r.rows).map(|r| r[0].clone().unwrap()).collect::<Vec<_>>().join("\n");
+        assert!(plan.contains("Index Scan using v_copy_iv_idx") && !plan.contains("Seq Scan"), "{q}:\n{plan}");
+    }
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A keyed sink deletes by `=` on the key, which also matches other
+/// representations of an equal key (`'1 mon'` for `'30 days'`, `1.5` for
+/// `1.50`). That is right: keys are unique as `=` compares them (the
+/// target's primary key), and the engine keys rows and groups by `=` too,
+/// so the one row with an equal key is the one the retracted row wrote. A
+/// primary key and a group key whose representation changes are rewritten
+/// in the target.
+#[test]
+fn keyed_sinks_follow_changes_of_key_representation() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-keyed");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (k interval PRIMARY KEY, n numeric, f float8, x int)");
+    ivm.exec("INSERT INTO t VALUES ('1 mon', 1.5, 0, 1), ('1 day', 2.50, '-0', 2), ('2 days', 2.5, 0, 3)");
+    ivm.exec("CREATE MATERIALIZED VIEW g AS SELECT n, f, count(*) AS c, sum(x) AS s FROM t GROUP BY n, f");
+    ivm.exec(&format!("CREATE SINK st FROM t INTO POSTGRES CONNECTION '{}' TABLE 't_copy' KEY (k)", up.conninfo));
+    ivm.exec(&format!("CREATE SINK sg FROM g INTO POSTGRES CONNECTION '{}' TABLE 'g_copy' KEY (n, f)", up.conninfo));
+    let synced = |ivm: &mut Ivm, up: &mut Upstream| {
+        for (sink, view, copy) in [("st", "t", "t_copy"), ("sg", "g", "g_copy")] {
+            sink_caught_up(ivm, &mut up.client, sink);
+            assert_eq!(sorted(up.rows(&format!("SELECT * FROM {copy}"))), sorted(ivm.rows(&format!("SELECT * FROM {view}"))), "{view}");
+        }
+    };
+    synced(&mut ivm, &mut up);
+    // the same primary keys in other representations
+    ivm.exec("UPDATE t SET k = '30 days' WHERE x = 1");
+    ivm.exec("UPDATE t SET k = '24:00:00', n = 2.500, f = 0 WHERE x = 2");
+    // the groups' only rows in other representations
+    ivm.exec("DELETE FROM t WHERE x = 3");
+    ivm.exec("UPDATE t SET n = 1.50, f = '-0' WHERE x = 1");
+    synced(&mut ivm, &mut up);
+    assert_eq!(sorted(up.rows("SELECT k, n, f FROM t_copy")), ["24:00:00|2.500|0", "30 days|1.50|-0"]);
+    assert_eq!(sorted(up.rows("SELECT n, f, c FROM g_copy")), ["1.50|-0|1", "2.500|0|1"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A sink's target table has its view's columns: a replacement changing
 /// them is rejected (the sink used to go on writing the new rows under the
 /// old column names); one keeping them is delivered.
@@ -970,6 +1412,49 @@ fn sinks_keep_their_columns_across_view_replacements() {
     up.exec("INSERT INTO t VALUES (2, 20, 200)");
     let want = vec![vec![Some("1".to_string()), Some("110".to_string())], vec![Some("2".to_string()), Some("220".to_string())]];
     eventually("replacement delivered", || copy(&mut up) == want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink whose view is being replaced is held (sent nothing) until the
+/// new version is hydrated. The engine stopping meanwhile recorded the last
+/// applied GSN as the sink's progress all the same, and the restart resumed
+/// the sink past the replacement's change: its target kept the old version's
+/// rows. Now a held sink records nothing then, and after the restart the
+/// target equals the view.
+#[test]
+fn a_sink_held_by_a_replacement_is_not_resumed_past_it() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-held");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE big (id bigint PRIMARY KEY, x bigint, g int)");
+    for lo in (0..300_000).step_by(50_000) {
+        ivm.exec(&format!("INSERT INTO big SELECT i, (i::bigint * 7919) % 300000, i % 97 FROM generate_series({lo}, {}) i", lo + 49_999));
+    }
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT g, count(*) AS n, sum(x) AS s FROM big GROUP BY g");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'v_copy' KEY (g)", up.conninfo));
+    // (rows as text; the target table is created by the sink)
+    let copy = |up: &mut Upstream| up.client.query("SELECT g, n, s FROM v_copy ORDER BY g").map(|r| r.rows).unwrap_or_default();
+    let view = |ivm: &mut Ivm| ivm.client.query("SELECT g, n, s FROM v ORDER BY g").unwrap().rows;
+    let want = view(&mut ivm);
+    eventually("the snapshot", || copy(&mut up) == want);
+    // the same columns, other contents; a join, hydrated off the engine
+    // thread for a while
+    let mut other = ivm.connect();
+    let replace = std::thread::spawn(move || {
+        other.simple_query("CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT a.g, count(*) AS n, sum(b.x) AS s FROM big a JOIN big b ON a.x = b.id GROUP BY a.g")
+    });
+    // its record applied (in the history), while it is hydrated
+    eventually("the replacement's record", || {
+        ivm.rows("SELECT count(*) FROM ivm.catalog_history WHERE statement LIKE 'CREATE OR REPLACE%'") == ["1"]
+    });
+    assert!(!replace.is_finished(), "the replacement was hydrated before the engine stopped");
+    ivm.shutdown();
+    let _ = replace.join();
+    let mut ivm = Ivm::start(&dir);
+    let new = view(&mut ivm);
+    assert_ne!(new, want, "the replacement changed nothing");
+    eventually("the target to follow the replacement", || copy(&mut up) == new);
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1000,6 +1485,57 @@ fn sink_keeps_changes_while_its_target_is_unreachable() {
     eventually("sink", || {
         later.query("SELECT count(*) FROM v_copy").map(|r| r.rows[0][0].clone()).ok().flatten() == Some("6".to_string())
     });
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sink writes a transaction in messages of bounded size (a
+/// resynchronization used to be one SQL string, which PostgreSQL rejects
+/// beyond 1 GB, so a large relation never finished its first sync), and
+/// the changes it keeps while it cannot write are bounded by its queue's
+/// limit (a sixteenth of the memory budget, at least 4 MiB): beyond it,
+/// the engine stops sending, the sink drops them and resynchronizes the
+/// target from a fresh snapshot instead (they used to grow without limit,
+/// and the catch-up write with them). Each resynchronization is one
+/// transaction.
+#[test]
+fn sinks_write_in_bounded_messages_and_resynchronize_a_large_backlog() {
+    let mut up = Upstream::start();
+    up.exec("CREATE TABLE target (id int PRIMARY KEY, v int, s text)");
+    let dir = tmpdir("sink-bounded");
+    let mut ivm = Ivm::start_with(&dir, |c| {
+        c.sink_limits = ivm::sink::SinkLimits { message_bytes: 4096 };
+        c.memory_bytes = 16 << 20;
+    });
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int, s text)");
+    ivm.exec("INSERT INTO t SELECT g, g, repeat('s', 1000) FROM generate_series(1, 3000) g");
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    let same = |ivm: &mut Ivm, up: &mut Upstream| {
+        let want = ivm.rows("SELECT count(*), sum(v) FROM t");
+        up.client.query("SELECT count(*), sum(v) FROM target").ok().map(|r| r.rows.into_iter().map(|r| r.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>().join("|")).collect::<Vec<_>>()) == Some(want)
+    };
+    // (about 50 KB of SQL in messages of 4 KB)
+    eventually("the first sync", || same(&mut ivm, &mut up));
+    let xmins = |up: &mut Upstream| up.rows("SELECT count(DISTINCT xmin::text) FROM target");
+    assert_eq!(xmins(&mut up), ["1"], "the first sync is one transaction");
+    eventually("the sink to run", || status(&mut ivm).starts_with("running"));
+    ivm.exec("INSERT INTO t VALUES (5000, 5000, 'x')");
+    eventually("a change", || same(&mut ivm, &mut up));
+    // the target rejects every change while about 6 MiB of changes (in
+    // memory) come, more than the 4 MiB the sink may keep
+    up.exec("ALTER TABLE target ADD CONSTRAINT small CHECK (v < 10000)");
+    for i in 0..40 {
+        ivm.exec(&format!("UPDATE t SET v = v + 10000 WHERE id % 40 = {i}"));
+    }
+    eventually("the writes to fail", || status(&mut ivm).contains("violates check constraint"));
+    up.exec("ALTER TABLE target DROP CONSTRAINT small");
+    eventually("the target to catch up", || same(&mut ivm, &mut up));
+    // by a resynchronization (rows that did not change were rewritten too)
+    assert_eq!(xmins(&mut up), ["1"], "the backlog was dropped and the target rewritten in one transaction");
+    eventually("the sink to run again", || status(&mut ivm).starts_with("running"));
+    ivm.exec("DELETE FROM t WHERE id <= 10");
+    eventually("the next change", || same(&mut ivm, &mut up));
     drop(ivm);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1277,8 +1813,9 @@ mod api {
             upstream_rows(up, "SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND backend_type = 'client backend'")
         };
         wait_until("the schema change", || {
-            let stmt = ivm::sql::parse_statement("SELECT x FROM t AS OF LATEST").unwrap();
-            h.execute(stmt, vec![], SessionVars::default(), String::new()).is_ok()
+            let stmt = ivm::sql::parse_statement("SELECT x FROM t").unwrap();
+            let latest = SessionVars { read_mode: "latest".into(), ..SessionVars::default() };
+            h.execute(stmt, vec![], latest, String::new()).is_ok()
         });
         wait_until("the re-snapshot to wait for the lock", || !chunk_waiting(&mut up).is_empty());
         // stop the engine: the source, once its chunk query fails, sees the
@@ -1407,4 +1944,31 @@ mod api {
         running.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A new sink over a relation too large to snapshot within the engine
+/// thread's read budget synchronises its target from a snapshot read on a
+/// reader thread as the sink writes it, as of the GSN it asked at, and then
+/// gets the changes applied meanwhile: the target ends up equal to the
+/// relation, and commits made while the snapshot was read and written are
+/// not lost or doubled.
+#[test]
+fn sinks_over_large_relations_synchronise_from_a_snapshot_read_off_the_engine_thread() {
+    let up = Upstream::start();
+    let dir = tmpdir("sink-large");
+    let mut ivm = Ivm::start(&dir);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, v int)");
+    ivm.exec("INSERT INTO t SELECT i, i % 10 FROM generate_series(1, 120000) i");
+    let mut other = ivm.connect();
+    ivm.exec(&format!("CREATE SINK sk FROM t INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    for i in 0..50 {
+        other.simple_query(&format!("UPDATE t SET v = v + 100 WHERE id = {}", i * 997 + 1)).unwrap();
+        other.simple_query(&format!("INSERT INTO t VALUES ({}, 7)", 200_000 + i)).unwrap();
+        other.simple_query(&format!("DELETE FROM t WHERE id = {}", i * 991 + 5)).unwrap();
+    }
+    let mut up = up;
+    let want = ivm.rows("SELECT count(*), sum(v), sum(id) FROM t");
+    eventually("the target to catch up", || up.rows("SELECT count(*), sum(v), sum(id) FROM target") == want);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
 }

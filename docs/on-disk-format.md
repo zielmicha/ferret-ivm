@@ -1,17 +1,19 @@
 # On-disk format
 
 > **Scope.** This document describes the formats the current code writes and
-> reads. The engine has no format version number (see
-> [Compatibility](#compatibility)), so a change to any of these files changes
-> a format described here and must be reflected in this document (paths
-> relative to `crates/ivm/src/` unless noted): `log.rs`, `storage/`,
-> `types/codec.rs`, `types/encoding.rs`, `dataflow/layout.rs`,
-> `dataflow/mod.rs` and the operators' `fingerprint` methods (structural
-> fingerprints), `expr/mod.rs` (expression fingerprints), the function
-> registry order (`expr/ops.rs`, `expr/builtins.rs`), `catalog.rs`,
-> `coord/mod.rs` (`AppState`), `coord/ddl.rs` (`DiscoveredTable`, the
-> `CREATE SOURCE` record's `extra`), `source/` (`SourceState`, `SlotDrop`),
-> `crates/pgnumeric/src/encoding.rs` and `crates/pgfuncs/src/json/keyenc.rs`.
+> reads: format version 2, and format 1 as far as it is read to migrate it
+> (see [Compatibility](#compatibility) for what changes the version). A
+> change to any of these files changes a format described here and must be
+> reflected in this document (paths relative to `crates/ivm/src/` unless
+> noted): `log.rs`, `storage/`, `types/codec.rs`, `types/encoding.rs`,
+> `dataflow/layout.rs`, `dataflow/mod.rs` and the operators' `fingerprint`
+> methods (structural fingerprints), `expr/mod.rs` (expression
+> fingerprints), the function registry order (`expr/ops.rs`,
+> `expr/builtins.rs`), `catalog.rs`, `coord/meta.rs` (the metadata tree, the
+> checkpoint header, `FORMAT`, format 1's `AppState`), `coord/ddl.rs`
+> (`DiscoveredTable`, the `CREATE SOURCE` record's `extra`), `source/`
+> (`SourceState`, `SlotDrop`), `crates/pgnumeric/src/encoding.rs` and
+> `crates/pgfuncs/src/json/keyenc.rs`.
 
 Every statement below was checked against the code and, where indicated, by
 decoding files written by a running engine.
@@ -21,14 +23,16 @@ decoding files written by a running engine.
 1. [Conventions](#conventions)
 2. [Data directory layout](#data-directory-layout)
 3. [The LOCK file](#the-lock-file)
-4. [Input log](#input-log)
-5. [Storage segments and nodes](#storage-segments-and-nodes)
-6. [Manifest and checkpoints](#manifest-and-checkpoints)
-7. [Checkpoint application state](#checkpoint-application-state-appstate)
-8. [Data encodings](#data-encodings)
-9. [Structural fingerprints](#structural-fingerprints)
-10. [Garbage collection and retention](#garbage-collection-and-retention)
-11. [Compatibility](#compatibility)
+4. [The FORMAT file](#the-format-file)
+5. [Input log](#input-log)
+6. [Storage segments and nodes](#storage-segments-and-nodes)
+7. [Manifest and checkpoints](#manifest-and-checkpoints)
+8. [The metadata tree](#the-metadata-tree)
+9. [Format 1 application state (AppState)](#format-1-application-state-appstate)
+10. [Data encodings](#data-encodings)
+11. [Structural fingerprints](#structural-fingerprints)
+12. [Garbage collection](#garbage-collection)
+13. [Compatibility](#compatibility)
 
 ## Conventions
 
@@ -48,9 +52,13 @@ decoding files written by a running engine.
 
 ```
 <data-dir>/
+├── FORMAT
+├── FORMAT.new                  (transient)
 ├── LOCK
 ├── log/
-│   └── log-<first GSN, %020u>.ivl ...
+│   ├── log-<first GSN, %020u>.ivl ...
+│   ├── parts-<GSN, %020u>.ivp ...
+│   └── spool-<pid>-<n>.tmp     (transient)
 └── store/
     ├── MANIFEST
     ├── MANIFEST.new            (transient)
@@ -59,8 +67,12 @@ decoding files written by a running engine.
 
 | Path | Written by | Contents |
 |---|---|---|
+| `FORMAT` | `coord::start` | the format version, ASCII decimal and a newline |
+| `FORMAT.new` | `coord::start` | the new `FORMAT`, until renamed |
 | `LOCK` | `coord::start` | empty; exclusive lock |
 | `log/log-NNNNNNNNNNNNNNNNNNNN.ivl` | sequencer (`log::LogWriter`) | input-log segment; the number is the GSN of its first record, zero-padded to 20 digits |
+| `log/parts-NNNNNNNNNNNNNNNNNNNN.ivp` | sequencer, or a source's spool renamed by it | the changes of the `CommitParts` record at that GSN ([Parts files](#parts-files)) |
+| `log/spool-<pid>-<n>.tmp` | source threads (`log::Spool`) | the changes of an upstream transaction still being received; renamed to a parts file at its commit |
 | `store/MANIFEST` | checkpoints (`storage::manifest`) | sequence of checkpoint records |
 | `store/MANIFEST.new` | manifest rewrite | the single record of a rewritten manifest, until renamed |
 | `store/seg-NNNNNNNN.dat` | checkpoints (`storage::segment`) | B+tree node frames; the number is the segment id (`u32`, from 1), zero-padded to 8 digits |
@@ -69,9 +81,10 @@ Directories are created on demand; creating `store/` (and `log/`, unless
 `--no-sync`) is followed by an `fsync` of the data directory, so that their
 entries survive a crash. Files in `log/` and `store/` whose names do not
 match these patterns are ignored. Example of a fresh directory after one
-second: `LOCK` (0 bytes), `log/log-00000000000000000001.ivl` (one tick frame
-per second, 25 bytes each), `store/MANIFEST` (0 bytes until the first
-checkpoint), `store/seg-00000001.dat` (0 bytes).
+second: `FORMAT` (2 bytes, `2\n`), `LOCK` (0 bytes),
+`log/log-00000000000000000001.ivl` (one tick frame per second, 25 bytes
+each), `store/MANIFEST` (0 bytes until the first checkpoint),
+`store/seg-00000001.dat` (0 bytes).
 
 ## The LOCK file
 
@@ -85,6 +98,27 @@ start-up fails with SQLSTATE `55006`
 (`data directory <dir> is in use by another ivm process`). The file is never
 deleted and its contents are never read.
 
+## The FORMAT file
+
+Code: `coord::meta` (`read_format`, `write_format`), `coord::start`.
+
+`FORMAT` holds the data directory's format version: the version in ASCII
+decimal followed by a newline (`2\n`). It is read right after the lock is
+taken, before anything else is opened (opening the log truncates a torn
+tail, opening the store deletes unreferenced segment files):
+
+| `FORMAT` | Meaning | Start-up |
+|---|---|---|
+| missing, `log/` and `store/` empty or absent | a new directory | `FORMAT` is written first |
+| missing, `log/` or `store/` holds a file | format 1, written before versions were recorded | recovered, then migrated: see [Compatibility](#compatibility) |
+| `2` | the current format | normal |
+| a larger number | written by a newer engine | refused with SQLSTATE `0A000` (`the data directory has format <n>, which this version of ivm cannot read (it reads formats up to 2)`), nothing is modified |
+| anything else | damaged | refused with `XX001` (`.../FORMAT does not hold a format version: ...`) |
+
+`FORMAT` is written atomically: to `FORMAT.new`, which is `fsync`ed and
+renamed over `FORMAT`, followed by an `fsync` of the data directory. A
+leftover `FORMAT.new` is never read.
+
 ## Input log
 
 Code: `crates/ivm/src/log.rs`.
@@ -93,9 +127,11 @@ Code: `crates/ivm/src/log.rs`.
 
 - A new log starts with `log-00000000000000000001.ivl`.
 - Records are appended by the sequencer in batches: each record is encoded
-  into an in-memory buffer as a frame, the whole batch is written with one
-  `write_all`, and then the file is `fdatasync`ed (`sync_data`) unless
-  `--no-sync` is set.
+  into an in-memory buffer as a frame, the batch is written with
+  `write_all` (whenever the buffer reaches 8 MiB, and at the end of the
+  batch), and then the file is `fdatasync`ed (`sync_data`) unless
+  `--no-sync` is set. Afterwards a buffer that grew beyond 10 MiB (a single
+  large record) is freed.
 - **Rotation**: when a record is appended while the buffer is empty (i.e. the
   first record of a batch) and the current segment holds at least 64 MiB
   (67,108,864 bytes), the current segment is `fsync`ed, a new segment named
@@ -122,7 +158,11 @@ offset  size  field
 ```
 
 The CRC covers the GSN, so a frame moved to another position fails its
-check. A tick frame from a running engine:
+check. A record whose payload does not fit the 32-bit length is refused
+when it is appended (SQLSTATE `54000`, `a log record of <n> bytes exceeds
+the frame limit of 4 GiB`; only a single row of more than 4 GiB could
+cause it, as commits are split, see below): written with a wrapped length,
+it would be read back as a torn tail. A tick frame from a running engine:
 
 ```
 09 00 00 00                 len = 9
@@ -143,6 +183,8 @@ The first payload byte is the record tag (`LogRecord::encode` / `decode`):
 | 3 | `Progress` | `uvarint source`, `uvarint lsn`, `str state` |
 | 4 | `Schema` | `uvarint source`, `uvarint table`, `bytes columns_json`, `uvarint k`, `k × uvarint pk_column` |
 | 5 | `Tick` | `ivarint micros` |
+| 6 | `CommitParts` | `uvarint source`, `uvarint lsn`, `uvarint parts`, `uvarint changes` |
+| 7 | `ProgressDelta` | `uvarint source`, `uvarint lsn`, `str delta` |
 
 Any other tag is a decoding error (`bad log record tag`).
 
@@ -163,12 +205,16 @@ truncation a source logs before re-copying a table.
 | 3 | `Insert` | `row` | add one instance (multiset tables) |
 | 4 | `Remove` | `row` | remove one instance (multiset tables) |
 | 5 | `Truncate` | — | remove all rows, including those the commit changed before it |
+| 6 | `UpsertIfPresent` | as `Upsert` | as `Upsert`, except that the listed columns are taken only from the key's current row (not from a row deleted just before), and without one it changes nothing. Sources log it for an update with unchanged TOASTed values of a table being copied: a key without a row there has not been copied yet, and its copy brings the whole row |
 
 Changes apply in order. Tables with a key receive `Upsert`, `Delete` and
 `Truncate` (an `Insert` or `Remove` there sets or deletes the row's key);
 multiset tables receive `Insert`, `Remove` and `Truncate` (an `Upsert` or
-`Delete` there adds or removes one instance of the row). The DBLog snapshot
-of a multiset table is logged as `Truncate` followed by an `Insert` per row.
+`Delete` there adds or removes one instance of the row; an
+`UpsertIfPresent` adds one, as `Upsert`). The DBLog snapshot of a multiset
+table is logged as a commit holding a `Truncate`, followed by commits of up
+to 10,000 `Insert`s each (one per row; earlier versions logged the
+`Truncate` and all the `Insert`s in one commit).
 
 `row` is a row in the [row codec](#row-codec). Example (local
 `INSERT INTO customers VALUES (1, 'eu'), (2, 'us')`, table id 1001):
@@ -187,6 +233,14 @@ and `DELETE FROM orders WHERE id = 4` (table 1000):
 `01 00 0c 01 e8 07 02 01 04 08` — Commit, source 0, request 12, one change,
 table 1000, `Delete`, key row with one value, int4 4.
 
+**CommitParts** — a commit whose changes take more than `PART_BYTES`
+(1 MiB, 1,048,576 bytes) encoded: the same as a `Commit` with the same
+`source` and `lsn`, whose `changes` changes are in the
+[parts file](#parts-files) of the record's GSN, in `parts` frames. The
+sequencer logs every larger `Commit` this way (local DML), and sources log
+their spooled transactions this way. Records written before it existed are
+single `Commit` frames of any size, which are still read.
+
 **Ddl** — a catalog change.
 
 - `req`: the request id of the submitting session (meaningless on replay).
@@ -201,7 +255,7 @@ table 1000, `Delete`, key row with one value, int4 4.
 - `extra`: empty, except for the statements that discover upstream tables.
   A discovered table is
   `{"schema": str, "name": str, "columns": [Column], "pk": [column index, ...], "replica_identity_full": bool}`
-  (`coord::ddl::DiscoveredTable`; `Column` as in [AppState](#checkpoint-application-state-appstate);
+  (`coord::ddl::DiscoveredTable`; `Column` as in [catalog objects](#catalog-objects);
   `pk` is the key: the columns of the replica identity index under
   `REPLICA IDENTITY USING INDEX`, else the primary key's, in key order).
   `ALTER SOURCE ... REFRESH` logs a JSON array of all discovered tables (the
@@ -214,27 +268,56 @@ table 1000, `Delete`, key row with one value, int4 4.
   by versions without instance ids) means a default name without it,
   `ivm_<name>_<id>`.
 
-**Progress** — a source's bookkeeping without data.
+**Progress** — a source's bookkeeping without data (written by earlier
+versions; the current code writes `ProgressDelta` records instead, and still
+reads these).
 
 - `lsn`: the end LSN of the commit after which it was logged (informational;
   not used on replay).
 - `state`: JSON `SourceState` (`source::postgres`):
-  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...], "truncate": bool}}}`
+  `{"slot_created": bool, "tables": {"<table id>": {"done": bool, "boundary": null | [str, ...], "truncate": bool, "index_order": bool, "scanned": bool, "reread": [[str, ...], ...]}}}`
   where `boundary` holds the text values of the last key copied by the
   table's snapshot, and `truncate` (absent: `false`) says that the table's
   next snapshot chunk starts by logging a commit that truncates it (set for
   tables with a key after a key change upstream or a lost replication
-  slot). The whole state replaces the previous one; a state that does not
-  parse is taken as empty (the slot counts as not created and every table
-  is copied again). Progress records of a source that is no longer in the
-  catalog are ignored.
+  slot). `index_order` (absent: `false`; written only when `true`) says that
+  `boundary` is in the order of the upstream key index, in which the
+  current code reads chunks. Boundaries without it were logged by earlier
+  versions, which read chunks in the engine's key order (string key columns
+  compared as `col::text COLLATE "C"`): when the source starts, it keeps
+  such a boundary if no key column is of a string type (the two orders are
+  the same then), and otherwise drops it, so that the table's copy starts
+  again from its first key. `scanned` (absent: `false`; written only when
+  `true`) says that every key range has been copied, and `reread` (absent:
+  empty; written only when not) lists keys, as text values, whose rows are
+  to be read again before the table is done: keys the stream moved a row to
+  leaving TOASTed values unchanged that the source could not supply. Both
+  are absent in states of earlier versions (a table not done has its ranges
+  still to copy then). The whole state replaces the previous one; a
+  state that does not parse is taken as empty (the slot counts as not
+  created and every table is copied again). Progress records of a source
+  that is no longer in the catalog are ignored.
+
+**ProgressDelta** — a change of a source's bookkeeping: the entries of its
+state that changed since its previous progress record, so that copying `T`
+tables logs `O(T)` bytes of progress rather than `O(T²)`.
+
+- `lsn`: as in `Progress`.
+- `delta`: JSON `StateDelta` (`source::postgres`):
+  `{"slot_created": bool, "tables": {"<table id>": SnapState}}`, where
+  `SnapState` is a table's entry as in `Progress` and `slot_created` is
+  absent unless it changed. Applying it sets `slot_created` if present and
+  replaces the listed tables' entries; the other entries stay. A delta that
+  does not parse empties the source's state, as a `Progress` state that does
+  not parse does. Records of a source that is no longer in the catalog are
+  ignored.
 
 **Schema** — an upstream table changed shape or key: the source `ObjectId`,
 the table `ObjectId`, the new columns as a JSON array of `Column` (key
 columns `NOT NULL`), and the new key as column indexes (the replica
 identity's columns, as for `pk` above). Applying it also resets the table's
 entry in the source's stored state to `{"done": false, "boundary": null}`,
-keeping its `truncate` flag (which the source's `Progress` record logged just
+keeping its `truncate` flag (which the source's progress record logged just
 before sets after a key change), so that the table is copied again, from an
 empty table after a key change, even if the engine restarts before the
 copy starts.
@@ -243,32 +326,69 @@ copy starts.
 The engine converts it to the PostgreSQL epoch (subtracting
 946,684,800,000,000) and keeps the maximum.
 
+### Parts files
+
+`log/parts-<GSN>.ivp` holds the changes of the `CommitParts` record at that
+GSN as a sequence of frames with the [frame](#frame) layout, except that the
+`u64` after the CRC is the part's number (0, 1, …) instead of a GSN (the
+CRC covers it). A part's payload is `uvarint n` followed by `n` changes
+encoded as in a `Commit` record. A part is cut once its changes reach
+`PART_BYTES` encoded, so it holds at most `PART_BYTES` plus one change; the
+file has no header, and its frame count and total number of changes are
+those of its record.
+
+A parts file is complete and durable before its record can be: the
+sequencer writes the file of a large `Commit` (`fdatasync`), or renames a
+source's finished spool (written and `fdatasync`ed by the source thread) to
+the record's GSN, then `fsync`s `log/`, and only then appends the record.
+The record is the commit point: a parts file without it (a crash in
+between) is deleted when the log is opened.
+
+A source spools a transaction (`log::Spool`, `log/spool-<pid>-<n>.tmp`,
+the same format) once the changes it holds reach `PART_BYTES`, and writes
+further changes there as they arrive; a schema change or a failed table in
+the middle of the transaction rewrites the spool through a second file
+(`.new`, renamed over it). Spools of transactions that did not commit (the
+replication session ended; the transaction is sent again) are deleted when
+the session ends, and any left by a crash when the log is opened.
+
 ### Opening, replay and truncation
 
 - **Open** (`LogWriter::open`): only the newest segment is read. Frames are
-  parsed from offset 0 while a full 16-byte header is present, the payload is
-  complete, the CRC matches and the payload decodes. If any bytes follow the
-  last good frame, the file is truncated there and `fsync`ed (logged as
-  `truncating torn log tail`). The last GSN is the last good frame's; if the
-  newest segment has none, it is the last frame of the previous segment, or
-  the segment's first GSN − 1 if there is no previous segment. The next GSN is
-  the last GSN + 1 (or the checkpoint's GSN + 1 if that is later, see above),
-  and appends continue in the newest segment.
+  read from offset 0 while a full 16-byte header is present, the payload is
+  complete and the CRC matches (payloads are not decoded: replay does that
+  once). If any bytes follow the last good frame, the file is truncated
+  there and `fsync`ed (logged as `truncating torn log tail`). The last GSN
+  is the last good frame's; if the newest segment has none, it is the last
+  frame of the previous segment, or the segment's first GSN − 1 if there is
+  no previous segment. Then every `spool-*` file and every parts file whose
+  GSN is above the last GSN is deleted (and `log/` `fsync`ed). The next GSN
+  is the last GSN + 1 (or the checkpoint's GSN + 1 if that is later, see
+  above), and appends continue in the newest segment.
 - **Replay** (`read_from(after)`, `after` = the checkpoint's GSN, 0 without
-  a checkpoint): segments
-  are visited in GSN order; a segment is skipped if the next segment starts
-  at or before `after + 1`. Each remaining segment is parsed with the same
-  rules and its records with `gsn > after` are returned. Only the newest
-  segment may end in a torn write (already truncated by the open): a frame
-  that fails to parse in any earlier segment stops the start with a
-  data-corrupted error (`input log segment <path> is corrupt at byte <n>`),
-  and so do returned GSNs that are not consecutive from `after + 1`
+  a checkpoint) is an iterator reading one frame at a time: segments are
+  visited in GSN order; a segment is skipped if the next segment starts at
+  or before `after + 1`. Frames of the remaining segments are read with the
+  same rules; those with `gsn ≤ after` are checked (CRC) but not decoded,
+  the others are decoded and returned. Only the newest segment may end in a
+  torn write (already truncated by the open): a frame that fails its check
+  in any earlier segment stops the start with a data-corrupted error
+  (`input log segment <path> is corrupt at byte <n>`), and so do a frame
+  whose CRC matches but whose payload does not decode
+  (`input log segment <path> has a record that does not decode at gsn <g>`)
+  and GSNs that are not consecutive from `after + 1`
   (`input log is missing records: expected gsn <g>, found <h> in <path>`),
-  rather than replaying around the damage.
+  rather than replaying around the damage. The parts of a `CommitParts`
+  record are read when it is applied, one part at a time (`read_parts`); a
+  missing parts file, a part with the wrong number, an incomplete or
+  damaged frame, or a number of parts or changes other than the record's
+  is a data-corrupted error too.
 - **Truncation** (`truncate_before(g)`, after every checkpoint with
-  `g = checkpoint GSN − retention`): every segment except the current one
-  whose successor starts at or before `g + 1` (so all its records are ≤ `g`)
-  is deleted.
+  `g` = the checkpoint's GSN): every segment except the current one whose
+  successor starts at or before `g + 1` (so all its records are ≤ `g`) is
+  deleted, and so is every parts file of a GSN ≤ `g`. Recovery replays the
+  log after the checkpoint, and nothing else reads the log, so the records a
+  checkpoint covers are not kept.
 - The engine ignores records whose GSN is at or below the last GSN it has
   applied.
 
@@ -293,52 +413,91 @@ header. Reading a node reads exactly `len` bytes at `off` and checks that
 `frame.len + 8 == len` and the CRC (`node frame length mismatch`,
 `node checksum mismatch`, SQLSTATE `XX001`).
 
-- Segments are written only by checkpoints, append-only, through a buffer
-  that is written out when it exceeds 4 MiB and at the checkpoint's sync.
+- Segments are written append-only, by checkpoints and by the early writes
+  of dirty nodes — the engine's buffer pool's, also while a checkpoint is
+  being written, and those of forks of the store (hydrations), whose trees
+  are adopted with their frames — which no manifest record refers to until
+  a checkpoint names a root above them. All writers share one append side:
+  frames are appended whole, one after another, through a buffer that is
+  written out when it exceeds 4 MiB and at the checkpoint's sync (a frame
+  still in it is read from it).
 - Before each append, if the active segment holds at least 256 MiB
   (268,435,456 bytes), it is sealed and segment `id + 1` is created (an
   existing file of that name is truncated) and the store directory
   `fsync`ed. Sealed segments are never modified; they are `fsync`ed at the
-  next sync and deleted whole once no live node remains in them.
+  next sync and deleted whole once no live node remains in them (see
+  [Garbage collection](#garbage-collection)).
 - On open, the active segment named by the last checkpoint (segment 1 for a
   new store) is opened, created if missing (then the store directory is
   `fsync`ed), and resized to the checkpoint's `active_len` (0 for a new
-  store) — discarding nodes written by an interrupted checkpoint. Every
-  other `seg-*.dat` that the checkpoint's segment table does not list is
-  deleted.
+  store) — discarding nodes written after the checkpoint (early, or by an
+  interrupted checkpoint). Every other `seg-*.dat` that the checkpoint's
+  segment table does not list (segments started since, and dead segments
+  kept for forks) or lists with `live_bytes` 0 is deleted.
 
 ### Leaf node
+
+```
+u8       kind = 4
+uvarint  n                         number of entries
+n × entry:
+  uvarint  shared                  length of the prefix shared with the previous entry's key (0 for the first)
+  bytes    suffix                  the rest of the key
+  ivarint  weight                  the entry's weight (never 0)
+```
+
+Keys are unique, in ascending `memcmp` order. A leaf holds the current
+weight of each entry and nothing else: an entry whose weight a change makes
+0 is removed, and a leaf left without entries is removed from its tree.
+Example — the three entries of a table `customers (id int PRIMARY KEY,
+region text)` after `INSERT INTO customers VALUES (1, 'eu'), (2, 'us')`,
+`INSERT INTO customers VALUES (3, 'apac')` and `UPDATE customers SET region
+= 'EU' WHERE id = 1` (decoded from a running engine; key = `02` + int4 key
++ payload, see [Arrangement entries](#arrangement-entries)):
+
+```
+20 00 00 00  ad f1 20 64           frame: len 32, crc
+04  03                             leaf, 3 entries
+00  09 02 80 00 00 01 09 02 45 55  02
+                                   key (1, 'EU'); weight 1
+04  05 02 09 02 75 73  02          shares 4 bytes; key (2, 'us'); weight 1
+04  07 03 09 04 61 70 61 63  02    shares 4 bytes; key (3, 'apac'); weight 1
+```
+
+(The update of row 1 retracted its old version (1, 'eu'), whose entry is
+gone, and added (1, 'EU').)
+
+Leaves of kind 1, written by versions that kept every entry's history of
+(GSN, weight) changes for reads as of earlier GSNs, are still read:
 
 ```
 u8       kind = 1
 uvarint  n                         number of entries
 n × entry:
-  uvarint  shared                  length of the prefix shared with the previous entry's key (0 for the first)
-  bytes    suffix                  the rest of the key
+  uvarint  shared, bytes suffix    as above
   uvarint  h                       number of history elements
   h × (uvarint gsn_delta, ivarint weight)
                                    gsn = previous element's gsn + gsn_delta (the first delta is from 0)
 ```
 
-Keys are unique, in ascending `memcmp` order; history elements are in
-ascending GSN order with non-zero weights. Example — the four entries of a
-table `customers (id int PRIMARY KEY, region text)` (decoded from a running
-engine; key = `02` + int4 key + payload, see
-[Arrangement entries](#arrangement-entries)):
+An entry's weight is the sum of its history's weights; an entry whose
+weights add up to 0 (a retraction kept for reads of earlier GSNs) is
+dropped as the leaf is decoded. The same table written by such a version,
+the update at GSN 115:
 
 ```
 2f 00 00 00  e0 4d a2 e2           frame: len 47, crc
 01  04                             leaf, 4 entries
 00  09 02 80 00 00 01 09 02 45 55  01 73 02
-                                   key (1, 'EU'); history [(115, +1)]
-07  02 65 75  02 32 02 41 01       shares 7 bytes; key (1, 'eu'); history [(50, +1), (115, −1)]
+                                   key (1, 'EU'); history [(115, +1)]: weight 1
+07  02 65 75  02 32 02 41 01       shares 7 bytes; key (1, 'eu'); history [(50, +1), (115, −1)]: dropped
 04  05 02 09 02 75 73  01 32 02    shares 4 bytes; key (2, 'us'); [(50, +1)]
 04  07 03 09 04 61 70 61 63  01 4c 02
                                    shares 4 bytes; key (3, 'apac'); [(76, +1)]
 ```
 
-(The update of row 1 from `'eu'` to `'EU'` at GSN 115 left two entries:
-retention had not yet consolidated the old version.)
+A leaf is written in the current kind when it is next rewritten (a change
+in it, or the maintenance pass relocating it).
 
 ### Internal node
 
@@ -357,6 +516,12 @@ A key belongs to the last child whose separator is `<=` the key. Separators
 are shortened at leaf splits: the separator of a new leaf is the shortest
 prefix of its first key that is greater than the previous leaf's last key.
 
+Internal nodes of kind 3, written by versions that compacted histories, are
+still read: the same layout with a `uvarint due + 1` after `min_seg`, the
+child subtree's compaction state (the retention frontier at which
+compacting some leaf of it was worth rewriting the leaf), which is skipped.
+Kind 2 is also the layout versions before those wrote.
+
 ### Summary
 
 ```
@@ -370,14 +535,36 @@ m × aggstate
 | 1 | `Count` | `ivarint` |
 | 2 | `SumInt` | 16 bytes, `i128 LE` (two's complement) |
 | 4 | `SumNumeric` | finite sum as a [compact numeric](#compact-numeric-encoding) (not limited to numeric's range, see below); `uvarint s`, `s × (uvarint display_scale, ivarint count)`; `ivarint nan`; `ivarint pos_inf`; `ivarint neg_inf` |
-| 5 | `SumFloat` | `u8 sign` (0 = zero, 1 = positive, 2 = negative), `bytes magnitude` (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = sign × magnitude × 2^−1074 |
-| 6 | `Min` | one [codec datum](#row-codec); NULL (tag 0) means "no value" |
-| 7 | `Max` | same |
+| 5 | `SumFloat` (read only) | `u8 sign` (0 = zero, 1 = positive, 2 = negative), `bytes magnitude` (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = sign × magnitude × 2^−1074. Written by earlier versions; decoded into the state that tag 8 encodes |
+| 6 | `Min` | one [codec datum](#row-codec); NULL (tag 0) means "no value". A value whose key encoding is longer than 128 bytes is held as tag 9 instead |
+| 7 | `Max` | same, with tag 10 |
+| 8 | `SumFloat` | `ivarint exp`, `uvarint h`, `h >> 1` bytes magnitude (little-endian), `ivarint nan`, `ivarint pos_inf`, `ivarint neg_inf`; finite value = (−1 if `h & 1`) × magnitude × 2^exp |
+| 9 | `MinPrefix` | `bytes` of length 128: the first 128 bytes of the ascending [key encoding](#order-preserving-key-encoding) (`0x02` and the value bytes) of the minimum, a value whose key encoding is longer; `u8 same` (0 or 1); if 1, 32 bytes: the SHA-256 of the minimum's codec datum, present when every entry of the subtree whose value has this prefix has that value |
+| 10 | `MaxPrefix` | same, of the maximum |
 
 Tag 3 is unused. The aggregate states are positional: their meaning (which
 `AggKind` and which argument expression) comes from the arrangement's layout,
 which is derived from the catalog when the dataflow is planned; it is not
 stored in the tree.
+
+Float sums and `min`/`max` states have one encoding per value:
+
+- `SumFloat` (tag 8) is normalized: the magnitude is odd and has no high
+  zero bytes, or the finite value is 0, encoded as `exp` 0, `h` 0 and no
+  bytes. Every finite sum of doubles is a multiple of 2^−1074 (squares are
+  truncated to that grid), so `exp` ≥ −1074; decoding normalizes and
+  rejects an `exp` below that or a value beyond 2^65536 (`bad float sum in
+  summary`). The sum of the values 1 to 10 (55 × 2^0) is the state
+  `08 00 02 37 00 00 00`; the sum of 0.1 and 0.2 (0x26666666666667 ×
+  2^−55) is `08 6d 0e 67 66 66 66 66 66 26 00 00 00`; and two NaNs (the
+  finite part 0) `08 00 00 04 00 00`.
+- A `min`/`max` value is held as a value (tags 6, 7) when its key encoding
+  has at most 128 bytes, else as the prefix (tags 9, 10; other lengths fail
+  to decode, `bad MIN/MAX prefix length`), with the hash exactly when the
+  entries with the prefix all have the value. Equal values have one key
+  encoding, so they take the same form; the codec datum keeps the value's
+  exact representation. A wider value under tag 6 or 7, written by earlier
+  versions, decodes as tag 9 or 10 without the hash.
 
 The finite part of a `SumNumeric` state is the exact sum of its subtree's
 terms (the arguments, or for `SumSqNumeric` their squares, times their
@@ -423,26 +610,66 @@ ns × (uvarint id, uvarint total_bytes, uvarint live_bytes)
 uvarint  active_seg              id of the active segment
 uvarint  active_len              length of the active segment belonging to this checkpoint
 uvarint  next_tree_id            next tree id to allocate
-bytes    app                     application state (JSON, see below)
+bytes    app                     application state: the header below (format 1: JSON, see AppState below)
+[ uvarint  nt                    tree space: the number of trees again, then for each
+                                 tree, in the order of the trees above:
+  nt × (uvarint 0                written as 0 (versions that compacted histories
+                                 recorded the root's compaction state, due + 1, here;
+                                 it is read and ignored)
+        uvarint ns
+        ns × (uvarint seg, uvarint live_bytes)) ]
+                                 bytes of the tree's node frames still live, per segment
+                                 (segments with none are left out)
 ```
 
-Every record is complete: it lists every tree, every segment and the whole
-application state, so only the last record matters. The very first record of
-a new data directory (after about ten seconds of ticks):
+The application state of the current format is a header naming the
+[metadata tree](#the-metadata-tree), which holds the catalog and the rest of
+the engine's state:
 
 ```
-e6 01 00 00  34 b1 84 4e     len 486, crc
+uvarint  format                  2 (format 1's JSON starts with '{', 0x7B)
+uvarint  meta_tree               id of the metadata tree (one of the trees above)
+uvarint  next_req                request counter
+```
+
+The tree space section follows `app` to the end of the record. Records of
+format 1 end after `app`; reading one, the engine counts each tree's live
+bytes per segment from its internal nodes (the leaves' frame lengths are in
+their parents' pointers, so no leaf is read; every leaf is at the depth of
+the leftmost one).
+
+Every record is complete: it lists every tree (the metadata tree included),
+every segment and every tree's live bytes per segment, so only the last
+record matters. Temporary trees (below) are not listed, and the segment
+table does not count their bytes as live. The first record of a new data directory, ten seconds after
+`CREATE TABLE customers (id int PRIMARY KEY, region text)`, `INSERT INTO
+customers VALUES (1, 'eu'), (2, 'us'), (3, 'x')` and `CREATE MATERIALIZED
+VIEW c AS SELECT id, region::int AS r FROM customers` (three error records,
+no rows):
+
+```
+30 00 00 00  6d 77 06 7f     len 48, crc
 01                           seq 1
-0b                           gsn 11
-00                           no trees
-01  01 00 00                 one segment: id 1, 0 bytes written, 0 live
+0e                           gsn 14
+03                           three trees
+01  01  01 00 25  06 00  01  tree 1 (customers): root at segment 1, offset 0, 37 bytes; count 3, no aggregates; min_seg 1
+02  01  01 25 88 08  16 00  01
+                             tree 2 (the metadata tree): root at offset 37, 1032 bytes; 11 entries
+03  00                       tree 3 (c): empty
+01  01 ad 08 ad 08           one segment: id 1, 1069 bytes written, 1069 live
 01                           active segment 1
-00                           active length 0
-01                           next tree id 1
-da 03  7b 22 63 61 ...       app: 474 bytes of JSON {"catalog":{"objects":{},"next_id":1000,...
+ad 08                        active length 1069
+04                           next tree id 4
+03  02 02 04                 app: format 2, metadata tree 2, next request 4
+03                           tree space of three trees:
+00  01  01 25                  tree 1: 0; 37 bytes live in segment 1
+00  01  01 88 08               tree 2: 0; 1032 bytes live in segment 1
+00  00                         tree 3: 0; no live bytes
 ```
 
-(Almost half of the 474 bytes are the eleven clock ticks in `ticks`.)
+A checkpoint after changes to some rows of one tree has the same size; the
+record grows only with the number of trees and segments (and of the
+segments each tree has nodes in).
 
 ### Reading and updating
 
@@ -460,27 +687,167 @@ da 03  7b 22 63 61 ...       app: 474 bytes of JSON {"catalog":{"objects":{},"ne
 - **Rewrite**: if the append would grow the file beyond 8 MiB
   (8,388,608 bytes), the new frame is written alone to `MANIFEST.new`, which
   is `fsync`ed and renamed over `MANIFEST`; then the directory is `fsync`ed.
-  Readers either see the old file or the new one.
+  Readers either see the old file or the new one. (With records of tens of
+  bytes per tree this takes many thousands of checkpoints; format 1's
+  records carried the whole engine state and could reach it every few.)
 
 ### Checkpoint procedure
 
+0. The engine writes the metadata changed since the previous checkpoint into
+   the [metadata tree](#the-metadata-tree) (`Engine::persist_meta`), then
+   runs a maintenance pass, which marks the nodes it rewrites dirty (see
+   [Garbage collection](#garbage-collection)).
 1. Every tree with a dirty root is written depth-first, children before their
-   parent, so that each internal node records the final locations of its
-   children; each written frame adds its length to its segment's
-   `total_bytes` and `live_bytes`.
+   parent, so that each internal node records the final locations (and
+   `min_seg`) of its children; each written frame adds its length
+   to its segment's `total_bytes` and `live_bytes`, and to its tree's live
+   bytes in that segment. (Nodes the buffer pool wrote earlier, and did not
+   modify since, are clean: their frames are referred to as they are, and
+   are counted in the segment table like any other.)
 2. The active segment and any segments sealed since the last checkpoint are
-   `fsync`ed.
+   `fsync`ed. The record's `active_seg` and `active_len` are what this
+   sync covered; each segment's `total_bytes` is its length (also counting
+   frames others appended while the checkpoint was being written, garbage
+   in it), and frames appended after the sync lie beyond `active_len` or in
+   segments the record does not list.
 3. The checkpoint record is appended to the manifest.
-4. Sealed segments whose `live_bytes` is 0 are deleted.
+4. Sealed segments whose `live_bytes` is 0 are deleted — once the running
+   engine has taken the checkpoint as written, and only those that hold no
+   live node for it either (it may have written to them, or adopted a fork's
+   tree with nodes in them, since the checkpoint was begun) and that no
+   fork still writing to them pins. One that a fork of the engine may still
+   read (a hydration or a large read that began before it died) is deleted
+   when that fork ends instead; later records no longer list it.
 
 Creating a segment file (the first one, and each new active segment) is
 followed by an `fsync` of the store directory, so that a checkpoint never
 refers to a file whose directory entry a crash could lose.
 
-## Checkpoint application state (AppState)
+## The metadata tree
 
-The record's `app` field is a JSON object (`coord::AppState`, serialized
-with `serde_json`):
+Code: `crates/ivm/src/coord/meta.rs`.
+
+The catalog, its DDL history and the engine's state live in one storage
+tree, the *metadata tree*, named by the [checkpoint header](#checkpoint-record).
+It is stored like an arrangement's tree (the same nodes; its summaries hold
+the count only), and each record is one entry: a byte string whose first
+byte is the record's tag, with a weight. A record kept by key — every
+record but the error records — has weight 1; changing it retracts the old
+entry (weight −1, which removes it) and adds the new one (+1), as an
+arrangement's rows change. An error record's weight is its count.
+
+| Tag | Record | Entry after the tag | Weight |
+|---|---|---|---|
+| 1 | catalog object | `u64 BE id`, then the [`CatalogObject`](#catalog-objects) as JSON (to the end of the entry) | 1 |
+| 2 | catalog scalar | `u8 field`, then its value: field 1, the next object id (`uvarint`); field 2, the instance id (`str`; no record while there is none) | 1 |
+| 3 | DDL history | `u64 BE gsn`, then the statement (UTF-8, to the end of the entry) | 1 |
+| 4 | source state | `u64 BE source`, then its `SourceState` JSON (to the end of the entry), as in [`Progress` records](#logrecord), written without its tables' entries (tag 12 holds them; one written by earlier versions with them is read with them) | 1 |
+| 5 | source resume LSN | `u64 BE source`, `uvarint lsn` | 1 |
+| 6 | arrangement, with the start of its history (read only) | `bytes fingerprint`, `uvarint tree`, `uvarint since` | 1 |
+| 7 | node error record | `bytes node fingerprint`, `str sqlstate`, `str message` | its count |
+| 8 | group error | `bytes node fingerprint`, `bytes group key`, `str sqlstate`, `str message` | 1 |
+| 9 | the last clock tick | `u64 BE gsn`, `ivarint clock` | 1 |
+| 10 | pending slot drop | `str conninfo`, `str slot` | 1 |
+| 11 | groups in error known | `bytes node fingerprint` | 1 |
+| 12 | source table state | `u64 BE source`, `u64 BE table`, then the table's `SnapState` JSON (to the end of the entry): its entry in the source's `SourceState` | 1 |
+| 13 | arrangement | `bytes fingerprint`, `uvarint tree` | 1 |
+
+The *key* of a record kept by key is its entry up to its value: tag and
+id for tags 1, 3, 4, 5 and 9, tag and field for 2, tag and fingerprint for
+6 and 13, tag, source and table for 12, the whole entry for 10. Fixed-width big-endian ids and length-prefixed
+fields make keys prefix-free, so the entries of one key are found by a
+prefix scan.
+
+| Record | Contents |
+|---|---|
+| catalog objects | every object of the catalog, by id |
+| DDL history | `ivm.catalog_history`: the successfully applied DDL statements, by GSN, the most recent 10,000; when a statement makes the history longer than 11,000, the oldest are retracted down to 10,000. Trimming happens when a statement is applied, so replay trims identically |
+| catalog scalars | the next object id; the instance id: 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted |
+| source states, resume LSNs | per source: its `SourceState` (its tables' entries one record each, so that progress logged for one table changes one record); the end LSN of its last logged commit, from which it resumes streaming |
+| arrangements | every hydrated arrangement (also private state arrangements, such as a temporal filter's events): its [structural fingerprint](#structural-fingerprints) and its tree (tag 13). Versions that kept histories wrote tag 6, with the GSN from which the arrangement's history was complete; it is read as tag 13 is (the GSN is ignored), and the first write after recovery replaces every tag-6 record by a tag-13 one |
+| node error records | the error records in the contents of every arranged node, by node fingerprint, so that views created later over the node start with them (an arrangement holds rows only); a materialized view's error records are those of its root node |
+| group errors | for every `Reduce`, `Recursive` and `Window` node, the groups (a window's partitions) in error with their error record, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (of a window's partition columns; empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers |
+| groups in error known | the `Window` nodes whose group errors are complete (computed by a snapshot, or restored), also when none is in error. A window operator changes a partition in part only when it knows that the partition is not in error; one recovered without this record (from an earlier version, or format 1) computes its partitions in error at the end of the hydration after recovery, reading its input once |
+| the last clock tick | `(gsn, clock)` of the last clock tick applied (none before the first): `clock` is microseconds since the PostgreSQL epoch, and the logical clock (0 without ticks). Versions that kept histories kept the ticks of their retention window, for `now()` in reads as of earlier GSNs; the logical clock is the last of them, and the first write after recovery retracts the others |
+| pending slot drops | replication slots of dropped sources not dropped upstream yet, retried after the start |
+
+**Writing** (`Engine::persist_meta`): after every applied DDL or `Schema`
+record, and at every checkpoint, before its nodes are written. Each time
+only what changed since the previous time is written, and only what may
+have changed is looked at: the catalog objects inserted, replaced or
+removed (the stored entries of each are retracted, whatever their bytes);
+history entries after the last ones written, and those trimmed (retracted
+by a range scan); the last tick, replacing the record of the one before;
+the arrangements created, hydrated or freed since
+(`Graph::take_arrangement_changes`) and the source states' heads and table
+entries changed since (`Engine::source_changed`), whose entries are
+replaced where they differ from the ones the tree holds — all of them at
+the first write into a new tree or after recovery; the other records kept
+by key whose entry differs; and the changes to the error state
+(`Graph::take_error_changes`, which visits only the nodes whose
+arrangements changed or that keep groups in error and ran: a node's error
+records are added when it is first seen with an arrangement and retracted
+when it loses its last one or leaves the graph; an operator's group errors
+when it is first seen and when it leaves, its record of being known when
+it becomes known and when it leaves).
+
+**Reading** (recovery, `meta::load`): every entry.
+An entry with an unknown tag or trailing bytes, a record kept by key whose
+weight is not 1 or whose key appears twice, a catalog object whose key is
+not its `id`, and a tree without the next object id are refused
+(`bad metadata entry (...)` with the entry's bytes, SQLSTATE `XX001`).
+
+Entries of the data directory of the [example record](#checkpoint-record),
+decoded:
+
+```
+01 00 00 00 00 00 00 03 e8  7b 22 69 64 22 3a 31 30 30 30 ...
+                                   catalog object 1000: {"id":1000,"name":"customers","kind":{"Table":...
+02 01  ea 07                       next object id 1002 (the entry 02 01 e9 07, 1001, was
+                                   retracted when the view took id 1001: it is gone)
+03 00 00 00 00 00 00 00 04  43 52 45 41 54 45 ...
+                                   history: GSN 4, CREATE TABLE customers (id INT PRIMARY KEY, region TEXT)
+07 10 c3 bf 44 d5 ... 2d ef 75  05 32 32 50 30 32  2a 69 6e 76 61 6c 69 64 ...
+                                   node c3bf44d5...2def75: 22P02, invalid input syntax for type integer: "x"; weight 1
+09 00 00 00 00 00 00 00 0e  ee aa ab e3 9a f4 80 03
+                                   the last tick, at GSN 14: 846421388782263 (2026-10-27 13:03:08.782263 UTC)
+0d 10 b7 47 23 59 ... 1f 56  01
+                                   arrangement b7472359...ae511f56 (customers' primary index): tree 1
+```
+
+### Catalog objects
+
+`CatalogObject`: `id`, `name`, `kind`, `created_gsn`, `create_sql` (the
+logged statement; for replicated tables the text
+`-- table <schema>.<table> replicated by source <id>`). `kind` is one of:
+
+| Variant | Fields |
+|---|---|
+| `Table` | `columns: [Column]`, `pk: [column index]` (the key in key order: for a replicated table the replica identity index's columns, else the primary key's; empty: multiset), `source: id or null`, `upstream: [schema, table] or null`, `version: u32` (incremented by upstream schema changes) |
+| `MaterializedView`, `View` | `sql` (the query text), `columns: [Column]` |
+| `Index` | `on: id`, `columns: [column index]` |
+| `Source` | `conninfo`, `publication`, `slot`, `tables: [name] or null` |
+| `Sink` | `from: id`, `conninfo`, `table`, `key: [name] or null` |
+
+`Column` is `{"name": str, "ty": {"ty": SqlType, "typmod": i32, "nullable": bool}}`.
+`SqlType` is serialized by variant name: `"Bool"`, `"Int2"`, `"Int4"`,
+`"Int8"`, `"Float4"`, `"Float8"`, `"Numeric"`, `"Text"`, `"Varchar"`,
+`"Bpchar"`, `"Name"`, `"Bytea"`, `"Date"`, `"Time"`, `"Timestamp"`,
+`"TimestampTz"`, `"Interval"`, `"Uuid"`, `"Json"`, `"Jsonb"`, `"JsonPath"`,
+`"Oid"`, `"Unknown"`, and `{"Array": SqlType}`. Type modifiers follow
+PostgreSQL (`numeric(p,s)`: `((p << 16) | s) + 4`; `varchar(n)`, `char(n)`:
+`n + 4`; `time(p)`, `timestamp(p)`, `timestamptz(p)`: `p`; `interval`:
+`(field range << 16) | precision`, with range `0x7FFF` for all fields and
+precision `0xFFFF` for none; `-1`: none). An array column carries its
+element type's modifier.
+
+## Format 1 application state (AppState)
+
+Data directories of format 1 (written before `FORMAT` existed) carry the
+whole engine state in every checkpoint record's `app` field, as a JSON
+object (`coord::meta::AppState`, `serde_json`). The current code reads it
+to migrate the directory ([Compatibility](#compatibility)); it never writes
+it.
 
 ```json
 {
@@ -518,45 +885,22 @@ with `serde_json`):
 |---|---|
 | `catalog.objects` | map from object id (as a JSON string key) to `CatalogObject` |
 | `catalog.next_id` | next object id |
-| `catalog.history` | `[gsn, statement]` of the successfully applied DDL statements (`ivm.catalog_history`), oldest first: the most recent 10,000; when a statement makes it longer than 11,000, the oldest entries are dropped down to 10,000. Trimming happens when a statement is applied, so replay trims identically |
+| `catalog.history` | `[gsn, statement]` of the DDL history, oldest first (as in the metadata tree) |
 | `catalog.instance_id` | 8 hexadecimal digits, the data directory's random id in default slot names, chosen when the first `CREATE SOURCE` is submitted; `null` before that (and if absent) |
 | `trees` | `[fingerprint, tree id]` for every hydrated arrangement; the fingerprint is 16 bytes as a JSON array of numbers ([Structural fingerprints](#structural-fingerprints)) |
 | `view_errors` | per materialized view with a dataflow: its error records `[[sqlstate, message], count]` |
-| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records) |
+| `source_states` | per source: its `SourceState` JSON as a string (as in `Progress` records), after the `Progress` records up to the checkpoint |
 | `source_lsns` | per source: the end LSN of its last logged commit (resume point); `[]` if absent |
 | `next_req` | request counter |
 | `clock` | logical clock, microseconds since the PostgreSQL epoch; `0` if absent |
 | `errors` | error state of the dataflow, by node fingerprint. `nodes`: for every node that has an arrangement and error records, the error records in its contents (`[[sqlstate, message], count]`), so that views created later over the node start with them (an arrangement holds rows only). `operators`: for every `Reduce` and `Recursive` node with groups in error, `[group key, [sqlstate, message]]`, the group key being the canonical [key encoding](#order-preserving-key-encoding) of the group's key values (empty for an aggregate without `GROUP BY` and for a recursive query), so that the error is retracted when the group recovers. Restored by fingerprint before hydration; `{"nodes": [], "operators": []}` if absent (`operators` may also be absent alone) |
-| `arr_since` | `[fingerprint, gsn]` for every hydrated arrangement: the GSN from which its history is complete (when it was hydrated, or created with its table). `AS OF` reads of earlier GSNs do not use the arrangement. `[]` if absent: recovered arrangements then count as complete from GSN 0 |
-| `ticks` | `[gsn, clock]` of recent clock ticks, for `now()` in reads as of earlier GSNs: the last tick at or before the retention frontier and every later one, at most the last 100,000; `[]` if absent (recovery then starts from `[[checkpoint gsn, clock]]`) |
+| `arr_since` | `[fingerprint, gsn]` for every hydrated arrangement: the GSN from which its history was complete, for `AS OF` reads. Ignored: there are no histories |
+| `ticks` | `[gsn, clock]` of recent clock ticks, for `now()` in reads as of earlier GSNs (the ticks of the retention window, at most the last 100,000). Only the last one's GSN is used: as the GSN of the tick that set `clock`, which the migration writes to the metadata tree; `[]` if absent (the checkpoint's GSN then, if `clock` is not 0) |
 | `slot_drops` | replication slots of dropped sources not dropped upstream yet (`conninfo`, `slot`), retried after the start; `[]` if absent |
 
-`CatalogObject`: `id`, `name`, `kind`, `created_gsn`, `create_sql` (the
-logged statement; for replicated tables the text
-`-- table <schema>.<table> replicated by source <id>`). `kind` is one of:
-
-| Variant | Fields |
-|---|---|
-| `Table` | `columns: [Column]`, `pk: [column index]` (the key in key order: for a replicated table the replica identity index's columns, else the primary key's; empty: multiset), `source: id or null`, `upstream: [schema, table] or null`, `version: u32` (incremented by upstream schema changes) |
-| `MaterializedView`, `View` | `sql` (the query text), `columns: [Column]` |
-| `Index` | `on: id`, `columns: [column index]` |
-| `Source` | `conninfo`, `publication`, `slot`, `tables: [name] or null` |
-| `Sink` | `from: id`, `conninfo`, `table`, `key: [name] or null` |
-
-`Column` is `{"name": str, "ty": {"ty": SqlType, "typmod": i32, "nullable": bool}}`.
-`SqlType` is serialized by variant name: `"Bool"`, `"Int2"`, `"Int4"`,
-`"Int8"`, `"Float4"`, `"Float8"`, `"Numeric"`, `"Text"`, `"Varchar"`,
-`"Bpchar"`, `"Name"`, `"Bytea"`, `"Date"`, `"Time"`, `"Timestamp"`,
-`"TimestampTz"`, `"Interval"`, `"Uuid"`, `"Json"`, `"Jsonb"`, `"JsonPath"`,
-`"Oid"`, `"Unknown"`, and `{"Array": SqlType}`. Type modifiers follow
-PostgreSQL (`numeric(p,s)`: `((p << 16) | s) + 4`; `varchar(n)`, `char(n)`:
-`n + 4`; `time(p)`, `timestamp(p)`, `timestamptz(p)`: `p`; `interval`:
-`(field range << 16) | precision`, with range `0x7FFF` for all fields and
-precision `0xFFFF` for none; `-1`: none). An array column carries its
-element type's modifier.
-
-The application state is the only place where the catalog is stored besides
-the log; dataflow plans are re-derived from it on every start.
+`view_errors` duplicates the error records of each view's root node in
+`errors.nodes`; recovery gives a root node without records of its own
+(checkpoints from before `errors` existed) its view's.
 
 ## Data encodings
 
@@ -669,7 +1013,8 @@ They are kept in a *fidelity suffix* written after **all** key columns of an
 entry, so that key prefixes still group equal values together. For each key
 column in order whose value is not NULL and whose type has fidelity
 (`numeric`, `real`, `double precision`, `interval`, `jsonb`, and arrays of
-those):
+those: the types whose equal values can differ in representation,
+`SqlType::equality` in `crates/ivm/src/types/mod.rs`):
 
 | Type | Fidelity bytes |
 |---|---|
@@ -762,7 +1107,7 @@ The payload columns are all row columns that are not a plain `Column` key
 expression, in column order (without a count prefix). Decoding reads the key
 values, applies the fidelity suffix, decodes the payload, and copies plain
 key columns into the row; trailing bytes are an error. The tree value of an
-entry is its history.
+entry is its weight (the row's multiplicity).
 
 Examples (decoded from a running engine):
 
@@ -789,16 +1134,17 @@ Arrangements used by the engine:
 
 ### Catalog serialisation
 
-The catalog is serialised only as part of the [application state](#checkpoint-application-state-appstate)
-(JSON); DDL statements are additionally logged as text in `Ddl` records.
+The catalog is stored in the [metadata tree](#the-metadata-tree): each object
+as JSON, the history as statement text by GSN; DDL statements are
+additionally logged as text in `Ddl` records.
 
 ## Structural fingerprints
 
 Code: `crates/ivm/src/dataflow/mod.rs` (`hash128`, `node_fp`,
 `add_arrangement`), the operators' `fingerprint` methods, `Mfp::fingerprint`,
 `Expr::fingerprint`. Checkpoints identify arrangement trees by fingerprint
-(`AppState.trees`); recovery finds them again by re-planning the catalog and
-computing the same fingerprints.
+(the metadata tree's arrangement records); recovery finds them again by
+re-planning the catalog and computing the same fingerprints.
 
 **Hash**: 128-bit FNV-1a — state initialised to
 `0x6c62272e07bb014262b821756295c58d`; for each byte, `state ^= byte;
@@ -823,14 +1169,14 @@ operator name (ASCII: Table, Constant, Mfp, Union, Negate, FlatMap, DeltaJoin,
 | `Union` | one byte per input: 1 if negated |
 | `Negate` | — |
 | `FlatMap` | per function: `Debug` text `"<TableFunc>/<arity>"`, its argument expressions, `0xFD`; then the ordinality flag byte |
-| `DeltaJoin` | per input: node fingerprint, MFP fingerprint, then for a presence input its arrangement fingerprint followed by `0xE0` if it matches exactly (by representation), otherwise `0x00`; per delta path: `0xA0`, source input `u32 LE`, source filter expressions; per step: `0xA1`, input `u32 LE`, arrangement fingerprint, key expressions, null-safe flag bytes, filter expressions, and `0xE1` if the lookup matches keys exactly |
+| `DeltaJoin` | (the node's inputs are the join inputs' nodes followed by the error trackers' `Mfp` nodes, see [Dataflow](internals/dataflow.md#deltajoin)) per input: node fingerprint, MFP fingerprint, then for a presence input its arrangement fingerprint followed by `0xE0` if it matches exactly (by representation), otherwise `0x00`; per delta path: `0xA0`, source input `u32 LE`, source filter expressions; per step: `0xA1`, input `u32 LE`, arrangement fingerprint, key expressions, null-safe flag bytes, filter expressions, and `0xE1` if the lookup matches keys exactly |
 | `Reduce` | `Debug` of the group-key column list; per aggregate `Debug` of (function, argument, second argument, filter, argument type, fraction) concatenated; input arrangement fingerprint |
 | `Distinct` | arrangement fingerprint |
 | `SetOp` | `Debug` text `"<op><all>"` (e.g. `Exceptfalse`), left and right arrangement fingerprints |
 | `TopK` | `Debug` text of group key, limit, offset and with-ties concatenated; input arrangement fingerprint |
-| `Window` | `Debug` of partition and order; input arrangement fingerprint; per function `Debug` of function, arguments, frame, range offsets |
+| `Window` | `Debug` of partition and order; input arrangement fingerprint; per function `Debug` of function, arguments, frame, range offsets, followed by `0xF8 0x01` if the function is maintained otherwise than before (`WinSpec::revised`, see [Compatibility](#compatibility)): `ntile` whose argument is not a constant, `lag` or `lead` whose offset is not a constant of at least 0 |
 | `Recursive` | `Debug` text of the base and step plans (`Rel`), distinct flag byte, per source object: id `u64 LE` + node fingerprint |
-| `TemporalFilter` | per predicate: clock expression, operator byte (`<` 0, `<=` 1, `>` 2, `>=` 3), row expression |
+| `TemporalFilter` | per predicate: clock expression, operator byte (`<` 0, `<=` 1, `>` 2, `>=` 3), row expression, then `0xD0` if the clock expression adds an interval with months to a date or timestamp (added when such predicates became exact: the event indexes of earlier versions, which could end a row's validity at another change of the predicate, are not matched and are rebuilt) |
 
 **Expression fingerprint** (pre-order; each node writes a tag byte and a
 `u32 LE` value, plus extras, then its children's fingerprints):
@@ -878,63 +1224,232 @@ and arrangement fingerprint
 (recomputed independently from the description above and matching the
 checkpoint of a running engine).
 
-## Garbage collection and retention
+## Garbage collection
 
 - **Segment liveness**: the manifest's segment table records, per segment,
-  the bytes written and the bytes still referenced by some tree. A node frame
-  stops being live when its node is modified (dirty), dropped, or released
-  with its tree.
+  the bytes written and the bytes still referenced by some tree, and its tree
+  space section the same live bytes per tree. A node frame stops being live
+  when its node is modified (dirty), dropped, or released with its tree.
 - **Deletion**: after each checkpoint, sealed segments with zero live bytes
-  are deleted. The active segment is never deleted or collected.
-- **Relocation** (`Env::gc`, after each checkpoint, budget 1000 nodes): the
-  oldest sealed segment with `live_bytes × 2 < total_bytes` is the victim;
-  nodes stored in it (or in older segments) are marked dirty, found through
-  the per-subtree `min_seg` values, and rewritten by the next checkpoint.
+  in it are deleted, unless the running engine still holds live nodes in
+  them or a fork pins them, or once the forks that may read them end (see
+  [Checkpoint procedure](#checkpoint-procedure)); at the latest on the next
+  open.
+  The active segment is never deleted or collected.
+- **Removed entries**: an entry whose weight a change makes 0 is removed
+  from its leaf at once, a leaf left without entries from its parent, and a
+  node an update leaves smaller than a quarter of its target size (16 KiB)
+  is merged with a neighbour when both fit in three quarters of it. Leaves
+  of kind 1, written by versions that kept histories, keep their retracted
+  entries on disk until they are rewritten (they are dropped when the leaf
+  is read).
+- **Maintenance pass** (`Env::maintain`, before each checkpoint, which then
+  writes what it rewrote): it relocates the live nodes of the evacuated
+  segments (chosen below): it marks them dirty, found through the
+  per-subtree `min_seg` values, the per-tree live bytes and the parents'
+  locations of leaves (which it does not read unless they are rewritten),
+  and merges a relocated node smaller than a quarter of its target size
+  with a neighbour when both fit in three quarters of it. Reading and
+  rewriting clean nodes is budgeted: 8 MiB plus the bytes the checkpoints
+  since the previous pass wrote for the engine's own updates, and in
+  memory, what the buffer pool has room for besides its dirty nodes.
+- **Evacuated segments**: sealed segments with `live_bytes × 2 <
+  total_bytes`, in decreasing order of `(1 − u) × age / (1 + u)` (`u` =
+  live / total, `age` = active segment id − segment id), while their live
+  bytes fit in the relocation budget (the first always does).
+- **Dropping a tree** reads nothing: its loaded nodes are freed and its live
+  bytes per segment subtracted from the segment table.
 - **Unreferenced trees**: trees present in the checkpoint but not attached by
   any arrangement after recovery (arrangements that no longer exist, whose
   fingerprint changed, or of views and indexes that could not be built and
   are kept as broken) are dropped during start-up, after hydration.
-- **Retention**: history elements at or before the retention frontier
-  (`processed GSN − --retention-gsns`) are merged when a leaf is next
-  modified; input-log segments whose records all lie at or before
-  `checkpoint GSN − retention` are deleted after the checkpoint.
+- **Temporary trees** (sorted runs, spilled deltas) take tree ids counting
+  down from 2^64 − 1 (never below 2^63), outside the range of
+  `next_tree_id`, and are dropped by the operation that creates them. A
+  checkpoint taken while one exists does not record it: its nodes, also
+  those written early, are garbage in that checkpoint.
+- **Input log**: segments whose records all lie at or before the
+  checkpoint's GSN are deleted after the checkpoint.
 
 ## Compatibility
 
-The engine writes no format version. It notices incompatible data only
-through these checks:
+### Format versions
+
+A data directory records the format it is written in, in
+[`FORMAT`](#the-format-file). Format 1 is everything written before the
+version was recorded (no `FORMAT` file): the catalog and the engine state
+as JSON in every checkpoint record. Format 2 keeps them in the
+[metadata tree](#the-metadata-tree), with a header in the checkpoint record.
+
+- **The version changes when existing data would not be read as it is**:
+  something already written changes its meaning or layout (an existing tag
+  or field reinterpreted, a structure replaced by another). Such a change
+  raises `coord::meta::FORMAT_VERSION`, keeps reading the previous format,
+  and migrates a directory of that format at its first start, as format 1
+  is migrated (below).
+- **Additive changes keep the version**: a new log record tag, change kind,
+  datum tag, node kind, summary state tag or metadata record tag, a new
+  JSON field with a default, data that existing code never reads. Code with
+  the change reads everything written before it unchanged, because no
+  existing tag or field changes its meaning. Data written after it may
+  contain the new encodings, which code without the change does not know:
+  it stops with a decoding error when it meets one (`bad log record tag`,
+  `bad metadata entry (tag)`, `bad agg state tag`, ...), never misreading
+  it — except that in the newest log segment a record it cannot decode is
+  taken for a torn write and truncated with everything after it (see
+  [Opening, replay and truncation](#opening-replay-and-truncation)). So an
+  engine of a format version reads every directory of that version and of
+  every earlier one, but running an older engine on a directory a newer one
+  has written is not supported, within a format version as across.
+- A directory of a newer format than the engine reads is refused before
+  anything in it is opened.
+
+Dropping the entries' histories kept format 2: leaves are written as kind 4
+(weights) instead of kind 1 (histories), internal nodes as kind 2 instead of
+kind 3 (its layout without the compaction state), arrangement records as
+tag 13 instead of tag 6 (without the start of their history), the tree
+space section's compaction state as 0, and one tick record instead of the
+ticks of a retention window. Each is additive: a new node kind and a new
+record tag; kind 2, tag 9 and the tree space's field written with their
+existing meaning (a constant for a field that no longer has a use); and
+everything written before reads as it is, the histories added up to the
+weights they stood for (nothing is reinterpreted, nothing needs migrating).
+What is lost is what the histories were for: reads as of earlier GSNs,
+which the engine no longer offers.
+
+### Migrating format 1
+
+A data directory without `FORMAT` whose `log/` or `store/` holds a file is
+of format 1. The engine starts it as usual — it recovers the last
+checkpoint from its JSON state, rebuilds the dataflow and replays the log
+after the checkpoint — then takes a checkpoint, which writes every record of
+a new metadata tree, and then writes `FORMAT`. Until that checkpoint's
+manifest append commits it, the format-1 record is the last valid one, so a
+crash before it migrates again at the next start (the nodes it wrote are
+beyond the recorded length of the active segment, and truncated); after it,
+the next start finds a record of the current format — the application
+state tells the formats apart: JSON starts with `{` (0x7B), the header with
+its format number — and only writes `FORMAT`. The migration keeps
+everything format 1 kept but the entries' histories: the catalog and its
+history, the trees (each entry's history read as its weight), the error
+records of nodes and the groups in error, source states and resume LSNs,
+the request counter, the clock (its last tick) and the pending slot drops
+(a view's error records, which format 1 also kept with the view, are its
+root node's).
+
+### Checks
+
+The engine notices incompatible data through these checks:
 
 | Check | Error | Effect |
 |---|---|---|
+| `FORMAT` | `the data directory has format <n>, which this version of ivm cannot read ...`, `... does not hold a format version` | refused at start-up before anything is opened |
 | frame CRC and length (log, segments, manifest) | `node checksum mismatch`, `input log segment ... is corrupt at byte <n>`, torn-tail truncation | log: in the newest segment, a bad frame and everything after it are truncated at start-up as a torn write; anywhere else, and for a gap in the GSNs after the checkpoint (`input log is missing records ...`), start-up fails; segments: fatal on access; manifest: a torn tail after the last valid record is dropped, and a manifest with contents but no valid record (or a missing one while segment files hold data) stops the start, modifying nothing |
-| record decoding | `bad log record tag`, `bad change tag`, `bad datum tag`, `bad agg state tag`, ... | fatal; except that in the newest log segment a frame that does not decode counts as a torn write and is truncated with everything after it |
-| `AppState` JSON decoding | `cannot decode checkpoint state: ...` | fatal at start-up |
+| record decoding | `bad log record tag`, `bad change tag`, `bad datum tag`, `bad agg state tag`, ... | fatal (in the log: also in the newest segment, where a frame with a valid CRC that does not decode stops replay instead of being truncated) |
+| checkpoint header and metadata tree | `the data directory has format <n> ...` (header), `bad metadata entry (...)`, `the metadata tree has no next object id` | fatal at start-up |
+| format 1 `AppState` JSON decoding | `cannot decode checkpoint state: ...` | fatal at start-up |
 | every table's primary index found by fingerprint | `the checkpoint has no index for table <id> (version <v>); refusing to start without its rows` | fatal at start-up |
 
 Consequences of code changes for an existing data directory:
 
 | Change | Consequence |
 |---|---|
-| frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag truncates the newest log segment at the first such record (see above), losing it and everything after it |
-| `AppState`, `Catalog`, `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType` serde layout (renamed or removed fields or variants, new fields without `#[serde(default)]`) | `cannot decode checkpoint state`; incompatible. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since`, `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate` in `SourceState` were added with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#checkpoint-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array.) |
+| frame layouts, `LogRecord` tags or field order, row codec tags, compact numeric encoding | decoding errors, or silently wrong values; incompatible. Code that does not know a record tag fails to replay a log holding it (versions before `CommitParts` truncated the newest log segment at the first such record, losing it and everything after it: a log with `CommitParts` records, tag 6, `ProgressDelta` records, tag 7, or `UpsertIfPresent` changes, kind 6, cannot be opened by them) |
+| `CatalogObject`, `ObjectKind`, `TableDef`, `ViewDef`, `Column`, `ColumnType`, `SqlType`, `SourceState` serde layout (stored as JSON in the metadata tree and in format 1's `AppState`, `SourceState` also in `Progress` records: renamed or removed fields or variants, new fields without `#[serde(default)]`) | `bad metadata entry (catalog object ...)`, or `cannot decode checkpoint state` for format 1; incompatible: a new format version with a migration. A new field with a default is additive |
+| metadata record layouts (tags 1–13), the checkpoint header | incompatible: a new format version with a migration. New record tags are additive (unknown to older code: `bad metadata entry (tag)`): tags 11, 12 and 13 were added within format 2 (a directory without tag 11 recomputes its window operators' partitions in error once, at the first start; one written without tag 12 keeps its source states' tables in tag 4, which the first write splits out; one written with tag 6 instead of 13 has its arrangement records replaced at the first write) |
+| format 1 `AppState` serde layout | read only to migrate: must keep decoding what format 1 wrote. (`source_lsns`, `clock`, `errors` and its `operators`, `arr_since` (now ignored), `ticks`, `slot_drops`, `catalog.instance_id`, and `truncate`, `index_order`, `scanned` and `reread` in `SourceState` were added to format 1 with `#[serde(default)]`; the defaults and what they imply are given in the [AppState](#format-1-application-state-appstate) table. The object form of the `CREATE SOURCE` record's `extra` is read next to the older plain array) |
 | key encoding of any type, numeric or jsonb key encodings, fidelity suffix, entry layout | **not detected**: existing entries decode wrongly or sort in the wrong place (lookups miss rows); incompatible |
-| summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them |
+| summary state encodings | as for the row codec. `SumNumeric` states may hold sums beyond numeric's range in the unchanged encoding; code that decodes summary states with numeric's range check fails on them. Tags 8–10 (float sums as normalized dyadic rationals, `min`/`max` prefixes) are written instead of format 1's tag 5 and wide values under tags 6 and 7, which are still read (as described [above](#summary)) |
+| node kinds (leaf kind 4, internal node kind 2), the checkpoint record's tree space section | leaves of kind 1 (histories) and internal nodes of kind 3 (compaction states) are read ([Leaf node](#leaf-node), [Internal node](#internal-node)), and so are records without the section ([Checkpoint record](#checkpoint-record)): the first start reads every tree's internal nodes once to count its live bytes. Code that does not know kind 4 stops with `bad node kind` |
 | inputs of a **table's** primary-index fingerprint: the operator name `Table`, the object id/version/key-column text, the column expression fingerprint (tag 1), the sort bytes, the `0xFE` separator, the hash function | the engine refuses to start (missing table index) |
-| inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again, and the rebuilt arrangements' history (`arr_since`) starts at the checkpoint the engine restarted from: `AS OF` reads that need them at earlier GSNs fail |
-| semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views |
+| inputs of other fingerprints: operator names and parameter encodings, expression tags, function ids (**the order of function registration** in `expr/ops.rs` and `expr/builtins.rs`: adding, removing or reordering a function renumbers the following ones), `Debug` formatting of plan types (`AggKind`, `AggFunc`, `SqlType`, `SortKey`, `WindowFunc`, `Frame`, `RangeOffsets`, `Rel`, `TableFunc`, `SetOpKind`, `FuncId`) | the affected arrangements of views and indexes are not matched; they are rebuilt by hydration at start-up and the old trees dropped. Correct, but start-up takes as long as creating the views again |
+| semantics of SQL functions, operators or aggregates | not detected: maintained results keep values computed with the old code until the rows change; drop and re-create affected views (window functions: below) |
+| what a window function computes, or which rows a change recomputes, for some of its uses | the Window operator computes a partition's values before a change from its input, not from its stored output: an output stored by the old code that differs from what the new code computes would make a change retract rows the operator never emitted (negative multiplicities in the arrangements downstream). Such a change marks the affected uses in the operator's fingerprint (`WinSpec::revised`, the suffix of [`Window`](#structural-fingerprints)), so their operators are not matched and are rebuilt by hydration at the first start, with what is downstream of them, as for any fingerprint change; other uses keep their fingerprints. Marked so far (suffix `0xF8 0x01`): `ntile` whose argument is not a constant (it is read at the partition's first row where it is not NULL, where earlier versions read every row's), `lag` and `lead` whose offset is not a constant of at least 0 (earlier versions did not recompute the rows that a negative offset, or one differing between rows, reads a change from, so their output can be wrong). `crates/ivm/tests/data/window-revision`, written before, is rebuilt so by the restart tests |
 | planner or lowering changes that produce different plans for the same SQL | as for fingerprint changes: the views are rebuilt |
 | catalog SQL that no longer binds (removed syntax or functions, stricter checks) | the view (and what reads it) is marked broken at start-up: not maintained, reads of it fail with the reason; drop it or repair it with `CREATE OR REPLACE` ([Operations](user-guide/operations.md#recovery)). Stored view definitions are planned leniently: a parameter placeholder (`$1`) in a definition logged by an older version binds as NULL instead of failing |
 | stricter rules for [maintained views](sql/maintained-views.md#what-is-rejected) (a function that is no longer immutable, such as `pg_backend_pid()`; reads of the catalog) | not checked at start-up: a materialized view that uses such a construct is built and maintained as before. Re-planning it applies the rules: after an upstream schema change of a table it reads it is dropped as no longer valid, and a `CREATE OR REPLACE` of a view it reads is refused. Replace it with a definition that passes the rules |
 
-Data directories written by earlier versions of the engine are compatible:
-the formats have only gained fields with defaults. New functions (registered
-among the existing ones, which renumbers the later ones) and planner fixes
-did change the fingerprints of many views' arrangements (for example joins
-on computed keys, whose keys are materialized in an `Mfp` node, semijoins
-whose presence inputs match exactly, and the summaries of `var*`/`stddev*`
-over `bigint`), so such a data directory keeps its tables and rebuilds those
-arrangements once at its first start.
+Data directories written by earlier versions of the engine are compatible.
+A format-1 directory is migrated to format 2 at its first start (above).
+Within format 2, every additive change since the version was introduced is
+read as it was written, and what changed is rewritten once, as follows.
 
-An upgrade that changes any of the "incompatible" rows requires starting
+- **Read, no longer written.** Earlier encodings are decoded and written
+  anew in the current ones when their data is next written:
+  - leaves of kind 1 (each entry's history, read as its sum; an entry whose
+    history adds up to 0 is dropped) become kind 4 (weights), and internal
+    nodes of kind 3 (whose compaction state is skipped) kind 2, when the
+    node is modified or relocated by the maintenance pass
+    ([Leaf node](#leaf-node), [Internal node](#internal-node));
+  - checkpoint records without the tree space section are read, the first
+    start reading every tree's internal nodes once to count its live
+    bytes; the section's compaction state (now 0) is ignored
+    ([Checkpoint record](#checkpoint-record));
+  - summary states of float sums under tag 5 and of `min`/`max` values
+    wider than 128 bytes under tags 6 and 7 are read as tags 8–10 hold
+    them, which are written instead ([Summary](#summary));
+  - metadata records: arrangement records of tag 6 (the start of their
+    history ignored) and the ticks of a retention window (tag 9) are
+    replaced at the first write after recovery by tag-13 records and the
+    last tick; a source state of tag 4 that holds its tables' entries has
+    them split out into tag 12; a directory without tag 11 recomputes its
+    window operators' partitions in error once
+    ([The metadata tree](#the-metadata-tree));
+  - the `CREATE SOURCE` record's `extra` as a plain array, next to the
+    object form; format 1's `AppState` fields added with defaults (read
+    only to migrate).
+
+  The log only gained record tags and a change kind (`CommitParts`,
+  `ProgressDelta`, `UpsertIfPresent`) next to the ones it still reads.
+- **Rebuilt once.** Arrangements whose [structural
+  fingerprint](#structural-fingerprints) changed are not matched: they are
+  rebuilt by hydration at the first start and their old trees dropped
+  (tables keep their rows; start-up takes as long as creating those views
+  again):
+  - new functions (registered among the existing ones, which renumbers
+    the later ones) and planner fixes changed the plans of many views:
+    joins on computed keys (whose keys are materialized in an `Mfp`
+    node), semijoins whose presence inputs match exactly, the summaries of
+    `var*`/`stddev*` over `bigint`, joins whose input filters or maps can
+    fail (which have error-tracker inputs), and the input arrangements of
+    window aggregates whose frames reach a partition's end (which carry
+    summaries);
+  - views with aggregates with `FILTER`, whose input map now computes the
+    arguments and `ORDER BY` keys only for the rows that pass the filter,
+    and views with conditions over the computed columns of nested
+    projections, or expressions around a correlated scalar aggregate, that
+    inlining would make too large (no longer inlined, see
+    [Planner](internals/planner.md#optimizer));
+  - window operators of functions maintained otherwise than before (the
+    suffix `0xF8 0x01`, see the table above): `ntile` whose argument is not
+    a constant, `lag` and `lead` whose offset is not a constant of at
+    least 0;
+  - temporal filters whose clock expression adds an interval with months
+    (the suffix `0xD0`): their event indexes, which could end a row's
+    validity at another change of the predicate, are rebuilt with a
+    validity of several intervals;
+
+  and the arrangements downstream of all of them.
+- **Kept until they change.** Results that fixes of aggregate semantics
+  change keep their old values until their group changes: an `avg`,
+  `var*` or `stddev*` of `double precision` values whose sum or sum of
+  squares overflowed was `Infinity` (now the value, or an error where the
+  variance or standard deviation itself is beyond the range).
+- **Gone.** Reads as of earlier GSNs: the histories they read are added up
+  (a format-2 directory written while the engine kept them opens as it
+  is).
+- A table whose snapshot an upgrade interrupts is copied again from its
+  first key if its key has a string column (see `index_order` under
+  [Progress](#logrecord)).
+
+The restart tests open data directories written by earlier versions:
+`crates/ivm/tests/data/format1` (format 1, migrated),
+`crates/ivm/tests/data/format2-history` (format 2 with histories: kind-1
+leaves, kind-3 internal nodes, tag-6 arrangement records, many ticks) and
+`crates/ivm/tests/data/window-revision` (window operators of functions
+maintained otherwise since, rebuilt).
+
+A change in any of the "incompatible" rows needs a new format version whose
+migration the engine runs at the first start (as for format 1), or starting
 from an empty data directory (and re-creating sources, which re-snapshot the
-upstream tables) or a migration tool, which does not exist.
+upstream tables).

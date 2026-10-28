@@ -99,7 +99,7 @@ yet applied), throughput (log records per second), ingest (row changes per
 second over all sources), dataflow output rows per second and how busy the
 operators keep the engine thread, the last checkpoint and records since,
 buffer-pool use against its capacity, process memory and CPU, the logical
-clock and the retention frontier, and disk use of the store and the log.
+clock, and disk use of the store and the log.
 
 Six charts cover the last 1, 5 or 20 minutes, one measure each:
 throughput (GSN/s), ingest per source, apply lag, replication lag per
@@ -215,8 +215,8 @@ owning operator in the dataflow graph.
 `SUBSCRIBE` sessions (the operator they follow, the table or materialized
 view subscribed to, or an ad hoc query, which includes a subscription to a
 virtual view; whether progress messages are on), reads waiting for a GSN, an
-LSN (`AS OF AT LEAST LSN`) or a table's snapshot (initial, or a table copied
-again), with their statements, requests waiting for their log record, the
+LSN (`AS OF AT LEAST LSN`), a table's snapshot (initial, or a table copied
+again) or a view's hydration, with their statements, requests waiting for their log record, the
 DML queue, and sinks with status, committed GSN and how far behind the
 engine they are.
 
@@ -287,17 +287,20 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
 {
   "version": "0.1.0",
   "stats": {
-    "processed_gsn": 1453, "durable_gsn": 1453, "retention_frontier": 453,
+    "processed_gsn": 1453, "durable_gsn": 1453,
     "checkpoint_gsn": 1431, "records_since_checkpoint": 22,
     "last_checkpoint_ms": 1792931627308.5, "clock_ms": 1792931628328.0,
     "cache_used_bytes": 32505856, "cache_capacity_bytes": 268435456, "dirty_bytes": 11953766,
+    "group_cache_bytes": 1048576, "input_queue_bytes": 0, "output_queue_bytes": 20480,
+    "work_bytes": 0, "fork_pool_bytes": 134217728, "forwarded_bytes": 4096,
     "nodes": 27, "arrangements": 26, "nodes_created": 27, "arrangements_created": 26,
     "catalog_version": 15,
     "steps": {"steps": 604, "in_rows": 274155, "out_rows": 267461, "nanos": 437892939},
+    "reads": {"inline_entries": 1250310, "offloaded": 7},
     "subscriptions": 1, "parked_reads": 0, "view_errors": 30
   },
-  "config": {"data_dir": "ivm-data", "cache_bytes": 268435456, "checkpoint_interval_secs": 10.0,
-             "retention_gsns": 1000, "sync": true, "tick_ms": 1000},
+  "config": {"data_dir": "ivm-data", "memory_bytes": 2147483648, "checkpoint_interval_secs": 10.0,
+             "sync": true, "tick_ms": 1000},
   "storage": {"trees": 26, "loaded_nodes": 1520, "dirty_nodes": 410, "segments": 1,
               "segment_bytes": 136314880, "live_bytes": 120586240},
   "counts": {"tables": 4, "views": 1, "materialized_views": 8, "indexes": 2, "sources": 1,
@@ -311,12 +314,29 @@ Static files are served from `/` (`index.html`, `js/…`, `css/…`,
 }
 ```
 
+The `*_bytes` fields of `stats` are bytes of memory: the buffer pool's
+nodes (`cache_used_bytes`, of which `dirty_bytes` are dirty) against the
+pool's current share of the memory budget (`cache_capacity_bytes`, which
+moves as the other parts grow and shrink), the aggregation group caches,
+the records waiting to be applied, the changes queued for subscriptions
+and sinks with the snapshots and query results in flight to consumers,
+the dataflow's transient working memory in use (between two
+records, a hydration's), the buffer pools of forks of the storage (a
+hydration, large reads) and the changes forwarded to a hydration not
+applied there yet; `config.memory_bytes` is the budget (`--memory-mb`, see
+[Memory](user-guide/operations.md#memory)).
 `stats.steps` sums the per-operator counters since start (monotonic);
+`stats.reads` counts, also since start, the index entries that ad hoc
+reads and the snapshots of subscriptions and sinks visited on the engine
+thread (each within its budget of 50,000) and how many of them exceeded
+the budget and went to a reader thread;
 `catalog_version` is the length of the catalog history, so it changes with
 every applied DDL statement (the history is trimmed back to 10,000 entries
 once it exceeds 11,000); `last_checkpoint_ms` is the engine start until the
-first checkpoint; `clock_ms` is null before the first clock tick and
-`config.tick_ms` null with `--tick-ms 0`. The `process` fields come from
+first checkpoint; `records_since_checkpoint` counts every applied record,
+clock ticks included (ticks alone make a checkpoint due only after 3,600 of
+them, so on an idle engine it climbs to 3,600); `clock_ms` is null before
+the first clock tick and `config.tick_ms` null with `--tick-ms 0`. The `process` fields come from
 `/proc` and are null where it is not available (`cpu_percent` assumes 100
 clock ticks per second, the Linux norm).
 
@@ -424,7 +444,7 @@ keywords, such as `CREATE MATERIALIZED VIEW` or `DROP TABLE`.
     "counters": {"steps": 114, "in_rows": 11600, "out_rows": 95300, "nanos": 410000000}
   }],
   "arrangements": [{
-    "id": 6, "node": 1, "role": "index", "key": ["#2"], "summaries": [], "refs": 3,
+    "id": 6, "node": 1, "tree": 9, "role": "index", "key": ["#2"], "summaries": [], "refs": 3,
     "records": 272760, "resident_bytes": 6291456, "resident_nodes": 700,
     "hydrated": true, "readers": [4, 7, 25]
   }],
@@ -446,9 +466,12 @@ those the operator owns, `reads` those it reads (often its inputs'),
 tables, materialized views, indexes, sinks and subscriptions whose results
 depend on the operator. An edge `[a, b]` means `a` is an input of `b` (one
 per input; a self-join lists its input twice). `role` is `index` for an index
-of the operator's output and `state` for operator-private state. `records`
-is the weighted entry count (rows counting multiplicity) from the tree's
-summary; `resident_*` is what the buffer pool holds in memory.
+of the operator's output and `state` for operator-private state. `tree` is
+the storage tree holding the arrangement: one that recovery matched by its
+fingerprint keeps its tree from the checkpoint, one rebuilt at start-up has
+a new one. `records` is the weighted entry count (rows counting
+multiplicity) from the tree's summary; `resident_*` is what the buffer pool
+holds in memory.
 
 ### `GET /api/dataflow/node/ID?sample=N`
 
@@ -507,7 +530,7 @@ they do not apply. Unknown names get `404`.
 `target` names the table or materialized view whose dataflow node the
 subscription follows (one of them when identical views share the node), and
 is null for a subscription to an ad hoc query or to a virtual view (which is
-subscribed as its query); `wait` is `gsn`, `lsn` or `snapshot`.
+subscribed as its query); `wait` is `gsn`, `lsn`, `snapshot` or `hydration` (a statement reading a view still being hydrated).
 
 `/api/errors` returns `{"gsn", "views": [{"id", "name", "code", "message",
 "count"}], "sources": [{"id", "name", "status"}], "sinks": [...], "broken":

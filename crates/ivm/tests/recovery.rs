@@ -4,7 +4,8 @@
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
 use ivm::types::text::format_datum;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
@@ -212,33 +213,36 @@ fn log_tail_lost_behind_a_checkpoint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AS OF reads use only arrangements whose history covers the read's GSN:
-/// an index built later (it has no history before its creation) used to
-/// answer point queries with nothing, and a view rebuilt by CREATE OR
-/// REPLACE silently read as empty before the replacement. Also across a
-/// restart (the history starts are checkpointed).
+/// A commit larger than a log frame (a statement inserting 3 MB) is logged
+/// as a parts file of bounded frames and a CommitParts record, and is
+/// replayed from them after a crash; the checkpoint that covers it deletes
+/// the parts file with the log segments before it.
 #[test]
-fn as_of_reads_use_arrangements_with_history() {
-    let dir = tmpdir("asof-history");
+fn large_commits_replay_from_their_parts() {
+    let dir = tmpdir("parts");
     let running = start(&dir);
     let h = running.handle.clone();
-    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, v int)");
-    exec(&h, "INSERT INTO t VALUES (1, 10), (2, 20)");
-    exec(&h, "CREATE MATERIALIZED VIEW x AS SELECT id, v FROM t WHERE v > 10");
-    let g: String = rows(&h, "SHOW GSN").remove(0);
-    exec(&h, "INSERT INTO t VALUES (3, 10)");
-    exec(&h, "CREATE INDEX ti ON t (v)");
-    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW x AS SELECT id, v FROM t WHERE v > 0");
-    let check = |h: &EngineHandle| {
-        assert_eq!(rows(h, &format!("SELECT * FROM t WHERE v = 10 ORDER BY id AS OF {g}")), ["1|10"]);
-        assert_eq!(rows(h, &format!("SELECT * FROM t WHERE v = 10 ORDER BY id")), ["1|10", "3|10"]);
-        let err = try_exec(h, &format!("SELECT * FROM x AS OF {g}")).unwrap_err();
-        assert!(err.contains("before the history"), "{err}");
-    };
-    check(&h);
-    running.shutdown();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, s text)");
+    exec(&h, "CREATE MATERIALIZED VIEW c AS SELECT count(*) AS n, sum(length(s)) AS l FROM t");
+    exec(&h, "CHECKPOINT");
+    exec(&h, "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(1, 3000) g");
+    exec(&h, "DELETE FROM t WHERE id <= 1000");
+    let parts = || std::fs::read_dir(dir.join("log")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("parts-")).count();
+    assert_eq!(parts(), 1);
+    assert_eq!(rows(&h, "SELECT * FROM c"), ["2000|2000000"]);
+    running.crash();
     let running = start(&dir);
-    check(&running.handle);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT * FROM c"), ["2000|2000000"]);
+    assert_eq!(rows(&h, "SELECT count(*), min(id) FROM t"), ["2000|1001"]);
+    assert_eq!(parts(), 1);
+    exec(&h, "CHECKPOINT");
+    // (the sequencer truncates after the checkpoint is committed)
+    let t0 = std::time::Instant::now();
+    while parts() != 0 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the checkpoint left the parts file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -340,6 +344,145 @@ fn replacements_keep_dependents_deterministic() {
     assert!(try_exec(&h, "CREATE OR REPLACE VIEW pv AS SELECT id, random() AS r FROM t").is_err());
     exec(&h, "INSERT INTO t VALUES (2)");
     assert_eq!(rows(&h, "SELECT * FROM m"), ["2|3.0"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sizes of the store's manifest and of all its files.
+fn store_sizes(dir: &Path) -> (u64, u64) {
+    let store = dir.join("store");
+    let manifest = std::fs::metadata(store.join("MANIFEST")).unwrap().len();
+    (manifest, std::fs::read_dir(&store).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum())
+}
+
+/// Bytes a checkpoint after one INSERT appends to the manifest and to the
+/// store.
+fn insert_checkpoint_cost(h: &EngineHandle, dir: &Path, id: i32) -> (u64, u64) {
+    let (m0, s0) = store_sizes(dir);
+    exec(h, &format!("INSERT INTO t VALUES ({id})"));
+    exec(h, "CHECKPOINT");
+    let (m1, s1) = store_sizes(dir);
+    (m1 - m0, s1 - s0)
+}
+
+/// A checkpoint writes what changed since the previous one, so its cost
+/// does not depend on the size of what did not change, such as the DDL
+/// history or the error records of a view over dirty data. Every
+/// checkpoint used to write the whole catalog with its history (up to
+/// 11,000 statements), every error record and the rest of the engine state
+/// as JSON into its manifest record, and an idle engine took one every
+/// interval.
+#[test]
+fn checkpoint_cost_does_not_grow_with_the_catalog_history_or_the_errors() {
+    let dir = tmpdir("checkpoint-cost");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    exec(&h, "CREATE TABLE dirty (id int PRIMARY KEY, v text)");
+    exec(&h, "CREATE MATERIALIZED VIEW parsed AS SELECT id, v::int AS n FROM dirty");
+    exec(&h, "CHECKPOINT");
+    let before = insert_checkpoint_cost(&h, &dir, 1);
+    for i in 0..1000 {
+        exec(&h, &format!("CREATE TABLE x{i} (a int, b text, c numeric)"));
+        exec(&h, &format!("DROP TABLE x{i}"));
+    }
+    // 2,000 error records, one per value that does not parse
+    let values: Vec<String> = (0..2000).map(|i| format!("({i}, 'bad value {i}')")).collect();
+    exec(&h, &format!("INSERT INTO dirty VALUES {}", values.join(", ")));
+    assert_eq!(rows(&h, "SHOW VIEWS"), ["parsed|materialized|0|2000|ok"]);
+    exec(&h, "CHECKPOINT");
+    let after = insert_checkpoint_cost(&h, &dir, 2);
+    // (varints of GSNs, node offsets, sizes and ids grew by a byte or two
+    // each; the leaf of t gained a row)
+    assert!(after.0 <= before.0 + 40 && after.1 <= before.1 + 80, "{before:?} -> {after:?}");
+    assert!(after.0 < 200, "a manifest record of {} bytes", after.0);
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SELECT count(*) FROM ivm.catalog_history"), ["2003"]);
+    assert_eq!(rows(&h, "SELECT statement FROM ivm.catalog_history ORDER BY gsn DESC LIMIT 1"), ["DROP TABLE x999"]);
+    assert_eq!(rows(&h, "SELECT * FROM t ORDER BY id"), ["1", "2"]);
+    assert_eq!(rows(&h, "SHOW VIEWS"), ["parsed|materialized|0|2000|ok"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn frontier(h: &EngineHandle, name: &str) -> u64 {
+    let row = rows(h, "SHOW FRONTIERS").into_iter().find(|r| r.starts_with(&format!("{name}|"))).unwrap();
+    row[name.len() + 1..].parse().unwrap()
+}
+
+/// An idle engine takes no checkpoints: clock ticks that change nothing but
+/// the clock do not make one due.
+#[test]
+fn an_idle_engine_takes_no_checkpoints() {
+    let dir = tmpdir("idle");
+    let tick = Some(std::time::Duration::from_millis(2));
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick, checkpoint_interval: std::time::Duration::from_millis(10), ..Default::default() };
+    let running = coord::start(cfg).unwrap();
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY)");
+    exec(&h, "CHECKPOINT");
+    let before = frontier(&h, "checkpoint_gsn");
+    // a change makes one due
+    exec(&h, "INSERT INTO t VALUES (1)");
+    let t0 = std::time::Instant::now();
+    while frontier(&h, "checkpoint_gsn") == before {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "no checkpoint after the INSERT");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (checkpoint, sizes) = (frontier(&h, "checkpoint_gsn"), store_sizes(&dir));
+    // fifty ticks later
+    while frontier(&h, "processed_gsn") < checkpoint + 50 {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the clock does not tick");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!((frontier(&h, "checkpoint_gsn"), store_sizes(&dir)), (checkpoint, sizes));
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The error state survives restarts exactly, also through the changes
+/// made since the last checkpoint and replayed after a crash: error
+/// records of views and the errors of aggregation groups, also of views
+/// dropped and created again (whose records replace the old ones rather
+/// than adding to them).
+#[test]
+fn the_error_state_survives_restarts() {
+    let dir = tmpdir("error-state");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, v text)");
+    exec(&h, "INSERT INTO t VALUES (1, '10'), (2, 'x'), (3, 'y')");
+    exec(&h, "CREATE MATERIALIZED VIEW m AS SELECT id, v::int AS n FROM t");
+    exec(&h, "CREATE TABLE r (k int PRIMARY KEY, g int, x real)");
+    exec(&h, "INSERT INTO r VALUES (1, 1, 3e38), (2, 1, 3e38), (3, 2, 1)");
+    exec(&h, "CREATE MATERIALIZED VIEW s AS SELECT g, sum(x) AS total FROM r GROUP BY g");
+    exec(&h, "CHECKPOINT");
+    exec(&h, "INSERT INTO t VALUES (4, 'z')");
+    exec(&h, "DROP MATERIALIZED VIEW s");
+    exec(&h, "CREATE MATERIALIZED VIEW s AS SELECT g, sum(x) AS total FROM r GROUP BY g");
+    exec(&h, "CHECKPOINT");
+    exec(&h, "DROP MATERIALIZED VIEW m");
+    exec(&h, "CREATE MATERIALIZED VIEW m AS SELECT id, v::int AS n FROM t");
+    exec(&h, "INSERT INTO r VALUES (4, 3, 3e38), (5, 3, 3e38)");
+    running.crash();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SHOW VIEWS"), ["s|materialized|1|1|ok", "m|materialized|1|3|ok"]);
+    exec(&h, "CHECKPOINT");
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SHOW VIEWS"), ["s|materialized|1|1|ok", "m|materialized|1|3|ok"]);
+    exec(&h, "DELETE FROM t WHERE id > 1");
+    exec(&h, "DELETE FROM r WHERE k IN (2, 5)");
+    assert_eq!(rows(&h, "SELECT * FROM m"), ["1|10"]);
+    assert_eq!(rows(&h, "SELECT * FROM s ORDER BY g"), ["1|3e+38", "2|1", "3|3e+38"]);
+    running.shutdown();
+    let running = start(&dir);
+    let h = running.handle.clone();
+    assert_eq!(rows(&h, "SHOW VIEWS"), ["s|materialized|3|0|ok", "m|materialized|1|0|ok"]);
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

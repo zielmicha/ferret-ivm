@@ -10,6 +10,7 @@
 //! Semijoin inputs are "presence" inputs: their rows are the distinct keys
 //! of the underlying collection, read through count summaries.
 
+use super::delta::{NodeDelta, Overlay, StepOut};
 use super::mfp::Mfp;
 use super::*;
 use crate::types::datum::exact_cmp;
@@ -56,11 +57,24 @@ pub struct DeltaPath {
     pub steps: Vec<LookupStep>,
 }
 
+/// Counts the expression errors of a regular input's MFP (which may fail)
+/// once per input row: an Mfp node over the input's node, an input of the
+/// join, applying the MFP and keeping no rows (`arr`, its arrangement, stays
+/// empty; it makes the node's error records authoritative).
+#[derive(Clone, Debug)]
+pub struct JoinTracker {
+    pub input: usize,
+    pub node: NodeId,
+    pub arr: ArrId,
+}
+
 #[derive(Clone, Debug)]
 pub struct JoinPlan {
     pub inputs: Vec<JoinInput>,
     pub paths: Vec<DeltaPath>,
     pub width: usize,
+    /// Error trackers of the inputs whose MFP may fail (the others' cannot).
+    pub trackers: Vec<JoinTracker>,
 }
 
 impl JoinPlan {
@@ -76,7 +90,13 @@ impl JoinPlan {
                 v.push(a);
             }
         }
+        v.extend(self.trackers.iter().map(|t| t.arr));
         v
+    }
+
+    /// Are input `i`'s expression errors counted by an error tracker?
+    fn tracked(&self, i: usize) -> bool {
+        self.trackers.iter().any(|t| t.input == i)
     }
 
     pub fn fingerprint(&self, cx: &FpCtx, fp: &mut Vec<u8>) {
@@ -118,21 +138,51 @@ impl JoinPlan {
     }
 }
 
-/// Presence count of a key under `at` (count summaries; "before" derived from
-/// this tick's delta of the presence collection).
-fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], at: ReadAt, delta: Option<&FxHashMap<Vec<u8>, i64>>) -> Result<i64> {
+/// Receives a presence key and its weight change.
+type KeyChangeFn<'a> = dyn FnMut(&mut Env, &[u8], i64) -> Result<()> + 'a;
+
+/// The step's changes to a presence input's arrangement, added up per
+/// presence key (an entry's canonical key prefix, or for exact presence the
+/// entry), handed to `f` in key order for the keys that changed.
+fn presence_changes(env: &mut Env, changes: &Overlay, layout: &Layout, exact: bool, f: &mut KeyChangeFn) -> Result<()> {
+    let mut cur: Option<(Vec<u8>, i64)> = None;
+    changes.for_each_chunk(env, &mut |env, chunk| {
+        for (k, w) in chunk {
+            let key = if exact { &k[..] } else { &k[..layout.prefix_len(k, layout.key_len())?] };
+            match &mut cur {
+                Some((c, cw)) if c.as_slice() == key => *cw += w,
+                _ => {
+                    if let Some((c, cw)) = cur.replace((key.to_vec(), *w))
+                        && cw != 0
+                    {
+                        f(env, &c, cw)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    match cur {
+        Some((c, cw)) if cw != 0 => f(env, &c, cw),
+        _ => Ok(()),
+    }
+}
+
+/// Presence count of a key: now (count summaries), or before the step,
+/// with the step's changes to the presence arrangement (`before`)
+/// subtracted.
+fn presence_count(env: &mut Env, g: &Graph, arr: ArrId, prefix: &[u8], before: Option<&Overlay>) -> Result<i64> {
     let a = g.arr(arr);
     let hi = crate::types::encoding::prefix_successor(prefix);
-    let s = match &hi {
-        Some(h) => env.range_summary(a.tree, std::ops::Bound::Included(prefix), std::ops::Bound::Excluded(h))?,
-        None => env.range_summary(a.tree, std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded)?,
-    };
-    let latest = s.count;
-    Ok(match at {
-        ReadAt::Latest => latest,
-        ReadAt::Before(_) => latest - delta.and_then(|d| d.get(prefix)).copied().unwrap_or(0),
-        ReadAt::AsOf(_) => latest,
-    })
+    let hi = hi.as_deref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let mut count = env.range_summary(a.tree, std::ops::Bound::Included(prefix), hi)?.count;
+    if let Some(o) = before {
+        o.for_each(env, std::ops::Bound::Included(prefix), hi, &mut |_, w| {
+            count -= w;
+            Ok(true)
+        })?;
+    }
+    Ok(count)
 }
 
 /// Key of presence values in their arrangement: the canonical key prefix,
@@ -145,7 +195,20 @@ fn presence_prefix(layout: &Layout, vals: &[Datum], exact: bool) -> Result<Vec<u
 struct Ctx<'a> {
     g: &'a Graph,
     p: &'a JoinPlan,
-    pres_delta: Vec<Option<FxHashMap<Vec<u8>, i64>>>,
+    /// The outputs of the step's nodes (None: a snapshot, reading the
+    /// current state only).
+    all: Option<&'a FxHashMap<NodeId, NodeDelta>>,
+}
+
+impl Ctx<'_> {
+    /// The step's changes to arrangement `arr` of input `i`, to overlay on
+    /// it to read it as it was before the step (None: it did not change).
+    fn changes(&self, i: usize, arr: ArrId) -> Result<Option<Overlay<'_>>> {
+        match self.all.and_then(|all| all.get(&self.p.inputs[i].node)) {
+            Some(d) if !d.rows.is_empty() => d.overlay(arr).map(Some),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Key values of a lookup step for a joined row (None: matches nothing).
@@ -162,14 +225,27 @@ fn lookup_key(step: &LookupStep, row: &[Datum]) -> Option<Vec<Datum>> {
 }
 
 /// Rows of input `step.input` matching the key values `key`, encoded as
-/// `prefix` (post-MFP); for presence inputs, whether the key is present
-/// (the row is then the key).
-fn lookup_prefix(env: &mut Env, cx: &Ctx, step: &LookupStep, prefix: &[u8], key: &[Datum], at: ReadAt) -> Result<Vec<(Row, i64)>> {
+/// `prefix` (post-MFP), now or before the step (`before`), handed to `f` in
+/// batches (a key may match many rows); for presence inputs, whether the
+/// key is present (the row is then the key).
+fn lookup_prefix(
+    env: &mut Env,
+    cx: &Ctx,
+    step: &LookupStep,
+    prefix: &[u8],
+    key: &[Datum],
+    before: bool,
+    f: &mut super::ops::RowSink,
+) -> Result<()> {
     let inp = &cx.p.inputs[step.input];
     if let Some(parr) = inp.presence {
-        let c = presence_count(env, cx.g, parr, prefix, at, cx.pres_delta[step.input].as_ref())?;
-        return Ok(if c > 0 { vec![(Vec::new(), 1)] } else { vec![] });
+        let changes = if before { cx.changes(step.input, parr)? } else { None };
+        let c = presence_count(env, cx.g, parr, prefix, changes.as_ref())?;
+        return if c > 0 { f(env, vec![(Vec::new(), 1)]) } else { Ok(()) };
     }
+    // the input's entries before the step: the arrangement with the
+    // overlay of the step's changes to it (which may have removed some)
+    let changes = if before { cx.changes(step.input, step.arr)? } else { None };
     let a = cx.g.arr(step.arr);
     let layout = &a.layout;
     // only the columns the input's MFP (and an exact match) reads are decoded
@@ -183,74 +259,147 @@ fn lookup_prefix(env: &mut Env, cx: &Ctx, step: &LookupStep, prefix: &[u8], key:
             layout.decode_plan(&cols)
         })
         .as_ref();
-    let mut out = Vec::new();
-    env.for_each_prefix(a.tree, prefix, &mut |k, h| {
-        let w = h.weight(at);
-        if w <= 0 {
-            return Ok(true);
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let mut out = Vec::new();
+        let mut bytes = 0;
+        let mut last = None;
+        let mut visit = |k: &[u8], w: i64| {
+            if w <= 0 {
+                return Ok(true);
+            }
+            let r = layout.decode_row_with(k, plan)?;
+            if step.exact && layout.key_values(&r)?.iter().zip(key).any(|(a, b)| exact_cmp(a, b) != std::cmp::Ordering::Equal) {
+                return Ok(true);
+            }
+            if let Ok(Some(post)) = inp.mfp.eval(&r) {
+                out.push((post, w));
+                bytes += k.len();
+                if out.len() >= super::ops::BATCH_ROWS || bytes >= 1 << 20 {
+                    last = Some(k.to_vec());
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        let lo = match &resume {
+            None => std::ops::Bound::Included(prefix),
+            Some(from) => std::ops::Bound::Excluded(from.as_slice()),
+        };
+        let hi = crate::types::encoding::prefix_successor(prefix);
+        let hi = hi.as_deref().map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        match &changes {
+            None => env.for_each(a.tree, lo, hi, &mut visit)?,
+            Some(o) => o.for_each_versioned(env, a.tree, lo, hi, &mut |k, _, w| visit(k, w))?,
         }
-        let r = layout.decode_row_with(k, plan)?;
-        if step.exact && layout.key_values(&r)?.iter().zip(key).any(|(a, b)| exact_cmp(a, b) != std::cmp::Ordering::Equal) {
-            return Ok(true);
+        if !out.is_empty() {
+            f(env, out)?;
         }
-        if let Ok(Some(post)) = inp.mfp.eval(&r) {
-            out.push((post, w));
+        match last {
+            Some(k) => resume = Some(k),
+            None => return Ok(()),
         }
-        Ok(true)
-    })?;
-    Ok(out)
+    }
 }
 
-fn run_path(env: &mut Env, cx: &Ctx, path: &DeltaPath, start: Vec<(Row, i64)>, gsn: Option<Gsn>, out: &mut Delta) -> Result<()> {
+/// Estimated bytes of a path's frontier looked up at once (a lookup step's
+/// matches of that many rows are held at a time): a buffer of the working
+/// memory, at most 8 MiB. Large enough that rows with equal keys share
+/// lookups and lookups in key order find their leaves in the cache.
+fn path_bytes(env: &Env) -> usize {
+    env.work().buffer(256 << 10, 8 << 20)
+}
+
+/// Extend `start` (rows of the path's source) along the path, handing the
+/// joined rows to `out` in batches.
+fn run_path(
+    env: &mut Env,
+    cx: &Ctx,
+    path: &DeltaPath,
+    start: Vec<(Row, i64)>,
+    out: &mut super::ops::RowSink,
+) -> Result<()> {
     let mut frontier: Vec<(Row, i64)> = Vec::with_capacity(start.len());
     for (row, w) in start {
         if path.source_filters.iter().all(|f| f.eval_pred(&row).unwrap_or(false)) {
             frontier.push((row, w));
         }
     }
-    for step in &path.steps {
-        if frontier.is_empty() {
-            return Ok(());
+    run_steps(env, cx, path, &path.steps, frontier, out)
+}
+
+/// Extend `frontier` along `steps`, depth first in chunks of `path_bytes`
+/// (so that the rows in flight stay bounded whatever the fan-out).
+fn run_steps(
+    env: &mut Env,
+    cx: &Ctx,
+    path: &DeltaPath,
+    steps: &[LookupStep],
+    frontier: Vec<(Row, i64)>,
+    out: &mut super::ops::RowSink,
+) -> Result<()> {
+    if frontier.is_empty() {
+        return Ok(());
+    }
+    let Some((step, rest)) = steps.split_first() else { return out(env, frontier) };
+    // in a step, the inputs before the path's source are read after it,
+    // those after it before it
+    let before = cx.all.is_some() && step.input > path.source;
+    let mut start = 0;
+    while start < frontier.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < frontier.len() && bytes < path_bytes(env) {
+            bytes += row_bytes(&frontier[end].0);
+            end += 1;
         }
-        let at = match gsn {
-            None => ReadAt::Latest,
-            Some(g) => {
-                if step.input < path.source {
-                    ReadAt::Latest
-                } else {
-                    ReadAt::Before(g)
-                }
-            }
+        lookup_step(env, cx, step, before, &frontier[start..end], &mut |env, next| run_steps(env, cx, path, rest, next, out))?;
+        start = end;
+    }
+    Ok(())
+}
+
+/// The rows of `frontier` extended by one lookup step (into the input as
+/// it was before the step if `before`), handed to `emit` in chunks of
+/// `path_bytes`.
+fn lookup_step(
+    env: &mut Env,
+    cx: &Ctx,
+    step: &LookupStep,
+    before: bool,
+    frontier: &[(Row, i64)],
+    emit: &mut super::ops::RowSink,
+) -> Result<()> {
+    let inp = &cx.p.inputs[step.input];
+    // Rows whose keys encode equally share one lookup: (grouping key,
+    // length of the lookup key in it, row index, key values). Exact
+    // steps group by the values' exact encoding too.
+    let mut keyed: Vec<(Vec<u8>, usize, usize, Vec<Datum>)> = Vec::with_capacity(frontier.len());
+    for (i, (row, _)) in frontier.iter().enumerate() {
+        let Some(key) = lookup_key(step, row) else { continue };
+        let mut k = match inp.presence {
+            Some(parr) => presence_prefix(&cx.g.arr(parr).layout, &key, inp.exact)?,
+            None => cx.g.arr(step.arr).layout.encode_prefix(&key),
         };
-        let inp = &cx.p.inputs[step.input];
-        // Rows whose keys encode equally share one lookup: (grouping key,
-        // length of the lookup key in it, row index, key values). Exact
-        // steps group by the values' exact encoding too.
-        let mut keyed: Vec<(Vec<u8>, usize, usize, Vec<Datum>)> = Vec::with_capacity(frontier.len());
-        for (i, (row, _)) in frontier.iter().enumerate() {
-            let Some(key) = lookup_key(step, row) else { continue };
-            let mut k = match inp.presence {
-                Some(parr) => presence_prefix(&cx.g.arr(parr).layout, &key, inp.exact)?,
-                None => cx.g.arr(step.arr).layout.encode_prefix(&key),
-            };
-            let n = k.len();
-            if step.exact && inp.presence.is_none() {
-                crate::types::codec::encode_row(&key, &mut k);
-            }
-            keyed.push((k, n, i, key));
+        let n = k.len();
+        if step.exact && inp.presence.is_none() {
+            crate::types::codec::encode_row(&key, &mut k);
         }
-        if keyed.len() > 1 {
-            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+        keyed.push((k, n, i, key));
+    }
+    if keyed.len() > 1 {
+        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+    }
+    let mut next = Vec::new();
+    let mut next_bytes = 0;
+    let mut j = 0;
+    while j < keyed.len() {
+        let mut end = j + 1;
+        while end < keyed.len() && keyed[end].0 == keyed[j].0 {
+            end += 1;
         }
-        let mut next = Vec::new();
-        let mut j = 0;
-        while j < keyed.len() {
-            let mut end = j + 1;
-            while end < keyed.len() && keyed[end].0 == keyed[j].0 {
-                end += 1;
-            }
-            let (k, n, _, key) = &keyed[j];
-            let matches = lookup_prefix(env, cx, step, &k[..*n], key, at)?;
+        let (k, n, _, key) = &keyed[j];
+        lookup_prefix(env, cx, step, &k[..*n], key, before, &mut |env, matches| {
             for (_, _, i, key) in &keyed[j..end] {
                 let (row, w) = &frontier[*i];
                 for (post, mw) in &matches {
@@ -259,98 +408,44 @@ fn run_path(env: &mut Env, cx: &Ctx, path: &DeltaPath, start: Vec<(Row, i64)>, g
                     let post = if inp.presence.is_some() { key } else { post };
                     r[inp.offset..inp.offset + inp.width].clone_from_slice(post);
                     if step.filters.iter().all(|f| f.eval_pred(&r).unwrap_or(false)) {
+                        next_bytes += row_bytes(&r);
                         next.push((r, w * mw));
-                    }
-                }
-            }
-            j = end;
-        }
-        frontier = next;
-    }
-    out.extend(frontier);
-    Ok(())
-}
-
-fn presence_deltas(g: &Graph, p: &JoinPlan, all: &FxHashMap<NodeId, Output>) -> Result<Vec<Option<FxHashMap<Vec<u8>, i64>>>> {
-    let mut v = Vec::with_capacity(p.inputs.len());
-    for inp in &p.inputs {
-        match inp.presence {
-            None => v.push(None),
-            Some(parr) => {
-                let layout = &g.arr(parr).layout;
-                let mut m: FxHashMap<Vec<u8>, i64> = FxHashMap::default();
-                if let Some(o) = all.get(&inp.node) {
-                    for (row, w) in &o.data {
-                        let kv = layout.key_values(row)?;
-                        *m.entry(presence_prefix(layout, &kv, inp.exact)?).or_default() += w;
-                    }
-                }
-                v.push(Some(m));
-            }
-        }
-    }
-    Ok(v)
-}
-
-pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all: &FxHashMap<NodeId, Output>, out: &mut Output) -> Result<()> {
-    let cx = Ctx { g, p, pres_delta: presence_deltas(g, p, all)? };
-    for path in &p.paths {
-        let src = &p.inputs[path.source];
-        let Some(d) = all.get(&src.node) else { continue };
-        if d.data.is_empty() {
-            continue;
-        }
-        let mut start = Vec::new();
-        if let Some(parr) = src.presence {
-            // presence changes of keys touched this tick
-            let layout = g.arr(parr).layout.clone();
-            let deltas = cx.pres_delta[path.source].as_ref().unwrap();
-            let mut keys: Vec<&Vec<u8>> = deltas.keys().collect();
-            keys.sort();
-            for prefix in keys {
-                let dw = deltas[prefix];
-                if dw == 0 {
-                    continue;
-                }
-                let new = presence_count(env, g, parr, prefix, ReadAt::Latest, None)?;
-                let old = new - dw;
-                if (old > 0) != (new > 0) {
-                    let kv = if src.exact { layout.decode_row(prefix)? } else { layout.decode_key_values(prefix)?.0 };
-                    let mut row = vec![Datum::Null; p.width];
-                    row[src.offset..src.offset + src.width].clone_from_slice(&kv);
-                    start.push((row, if new > 0 { 1 } else { -1 }));
-                }
-            }
-        } else {
-            for (raw, w) in &d.data {
-                match src.mfp.eval(raw) {
-                    Ok(Some(post)) => {
-                        let mut row = vec![Datum::Null; p.width];
-                        row[src.offset..src.offset + src.width].clone_from_slice(&post);
-                        start.push((row, *w));
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        // input expression errors count once per input row
-                        if path.source == first_path_of(p, path.source) {
-                            out.errs.push((err_record(&e), *w));
+                        if next_bytes >= path_bytes(env) {
+                            next_bytes = 0;
+                            emit(env, std::mem::take(&mut next))?;
                         }
                     }
                 }
             }
+            Ok(())
+        })?;
+        j = end;
+    }
+    if next.is_empty() { Ok(()) } else { emit(env, next) }
+}
+
+pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, _gsn: Gsn, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
+    let cx = Ctx { g, p, all: Some(all) };
+    step_paths(env, &cx, all, out)
+}
+
+/// Extend the changes of every input along its path.
+fn step_paths(env: &mut Env, cx: &Ctx, all: &FxHashMap<NodeId, NodeDelta>, out: &mut StepOut) -> Result<()> {
+    let (g, p) = (cx.g, cx.p);
+    for path in &p.paths {
+        let src = &p.inputs[path.source];
+        let Some(d) = all.get(&src.node) else { continue };
+        if d.rows.is_empty() {
+            continue;
         }
-        // changes that cancel after the input's MFP (e.g. updates of
-        // columns the join does not use) need no lookups
-        consolidate(&mut start);
-        match src.presence.and_then(|_| presence_key_exprs(p, path.source)) {
-            Some(keys) => {
-                // The presence input's columns hold its key as decoded from
-                // the index: canonical, without numeric scales, -0 and the
-                // like. Paths that look the input up compute them from the
-                // other inputs' rows instead; recompute them that way, or
-                // rows derived here would not retract rows derived there.
-                let mut rows = Vec::new();
-                run_path(env, &cx, path, start, Some(gsn), &mut rows)?;
+        // The presence input's columns hold its key as decoded from the
+        // index: canonical, without numeric scales, -0 and the like. Paths
+        // that look the input up compute them from the other inputs' rows
+        // instead; recompute them that way, or rows derived here would not
+        // retract rows derived there.
+        let keys = src.presence.and_then(|_| presence_key_exprs(p, path.source));
+        let mut emit = |env: &mut Env, mut rows: Delta| {
+            if let Some(keys) = keys {
                 for (row, _) in rows.iter_mut() {
                     for (j, e) in keys.iter().enumerate() {
                         if let Ok(v) = e.eval(row) {
@@ -358,9 +453,73 @@ pub fn step(g: &Graph, env: &mut Env, _node: &Node, p: &JoinPlan, gsn: Gsn, all:
                         }
                     }
                 }
-                out.data.extend(rows);
             }
-            None => run_path(env, &cx, path, start, Some(gsn), &mut out.data)?,
+            for (r, w) in rows {
+                out.push(env, r, w)?;
+            }
+            Ok(())
+        };
+        // changes that cancel after the input's MFP (e.g. updates of
+        // columns the join does not use) need no lookups
+        let mut run = |env: &mut Env, mut start: Delta| {
+            consolidate(&mut start);
+            run_path(env, cx, path, start, &mut emit)
+        };
+        let (mut errs, mut errs_limit) = (Vec::new(), super::ops::BATCH_ROWS);
+        if let Some(parr) = src.presence {
+            // presence changes of keys touched this tick
+            let layout = g.arr(parr).layout.clone();
+            let changes = d.overlay(parr)?;
+            let mut start = Vec::new();
+            let mut bytes = 0;
+            presence_changes(env, &changes, &layout, src.exact, &mut |env, prefix, dw| {
+                let new = presence_count(env, g, parr, prefix, None)?;
+                let old = new - dw;
+                if (old > 0) != (new > 0) {
+                    let kv = if src.exact { layout.decode_row(prefix)? } else { layout.decode_key_values(prefix)?.0 };
+                    let mut row = vec![Datum::Null; p.width];
+                    row[src.offset..src.offset + src.width].clone_from_slice(&kv);
+                    bytes += row_bytes(&row);
+                    start.push((row, if new > 0 { 1 } else { -1 }));
+                    if bytes >= path_bytes(env) {
+                        bytes = 0;
+                        run(env, std::mem::take(&mut start))?;
+                    }
+                }
+                Ok(())
+            })?;
+            run(env, start)?;
+        } else {
+            d.for_each_batch(env, &mut |env, batch| {
+                let mut start = Vec::with_capacity(batch.len());
+                for (raw, w) in batch {
+                    match src.mfp.eval(raw) {
+                        Ok(Some(post)) => {
+                            let mut row = vec![Datum::Null; p.width];
+                            row[src.offset..src.offset + src.width].clone_from_slice(&post);
+                            start.push((row, *w));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            // Input expression errors count once per input
+                            // row, by the input's error tracker. (An input
+                            // without one has an MFP that cannot fail; were
+                            // it to fail anyway, its error is not dropped.)
+                            if !p.tracked(path.source) {
+                                errs.push((err_record(&e), *w));
+                            }
+                        }
+                    }
+                }
+                if errs.len() >= errs_limit {
+                    consolidate_errs(&mut errs);
+                    errs_limit = (2 * errs.len()).max(super::ops::BATCH_ROWS);
+                }
+                run(env, start)
+            })?;
+        }
+        for (e, w) in errs {
+            out.err(e, w);
         }
     }
     Ok(())
@@ -372,13 +531,10 @@ fn presence_key_exprs(p: &JoinPlan, i: usize) -> Option<&[Expr]> {
     p.paths.iter().filter(|pa| pa.source != i).flat_map(|pa| pa.steps.iter()).find(|s| s.input == i).map(|s| s.key.as_slice())
 }
 
-fn first_path_of(_p: &JoinPlan, source: usize) -> usize {
-    source
-}
-
-/// Full join contents (latest): drive the cheapest regular input's path.
-pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Result<()> {
-    let cx = Ctx { g, p, pres_delta: p.inputs.iter().map(|_| None).collect() };
+/// Full join contents (latest): drive the cheapest regular input's path,
+/// over that input's snapshot a batch at a time.
+pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut super::ops::SnapOut) -> Result<()> {
+    let cx = Ctx { g, p, all: None };
     // pick the smallest regular input as the source
     let mut best: Option<(usize, i64)> = None;
     for (i, inp) in p.inputs.iter().enumerate() {
@@ -396,32 +552,47 @@ pub fn snapshot(g: &Graph, env: &mut Env, p: &JoinPlan, out: &mut Output) -> Res
     let Some((src, _)) = best else { return Ok(()) };
     let path = p.paths.iter().find(|pa| pa.source == src).expect("path for every input");
     let inp = &p.inputs[src];
-    let mut cache = FxHashMap::default();
-    // expression errors in the other regular inputs' maps count once per
-    // input row, as on their delta paths (lookups skip the failing rows)
-    for (i, other) in p.inputs.iter().enumerate() {
-        if i == src || other.presence.is_some() || other.mfp.steps.is_empty() {
-            continue;
+    // (the inputs' expression errors are their error trackers', which are
+    // inputs of the join: lookups skip the failing rows)
+    // the source's rows are extended in chunks of `path_bytes`, so that rows
+    // with equal keys in a chunk share their lookups
+    let mut start = Vec::new();
+    let mut start_bytes = 0;
+    let (mut errs, mut errs_limit) = (Vec::new(), super::ops::BATCH_ROWS);
+    let mut emit = |env: &mut Env, rows: Delta| {
+        for (r, w) in rows {
+            out.push(env, r, w)?;
         }
-        let snap = super::ops::snapshot_node(g, env, other.node, &mut cache)?;
-        for (raw, w) in &snap.data {
-            if let Err(e) = other.mfp.eval(raw) {
-                out.errs.push((err_record(&e), *w));
+        Ok(())
+    };
+    super::ops::snapshot_stream(g, env, inp.node, &mut |env, batch| {
+        for (raw, w) in batch {
+            match inp.mfp.eval(&raw) {
+                Ok(Some(post)) => {
+                    let mut row = vec![Datum::Null; p.width];
+                    row[inp.offset..inp.offset + inp.width].clone_from_slice(&post);
+                    start_bytes += row_bytes(&row);
+                    start.push((row, w));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if !p.tracked(src) {
+                        errs.push((err_record(&e), w));
+                    }
+                }
             }
         }
-    }
-    let snap = super::ops::owned(super::ops::snapshot_node(g, env, inp.node, &mut cache)?);
-    let mut start = Vec::with_capacity(snap.data.len());
-    for (raw, w) in snap.data {
-        match inp.mfp.eval(&raw) {
-            Ok(Some(post)) => {
-                let mut row = vec![Datum::Null; p.width];
-                row[inp.offset..inp.offset + inp.width].clone_from_slice(&post);
-                start.push((row, w));
-            }
-            Ok(None) => {}
-            Err(e) => out.errs.push((err_record(&e), w)),
+        if errs.len() >= errs_limit {
+            consolidate_errs(&mut errs);
+            errs_limit = (2 * errs.len()).max(super::ops::BATCH_ROWS);
         }
-    }
-    run_path(env, &cx, path, start, None, &mut out.data)
+        if start_bytes >= path_bytes(env) {
+            start_bytes = 0;
+            run_path(env, &cx, path, std::mem::take(&mut start), &mut emit)?;
+        }
+        Ok(())
+    })?;
+    run_path(env, &cx, path, start, &mut emit)?;
+    out.errs(errs);
+    Ok(())
 }

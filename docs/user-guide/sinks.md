@@ -40,14 +40,22 @@ CREATE SINK events_out FROM events INTO POSTGRES
 - `TABLE` names the target table. A dotted name (`schema.table`) is split at
   the dots and each part is quoted as an identifier, so names are
   case-sensitive and not lowercased.
-- `KEY` lists columns of `relation` that are unique in it. With a key, rows
-  are upserted and deleted by key; without one, the target is maintained as a
-  multiset. The key is checked before the statement is logged (and again
-  when it is applied): an unknown column fails with SQLSTATE `42703`
-  (`sink key column "x" does not exist in "v"`), a repeated one with `42701`,
-  and a column of a type that cannot be part of a primary key (`json`,
-  `jsonpath`, or arrays of them) with `0A000`. Whether the key columns are
-  unique is not checked (see
+- `KEY` lists columns of `relation` that are unique in it, as `=` compares
+  them (as the target's primary key does: `1.0` and `1.00`, or `'1 mon'`
+  and `'30 days'`, are one key). With a key, rows are upserted and deleted
+  by key; without one, the target is maintained as a multiset. The key is
+  checked before the statement is logged (and again when it is applied): an
+  unknown column fails with SQLSTATE `42703` (`sink key column "x" does not
+  exist in "v"`), a repeated one with `42701`, and a column of a type that
+  cannot be part of a primary key (`json`, `jsonpath`, or arrays of them)
+  with `0A000`, as does one of type `bpchar` (`character` without a length)
+  or an array of it (`sink key column "c" has type bpchar, whose values
+  differing only in trailing spaces would be one key in the target`): `=`
+  ignores trailing spaces, while the engine's keys and groups do not
+  ([Known problems](troubleshooting.md#known-problems)), so keys unique in
+  the engine could be one in the target. Give such a column a length (the
+  values of a `character(n)` all have n characters) or cast it to `text`.
+  Whether the key columns are unique is not checked (see
   [Requirements on the target](#requirements-on-the-target)).
 
 The sink starts as soon as the statement is applied, and again after every
@@ -58,11 +66,12 @@ started (its status says why).
 
 ### Start-up and resynchronisation
 
-1. The engine takes a snapshot of the relation's current contents at the last
-   applied GSN (the *snapshot GSN*) and starts a sink thread. At an engine
-   start this happens before the log is replayed, from the checkpoint's
-   state: the snapshot GSN is the checkpoint's, and the replayed records
-   reach the sink like live ones.
+1. The engine starts a sink thread, which receives every change of the
+   relation after the last applied GSN (the *start GSN*). At an engine
+   start this happens before the log is replayed: the start GSN is the
+   checkpoint's, and the replayed records reach the sink like live ones.
+   No snapshot of the relation is taken unless the target needs one
+   (below).
 2. The thread connects and runs, every time it (re)connects:
 
    ```sql
@@ -76,23 +85,50 @@ started (its status says why).
    primary key is added when `KEY` is given. `ivm_sink_progress` is created
    unqualified, i.e. in the first schema of the role's `search_path`.
 3. It reads its progress row (`SELECT gsn FROM ivm_sink_progress WHERE sink = '<name>'`):
-   - if the recorded GSN is at or after the snapshot GSN, delivery resumes
-     after it;
-   - otherwise — no row yet, or the target is behind the snapshot — the
-     target is **resynchronised** in one transaction: `DELETE FROM <target>`,
-     `INSERT` of the snapshot rows (each row repeated by its multiplicity, 500
-     rows per statement), and the progress row set to the snapshot GSN. This
-     happens only at the thread's first synchronisation; if on a later
-     reconnect the row is missing or behind the snapshot GSN, the sink
-     reports `error: sink progress row went backwards` and keeps retrying.
+   - if the recorded GSN is at or after the start GSN (or the snapshot GSN
+     of the sink's last resynchronisation), delivery resumes after it;
+   - otherwise — no row yet, or the target is behind the changes the sink
+     has — the target is **resynchronised**. This happens only at the
+     thread's first synchronisation (and after the sink fell behind, see
+     [Delivering changes](#delivering-changes)); if on a later reconnect the
+     row is missing or behind, the sink reports
+     `error: sink progress row went backwards` and keeps retrying.
+
+To resynchronise, the sink thread asks the engine for a snapshot. The
+engine puts the relation at its last applied GSN (the *snapshot GSN*)
+into the sink's queue after the changes it sent before (the snapshot
+includes them; the thread drops them), as a stream of chunks of 10,000
+rows: a relation that the engine thread reads within its read budget (up
+to 50,000 index entries) at once, a larger one from a fork of the storage
+on a reader thread, which reads ahead of the sink by at most two chunks,
+as the sink writes them. The changes after the snapshot GSN follow in the
+queue. The thread writes the snapshot in one transaction:
+`DELETE FROM <target>`, `INSERT`s of the snapshot rows (each row repeated
+by its multiplicity, up to 500 rows per statement), and the progress row
+set to the snapshot GSN. `SHOW SINKS` shows `resynchronizing to gsn <n>`
+meanwhile. If the transaction fails, it is rolled back, the rest of the
+snapshot is dropped (which stops its reader), and once the thread is
+connected again it asks for a new snapshot. Nothing of the snapshot is
+kept after it is written. (A sink held for a view replacement being
+hydrated gets its snapshot once it follows the new version.)
+
+Every transaction a sink writes is sent in as many messages as it needs,
+each at most 8 MiB of SQL text (a single statement can be longer; an
+`INSERT` holds fewer than 500 rows when they would exceed it): PostgreSQL
+rejects messages over 1 GB, which a resynchronisation of a few million rows
+in one message used to exceed.
 
 ### Delivering changes
 
 For every GSN at which the relation changes, the engine hands the
 consolidated change (rows with positive and negative multiplicities) to the
-sink thread. The thread batches changes and flushes when more than 1000 rows
-are pending or 100 ms have passed since the last flush. A flush is one
-transaction:
+sink thread, in chunks of at most 1,024 rows when the change is large. The
+thread batches changes and flushes when more than 1000 rows are pending or
+100 ms have passed since the last flush. A flush is one transaction of
+whole GSNs (every chunk of a GSN: one is complete once a later GSN's
+changes or a progress mark at or after it have come), about 50,000 rows
+(at least one GSN): a backlog is written in several transactions, each of
+which leaves the target as of a GSN, without waiting in between:
 
 ```sql
 BEGIN;
@@ -106,6 +142,22 @@ INSERT INTO ivm_sink_progress (sink, gsn) VALUES ('<name>', <last gsn delivered>
 COMMIT;
 ```
 
+The changes queued for a sink and not written yet — in its channel and
+held by its thread — are bounded by one limit, a sixteenth of the memory
+budget (`--memory-mb`, at least 4 MiB), measured in bytes of memory as the
+other parts of the budget are ([Operations](operations.md#memory)). When a
+change would take them over it — the target is unreachable for long,
+keeps rejecting a batch, or does not keep up — the sink *falls behind*:
+the engine sends it nothing more (not even progress, so its progress row
+stays behind) but a notice, upon which the thread drops what it holds
+(logged as `sink <id> fell behind ...` and `sink <name>: its unwritten
+changes reached their memory limit; dropping them and resynchronizing the
+target from a snapshot`); once it is connected, it resynchronises the
+target from a fresh snapshot (above), after which it is sent the changes
+again. `SHOW SINKS` says `behind (...)` until it asks for the snapshot. A
+resynchronisation rewrites the whole target, which is expensive for a
+large relation.
+
 Every write — a flush, a progress update, a resynchronisation — first locks
 the sink's progress row, so that the writers of one sink take turns, and
 checks it: a flush or progress update goes on only if the row still holds
@@ -118,7 +170,12 @@ progress row itself never moves backwards.
 
 With `KEY`:
 
-- a removed row is `DELETE FROM <target> WHERE k1 = <v1> AND ...`;
+- a removed row is `DELETE FROM <target> WHERE k1 = <v1> AND ...`. This
+  also matches another representation of an equal key (`'30 days'` for
+  `'1 mon'`, `1.5` for `1.50`), which is right: keys are unique as `=`
+  compares them, so the one row with an equal key is the one the removed
+  row wrote (the engine keys rows and groups by `=` as well; a key whose
+  representation changes is removed and added again);
 - added rows are `INSERT ... ON CONFLICT (<key>) DO UPDATE SET <other
   columns> = EXCLUDED.<column>` (`DO NOTHING` if every column is a key
   column). An update of a view row is a removal followed by an addition with
@@ -126,15 +183,35 @@ With `KEY`:
 
 Without `KEY`:
 
-- a removed row deletes one matching row:
-  `DELETE FROM <target> WHERE ctid = (SELECT ctid FROM <target> WHERE c1 IS NOT DISTINCT FROM <v1> AND ... LIMIT 1)`.
-  Columns of type `json`, `jsonb`, `jsonpath`, `numeric`, `real` or
-  `double precision` (and arrays of them) are matched by their text
-  (`c::text IS NOT DISTINCT FROM (<v>)::text`): PostgreSQL has no equality
-  for `json` and `jsonpath`, and for the others equality would also match
-  another representation of an equal value (`1.5` and `1.50`, `-0` and
-  `0`), deleting a row the view still has;
+- a removed row deletes one row holding the same values:
+  `DELETE FROM <target> WHERE ctid = (SELECT ctid FROM <target> WHERE <c1 holds v1> AND ... LIMIT 1)`.
+  A column holds NULL if `c IS NULL`, and another value `<v>` if
+  `c = <v>`, except where `=` is coarser than identity: for types whose
+  equal values can differ in representation, `=` would also match another
+  representation than the removed one and delete a row the view still has,
+  leaving the removed one in the target for good. Such columns are matched
+  by their text as well, `c = <v> AND c::text = (<v>)::text`: `numeric`
+  (`1.5` and `1.50`), `real` and `double precision` (`-0` and `0`),
+  `interval` (`'1 mon'` and `'30 days'`, which differ in date arithmetic),
+  `jsonb` (`{"a": 1}` and `{"a": 1.0}`), `bpchar` (`character` without a
+  length: `'a'` and `'a  '`; by `octet_length(c) = octet_length(<v>)`
+  instead, as its cast to text drops trailing spaces), and arrays of these. `json`, `jsonpath` and arrays of them, which have no `=`, are
+  matched by their text alone. Together with `=`, the text tells the
+  representations apart whatever the session's settings
+  (`extra_float_digits`, `IntervalStyle`). The other types, `text` under
+  any deterministic collation included, have `=` only for identical values.
+  Which types are which is said in one place, `SqlType::equality`
+  (`crates/ivm/src/types/mod.rs`), which also decides which values have a
+  [fidelity suffix](../on-disk-format.md#fidelity-suffix) in the engine's
+  keys;
 - added rows are plain `INSERT`s.
+
+`=` and `IS NULL` can be answered from an index, so an index on a column of
+the target that tells its rows apart well makes a removal a lookup (the
+sink creates none). Without one, every removed row costs a scan of the
+target table: a keyless sink of a large relation that changes often is
+slow. Give the sink a `KEY` when the relation has unique columns, or index
+the target.
 
 Values are written as typed literals, `'<text output>'::<type>`, or `NULL`.
 
@@ -144,7 +221,7 @@ Each flush stores the data and the sink's progress GSN in the same
 transaction. If the transaction fails or its outcome is unknown, the thread
 waits, reconnects and reads the progress row again: batches at or below the
 committed GSN are discarded, the rest are applied again. Changes that arrive
-meanwhile are kept. A batch is therefore applied exactly once while the
+meanwhile are kept (up to the bound above). A batch is therefore applied exactly once while the
 engine keeps running. Failed connection attempts and failed writes are
 retried after 100 ms, then with a delay doubling up to 10 s while they keep
 failing (a batch the target rejects keeps failing until the target is
@@ -162,7 +239,7 @@ log is replayed. A target whose progress is at or after the checkpoint's GSN
 applied GSN when they stop, before the final checkpoint — resumes after
 its progress and receives the replayed changes; it is not rewritten. Only a
 target behind the checkpoint (the sink could not write for a while before a
-crash, or it was created by an older version) is resynchronised from the
+crash, or it was created by an older version) is resynchronised from a
 snapshot in one transaction. Changes that the sink received but had not
 written when the engine stopped are written when it stops.
 
@@ -177,10 +254,16 @@ written when the engine stopped are written when it stops.
   there must be a unique index or constraint on exactly the key columns
   (`ON CONFLICT (<key>)` needs one); the table created by the sink has a
   primary key.
-- The key columns must be unique in the relation. Duplicate keys make the
-  upsert fail (`ON CONFLICT DO UPDATE command cannot affect row a second
-  time`), which stops delivery (the batch is retried until it succeeds),
-  or silently merge rows.
+- The key columns must be unique in the relation, as `=` compares them
+  (the engine's primary keys, `GROUP BY` and `DISTINCT` are). Duplicate
+  keys make the upsert fail (`ON CONFLICT DO UPDATE command cannot affect
+  row a second time`), which stops delivery (the batch is retried until it
+  succeeds), or silently merge rows.
+- Text columns of a target created beforehand must have deterministic
+  collations (a database's default collation is always one): under a
+  nondeterministic one (`CREATE COLLATION ... (deterministic = false)`,
+  such as a case-insensitive collation) `=` matches strings other than the
+  removed one, and a key column takes different strings for one key.
 - Sink names must be unique among all engines writing into the same database:
   the progress row is keyed by the sink name only.
 - The role needs `CREATE` on the schema (the `CREATE TABLE IF NOT EXISTS`
@@ -205,8 +288,8 @@ removed from the view, so the sink deletes its row.
 - When the relation's columns change anyway — an upstream schema change of
   a replicated table, or a materialized view re-planned after one
   ([Sources](sources.md#upstream-schema-changes)) — the sink restarts with
-  the new columns, like a new sink: from a fresh snapshot, with a
-  resynchronisation (its progress is behind that snapshot). The target
+  the new columns, like a new sink: with a resynchronisation from a fresh
+  snapshot (its progress is behind the GSN it starts at). The target
   table is never altered: until it has every new column, with a type the
   values convert to, the resynchronisation fails (for example
   `error: column "c" of relation "t" does not exist`) and is retried. Add
@@ -222,11 +305,16 @@ removed from the view, so the sink deletes its row.
 
 `SHOW SINKS` shows `name`, `from` (the relation), `table` (the target as
 given), and `status`: `starting`, `running (gsn <n>)` (the GSN up to which
-the target is current, as committed in the progress row), `error: <message>`
+the target is current, as committed in the progress row),
+`resynchronizing to gsn <n>` (a snapshot is being written),
+`error: <message>`
 while it cannot connect or its writes fail (the error of the last attempt,
 shown until a write succeeds: reconnecting alone does not clear the error of
 a batch the target rejects), `error: broken: <reason>` (the relation is a
-broken materialized view; the sink is not started), or `stopped`.
+broken materialized view; the sink is not started), `behind (<status>)`
+(its unwritten changes reached their memory limit: it is sent nothing more
+until it asks for a snapshot to resynchronise its target, see
+[Delivering changes](#delivering-changes)), or `stopped`.
 
 ```sql
 DROP SINK [ IF EXISTS ] name
@@ -251,6 +339,11 @@ engine waits up to 5 s for its sinks to stop.
 
 See also [Troubleshooting](troubleshooting.md#known-problems).
 
-- The queue of changes from the engine to each sink is unbounded: while a
-  sink cannot write (its target is down, or a batch keeps failing), the
-  changes it has not written accumulate in memory.
+- A sink that cannot write for long (its target is down, or a batch keeps
+  failing), or does not keep up, falls behind once its unwritten changes
+  reach their memory limit, and then rewrites the whole target from a
+  snapshot ([Delivering changes](#delivering-changes)), which is expensive
+  for a large relation; if changes keep coming faster than such a snapshot
+  is written, it can fall behind again right after it.
+- While a large snapshot is written, its reader thread (one of four shared
+  with large reads) waits for the sink.

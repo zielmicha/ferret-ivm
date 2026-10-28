@@ -19,8 +19,9 @@ is a pure function of the input log up to *g*. Several mechanisms rely on it:
   any number of changes.
 - **Sharing**: a sub-plan identical to one of another view reuses that
   view's operators and indexes; it must compute the same thing.
-- **Time travel and repeatable reads**: reading a view `AS OF g` must give
-  the same answer every time.
+- **Incremental maintenance**: a change retracts what a row produced by
+  evaluating the expressions again on the old row; the retraction must
+  cancel what was added then.
 
 A function whose result depends on something other than its arguments
 breaks all of these. Such functions are therefore rejected, and constructs
@@ -127,7 +128,7 @@ maintained:
 | window functions | `Window` | recomputation of each changed partition (before and after) | input index keyed by (partition, order) |
 | set-returning functions | `FlatMap` | the function's output | none |
 | `WITH RECURSIVE` | `Recursive` | recomputation of the whole fixpoint from the current inputs, diffed against the previous result | index of the result (and of the inputs) |
-| conditions over `now()` | `TemporalFilter` | bisection of the row's validity interval; due events at each tick | index of pending (time, row) events |
+| conditions over `now()` | `TemporalFilter` | per changed row, the times at which its conditions change (a few evaluations of them, see [Temporal filters](../user-guide/temporal-filters-and-errors.md#how-temporal-filters-are-maintained)); due events at each tick | index of pending (time, row) events |
 | `VALUES` | `Constant` | — | none |
 
 Output of every operator is *consolidated* per GSN: a row inserted and

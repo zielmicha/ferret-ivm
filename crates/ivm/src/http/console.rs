@@ -125,7 +125,7 @@ async fn run(st: &AppState, headers: &HeaderMap, body: &[u8]) -> Result<QueryRes
             }
             Err(_) => return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "the engine is shutting down")),
         };
-        Ok(render(res, limit))
+        render(res, limit)
     });
     let mut resp = task.await.map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("query task failed: {e}")))??;
     resp.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -142,47 +142,65 @@ fn statement_error(e: crate::error::SqlError) -> ApiError {
     a
 }
 
-fn render(res: ExecResult, limit: usize) -> QueryResponse {
+fn render(res: ExecResult, limit: usize) -> Result<QueryResponse, ApiError> {
+    let header = |columns: &[crate::coord::api::ResultColumn]| QueryResponse {
+        columns: columns.iter().map(|c| Column { name: c.name.clone(), ty: crate::types::format_type(&c.ty, c.typmod) }).collect(),
+        ..Default::default()
+    };
     match res {
         ExecResult::Query { columns, rows } => {
-            let mut out = QueryResponse {
-                columns: columns.iter().map(|c| Column { name: c.name.clone(), ty: crate::types::format_type(&c.ty, c.typmod) }).collect(),
-                row_count: rows.len(),
-                ..Default::default()
-            };
+            let mut out = header(&columns);
             let mut bytes = 0usize;
-            for r in rows.iter() {
-                if out.rows.len() >= limit || bytes > MAX_RESULT_BYTES {
-                    out.truncated = true;
-                    break;
-                }
-                let vals: Vec<Option<String>> = r
-                    .iter()
-                    .map(|d| {
-                        if d.is_null() {
-                            return None;
-                        }
-                        let mut s = format_datum(d);
-                        if s.len() > MAX_CELL {
-                            let mut end = MAX_CELL;
-                            while !s.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            s.truncate(end);
-                            s.push('…');
-                        }
-                        bytes += s.len();
-                        Some(s)
-                    })
-                    .collect();
-                out.rows.push(vals);
+            for r in &rows {
+                add_row(&mut out, r, limit, &mut bytes);
             }
-            out
+            Ok(out)
         }
-        ExecResult::Command { tag } => QueryResponse { command: Some(tag), ..Default::default() },
+        // (counted to the end, kept up to the limit)
+        ExecResult::Rows { columns, mut rows } => {
+            let mut out = header(&columns);
+            let mut bytes = 0usize;
+            while let Some(chunk) = rows.next_chunk() {
+                for r in chunk.map_err(statement_error)?.iter() {
+                    add_row(&mut out, r, limit, &mut bytes);
+                }
+            }
+            Ok(out)
+        }
+        ExecResult::Command { tag } => Ok(QueryResponse { command: Some(tag), ..Default::default() }),
         ExecResult::Subscribe { cancel, .. } => {
             cancel.store(true, std::sync::atomic::Ordering::Release);
-            QueryResponse { command: Some("SUBSCRIBE is not supported here".into()), ..Default::default() }
+            Ok(QueryResponse { command: Some("SUBSCRIBE is not supported here".into()), ..Default::default() })
         }
     }
+}
+
+/// Count a result row, and show it while within `limit` rows and
+/// `MAX_RESULT_BYTES`.
+fn add_row(out: &mut QueryResponse, r: &[crate::types::Datum], limit: usize, bytes: &mut usize) {
+    out.row_count += 1;
+    if out.truncated || out.rows.len() >= limit || *bytes > MAX_RESULT_BYTES {
+        out.truncated = true;
+        return;
+    }
+    let vals: Vec<Option<String>> = r
+        .iter()
+        .map(|d| {
+            if d.is_null() {
+                return None;
+            }
+            let mut s = format_datum(d);
+            if s.len() > MAX_CELL {
+                let mut end = MAX_CELL;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                s.truncate(end);
+                s.push('…');
+            }
+            *bytes += s.len();
+            Some(s)
+        })
+        .collect();
+    out.rows.push(vals);
 }

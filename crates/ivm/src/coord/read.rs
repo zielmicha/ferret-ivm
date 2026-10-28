@@ -1,16 +1,15 @@
-//! Reads: point-in-time SELECT (fresh / AS OF GSN / at least LSN),
+//! Reads: SELECT of the latest state (fresh, latest, at least an LSN),
 //! SUBSCRIBE, SHOW, EXPLAIN.
 
 use super::*;
 use crate::catalog::ObjectKind;
 use crate::dataflow::lower::Lowerer;
 use crate::dataflow::NodeKind;
-use crate::exec::{sort_rows, ExecCtx, Rows};
+use crate::exec::{ExecCtx, Rows};
 use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, ShowKind, Statement, SubscribeTarget};
 use crate::sql::plan::Rel;
 use crate::sql::ParamSlot;
 use crate::sql_bail;
-use crate::storage::ReadAt;
 use crate::types::{ColumnType, Datum, Row, SqlType};
 use sqlparser::ast;
 
@@ -37,11 +36,147 @@ fn interruption(req: &Request, read: bool) -> Option<SqlError> {
     (read && i.gone()).then(|| SqlError::new(codes::QUERY_CANCELED, "canceling statement: the client is gone"))
 }
 
+/// The result columns of a query.
+pub(crate) fn result_columns(bq: &crate::sql::BoundQuery) -> Vec<ResultColumn> {
+    let types = bq.column_types();
+    bq.names.iter().take(bq.visible).zip(types).map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod }).collect()
+}
+
 pub fn parse_lsn(s: &str) -> Result<u64> {
     let (hi, lo) = s.split_once('/').ok_or_else(|| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
     let hi = u64::from_str_radix(hi.trim(), 16).map_err(|_| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
     let lo = u64::from_str_radix(lo.trim(), 16).map_err(|_| SqlError::new(codes::INVALID_TEXT_REPRESENTATION, format!("invalid LSN \"{s}\"")))?;
     Ok((hi << 32) | lo)
+}
+
+/// Rows per chunk of a snapshot sent to a sink or a subscriber (or about
+/// `SNAPSHOT_CHUNK_BYTES` of memory, whichever comes first).
+pub(crate) const SNAPSHOT_CHUNK_ROWS: usize = 10_000;
+pub(crate) const SNAPSHOT_CHUNK_BYTES: usize = 4 << 20;
+
+/// A query result goes to the session in chunks of this many rows, or of
+/// about `RESULT_CHUNK_BYTES` (estimated), whichever comes first.
+const RESULT_CHUNK_ROWS: usize = 1024;
+const RESULT_CHUNK_BYTES: usize = 256 << 10;
+
+/// A read on the engine thread keeps its rows until it is done (it may
+/// still turn out too large and run again off the engine thread, which
+/// only one that has sent nothing can): beyond this many rows, or this much
+/// memory, it fails with `READ_BUDGET`, as one that visits too many entries.
+const INLINE_RESULT_ROWS: usize = super::reader::INLINE_READ_ENTRIES as usize;
+const INLINE_RESULT_BYTES: usize = 8 << 20;
+
+/// Answers a read with its rows in chunks: a result of one chunk as
+/// `ExecResult::Query` (an error before it is complete fails the
+/// statement), a larger one as `ExecResult::Rows`, whose first chunk is in
+/// the reply and the rest follow (an error then ends the rows). Chunks are
+/// counted in the memory of the outputs until the session drops them. Off
+/// the engine thread (`streaming`) a chunk is sent as soon as it is full,
+/// the reader waiting for the session to take it (`coord::stream`); on it,
+/// the chunks are kept until the read is done (`INLINE_RESULT_ROWS`).
+pub(crate) struct ChunkedReply {
+    columns: Vec<ResultColumn>,
+    reply: Option<Sender<Result<ExecResult>>>,
+    meter: Arc<crate::memory::Meter>,
+    chunk: Vec<Row>,
+    /// The chunk's estimated encoded bytes, and its memory.
+    bytes: usize,
+    mem: usize,
+    /// The full chunks kept (on the engine thread), with their memory.
+    kept: Vec<(Vec<Row>, usize)>,
+    rows: usize,
+    kept_mem: usize,
+    /// Off the engine thread: what stops the reader while the session does
+    /// not take its rows, until the stream after the first chunk is made...
+    stop: Option<Box<dyn Fn() -> bool + Send>>,
+    /// ... and the stream.
+    rest: Option<super::stream::ChunkSender<Vec<Row>>>,
+}
+
+impl ChunkedReply {
+    /// A reply on the engine thread, which keeps the rows until the end.
+    pub(crate) fn kept(columns: Vec<ResultColumn>, reply: Sender<Result<ExecResult>>, meter: Arc<crate::memory::Meter>) -> ChunkedReply {
+        ChunkedReply { columns, reply: Some(reply), meter, chunk: Vec::new(), bytes: 0, mem: 0, kept: Vec::new(), rows: 0, kept_mem: 0, stop: None, rest: None }
+    }
+
+    /// A reply off the engine thread, which streams the rows; `stop` ends
+    /// the read while the session does not take them.
+    pub(crate) fn streaming(
+        columns: Vec<ResultColumn>,
+        reply: Sender<Result<ExecResult>>,
+        meter: Arc<crate::memory::Meter>,
+        stop: Box<dyn Fn() -> bool + Send>,
+    ) -> ChunkedReply {
+        ChunkedReply { stop: Some(stop), ..ChunkedReply::kept(columns, reply, meter) }
+    }
+
+    /// Add a row; false once nobody reads the rows any more. On the engine
+    /// thread, `READ_BUDGET` once it keeps too much.
+    pub(crate) fn push(&mut self, row: Row) -> Result<bool> {
+        self.bytes += row.iter().map(crate::types::codec::approx_len).sum::<usize>();
+        self.mem += std::mem::size_of::<Row>() + crate::memory::row_heap(&row);
+        self.chunk.push(row);
+        if self.chunk.len() < RESULT_CHUNK_ROWS && self.bytes < RESULT_CHUNK_BYTES {
+            return Ok(true);
+        }
+        let chunk = std::mem::replace(&mut self.chunk, Vec::with_capacity(RESULT_CHUNK_ROWS));
+        let mem = std::mem::take(&mut self.mem);
+        self.bytes = 0;
+        if self.stop.is_none() && self.rest.is_none() {
+            self.rows += chunk.len();
+            self.kept_mem += mem;
+            if self.rows > INLINE_RESULT_ROWS || self.kept_mem > INLINE_RESULT_BYTES {
+                return Err(SqlError::new(crate::storage::READ_BUDGET, "the read returned more rows than its budget"));
+            }
+            self.kept.push((chunk, mem));
+            return Ok(true);
+        }
+        match &self.rest {
+            Some(tx) => Ok(tx.send(chunk, mem)),
+            None => {
+                let (tx, rest) = super::stream::bounded(self.meter.clone(), self.stop.take().expect("a streaming reply"));
+                self.rest = Some(tx);
+                let rows = RowStream { first: Some(super::stream::Chunk::new(chunk, self.meter.charge(mem))), rest };
+                let reply = self.reply.take().expect("a reply");
+                Ok(reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows })).is_ok())
+            }
+        }
+    }
+
+    /// The reply channel back (a read on the engine thread that goes on
+    /// elsewhere; it sent nothing).
+    pub(crate) fn abandon(mut self) -> Sender<Result<ExecResult>> {
+        self.reply.take().expect("a reply that was not sent")
+    }
+
+    /// The end of the rows, or the error that ends them.
+    pub(crate) fn finish(mut self, r: Result<()>) {
+        if let Some(tx) = self.rest.take() {
+            match r {
+                Ok(()) if !self.chunk.is_empty() => {
+                    tx.send(std::mem::take(&mut self.chunk), self.mem);
+                }
+                Ok(()) => {}
+                Err(e) => tx.fail(e),
+            }
+            return;
+        }
+        let reply = self.reply.take().expect("a reply");
+        let mut kept = std::mem::take(&mut self.kept);
+        if kept.is_empty() {
+            let _ = reply.send(r.map(|()| ExecResult::Query { columns: std::mem::take(&mut self.columns), rows: std::mem::take(&mut self.chunk) }));
+            return;
+        }
+        let (first, mem) = kept.remove(0);
+        let mut end = Ok(());
+        match r {
+            Ok(()) if !self.chunk.is_empty() => kept.push((std::mem::take(&mut self.chunk), self.mem)),
+            Ok(()) => {}
+            Err(e) => end = Err(e),
+        }
+        let rows = RowStream { first: Some(super::stream::Chunk::new(first, self.meter.charge(mem))), rest: super::stream::ready(&self.meter, kept, end) };
+        let _ = reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows }));
+    }
 }
 
 impl Engine {
@@ -59,14 +194,13 @@ impl Engine {
         }
         match stmt {
             Statement::Select { query, as_of, .. } => self.select(query, as_of, params, vars, reply),
-            Statement::Subscribe { target, snapshot, progress, as_of: _, copy: _ } => {
-                self.subscribe(target, snapshot, progress, params).map(Some)
-            }
+            Statement::Subscribe { target, snapshot, progress, copy: _ } => self.subscribe(target, snapshot, progress, params, reply),
             Statement::Show(k) => self.show(k).map(Some),
             Statement::Explain { kind, target } => self.explain(kind, target, params).map(Some),
             Statement::Checkpoint => {
-                self.checkpoint()?;
-                Ok(Some(ExecResult::Command { tag: "CHECKPOINT".into() }))
+                // (answered once the next checkpoint is committed)
+                self.request_checkpoint(super::checkpoint::Waiter::Statement(reply));
+                Ok(None)
             }
             Statement::Empty => Ok(Some(ExecResult::Command { tag: String::new() })),
             Statement::Sql(s) => match *s {
@@ -95,12 +229,34 @@ impl Engine {
         }
     }
 
-    /// Run a logical plan against current (or historical) state.
-    pub(crate) fn execute_rel(&mut self, rel: &Rel, at: ReadAt) -> Result<Rows> {
+    /// Run a logical plan against the current state.
+    pub(crate) fn execute_rel(&mut self, rel: &Rel) -> Result<Rows> {
+        if self.reads_hydrating(rel) {
+            // (the request is parked until the hydration is done)
+            return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
+        }
+        if self.dml_reads.is_some() {
+            self.record_dml_reads(rel);
+        }
         let rt = &self.rt;
         let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, at, objects: &objects, rec: Default::default() };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, objects: &objects, rec: Default::default(), visited: 0 };
         ctx.execute(rel)
+    }
+
+    /// The result rows of a query, handed to `out` as they are found
+    /// (`exec::ExecCtx::run_query`; false from `out` ends the read). Returns
+    /// the number of arrangement entries its scans visited.
+    pub(crate) fn read_query(&mut self, q: &crate::sql::BoundQuery, out: &mut dyn FnMut(Row) -> Result<bool>) -> Result<u64> {
+        if self.reads_hydrating(&q.rel) {
+            // (the request is parked until the hydration is done)
+            return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
+        }
+        let rt = &self.rt;
+        let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
+        let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, objects: &objects, rec: Default::default(), visited: 0 };
+        ctx.run_query(q, out)?;
+        Ok(ctx.visited)
     }
 
     fn check_view_errors(&self, rel: &Rel) -> Result<()> {
@@ -125,33 +281,17 @@ impl Engine {
     }
 
     /// Replicated tables whose initial snapshot is still loading (their
-    /// contents are no state the upstream ever had); cached per epoch.
-    fn loading_tables(&mut self) -> &std::collections::HashSet<ObjectId> {
-        if self.loading.0 != self.snap_epoch || self.snap_epoch == 0 {
-            let mut states: HashMap<ObjectId, crate::source::postgres::SourceState> = HashMap::new();
-            let mut set = std::collections::HashSet::new();
-            for o in self.catalog.objects.values() {
-                if let ObjectKind::Table(t) = &o.kind
-                    && let Some(src) = t.source
-                {
-                    let st = states
-                        .entry(src)
-                        .or_insert_with(|| self.source_states.get(&src).and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default());
-                    if !st.tables.get(&o.id).is_some_and(|s| s.done) {
-                        set.insert(o.id);
-                    }
-                }
-            }
-            self.loading = (self.snap_epoch, set);
-        }
-        &self.loading.1
+    /// contents are no state the upstream ever had).
+    fn loading_tables(&self) -> &std::collections::HashSet<ObjectId> {
+        &self.loading
     }
 
-    /// A table the plan reads (directly or through views) whose initial
+    /// The tables the plan reads (directly or through views) whose initial
     /// snapshot is still loading.
-    fn snapshotting_table(&mut self, rel: &Rel) -> Option<ObjectId> {
+    fn snapshotting_tables(&mut self, rel: &Rel) -> Vec<ObjectId> {
+        let mut loading = Vec::new();
         if self.loading_tables().is_empty() {
-            return None;
+            return loading;
         }
         fn gets(r: &Rel, out: &mut Vec<u64>) {
             if let Rel::Get { id, .. } = r {
@@ -171,8 +311,8 @@ impl Engine {
             }
             match self.catalog.get(id).map(|o| &o.kind) {
                 Some(ObjectKind::Table(_)) => {
-                    if self.loading.1.contains(&id) {
-                        return Some(id);
+                    if self.loading.contains(&id) {
+                        loading.push(id);
                     }
                 }
                 Some(ObjectKind::View(v)) | Some(ObjectKind::MaterializedView(v)) => {
@@ -185,7 +325,7 @@ impl Engine {
                 _ => {}
             }
         }
-        None
+        loading
     }
 
     fn select(
@@ -199,14 +339,14 @@ impl Engine {
         // fresh reads wait for the initial snapshots of what they read
         let fresh = match &as_of {
             AsOf::Default => vars.read_mode != "latest",
-            AsOf::Fresh | AsOf::AtLeastLsn(_) => true,
-            AsOf::Gsn(_) | AsOf::Latest => false,
+            AsOf::Fresh | AsOf::AtLeastLsn(_) | AsOf::AtLeastGsn(_) => true,
         };
         if fresh && !self.loading_tables().is_empty() {
             let bq = crate::sql::plan_query(&self.catalog, &query, params.clone())?;
-            if self.snapshotting_table(&bq.rel).is_some() {
+            let tables = self.snapshotting_tables(&bq.rel);
+            if !tables.is_empty() {
                 self.parked.push(Parked {
-                    wait: Wait::Snapshot,
+                    wait: Wait::Snapshot { tables, catalog: self.catalog_epoch },
                     req: Request::Execute {
                         stmt: Box::new(Statement::Select { query, as_of, text: String::new() }),
                         params,
@@ -218,18 +358,22 @@ impl Engine {
                 return Ok(None);
             }
         }
+        // what the read waits for the engine to apply
         let target = match &as_of {
-            AsOf::Gsn(g) => *g,
-            AsOf::Latest => self.processed,
+            AsOf::AtLeastGsn(g) => *g,
             AsOf::Default if vars.read_mode == "latest" => self.processed,
             AsOf::Default | AsOf::Fresh => self.shared.durable(),
             AsOf::AtLeastLsn(l) => {
                 let lsn = parse_lsn(l)?;
                 if !self.lsn_reached(l, lsn)? {
-                    self.shared.lsn_waiters.store(true, Ordering::Release);
+                    // (wake_parked keeps these up to date while reads wait)
+                    if !self.shared.lsn_waiters.swap(true, Ordering::AcqRel) {
+                        self.shared.lsn_wanted.store(u64::MAX, Ordering::Release);
+                    }
+                    self.shared.lsn_wanted.fetch_min(lsn, Ordering::AcqRel);
                     self.shared.want_keepalive.store(true, Ordering::Release);
                     self.parked.push(Parked {
-                        wait: Wait::Lsn,
+                        wait: Wait::Lsn(lsn),
                         req: Request::Execute {
                             stmt: Box::new(Statement::Select { query, as_of: as_of.clone(), text: String::new() }),
                             params,
@@ -247,7 +391,7 @@ impl Engine {
             self.parked.push(Parked {
                 wait: Wait::Gsn(target),
                 req: Request::Execute {
-                    stmt: Box::new(Statement::Select { query, as_of: AsOf::Gsn(target), text: String::new() }),
+                    stmt: Box::new(Statement::Select { query, as_of: AsOf::AtLeastGsn(target), text: String::new() }),
                     params,
                     vars,
                     extra: String::new(),
@@ -256,61 +400,28 @@ impl Engine {
             });
             return Ok(None);
         }
-        let at = if target >= self.processed {
-            ReadAt::Latest
-        } else {
-            if target < self.env.frontier() {
-                sql_bail!(
-                    codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "AS OF {target} is before the retention frontier {}",
-                    self.env.frontier()
-                );
-            }
-            ReadAt::AsOf(target)
-        };
+        // (the latest state: at or after the target)
         let mut bq = crate::sql::plan_query(&self.catalog, &query, params)?;
         self.check_broken(&bq.rel)?;
         self.check_view_errors(&bq.rel)?;
-        // now() is the logical clock as of the read, so reads are repeatable
-        bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock_at(target));
-        let mut rows = self.execute_rel(&bq.rel, at)?;
-        crate::dataflow::consolidate(&mut rows);
-        rows.retain(|(_, w)| *w > 0);
-        if !bq.order.is_empty() {
-            sort_rows(&mut rows, &bq.order);
+        // now() is the logical clock of the state read
+        bq.rel = std::mem::replace(&mut bq.rel, crate::sql::Rel::unit()).bind_now(self.clock);
+        // within a budget on the engine thread, or else off it; the rows go
+        // to the session in chunks as they are found
+        let mut res = ChunkedReply::kept(result_columns(&bq), reply, self.shared.mem.outputs.clone());
+        // (without threads, no budget: there is nowhere else to go)
+        let budget = self.handle.is_some().then_some(super::reader::INLINE_READ_ENTRIES);
+        self.env.set_read_budget(budget);
+        let r = self.read_query(&bq, &mut |row| res.push(row));
+        self.end_inline_read();
+        match r {
+            // (it sent nothing yet: it runs again there)
+            Err(e) if e.code == crate::storage::READ_BUDGET => self.read_elsewhere(bq, vars, res.abandon())?,
+            // (parked, to run again once the relation is hydrated)
+            Err(e) if e.code == super::hydrate::HYDRATING => return Err(e),
+            r => res.finish(r.map(|_| ())),
         }
-        // expand multiplicities, apply OFFSET/LIMIT, project visible columns
-        let mut out: Vec<Row> = Vec::new();
-        let mut skipped = 0u64;
-        let limit = bq.limit.unwrap_or(u64::MAX);
-        let mut last: Option<Row> = None;
-        'outer: for (r, w) in rows {
-            for _ in 0..w {
-                if skipped < bq.offset {
-                    skipped += 1;
-                    continue;
-                }
-                if out.len() as u64 >= limit {
-                    // FETCH ... WITH TIES keeps rows tied with the last one
-                    let tied = bq.with_ties
-                        && last.as_ref().is_some_and(|l| bq.order.iter().all(|k| l[k.col].sql_cmp(&r[k.col]) == std::cmp::Ordering::Equal));
-                    if !tied {
-                        break 'outer;
-                    }
-                }
-                out.push(r[..bq.visible].to_vec());
-                last = Some(r.clone());
-            }
-        }
-        let types = bq.column_types();
-        let columns = bq
-            .names
-            .iter()
-            .take(bq.visible)
-            .zip(types)
-            .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
-            .collect();
-        Ok(Some(ExecResult::Query { columns, rows: out }))
+        Ok(None)
     }
 
     /// Has every source's LSN frontier reached `lsn` (written `text`)? A
@@ -320,17 +431,32 @@ impl Engine {
     /// it, and reading at once could not show the commit the client waits
     /// for (read-your-writes).
     pub(crate) fn lsn_reached(&self, text: &str, lsn: u64) -> Result<bool> {
-        let sources: Vec<ObjectId> =
-            self.catalog.objects.values().filter(|o| matches!(o.kind, ObjectKind::Source(_))).map(|o| o.id).collect();
-        if sources.is_empty() {
-            return Err(SqlError::new(
+        match self.lsn_floor() {
+            None => Err(SqlError::new(
                 codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 format!("AS OF AT LEAST LSN '{text}' cannot be satisfied: there is no source"),
             )
-            .with_hint("The LSN is a position in the WAL of a source's upstream server; create the source first."));
+            .with_hint("The LSN is a position in the WAL of a source's upstream server; create the source first.")),
+            Some(floor) => Ok(floor.is_some_and(|f| f >= lsn)),
         }
+    }
+
+    /// The LSN frontier every source of the catalog has reached: None
+    /// without any source, Some(None) while one has reported none.
+    fn lsn_floor(&self) -> Option<Option<u64>> {
         let frontiers = self.shared.source_lsn.lock();
-        Ok(sources.iter().all(|s| frontiers.get(s).is_some_and(|f| *f >= lsn)))
+        let mut floor: Option<Option<u64>> = None;
+        for o in self.catalog.objects.values() {
+            if matches!(o.kind, ObjectKind::Source(_)) {
+                let f = frontiers.get(&o.id).copied();
+                floor = Some(match (floor, f) {
+                    (None, f) => f,
+                    (Some(Some(a)), Some(b)) => Some(a.min(b)),
+                    _ => None,
+                });
+            }
+        }
+        floor
     }
 
     /// Re-run parked reads whose GSN (or LSN) condition is now satisfied;
@@ -354,6 +480,9 @@ impl Engine {
         // snapshot progress or catalog changes since reads were parked
         let snapshots_changed = self.snap_epoch != self.snap_epoch_seen;
         self.snap_epoch_seen = self.snap_epoch;
+        let lsn_waiting = self.parked.iter().any(|p| matches!(p.wait, Wait::Lsn(_)));
+        // (the sources' common frontier, once for all reads)
+        let mut floor = if lsn_waiting { self.lsn_floor() } else { None };
         let mut still = Vec::new();
         for p in std::mem::take(&mut self.parked) {
             if let Some(e) = interruption(&p.req, true) {
@@ -362,21 +491,18 @@ impl Engine {
                 }
                 continue;
             }
-            let ready = match p.wait {
-                // (re-run on an error: it fails then, e.g. when the last
-                // source was dropped)
-                Wait::Lsn => match &p.req {
-                    Request::Execute { stmt, .. } => match &**stmt {
-                        Statement::Select { as_of: AsOf::AtLeastLsn(l), .. } => {
-                            parse_lsn(l).and_then(|lsn| self.lsn_reached(l, lsn)).unwrap_or(true)
-                        }
-                        _ => true,
-                    },
-                    _ => true,
-                },
-                // re-run: it parks again if a snapshot is still loading
-                Wait::Snapshot => snapshots_changed,
-                Wait::Gsn(g) => self.processed >= g,
+            let ready = match &p.wait {
+                // (re-run without any source: it fails then, e.g. when the
+                // last source was dropped)
+                Wait::Lsn(lsn) => floor.is_none_or(|f| f.is_some_and(|f| f >= *lsn)),
+                // re-run (re-planned) after a catalog change, or once the
+                // tables it waited for are loaded: it parks again if a table
+                // it reads is still loading
+                Wait::Snapshot { tables, catalog } => {
+                    snapshots_changed && (*catalog != self.catalog_epoch || !tables.iter().any(|t| self.loading.contains(t)))
+                }
+                Wait::Gsn(g) => self.processed >= *g,
+                Wait::Hydration(done) => self.hydrations_done > *done,
             };
             if ready {
                 self.deferred.push(p.req);
@@ -384,16 +510,39 @@ impl Engine {
                 still.push(p);
             }
         }
-        let lsn_waiting = still.iter().any(|p| p.wait == Wait::Lsn);
-        self.shared.lsn_waiters.store(lsn_waiting, Ordering::Release);
-        if lsn_waiting {
+        // Sources wake the engine when their frontier passes the smallest
+        // LSN still waited for. One that passed it while it was being set
+        // has not: the frontiers are read again after setting it.
+        loop {
+            let wanted = still.iter().filter_map(|p| if let Wait::Lsn(l) = p.wait { Some(l) } else { None }).min();
+            self.shared.lsn_wanted.store(wanted.unwrap_or(u64::MAX), Ordering::Release);
+            self.shared.lsn_waiters.store(wanted.is_some(), Ordering::Release);
+            let Some(wanted) = wanted else { break };
             // keep asking until the frontier passes
             self.shared.want_keepalive.store(true, Ordering::Release);
+            let now = self.lsn_floor();
+            if now == floor || !now.is_none_or(|f| f.is_some_and(|f| f >= wanted)) {
+                break;
+            }
+            floor = now;
+            let (ready, rest): (Vec<Parked>, Vec<Parked>) =
+                still.into_iter().partition(|p| matches!(p.wait, Wait::Lsn(l) if floor.is_none_or(|f| f.is_some_and(|f| f >= l))));
+            self.deferred.extend(ready.into_iter().map(|p| p.req));
+            still = rest;
         }
         self.parked = still;
     }
 
-    pub(super) fn subscribe(&mut self, target: SubscribeTarget, snapshot: bool, progress: bool, params: Vec<ParamSlot>) -> Result<ExecResult> {
+    /// Start a subscription; the reply is sent once a query's dataflow is
+    /// hydrated (Ok(None)).
+    pub(super) fn subscribe(
+        &mut self,
+        target: SubscribeTarget,
+        snapshot: bool,
+        progress: bool,
+        params: Vec<ParamSlot>,
+        reply: Sender<Result<ExecResult>>,
+    ) -> Result<Option<ExecResult>> {
         let mut view = None;
         let (node, pinned, columns, reads): (NodeId, Option<NodeId>, Vec<ResultColumn>, Vec<ObjectId>) = match target {
             SubscribeTarget::Name(name) => {
@@ -407,8 +556,14 @@ impl Engine {
                     ObjectKind::MaterializedView(v) => {
                         view = Some(obj.id);
                         let rt = &self.rt.views[&obj.id];
+                        if self.hydration.is_some() && !self.graph.arr(rt.arr).hydrated {
+                            return Err(SqlError::new(super::hydrate::HYDRATING, "the view is being hydrated"));
+                        }
                         let cols = v.columns.iter().map(|c| ResultColumn { name: c.name.clone(), ty: c.ty.ty.clone(), typmod: c.ty.typmod }).collect();
                         (rt.node, None, cols, vec![obj.id])
+                    }
+                    ObjectKind::Table(_) if self.hydration.is_some() && !self.graph.node(self.rt.tables[&obj.id]).hydrated => {
+                        return Err(SqlError::new(super::hydrate::HYDRATING, "the table is being rebuilt"));
                     }
                     ObjectKind::Table(t) => (
                         self.rt.tables[&obj.id],
@@ -421,12 +576,16 @@ impl Engine {
                         // names the columns, as in reads of it
                         let text = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
                         let q = crate::sql::parser::parse_single_query(&text)?;
-                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params);
+                        return self.subscribe(SubscribeTarget::Query(Box::new(q), text), snapshot, progress, params, reply);
                     }
                     _ => sql_bail!(codes::WRONG_OBJECT_TYPE, "cannot subscribe to {} \"{name}\"", obj.kind.name()),
                 }
             }
             SubscribeTarget::Query(q, _) => {
+                if self.hydration.is_some() {
+                    // (its dataflow is hydrated after the one in progress)
+                    return Err(SqlError::new(super::hydrate::HYDRATING, "a hydration is in progress"));
+                }
                 let bq = crate::sql::plan_query(&self.catalog, &q, params)?;
                 super::ddl::check_deterministic(&bq.rel)?;
                 super::ddl::check_catalog_reads(&bq)?;
@@ -470,25 +629,22 @@ impl Engine {
                 };
                 self.graph.retain_node(node);
                 self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-                if let Err(e) = self.graph.hydrate(&mut self.env, self.processed) {
-                    let _ = self.graph.release_node(&mut self.env, node);
-                    return Err(e);
-                }
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
                 (node, Some(node), cols, reads)
             }
         };
-        let (tx, rx) = unbounded();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if snapshot {
-            let snap = self.graph.snapshot(&mut self.env, node)?;
-            if !snap.data.is_empty() {
-                let _ = tx.send(SubEvent::Data { gsn: self.processed, rows: snap.data });
+        // as of the last record: in the background if it has a new dataflow
+        let p = super::hydrate::PendingSub { node, pinned, columns, reads, view, snapshot, progress, reply };
+        if pinned.is_none() {
+            // (a view or table: nothing to hydrate)
+            self.then_inline(super::hydrate::Then::Subscribe(p))?;
+        } else if let Err(e) = self.hydrate(self.processed, vec![super::hydrate::Then::Subscribe(p)]) {
+            if let Some(n) = pinned {
+                let _ = self.graph.release_node(&mut self.env, n);
             }
+            return Err(e);
         }
-        let _ = tx.send(SubEvent::Progress { gsn: self.processed });
-        self.subs.push(Subscription { node, tx, cancel: cancel.clone(), pinned, progress, view, reads });
-        Ok(ExecResult::Subscribe { columns, rx, cancel, progress })
+        Ok(None)
     }
 
     /// Add to `reads` the relations that the materialized views in it read
@@ -660,7 +816,6 @@ impl Engine {
                     vec!["durable_gsn".into(), self.shared.durable().to_string()],
                     vec!["processed_gsn".into(), self.processed.to_string()],
                     vec!["checkpoint_gsn".into(), st.checkpoint_gsn.to_string()],
-                    vec!["retention_frontier".into(), self.env.frontier().to_string()],
                     vec!["cache_bytes".into(), st.mem_bytes.to_string()],
                     vec!["segments".into(), st.segments.len().to_string()],
                 ];
@@ -887,27 +1042,44 @@ impl Engine {
         rows
     }
 
-    /// Average entries per key prefix of an arrangement (sampled).
+    /// Average entries (of positive weight) per key prefix of an
+    /// arrangement, sampled from runs of entries starting at evenly spaced
+    /// ranks of its weight (found through the subtree counts).
     fn estimate_fanout(&mut self, arr: ArrId) -> f64 {
+        use std::ops::Bound;
+        const RUNS: i64 = 16;
+        const RUN: usize = 128;
         let a = self.graph.arr(arr);
         let layout = a.layout.clone();
         let tree = a.tree;
-        let total = self.env.tree_count(tree).max(0) as f64;
-        if total == 0.0 {
+        let total = self.env.tree_count(tree);
+        if total <= 0 {
             return 1.0;
         }
-        let mut c = self.env.cursor(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
-        let mut keys = std::collections::BTreeSet::new();
-        let mut n = 0;
-        while let Ok(Some((k, _))) = self.env.cursor_next(&mut c) {
-            if let Ok(kb) = layout.key_bytes(&k) {
-                keys.insert(kb.to_vec());
-            }
-            n += 1;
-            if n >= 2000 {
-                break;
-            }
+        // a small tree is one run from its start
+        let runs = if total <= RUNS * RUN as i64 { 1 } else { RUNS };
+        let (mut entries, mut keys) = (0usize, 0usize);
+        for r in 0..runs {
+            let rank = if runs == 1 { 0 } else { (total as i128 * (2 * r as i128 + 1) / (2 * runs as i128)) as i64 };
+            let Ok(Some((start, _, _))) = self.env.nth(tree, Bound::Unbounded, Bound::Unbounded, rank) else { continue };
+            let (mut n, mut visited) = (0usize, 0usize);
+            let mut last: Option<Vec<u8>> = None;
+            let _ = self.env.for_each(tree, Bound::Included(&start), Bound::Unbounded, &mut |k, w| {
+                visited += 1;
+                if w > 0
+                    && let Ok(kb) = layout.key_bytes(k)
+                {
+                    // entries with equal keys are adjacent
+                    if last.as_deref() != Some(kb) {
+                        keys += 1;
+                        last = Some(kb.to_vec());
+                    }
+                    n += 1;
+                }
+                Ok(n < RUN && visited < 8 * RUN)
+            });
+            entries += n;
         }
-        if keys.is_empty() { 1.0 } else { (n as f64 / keys.len() as f64).max(1.0) }
+        if keys == 0 { 1.0 } else { (entries as f64 / keys as f64).max(1.0) }
     }
 }

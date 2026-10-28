@@ -43,6 +43,32 @@ fn tick(h: &EngineHandle, secs: i64) {
     h.log(LogRecord::Tick { micros: base + secs * 1_000_000 }).unwrap();
 }
 
+/// A conditional upsert (what a source logs for an update leaving TOASTed
+/// values unchanged while the table is being copied) fills the unchanged
+/// values from the key's row, and changes nothing without one: the key has
+/// not been copied yet, and its copy brings the whole row. Unlike a plain
+/// upsert, it takes nothing from a row deleted just before (the delete need
+/// not be of its old key).
+#[test]
+fn conditional_upserts_need_a_row() {
+    use ivm::dataflow::TableChange::{Delete, UpsertIfPresent};
+    use ivm::types::Datum;
+    let dir = tmpdir("upsert-if-present");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int, b text)");
+    exec(&h, "INSERT INTO t VALUES (1, 1, 'kept')");
+    let upsert = |id: i32, a: i32| UpsertIfPresent { row: vec![Datum::Int4(id), Datum::Int4(a), Datum::Null], unchanged: vec![2] };
+    // (table t is object 1000; the source, which need not exist, is 4242)
+    let commit = |changes| LogRecord::Commit { source: 4242, lsn: 1, changes };
+    h.log(commit(vec![(1000, upsert(1, 2)), (1000, upsert(2, 2))])).unwrap();
+    assert_eq!(rows(&h, "SELECT * FROM t ORDER BY id"), ["1|2|kept"]);
+    h.log(commit(vec![(1000, Delete { key: vec![Datum::Int4(1)] }), (1000, upsert(5, 5))])).unwrap();
+    assert!(rows(&h, "SELECT * FROM t ORDER BY id").is_empty());
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn temporal_filters_follow_the_logged_clock() {
     let dir = tmpdir("temporal");
@@ -101,6 +127,58 @@ fn temporal_filters_follow_the_logged_clock() {
     // the clock never goes backwards
     tick(&h, 0);
     assert_eq!(rows(&h, "SELECT now()"), vec!["2026-01-02 00:00:50+00".to_string()]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Adding a month clamps the day to the end of a shorter month: January
+/// 29th to 31st plus a month are all February 28th, at their time of day,
+/// so `now() + interval '1 month'` goes back a day at the midnights
+/// starting them, and a row of February 28th noon enters
+/// `ts > now() + interval '1 month'` on each of those days until noon.
+/// Likewise `now() - interval '1 month'` on March 28th to 31st.
+#[test]
+fn temporal_filters_with_months_follow_the_calendar() {
+    let dir = tmpdir("temporal-months");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    tick(&h, 0);
+    exec(&h, "CREATE TABLE ev (id int PRIMARY KEY, ts timestamptz)");
+    exec(&h, "INSERT INTO ev VALUES (1, '2026-02-28 12:00:00+00'), (2, '2026-02-28 00:00:00+00'), (3, '2026-03-01 00:00:00+00')");
+    let ahead = "SELECT id FROM ev WHERE ts > now() + interval '1 month'";
+    let recent = "SELECT id FROM ev WHERE ts > now() - interval '1 month'";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW ahead AS {ahead}"));
+    exec(&h, &format!("CREATE MATERIALIZED VIEW recent AS {recent}"));
+    let ids = |h: &EngineHandle, q: &str| {
+        let mut r = rows(h, q);
+        r.sort();
+        r.join(",")
+    };
+    // (day of 2026, hour, ids in `ahead`, ids in `recent`)
+    let steps = [
+        (27, 6, "1,3", "1,2,3"),
+        (27, 13, "3", "1,2,3"),
+        (28, 6, "1,3", "1,2,3"),
+        (29, 18, "3", "1,2,3"),
+        (30, 6, "1,3", "1,2,3"), // January 31st, 06:00
+        (30, 13, "3", "1,2,3"),
+        (31, 6, "", "1,2,3"), // February 1st: plus a month is March 1st
+        (31 + 28 + 27, 6, "", "1,3"), // March 28th
+        (31 + 28 + 27, 13, "", "3"),
+        (31 + 28 + 28, 6, "", "1,3"),
+        (31 + 28 + 28, 13, "", "3"),
+        (31 + 28 + 30, 6, "", "1,3"), // March 31st
+        (31 + 28 + 30, 13, "", "3"),
+        (31 + 28 + 31, 6, "", ""), // April 1st: minus a month is March 1st
+    ];
+    for (day, hour, want_ahead, want_recent) in steps {
+        tick(&h, day * 86_400 + hour * 3600);
+        let at = rows(&h, "SELECT now()").join("");
+        assert_eq!(ids(&h, ahead), want_ahead, "{ahead} at {at}");
+        assert_eq!(ids(&h, recent), want_recent, "{recent} at {at}");
+        assert_eq!(ids(&h, "SELECT id FROM ahead"), want_ahead, "view ahead at {at}");
+        assert_eq!(ids(&h, "SELECT id FROM recent"), want_recent, "view recent at {at}");
+    }
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -204,6 +282,105 @@ fn temporal_views_match_recompute_as_time_passes() {
             assert_eq!(got, want, "step {step} (clock {clock}): view tv{i} = {v}");
         }
     }
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Temporal filters adding months to the clock, which goes back at the
+/// midnights starting days clamped to the end of a shorter month, equal
+/// their queries at every clock reading of a walk across month ends
+/// (January to April 2026, and February 2024's leap day two years back),
+/// as rows near those ends change, views are created over existing rows,
+/// and the engine restarts.
+#[test]
+fn temporal_views_with_months_match_recompute() {
+    let dir = tmpdir("temporal-months-random");
+    let mut running = start(&dir);
+    let mut h = running.handle.clone();
+    tick(&h, 0);
+    exec(&h, "CREATE TABLE ev (id int PRIMARY KEY, ts timestamptz, d date, lts timestamp)");
+    let views = [
+        "SELECT id FROM ev WHERE ts > now() - interval '1 month'",
+        "SELECT id FROM ev WHERE ts <= now() + interval '1 month'",
+        "SELECT id FROM ev WHERE ts BETWEEN now() - interval '1 month 2 days' AND now() + interval '1 month -3 hours'",
+        "SELECT id FROM ev WHERE d > current_date - interval '1 month'",
+        "SELECT id FROM ev WHERE lts >= localtimestamp + interval '-1 month 6 hours'",
+        "SELECT count(*) AS n FROM ev WHERE ts::date = (now() - interval '1 month')::date",
+        "SELECT id FROM ev WHERE ts > (now() + interval '1 month') - interval '1 month' - interval '29 days'",
+        "SELECT id FROM ev WHERE date_trunc('hour', ts) < date_trunc('minute', now() - interval '2 years')",
+        "SELECT id FROM ev WHERE ts = date_trunc('hour', now() + interval '13 months') - interval '1 year 1 month'",
+    ];
+    // the last three are created over existing rows
+    let early = 6;
+    for (i, v) in views[..early].iter().enumerate() {
+        exec(&h, &format!("CREATE MATERIALIZED VIEW mv{i} AS {v}"));
+    }
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    // a time near a month's end, as SQL: ten days around the start of one
+    // of February to April 2026 (or two years before, around February
+    // 29th 2024), at an hour, minute or microsecond
+    let near_end = |rng: &mut Rng| {
+        let month = ["2026-02-01", "2026-03-01", "2026-04-01", "2024-03-01"][rng.below(4) as usize];
+        let secs = rng.below(10 * 86_400) as i64 - 6 * 86_400;
+        let secs = match rng.below(3) {
+            0 => secs - secs.rem_euclid(3600),
+            1 => secs - secs.rem_euclid(60),
+            _ => secs,
+        };
+        format!("timestamp '{month}' + {secs} * interval '1 second' + {} * interval '1 microsecond'", rng.below(2))
+    };
+    let row = |rng: &mut Rng, id: u64| {
+        let (a, b, c) = (near_end(rng), near_end(rng), near_end(rng));
+        format!("({id}, ({a}) AT TIME ZONE 'UTC', ({b})::date, {c})")
+    };
+    let rows_now: Vec<String> = (0..60).map(|id| row(&mut rng, id)).collect();
+    exec(&h, &format!("INSERT INTO ev VALUES {}", rows_now.join(", ")));
+    // from January 20th to April 5th 2026
+    let mut clock = 19 * 86_400;
+    let mut step = 0;
+    while clock < 94 * 86_400 {
+        clock += match rng.below(4) {
+            0 => rng.below(60) as i64,
+            1 => rng.below(3600) as i64,
+            _ => rng.below(7 * 3600) as i64,
+        };
+        tick(&h, clock);
+        match rng.below(6) {
+            0 => {
+                let id = rng.below(100);
+                let r = row(&mut rng, id);
+                exec(&h, &format!("DELETE FROM ev WHERE id = {id}"));
+                exec(&h, &format!("INSERT INTO ev VALUES {r}"));
+            }
+            1 => {
+                exec(&h, &format!("DELETE FROM ev WHERE id = {}", rng.below(100)));
+            }
+            _ => {}
+        }
+        if step == 40 {
+            for (i, v) in views.iter().enumerate().skip(early) {
+                exec(&h, &format!("CREATE MATERIALIZED VIEW mv{i} AS {v}"));
+            }
+        }
+        if step == 150 || step == 300 {
+            running.shutdown();
+            running = start(&dir);
+            h = running.handle.clone();
+        }
+        for (i, v) in views.iter().enumerate() {
+            if i >= early && step < 40 {
+                continue;
+            }
+            let mut got = rows(&h, &format!("SELECT * FROM mv{i}"));
+            let mut want = rows(&h, v);
+            got.sort();
+            want.sort();
+            let at = rows(&h, "SELECT now()").join("");
+            assert_eq!(got, want, "step {step} at {at}: view mv{i} = {v}");
+        }
+        step += 1;
+    }
+    assert!(step > 300, "{step} clock readings");
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -326,14 +503,12 @@ fn distinct_on_infinite_intervals() {
 /// current sizes of their inputs. When the sizes changed since the view was
 /// created, the re-planned joins look up other indexes, the view's
 /// arrangements no longer match the checkpointed ones and are hydrated
-/// afresh: their history is gone, so reads AS OF a GSN before the restart
-/// fail ("before the history of a relation it reads"; they used to return
-/// the hydrated state) instead of returning what the view held.
+/// afresh, from the current state: the view's contents are those of its
+/// query, as before the restart.
 #[test]
-#[ignore = "bug: recovery re-plans joins from current table sizes; changed plans re-hydrate views, whose AS OF history then starts at the restart"]
-fn as_of_history_survives_restart_after_table_sizes_change() {
-    let dir = tmpdir("replan-history");
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, retention_gsns: 100_000, ..Default::default() };
+fn views_replanned_at_restart_after_table_sizes_change() {
+    let dir = tmpdir("replan-sizes");
+    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
     let running = coord::start(cfg.clone()).unwrap();
     let h = running.handle.clone();
     exec(&h, "CREATE TABLE a (id int PRIMARY KEY, k1 int, k3 int)");
@@ -342,18 +517,19 @@ fn as_of_history_survives_restart_after_table_sizes_change() {
     exec(&h, "INSERT INTO a SELECT g, g % 3, g % 5 FROM generate_series(1, 10) g");
     exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(1, 5) g");
     exec(&h, "INSERT INTO c SELECT g, g % 4, g % 5 FROM generate_series(1, 50) g");
-    exec(&h, "CREATE MATERIALIZED VIEW v AS SELECT count(*) AS n FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3");
-    let gsn = rows(&h, "SHOW GSN")[0].clone();
-    let then = rows(&h, "SELECT * FROM v");
+    let q = "SELECT count(*) AS n FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3";
+    exec(&h, &format!("CREATE MATERIALIZED VIEW v AS {q}"));
     // b grows, c shrinks: the join order flips
     exec(&h, "DELETE FROM c WHERE id > 3");
     exec(&h, "INSERT INTO b SELECT g, g % 3, g % 4 FROM generate_series(6, 200) g");
-    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then);
+    let now = rows(&h, q);
+    assert_eq!(rows(&h, "SELECT * FROM v"), now);
     running.shutdown();
     let running = coord::start(cfg).unwrap();
     let h = running.handle.clone();
-    assert_eq!(rows(&h, "SELECT * FROM v"), rows(&h, "SELECT count(*) FROM a JOIN b ON a.k1 = b.k1 JOIN c ON b.k2 = c.k2 AND a.k3 = c.k3"));
-    assert_eq!(rows(&h, &format!("SELECT * FROM v AS OF {gsn}")), then, "view v AS OF {gsn} after the restart");
+    assert_eq!(rows(&h, "SELECT * FROM v"), now);
+    exec(&h, "DELETE FROM a WHERE id % 2 = 0");
+    assert_eq!(rows(&h, "SELECT * FROM v"), rows(&h, q));
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -530,8 +706,8 @@ fn dropping_a_view_leaves_subscriptions_to_its_twin_alone() {
     let mut acc = std::collections::BTreeMap::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            SubEvent::Data { rows, .. } => {
-                for (r, w) in rows {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
+                for (r, w) in ev.rows().unwrap() {
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
                 }
             }
@@ -568,9 +744,9 @@ fn replacing_a_view_with_other_columns_ends_its_subscriptions() {
     let mut error = None;
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            SubEvent::Data { rows, .. } => {
+            ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => {
                 assert!(error.is_none(), "rows after the error");
-                for (r, w) in rows {
+                for (r, w) in ev.rows().unwrap() {
                     assert_eq!(r.len(), 2, "a row of another shape: {r:?}");
                     *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
                 }
@@ -603,8 +779,8 @@ fn replacing_a_view_leaves_subscriptions_to_its_twin_alone() {
     exec(&h, "INSERT INTO t VALUES (3, 3)");
     let mut acc = std::collections::BTreeMap::new();
     while let Ok(ev) = rx.try_recv() {
-        if let SubEvent::Data { rows, .. } = ev {
-            for (r, w) in rows {
+        if matches!(ev, SubEvent::Data { .. } | SubEvent::Snapshot { .. }) {
+            for (r, w) in ev.rows().unwrap() {
                 *acc.entry(r.iter().map(format_datum).collect::<Vec<_>>().join("|")).or_insert(0i64) += w;
             }
         }
@@ -612,6 +788,98 @@ fn replacing_a_view_leaves_subscriptions_to_its_twin_alone() {
     acc.retain(|_, w| *w != 0);
     assert_eq!(acc.keys().cloned().collect::<Vec<_>>(), ["1", "2", "3"]);
     assert_eq!(rows(&h, "SELECT * FROM a ORDER BY 1"), ["11", "12", "13"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reads that stop at their LIMIT — in the order of an arrangement that is
+/// the ORDER BY (also within an equality on a key prefix, under computed
+/// columns, and after deletes), or keeping only the top rows of another
+/// order — return what sorting the whole result returns. The
+/// reference queries order by `+ 0` expressions, which no arrangement is in.
+#[test]
+fn limited_reads_match_sorts() {
+    let dir = tmpdir("limited-reads");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, g int, v text)");
+    let mut rng = Rng(0x0BAD_5EED_1234_5678);
+    let vals: Vec<String> = (1..=2000)
+        .map(|i| {
+            let g = if i % 50 == 0 { "NULL".to_string() } else { rng.below(20).to_string() };
+            format!("({i}, {g}, 'v{}')", rng.below(1000))
+        })
+        .collect();
+    exec(&h, &format!("INSERT INTO t VALUES {}", vals.join(", ")));
+    exec(&h, "CREATE INDEX t_g ON t (g, id)");
+    // (in the ORDER BY clause, and an equality that an index could serve)
+    let slow = |q: &str| {
+        let (head, tail) = q.split_once(" ORDER BY ").unwrap();
+        let tail = tail.replace("id", "id + 0").replace("g ", "g + 0 ").replace("g,", "g + 0,").replace("v ", "v || '' ");
+        format!("{} ORDER BY {tail}", head.replace("g = ", "g + 0 = "))
+    };
+    let mut n = 0;
+    for q in [
+        "SELECT * FROM t ORDER BY id LIMIT 7",
+        "SELECT id, v FROM t ORDER BY id OFFSET 13 LIMIT 5",
+        "SELECT id FROM t WHERE id > 1500 ORDER BY id LIMIT 3",
+        "SELECT id, v FROM t WHERE g = 3 ORDER BY id LIMIT 4",
+        "SELECT g, id FROM t ORDER BY g, id LIMIT 9",
+        "SELECT g, id FROM t ORDER BY g, id OFFSET 1990 LIMIT 20",
+        "SELECT g, id FROM t ORDER BY g NULLS FIRST, id LIMIT 6",
+        "SELECT g, id FROM t ORDER BY g DESC, id LIMIT 5",
+        "SELECT id, id * 2 AS d FROM t ORDER BY id LIMIT 3",
+        "SELECT v, id FROM t ORDER BY v DESC, id LIMIT 8",
+        "SELECT t.id, u.v FROM t JOIN t u ON u.id = t.id + 1 ORDER BY t.id LIMIT 4",
+    ] {
+        let (fast, reference) = (rows(&h, q), rows(&h, &slow(q)));
+        assert_eq!(fast, reference, "{q}");
+        n += fast.len();
+    }
+    // with ties, the set of rows is determined
+    for q in ["SELECT g, id FROM t ORDER BY g FETCH FIRST 3 ROWS WITH TIES", "SELECT g, id FROM t ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES"] {
+        let (mut fast, mut reference) = (rows(&h, q), rows(&h, &slow(q)));
+        fast.sort();
+        reference.sort();
+        assert_eq!(fast, reference, "{q}");
+        assert!(fast.len() > 3, "{q}: {fast:?}");
+    }
+    // without ORDER BY, any rows that pass
+    assert_eq!(rows(&h, "SELECT id FROM t WHERE v LIKE 'v1%' LIMIT 5").len(), 5);
+    assert_eq!(rows(&h, "SELECT * FROM t LIMIT 0"), Vec::<String>::new());
+    assert_eq!(n, 64);
+    // after deletes
+    exec(&h, "DELETE FROM t WHERE id % 2 = 0");
+    let q = "SELECT id, g FROM t ORDER BY id LIMIT 6";
+    assert_eq!(rows(&h, q), rows(&h, &slow(q)));
+    assert_eq!(rows(&h, q).len(), 6);
+    assert_eq!(rows(&h, "SELECT id FROM t ORDER BY id LIMIT 2"), ["1", "3"]);
+    running.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A subscription's snapshot comes in chunks read from the arrangement as
+/// the session takes them (it used to be built whole on the engine thread
+/// and sent as one event).
+#[test]
+fn subscription_snapshots_come_in_chunks() {
+    let dir = tmpdir("sub-chunks");
+    let running = start(&dir);
+    let h = running.handle.clone();
+    exec(&h, "CREATE TABLE t (id int PRIMARY KEY, a int)");
+    exec(&h, "INSERT INTO t SELECT g, g % 7 FROM generate_series(1, 25000) g");
+    let ExecResult::Subscribe { rx, .. } = exec(&h, "SUBSCRIBE TO t") else { panic!("not a subscription") };
+    let mut sizes = Vec::new();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)).expect("an event") {
+            SubEvent::Data { rows, .. } => sizes.push(rows.len()),
+            SubEvent::Snapshot { rows, .. } => sizes.extend(rows.map(|c| c.unwrap().len())),
+            SubEvent::Progress { .. } => break,
+            SubEvent::Error(e) => panic!("subscription failed: {e}"),
+        }
+    }
+    assert_eq!(sizes.iter().sum::<usize>(), 25000);
+    assert!(sizes.len() >= 3 && sizes.iter().all(|n| *n <= 10_000), "{sizes:?}");
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -696,39 +964,22 @@ fn indexed_reads_match_scans() {
         );
     }
     assert!(n > 200, "the queries return rows ({n})");
-    // as of an earlier GSN
-    let gsn: u64 = rows(&h, "SHOW GSN")[0].parse().unwrap();
+    // after changes, and through an index built after them
     exec(&h, "DELETE FROM t WHERE id % 3 = 0");
     exec(&h, "UPDATE a SET region = 'moved' WHERE id % 4 = 0");
-    let old = check(
-        &format!("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25 AS OF {gsn}"),
-        &format!("SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25 AS OF {gsn}"),
-    );
-    assert_eq!(old, 21);
-    check("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25", "SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25");
-    // arrangements built after the GSN lack the history before it: AS OF
-    // reads use neither their key ranges nor their lookups
+    let changed = check("SELECT * FROM per_a WHERE id BETWEEN 5 AND 25", "SELECT * FROM per_a WHERE id + 0 BETWEEN 5 AND 25");
+    assert_eq!(changed, 21);
     exec(&h, "DROP INDEX t_kind");
     exec(&h, "CREATE INDEX t_kind_a ON t (kind, a_id)");
     let mut m = 0;
     for k in [1, 2] {
+        m += check(&format!("SELECT id FROM t WHERE kind = 'k{k}'"), &format!("SELECT id FROM t WHERE kind || '' = 'k{k}'"));
         m += check(
-            &format!("SELECT id FROM t WHERE kind = 'k{k}' AS OF {gsn}"),
-            &format!("SELECT id FROM t WHERE kind || '' = 'k{k}' AS OF {gsn}"),
-        );
-        m += check(
-            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
-            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind || '' = 'k' || a.id::text WHERE a.id = {k} AS OF {gsn}"),
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind = 'k' || a.id::text WHERE a.id = {k}"),
+            &format!("SELECT a.id, t.id FROM a JOIN t ON t.kind || '' = 'k' || a.id::text WHERE a.id = {k}"),
         );
     }
-    assert!(m > 100, "the AS OF queries return rows ({m})");
-    // a relation rebuilt after the GSN has no history before it
-    exec(&h, "CREATE OR REPLACE MATERIALIZED VIEW per_a AS SELECT a.id, a.region FROM a");
-    for q in [format!("SELECT region FROM per_a WHERE id = 5 AS OF {gsn}"), format!("SELECT id FROM per_a AS OF {gsn}")] {
-        let stmt = ivm::sql::parse_statement(&q).unwrap();
-        let err = h.execute(stmt, vec![], SessionVars::default(), String::new()).err().map(|e| e.message);
-        assert!(err.as_deref().is_some_and(|e| e.contains("before the history")), "{q}: {err:?}");
-    }
+    assert!(m > 60, "the queries after the changes return rows ({m})");
     running.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
