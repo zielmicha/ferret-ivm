@@ -160,7 +160,7 @@ file, lock it, and run on the same directory concurrently.
 
 ## Recovery
 
-Every start is a recovery (the listen address is bound before it, so
+Every start is a recovery (the listen addresses are bound before it, so
 clients that connect meanwhile wait):
 
 1. Lock the data directory and read its format version (`FORMAT`): a

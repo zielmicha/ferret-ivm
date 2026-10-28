@@ -11,6 +11,7 @@ pub mod error;
 pub mod exec;
 pub mod expr;
 pub mod http;
+pub mod listen;
 pub mod log;
 pub mod memory;
 pub mod server;

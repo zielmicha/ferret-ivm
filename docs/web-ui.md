@@ -34,6 +34,20 @@ recovery has finished (an address that cannot be bound ends the process
 with status 1, `ivm: cannot start the web UI: …`) and stops first at
 shutdown.
 
+An address that contains a `/` is the path of a Unix-domain socket, for a
+reverse proxy on the same machine or for scripts; the file is created and
+removed as for `--listen` (see
+[Unix-domain sockets](user-guide/getting-started.md#unix-domain-sockets)):
+
+```sh
+ivm --data-dir ./ivm-data --http-listen /run/ivm/ui.sock
+curl --unix-socket /run/ivm/ui.sock http://localhost/api/overview
+```
+
+The flag can be given several times, to serve the same UI on several
+addresses (for example a socket for a proxy and `127.0.0.1:6876`); the
+limits below are shared by all of them.
+
 To reach a server on another machine without exposing the port, prefer an
 SSH tunnel (`ssh -L 6876:127.0.0.1:6876 host`) over listening on a public
 interface. The server speaks plain HTTP; put a TLS-terminating reverse proxy
@@ -51,9 +65,12 @@ in front of it if it must be reachable over a network.
   text, so use it over loopback, an SSH tunnel or TLS.
 - **Without a password,** the server only answers requests whose `Host`
   header is an IP address, `localhost` (or a `*.localhost` name) or the host
-  of `--http-listen`. This blocks DNS-rebinding attacks, where a web page on
-  another site points its own domain at your loopback address to read the
-  API. Other host names get `403`; start ivm with `--password` to use them.
+  of a TCP `--http-listen` address. This blocks DNS-rebinding attacks, where
+  a web page on another site points its own domain at your loopback address
+  to read the API. Other host names get `403`; start ivm with `--password`
+  to use them. Requests through a Unix-domain socket are checked the same
+  way (a proxy on a loopback port may forward to the socket): use
+  `localhost` in the URL, as above, or have the proxy send it.
 - **Read-only.** The API cannot change anything. The SQL console accepts
   exactly one `SELECT`, `SHOW` or `EXPLAIN` statement; everything else is
   refused with `403`. It only accepts `application/json` bodies (`415`
@@ -592,8 +609,8 @@ sampled time series.
 - `crates/ivm/src/coord/inspect.rs` builds the snapshots on the engine
   thread (`Request::Inspect`, `EngineHandle::inspect`). They are plain
   structs serialized by the HTTP thread.
-- `crates/ivm/src/http/` is the server: `mod.rs` (startup, connection
-  handling, router, auth), `api.rs` (JSON endpoints), `metrics.rs` (sampler,
+- `crates/ivm/src/http/` is the server: `mod.rs` (startup, listeners,
+  connection handling, router, auth), `api.rs` (JSON endpoints), `metrics.rs` (sampler,
   ring buffer, event stream, `/proc` statistics), `console.rs` (SQL console)
   and `assets.rs` (embedded files). It runs on a tokio runtime with two
   worker threads of its own (`ivm-http`); requests reach the engine through
@@ -609,7 +626,8 @@ sampled time series.
 - `crates/ivm/tests/http.rs` tests the server against a real engine:
   snapshot consistency with `SHOW ARRANGEMENTS` and `EXPLAIN DATAFLOW`,
   record counts, counters, error records, authentication, static files,
-  malformed requests, the console and the event stream.
+  malformed requests, the console, the event stream and Unix-domain
+  sockets.
 
 ## Third-party components
 
