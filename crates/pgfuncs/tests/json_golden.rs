@@ -1,16 +1,13 @@
 //! Golden tests for pgfuncs::json against results recorded from PostgreSQL 17
 //! (see tests/gen/gen_json.py).
 
+mod common;
+use common::{Golden, s};
 use pgfuncs::Error;
 use pgfuncs::json::{self, JsonNumber, Jsonb};
 use serde_json::Value;
 
 type Res = Result<Option<String>, Error>;
-
-fn s(v: &Value) -> &str {
-    v.as_str()
-        .unwrap_or_else(|| panic!("expected string arg, got {v}"))
-}
 
 fn strs(v: &Value) -> Vec<&str> {
     v.as_array()
@@ -191,78 +188,9 @@ fn eval(fname: &str, a: &[Value]) -> Res {
     }
 }
 
-fn show(r: &Res) -> String {
-    match r {
-        Ok(Some(v)) => {
-            let mut t: String = v.chars().take(300).collect();
-            if v.len() > 300 {
-                t.push_str("...");
-            }
-            format!("{t:?}")
-        }
-        Ok(None) => "NULL".to_owned(),
-        Err(e) => format!("ERROR {} {:?} detail={:?}", e.sqlstate, e.message, e.detail),
-    }
-}
-
 #[test]
 fn json_golden() {
-    let data = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/data/json_golden.jsonl"
-    ))
-    .unwrap();
-    let mut failures = Vec::new();
-    let mut total = 0;
-    for line in data.lines() {
-        let rec: Value = serde_json::from_str(line).unwrap();
-        let fname = rec["fn"].as_str().unwrap();
-        let args = rec["args"].as_array().unwrap();
-        total += 1;
-        let expected: Res = if let Some(e) = rec.get("error") {
-            Err(Error {
-                sqlstate: Box::leak(e["sqlstate"].as_str().unwrap().to_owned().into_boxed_str()),
-                message: e["message"].as_str().unwrap().to_owned(),
-                detail: e["detail"].as_str().map(str::to_owned),
-            })
-        } else {
-            Ok(rec["result"].as_str().map(str::to_owned))
-        };
-        let got = std::panic::catch_unwind(|| eval(fname, args));
-        let ok = match &got {
-            Ok(g) => *g == expected,
-            Err(_) => false,
-        };
-        if !ok {
-            let got_s = match &got {
-                Ok(g) => show(g),
-                Err(_) => "PANIC".to_owned(),
-            };
-            failures.push(format!(
-                "{fname}({}):\n   expected {}\n   got      {}",
-                line_args(args),
-                show(&expected),
-                got_s
-            ));
-        }
-    }
-    for f in failures.iter().take(60) {
-        eprintln!("{f}");
-    }
-    assert!(
-        failures.is_empty(),
-        "{} of {} golden cases failed",
-        failures.len(),
-        total
-    );
-    eprintln!("{total} golden cases passed");
-}
-
-fn line_args(args: &[Value]) -> String {
-    let s = serde_json::to_string(args).unwrap();
-    if s.chars().count() > 200 {
-        format!("{}...", s.chars().take(200).collect::<String>())
-    } else {
-        s
-    }
+    let mut g = Golden::load("json_golden.jsonl");
+    g.run(eval);
+    g.finish();
 }

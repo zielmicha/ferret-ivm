@@ -8,12 +8,15 @@
 //! zone use the `pgdatetime` crate.
 
 use super::ast::{DtMethod, Kind};
-use super::dtformat::{self, POSTGRES_EPOCH_JDATE, Parsed, Template, USECS_PER_DAY, USECS_PER_SEC};
 use crate::json::JsonNumber;
 use crate::{Error, Result, sqlstate};
-use pgdatetime::TimeZone;
+use pgdatetime::{DateTimeTemplate as Template, ParsedDateTime as Parsed, TimeZone};
 use std::cmp::Ordering;
 use std::sync::OnceLock;
+
+const POSTGRES_EPOCH_JDATE: i32 = 2_451_545;
+const USECS_PER_SEC: i64 = 1_000_000;
+const USECS_PER_DAY: i64 = 86_400_000_000;
 
 /// The session settings PostgreSQL consults for datetime items: the
 /// `TimeZone` setting, and the current date (transaction start) that
@@ -159,9 +162,9 @@ fn timestamp2tm(dt: i64) -> Option<(i32, i32, i32, i64, i64, i64, i64)> {
     if date < 0 || date > i64::from(i32::MAX) {
         return None;
     }
-    let (y, m, d) = dtformat::j2date(date as i32);
+    let (y, m, d) = pgdatetime::date_to_ymd((date as i32).wrapping_sub(POSTGRES_EPOCH_JDATE));
     let (hh, mi, ss, fs) = time2tm(time);
-    Some((y, m, d, hh, mi, ss, fs))
+    Some((y, m as i32, d as i32, hh, mi, ss, fs))
 }
 
 /// EncodeDateTime() in XSD style.
@@ -229,7 +232,7 @@ impl DateTime {
                 if d == i32::MAX {
                     return Ok("infinity".to_owned());
                 }
-                let (y, m, dd) = dtformat::j2date(d.wrapping_add(POSTGRES_EPOCH_JDATE));
+                let (y, m, dd) = pgdatetime::date_to_ymd(d);
                 let mut out = String::with_capacity(16);
                 push_year(&mut out, y);
                 out.push('-');
@@ -390,7 +393,7 @@ fn cached_template(fmt: &str) -> Result<std::sync::Arc<Template>> {
             return Ok(t);
         }
     }
-    let t = Arc::new(Template::parse(fmt)?);
+    let t = Arc::new(Template::parse(fmt).map_err(dt_error)?);
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     c.insert(0, (fmt.to_owned(), t.clone()));
     c.truncate(ENTRIES);
@@ -426,7 +429,7 @@ pub(crate) fn execute(
             ));
         };
         let t = cached_template(template)?;
-        let p = match dtformat::parse_datetime(s, &t) {
+        let p = match t.parse_value(s).map_err(dt_error) {
             Ok((p, _)) => p,
             Err(e) => return Ok(Err(e)),
         };
@@ -457,7 +460,7 @@ pub(crate) fn execute(
         }
         let found = iso_templates()
             .iter()
-            .find_map(|t| dtformat::parse_datetime(s, t).ok());
+            .find_map(|t| t.parse_value(s).ok());
         match found {
             Some((p, _)) => (p, parsed_zone(p)),
             None => {
@@ -501,7 +504,7 @@ pub(crate) fn execute(
             // Force the user-given time precision, if any (larger values
             // are reduced to 6 with a warning in PostgreSQL)
             DtVal::Time(if time_precision != -1 {
-                dtformat::adjust_time(t, time_precision.min(6))
+                pgdatetime::adjust_time(t, time_precision.min(6))
             } else {
                 t
             })
@@ -520,7 +523,7 @@ pub(crate) fn execute(
             };
             DtVal::TimeTz(
                 if time_precision != -1 {
-                    dtformat::adjust_time(t, time_precision.min(6))
+                    pgdatetime::adjust_time(t, time_precision.min(6))
                 } else {
                     t
                 },
@@ -540,7 +543,7 @@ pub(crate) fn execute(
                 }
             };
             DtVal::Timestamp(if time_precision != -1 {
-                dtformat::adjust_timestamp(ts, time_precision.min(6))
+                pgdatetime::adjust_timestamp(ts, time_precision.min(6)).map_err(dt_error)?
             } else {
                 ts
             })
@@ -564,7 +567,7 @@ pub(crate) fn execute(
                 Parsed::TimestampTz(t, _) => t,
             };
             DtVal::TimestampTz(if time_precision != -1 {
-                dtformat::adjust_timestamp(t, time_precision.min(6))
+                pgdatetime::adjust_timestamp(t, time_precision.min(6)).map_err(dt_error)?
             } else {
                 t
             })

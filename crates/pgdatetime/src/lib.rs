@@ -129,8 +129,8 @@ pub use fields::{
     extract_timestamptz, extract_timestamptz_opt,
 };
 pub use formatting::{
-    to_char_interval, to_char_interval_opt, to_char_timestamp, to_char_timestamp_opt,
-    to_char_timestamptz, to_char_timestamptz_opt, to_date, to_timestamp,
+    DateTimeTemplate, ParsedDateTime, to_char_interval, to_char_interval_opt, to_char_timestamp,
+    to_char_timestamp_opt, to_char_timestamptz, to_char_timestamptz_opt, to_date, to_timestamp,
 };
 pub use io::{
     IntervalFields, adjust_interval, adjust_interval_raw_typmod, adjust_interval_typmod,

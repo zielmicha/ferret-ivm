@@ -30,33 +30,6 @@ pub fn write_f32(v: f32, out: &mut String) {
     crate::ryu::format_f32(v, out);
 }
 
-/// float8in.
-pub fn parse_f64(s: &str) -> Result<f64> {
-    float_in(s, "double precision").map(|v| match v {
-        Parsed::F(x) => x,
-        Parsed::Nan(neg) => {
-            if neg {
-                -f64::NAN
-            } else {
-                f64::NAN
-            }
-        }
-        Parsed::Inf(neg) => {
-            if neg {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            }
-        }
-    })
-}
-
-/// float4in (type name "real").
-pub fn parse_f32(s: &str) -> Result<f32> {
-    // Parsed through the f32 path (no double rounding).
-    float4_in(s)
-}
-
 fn invalid_syntax(type_name: &str, orig: &str) -> Error {
     err(
         "22P02",
@@ -93,12 +66,6 @@ enum Scan {
         len: usize,
         neg: bool,
     },
-}
-
-enum Parsed {
-    F(f64),
-    Nan(bool),
-    Inf(bool),
 }
 
 /// Scan the longest prefix of `b` that glibc's strtod would accept.
@@ -299,126 +266,57 @@ fn round_hex(mant: u64, sticky: bool, exp2: i64, mant_bits: u32, bias: i64) -> (
     }
 }
 
-fn hex_to_f64(mant: u64, sticky: bool, exp2: i64) -> (f64, bool) {
-    if mant == 0 {
-        return (0.0, false);
-    }
-    let (bits, ovf) = round_hex(mant, sticky, exp2, 52, 1023);
-    if ovf {
-        return (f64::INFINITY, true);
-    }
-    (f64::from_bits(bits), false)
-}
-
-fn hex_to_f32(mant: u64, sticky: bool, exp2: i64) -> (f32, bool) {
-    if mant == 0 {
-        return (0.0, false);
-    }
-    let (bits, ovf) = round_hex(mant, sticky, exp2, 23, 127);
-    if ovf {
-        return (f32::INFINITY, true);
-    }
-    (f32::from_bits(bits as u32), false)
-}
-
-/// float8in_internal
-fn float_in(orig: &str, type_name: &str) -> Result<Parsed> {
-    let b = orig.as_bytes();
-    let mut i = 0;
-    while i < b.len() && is_space(b[i]) {
-        i += 1;
-    }
-    if i == b.len() {
-        return Err(invalid_syntax(type_name, orig));
-    }
-    let num = &b[i..];
-    let (val, len) = match scan_strtod(num) {
-        None => return Err(invalid_syntax(type_name, orig)),
-        Some(Scan::Inf { len, neg }) => (Parsed::Inf(neg), len),
-        Some(Scan::Nan { len, neg }) => (Parsed::Nan(neg), len),
-        Some(Scan::Decimal { len, nonzero }) => {
-            let text = &orig[i..i + len];
-            let v: f64 = text.parse().unwrap_or(0.0);
-            if v.is_infinite() || (v == 0.0 && nonzero) {
-                return Err(out_of_range(text, "double precision"));
+// Keep decimal parsing at the target precision: parsing as f64 then casting
+// to f32 would round twice. Both types otherwise use the same PG input rules.
+macro_rules! float_input {
+    ($name:ident, $float:ty, $type_name:literal, $mant_bits:literal, $bias:literal) => {
+        /// Parse PostgreSQL float input, including hexadecimal numbers and signed NaN.
+        pub fn $name(orig: &str) -> Result<$float> {
+            let num = orig.trim_start_matches(|c: char| c.is_ascii() && is_space(c as u8));
+            let scan =
+                scan_strtod(num.as_bytes()).ok_or_else(|| invalid_syntax($type_name, orig))?;
+            let (value, len) = match scan {
+                Scan::Inf { len, neg } => (
+                    if neg {
+                        <$float>::NEG_INFINITY
+                    } else {
+                        <$float>::INFINITY
+                    },
+                    len,
+                ),
+                Scan::Nan { len, neg } => (if neg { -<$float>::NAN } else { <$float>::NAN }, len),
+                Scan::Decimal { len, nonzero } => {
+                    let value: $float = num[..len].parse().unwrap_or(0.0);
+                    if value.is_infinite() || (value == 0.0 && nonzero) {
+                        return Err(out_of_range(&num[..len], $type_name));
+                    }
+                    (value, len)
+                }
+                Scan::Hex {
+                    len,
+                    mant,
+                    sticky,
+                    exp2,
+                } => {
+                    let (bits, overflow) = if mant == 0 {
+                        (0, false)
+                    } else {
+                        round_hex(mant, sticky, exp2, $mant_bits, $bias)
+                    };
+                    let value = <$float>::from_bits(bits as _);
+                    if overflow || (value == 0.0 && mant != 0) {
+                        return Err(out_of_range(&num[..len], $type_name));
+                    }
+                    (if num.starts_with('-') { -value } else { value }, len)
+                }
+            };
+            if !num.as_bytes()[len..].iter().all(|&b| is_space(b)) {
+                return Err(invalid_syntax($type_name, orig));
             }
-            (Parsed::F(v), len)
-        }
-        Some(Scan::Hex {
-            len,
-            mant,
-            sticky,
-            exp2,
-        }) => {
-            let neg = num[0] == b'-';
-            let (v, ovf) = hex_to_f64(mant, sticky, exp2);
-            if ovf || (v == 0.0 && mant != 0) {
-                return Err(out_of_range(&orig[i..i + len], "double precision"));
-            }
-            (Parsed::F(if neg { -v } else { v }), len)
+            Ok(value)
         }
     };
-    let mut j = i + len;
-    while j < b.len() && is_space(b[j]) {
-        j += 1;
-    }
-    if j != b.len() {
-        return Err(invalid_syntax(type_name, orig));
-    }
-    Ok(val)
 }
 
-/// float4in_internal
-fn float4_in(orig: &str) -> Result<f32> {
-    let type_name = "real";
-    let b = orig.as_bytes();
-    let mut i = 0;
-    while i < b.len() && is_space(b[i]) {
-        i += 1;
-    }
-    if i == b.len() {
-        return Err(invalid_syntax(type_name, orig));
-    }
-    let num = &b[i..];
-    let (val, len) = match scan_strtod(num) {
-        None => return Err(invalid_syntax(type_name, orig)),
-        Some(Scan::Inf { len, neg }) => (
-            if neg {
-                f32::NEG_INFINITY
-            } else {
-                f32::INFINITY
-            },
-            len,
-        ),
-        Some(Scan::Nan { len, neg }) => (if neg { -f32::NAN } else { f32::NAN }, len),
-        Some(Scan::Decimal { len, nonzero }) => {
-            let text = &orig[i..i + len];
-            let v: f32 = text.parse().unwrap_or(0.0);
-            if v.is_infinite() || (v == 0.0 && nonzero) {
-                return Err(out_of_range(text, "real"));
-            }
-            (v, len)
-        }
-        Some(Scan::Hex {
-            len,
-            mant,
-            sticky,
-            exp2,
-        }) => {
-            let neg = num[0] == b'-';
-            let (v, ovf) = hex_to_f32(mant, sticky, exp2);
-            if ovf || (v == 0.0 && mant != 0) {
-                return Err(out_of_range(&orig[i..i + len], "real"));
-            }
-            (if neg { -v } else { v }, len)
-        }
-    };
-    let mut j = i + len;
-    while j < b.len() && is_space(b[j]) {
-        j += 1;
-    }
-    if j != b.len() {
-        return Err(invalid_syntax(type_name, orig));
-    }
-    Ok(val)
-}
+float_input!(parse_f64, f64, "double precision", 52, 1023);
+float_input!(parse_f32, f32, "real", 23, 127);

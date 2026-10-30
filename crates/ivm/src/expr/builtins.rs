@@ -46,36 +46,6 @@ fn abs_any(a: &Datum) -> Result<Datum> {
         _ => return Err(SqlError::internal("abs")),
     })
 }
-fn ceil_f(a: &Datum) -> Result<Datum> {
-    f8(f(a).ceil())
-}
-fn ceil_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).ceil()))
-}
-fn floor_f(a: &Datum) -> Result<Datum> {
-    f8(f(a).floor())
-}
-fn floor_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).floor()))
-}
-fn round_f(a: &Datum) -> Result<Datum> {
-    f8(f(a).round_ties_even())
-}
-fn round_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).round(0)?))
-}
-fn round_n2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).round(i(b) as i32)?))
-}
-fn trunc_f(a: &Datum) -> Result<Datum> {
-    f8(f(a).trunc())
-}
-fn trunc_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).trunc(0)?))
-}
-fn trunc_n2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).trunc(i(b) as i32)?))
-}
 fn sign_f(a: &Datum) -> Result<Datum> {
     let x = f(a);
     f8(if x > 0.0 {
@@ -86,21 +56,12 @@ fn sign_f(a: &Datum) -> Result<Datum> {
         0.0
     })
 }
-fn sign_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).sign()))
-}
 fn sqrt_f(a: &Datum) -> Result<Datum> {
     let x = f(a);
     if x < 0.0 {
         return Err(SqlError::new("2201F", "cannot take square root of a negative number"));
     }
     f8(x.sqrt())
-}
-fn sqrt_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).sqrt()?))
-}
-fn cbrt_f(a: &Datum) -> Result<Datum> {
-    f8(glibc_cbrt(f(a)))
 }
 
 /// cbrt() as PostgreSQL computes it with glibc (sysdeps/ieee754/dbl-64/
@@ -146,9 +107,6 @@ fn exp_f(a: &Datum) -> Result<Datum> {
     }
     f8(r)
 }
-fn exp_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).exp()?))
-}
 fn ln_f(a: &Datum) -> Result<Datum> {
     let x = f(a);
     if x == 0.0 {
@@ -158,9 +116,6 @@ fn ln_f(a: &Datum) -> Result<Datum> {
         return Err(log_err("cannot take logarithm of a negative number"));
     }
     f8(x.ln())
-}
-fn ln_n(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).ln()?))
 }
 fn log10_f(a: &Datum) -> Result<Datum> {
     let x = f(a);
@@ -175,9 +130,6 @@ fn log10_f(a: &Datum) -> Result<Datum> {
 fn log10_n(a: &Datum) -> Result<Datum> {
     Ok(Datum::numeric(n(a).log10()?))
 }
-fn log_n2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).log(n(b))?))
-}
 fn mod_int(a: &Datum, b: &Datum) -> Result<Datum> {
     if i(b) == 0 {
         return Err(div_zero());
@@ -191,21 +143,6 @@ fn datum_int_type(d: &Datum) -> SqlType {
         Datum::Int4(_) => T::Int4,
         _ => T::Int8,
     }
-}
-fn mod_n(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).rem(n(b))?))
-}
-fn div_n(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).div_trunc(n(b))?))
-}
-fn pi(_: &[Datum]) -> Result<Datum> {
-    f8(std::f64::consts::PI)
-}
-fn degrees(a: &Datum) -> Result<Datum> {
-    f8(f(a).to_degrees())
-}
-fn radians(a: &Datum) -> Result<Datum> {
-    f8(f(a).to_radians())
 }
 macro_rules! trig {
     ($name:ident, $e:expr) => {
@@ -232,9 +169,6 @@ trig!(tanh, f64::tanh);
 trig!(asinh, f64::asinh);
 trig!(acosh, f64::acosh);
 trig!(atanh, f64::atanh);
-fn atan2(a: &Datum, b: &Datum) -> Result<Datum> {
-    f8(f(a).atan2(f(b)))
-}
 fn gcd_int(a: &Datum, b: &Datum) -> Result<Datum> {
     let (mut x, mut y) = (i(a).unsigned_abs(), i(b).unsigned_abs());
     while y != 0 {
@@ -258,30 +192,6 @@ fn lcm_int(a: &Datum, b: &Datum) -> Result<Datum> {
     let name = if ty == T::Int4 { "integer" } else { "bigint" };
     let v = (x / g).checked_mul(y).map(|v| v.abs()).ok_or_else(|| range_err(name))?;
     super::cast::int_to(v, &ty)
-}
-fn gcd_n(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).gcd(n(b))?))
-}
-fn lcm_n(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).lcm(n(b))?))
-}
-fn factorial(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(Numeric::factorial(i(a))?))
-}
-fn pow_f(a: &Datum, b: &Datum) -> Result<Datum> {
-    super::ops::float8_pow(a, b)
-}
-fn pow_n(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).pow(n(b))?))
-}
-fn trim_scale(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(n(a).normalize()))
-}
-fn scale(a: &Datum) -> Result<Datum> {
-    Ok(n(a).scale().map(Datum::Int4).unwrap_or(Datum::Null))
-}
-fn min_scale(a: &Datum) -> Result<Datum> {
-    Ok(n(a).min_scale().map(Datum::Int4).unwrap_or(Datum::Null))
 }
 fn width_bucket_args(cnt: i64, nan: bool, infinite_bound: bool) -> Result<()> {
     if cnt <= 0 {
@@ -380,9 +290,6 @@ fn lower(a: &Datum) -> Result<Datum> {
 fn upper(a: &Datum) -> Result<Datum> {
     Ok(txt(pgfuncs::text::upper(s(a))))
 }
-fn initcap(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::initcap(s(a))))
-}
 fn substr2(a: &Datum, b: &Datum) -> Result<Datum> {
     match a {
         Datum::Bytea(x) => Ok(Datum::bytea(pgfuncs::text::substr_bytes(x, i(b), None)?)),
@@ -401,99 +308,11 @@ fn substring_re(a: &Datum, b: &Datum) -> Result<Datum> {
         None => Datum::Null,
     })
 }
-fn strpos(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Int4(pgfuncs::text::strpos(s(a), s(b))))
-}
-fn overlay3(args: &[Datum]) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::overlay(s(&args[0]), s(&args[1]), i(&args[2]), None)?))
-}
-fn overlay4(args: &[Datum]) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::overlay(s(&args[0]), s(&args[1]), i(&args[2]), Some(i(&args[3])))?))
-}
-fn btrim1(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::btrim(s(a), " ")))
-}
-fn btrim2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::btrim(s(a), s(b))))
-}
-fn ltrim1(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::ltrim(s(a), " ")))
-}
-fn ltrim2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::ltrim(s(a), s(b))))
-}
-fn rtrim1(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::rtrim(s(a), " ")))
-}
-/// text(bpchar): the cast from character(n), which drops trailing spaces.
-fn bpchar_text(a: &Datum) -> Result<Datum> {
-    Ok(txt(s(a).trim_end_matches(' ').to_string()))
-}
-fn rtrim2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::rtrim(s(a), s(b))))
-}
-fn replace(args: &[Datum]) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::replace(s(&args[0]), s(&args[1]), s(&args[2]))))
-}
-fn split_part(args: &[Datum]) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::split_part(s(&args[0]), s(&args[1]), i(&args[2]) as i32)?))
-}
-fn left(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::left(s(a), i(b) as i32)))
-}
-fn right(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::right(s(a), i(b) as i32)))
-}
-fn lpad2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::lpad_checked(s(a), i(b) as i32, " ")?))
-}
-fn lpad3(args: &[Datum]) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::lpad_checked(s(&args[0]), i(&args[1]) as i32, s(&args[2]))?))
-}
-fn rpad2(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::rpad_checked(s(a), i(b) as i32, " ")?))
-}
-fn rpad3(args: &[Datum]) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::rpad_checked(s(&args[0]), i(&args[1]) as i32, s(&args[2]))?))
-}
-fn repeat(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::repeat(s(a), i(b) as i32)?))
-}
-fn reverse(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::reverse(s(a))))
-}
-fn translate(args: &[Datum]) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::translate(s(&args[0]), s(&args[1]), s(&args[2]))))
-}
-fn ascii(a: &Datum) -> Result<Datum> {
-    Ok(Datum::Int4(pgfuncs::text::ascii(s(a))))
-}
-fn chr(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::chr(i(a) as i32)?))
-}
-fn starts_with(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(pgfuncs::text::starts_with(s(a), s(b))))
-}
 fn md5(a: &Datum) -> Result<Datum> {
     Ok(txt(match a {
         Datum::Bytea(b) => pgfuncs::text::md5_hex(b),
         _ => pgfuncs::text::md5_hex(s(a).as_bytes()),
     }))
-}
-fn sha256(a: &Datum) -> Result<Datum> {
-    Ok(Datum::bytea(pgfuncs::text::sha256(a.as_bytes().unwrap())))
-}
-fn sha224(a: &Datum) -> Result<Datum> {
-    Ok(Datum::bytea(pgfuncs::text::sha224(a.as_bytes().unwrap())))
-}
-fn sha384(a: &Datum) -> Result<Datum> {
-    Ok(Datum::bytea(pgfuncs::text::sha384(a.as_bytes().unwrap())))
-}
-fn sha512(a: &Datum) -> Result<Datum> {
-    Ok(Datum::bytea(pgfuncs::text::sha512(a.as_bytes().unwrap())))
-}
-fn quote_ident(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::quote_ident(s(a))))
 }
 fn quote_literal(a: &Datum) -> Result<Datum> {
     Ok(txt(pgfuncs::text::quote_literal(&as_text(a))))
@@ -504,9 +323,6 @@ fn quote_nullable(args: &[Datum]) -> Result<Datum> {
 /// quote_literal(character(n)) quotes $1::text, which drops the padding.
 fn quote_literal_bpchar(a: &Datum) -> Result<Datum> {
     Ok(txt(pgfuncs::text::quote_literal(s(a).trim_end_matches(' '))))
-}
-fn quote_nullable_bpchar(args: &[Datum]) -> Result<Datum> {
-    if args[0].is_null() { Ok(txt("NULL".into())) } else { quote_literal_bpchar(&args[0]) }
 }
 fn to_hex(a: &Datum) -> Result<Datum> {
     Ok(txt(match a {
@@ -611,21 +427,6 @@ fn regexp_split_to_array(args: &[Datum]) -> Result<Datum> {
     let parts = regex(s(&args[1]), flags)?.split(s(&args[0]));
     Ok(text_array_datum(parts.into_iter().map(Some).collect()))
 }
-fn encode(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::bytea::encode(a.as_bytes().unwrap(), s(b))?))
-}
-fn decode(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::bytea(pgfuncs::bytea::decode(s(a), s(b))?))
-}
-fn unistr(a: &Datum) -> Result<Datum> {
-    Ok(txt(pgfuncs::text::unistr(s(a))?))
-}
-fn num_nulls(args: &[Datum]) -> Result<Datum> {
-    Ok(Datum::Int4(args.iter().filter(|a| a.is_null()).count() as i32))
-}
-fn num_nonnulls(args: &[Datum]) -> Result<Datum> {
-    Ok(Datum::Int4(args.iter().filter(|a| !a.is_null()).count() as i32))
-}
 fn gen_random_uuid(_: &[Datum]) -> Result<Datum> {
     let mut b = [0u8; 16];
     for (k, chunk) in b.chunks_mut(8).enumerate() {
@@ -682,12 +483,6 @@ fn overlaps(a: &[Datum]) -> Result<Datum> {
     })
 }
 
-fn zero_size(_: &Datum) -> Result<Datum> {
-    Ok(Datum::Int8(0))
-}
-fn zero_size2(_: &Datum, _: &Datum) -> Result<Datum> {
-    Ok(Datum::Int8(0))
-}
 /// pg_size_pretty (PostgreSQL 17's unit table and half rounding).
 fn size_pretty(a: &Datum) -> Result<Datum> {
     let mut size: i128 = match a {
@@ -712,23 +507,8 @@ fn size_pretty(a: &Datum) -> Result<Datum> {
     unreachable!()
 }
 
-fn always_true1(_: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(true))
-}
-fn always_false1(_: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(false))
-}
 fn always_true(_: &[Datum]) -> Result<Datum> {
     Ok(Datum::Bool(true))
-}
-fn always_false(_: &[Datum]) -> Result<Datum> {
-    Ok(Datum::Bool(false))
-}
-fn null_text(_: &[Datum]) -> Result<Datum> {
-    Ok(Datum::Null)
-}
-fn owner_name(_: &Datum) -> Result<Datum> {
-    Ok(Datum::text("ivm"))
 }
 thread_local! {
     /// The settings of the session whose statement this thread is running
@@ -790,12 +570,6 @@ fn current_setting(args: &[Datum]) -> Result<Datum> {
 fn set_config(args: &[Datum]) -> Result<Datum> {
     Ok(args[1].clone())
 }
-fn encoding_name(_: &Datum) -> Result<Datum> {
-    Ok(Datum::text("UTF8"))
-}
-fn backend_pid(_: &[Datum]) -> Result<Datum> {
-    Ok(Datum::Int4(std::process::id() as i32))
-}
 fn current_schemas(a: &Datum) -> Result<Datum> {
     let mut v = Vec::new();
     if a.as_bool() == Some(true) {
@@ -813,9 +587,6 @@ fn format_type_fn(a: &[Datum]) -> Result<Datum> {
     })
 }
 
-fn grouping_misplaced(_: &[Datum]) -> Result<Datum> {
-    Err(SqlError::new(codes::GROUPING_ERROR, "GROUPING is only allowed in queries with GROUP BY"))
-}
 
 fn now(_: &[Datum]) -> Result<Datum> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -885,12 +656,6 @@ fn age(a: &Datum, b: &Datum) -> Result<Datum> {
         _ => return Err(SqlError::internal("age")),
     }))
 }
-fn make_date(args: &[Datum]) -> Result<Datum> {
-    Ok(Datum::Date(pgdatetime::make_date(i(&args[0]) as i32, i(&args[1]) as i32, i(&args[2]) as i32)?))
-}
-fn make_time(args: &[Datum]) -> Result<Datum> {
-    Ok(Datum::Time(pgdatetime::make_time(i(&args[0]) as i32, i(&args[1]) as i32, f(&args[2]))?))
-}
 fn make_timestamp(args: &[Datum]) -> Result<Datum> {
     Ok(Datum::Timestamp(pgdatetime::make_timestamp(
         i(&args[0]) as i32,
@@ -914,15 +679,6 @@ fn make_interval(args: &[Datum]) -> Result<Datum> {
     let secs = args.get(6).map(f).unwrap_or(0.0);
     Ok(Datum::Interval(pgdatetime::make_interval(g(0), g(1), g(2), g(3), g(4), g(5), secs)?))
 }
-fn to_timestamp_epoch(a: &Datum) -> Result<Datum> {
-    Ok(Datum::TimestampTz(pgdatetime::to_timestamp_epoch(f(a))?))
-}
-fn to_timestamp_fmt(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::TimestampTz(pgdatetime::to_timestamp(s(a), s(b), &SESSION_TZ)?))
-}
-fn to_date(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Date(pgdatetime::to_date(s(a), s(b))?))
-}
 fn to_char(a: &Datum, b: &Datum) -> Result<Datum> {
     let r = match a {
         Datum::Timestamp(v) => pgdatetime::to_char_timestamp_opt(*v, s(b))?,
@@ -943,18 +699,6 @@ fn to_char(a: &Datum, b: &Datum) -> Result<Datum> {
         _ => return Err(SqlError::unsupported("to_char for this type is not supported")),
     };
     Ok(r.map(txt).unwrap_or(Datum::Null))
-}
-fn to_number(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(pgnumeric::to_number(s(a), s(b))?.map(Datum::numeric).unwrap_or(Datum::Null))
-}
-fn justify_hours(a: &Datum) -> Result<Datum> {
-    Ok(Datum::Interval(pgdatetime::justify_hours(a.as_interval().unwrap())?))
-}
-fn justify_days(a: &Datum) -> Result<Datum> {
-    Ok(Datum::Interval(pgdatetime::justify_days(a.as_interval().unwrap())?))
-}
-fn justify_interval(a: &Datum) -> Result<Datum> {
-    Ok(Datum::Interval(pgdatetime::justify_interval(a.as_interval().unwrap())?))
 }
 fn isfinite(a: &Datum) -> Result<Datum> {
     Ok(Datum::Bool(match a {
@@ -1124,18 +868,6 @@ fn json_build_array(args: &[Datum]) -> Result<Datum> {
     }
     Ok(Datum::Json(Arc::from(format!("[{}]", v.join(", ")).as_str())))
 }
-fn jsonb_typeof(a: &Datum) -> Result<Datum> {
-    Ok(txt(jsonb(a).type_name().to_string()))
-}
-fn json_typeof(a: &Datum) -> Result<Datum> {
-    Ok(txt(Jsonb::parse(s(a))?.type_name().to_string()))
-}
-fn jsonb_array_length(a: &Datum) -> Result<Datum> {
-    Ok(Datum::Int4(jsonb(a).array_length()?))
-}
-fn json_array_length(a: &Datum) -> Result<Datum> {
-    Ok(Datum::Int4(Jsonb::parse(s(a))?.array_length()?))
-}
 fn path_args(args: &[Datum]) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for a in args {
@@ -1238,45 +970,7 @@ fn path_query_first_impl(tz: bool, args: &[Datum]) -> Result<Datum> {
     let (doc, path, vars, silent) = jsonpath_args(args)?;
     Ok(path_context(tz, |c| c.query_first(doc, &path, vars, silent))?.map(Datum::jsonb).unwrap_or(Datum::Null))
 }
-fn jsonb_path_exists(args: &[Datum]) -> Result<Datum> {
-    path_exists_impl(false, args)
-}
-fn jsonb_path_exists_tz(args: &[Datum]) -> Result<Datum> {
-    path_exists_impl(true, args)
-}
-fn jsonb_path_match(args: &[Datum]) -> Result<Datum> {
-    path_match_impl(false, args)
-}
-fn jsonb_path_match_tz(args: &[Datum]) -> Result<Datum> {
-    path_match_impl(true, args)
-}
-fn jsonb_path_query_array(args: &[Datum]) -> Result<Datum> {
-    path_query_array_impl(false, args)
-}
-fn jsonb_path_query_array_tz(args: &[Datum]) -> Result<Datum> {
-    path_query_array_impl(true, args)
-}
-fn jsonb_path_query_first(args: &[Datum]) -> Result<Datum> {
-    path_query_first_impl(false, args)
-}
-fn jsonb_path_query_first_tz(args: &[Datum]) -> Result<Datum> {
-    path_query_first_impl(true, args)
-}
-/// jsonb @? jsonpath
-fn jsonb_path_exists_opr(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(opt_bool(pgfuncs::json::path_exists_op(jsonb(a), &*jsonpath(b)?)?))
-}
-/// jsonb @@ jsonpath
-fn jsonb_path_match_opr(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(opt_bool(pgfuncs::json::path_match_op(jsonb(a), &*jsonpath(b)?)?))
-}
 
-fn jsonb_strip_nulls(a: &Datum) -> Result<Datum> {
-    Ok(Datum::jsonb(jsonb(a).strip_nulls()))
-}
-fn jsonb_pretty(a: &Datum) -> Result<Datum> {
-    Ok(txt(jsonb(a).to_pretty()))
-}
 
 // ---------------------------------------------------------------- arrays
 
@@ -1309,9 +1003,6 @@ fn array_lower(a: &Datum, b: &Datum) -> Result<Datum> {
         Some((lb, _)) if dim >= 1 => Datum::Int4(*lb),
         _ => Datum::Null,
     })
-}
-fn cardinality(a: &Datum) -> Result<Datum> {
-    Ok(Datum::Int4(arr(a).elems.len() as i32))
 }
 fn array_dims(a: &Datum) -> Result<Datum> {
     let x = arr(a);
@@ -1405,15 +1096,6 @@ pub(super) fn array_cat2(a: &Datum, b: &Datum) -> Result<Datum> {
         _ => Err(SqlError::internal("array_cat")),
     }
 }
-fn array_append_f(args: &[Datum]) -> Result<Datum> {
-    array_append2(&args[0], &args[1])
-}
-fn array_prepend_f(args: &[Datum]) -> Result<Datum> {
-    array_prepend2(&args[0], &args[1])
-}
-fn array_cat_f(args: &[Datum]) -> Result<Datum> {
-    array_cat2(&args[0], &args[1])
-}
 
 // ---------------------------------------------------------------- registration
 
@@ -1423,39 +1105,39 @@ pub fn register(b: &mut Builder) {
         b.f1("abs", t.clone(), t.clone(), abs_any);
     }
     for name in ["ceil", "ceiling"] {
-        b.f1(name, T::Float8, T::Float8, ceil_f);
-        b.f1(name, T::Numeric, T::Numeric, ceil_n);
+        b.f1(name, T::Float8, T::Float8, |a| f8(f(a).ceil()));
+        b.f1(name, T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).ceil())));
     }
-    b.f1("floor", T::Float8, T::Float8, floor_f);
-    b.f1("floor", T::Numeric, T::Numeric, floor_n);
-    b.f1("round", T::Float8, T::Float8, round_f);
-    b.f1("round", T::Numeric, T::Numeric, round_n);
-    b.f2("round", T::Numeric, T::Int4, T::Numeric, round_n2);
-    b.f1("trunc", T::Float8, T::Float8, trunc_f);
-    b.f1("trunc", T::Numeric, T::Numeric, trunc_n);
-    b.f2("trunc", T::Numeric, T::Int4, T::Numeric, trunc_n2);
+    b.f1("floor", T::Float8, T::Float8, |a| f8(f(a).floor()));
+    b.f1("floor", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).floor())));
+    b.f1("round", T::Float8, T::Float8, |a| f8(f(a).round_ties_even()));
+    b.f1("round", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).round(0)?)));
+    b.f2("round", T::Numeric, T::Int4, T::Numeric, |a, b| Ok(Datum::numeric(n(a).round(i(b) as i32)?)));
+    b.f1("trunc", T::Float8, T::Float8, |a| f8(f(a).trunc()));
+    b.f1("trunc", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).trunc(0)?)));
+    b.f2("trunc", T::Numeric, T::Int4, T::Numeric, |a, b| Ok(Datum::numeric(n(a).trunc(i(b) as i32)?)));
     b.f1("sign", T::Float8, T::Float8, sign_f);
-    b.f1("sign", T::Numeric, T::Numeric, sign_n);
+    b.f1("sign", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).sign())));
     b.f1("sqrt", T::Float8, T::Float8, sqrt_f);
-    b.f1("sqrt", T::Numeric, T::Numeric, sqrt_n);
-    b.f1("cbrt", T::Float8, T::Float8, cbrt_f);
+    b.f1("sqrt", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).sqrt()?)));
+    b.f1("cbrt", T::Float8, T::Float8, |a| f8(glibc_cbrt(f(a))));
     b.f1("exp", T::Float8, T::Float8, exp_f);
-    b.f1("exp", T::Numeric, T::Numeric, exp_n);
+    b.f1("exp", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).exp()?)));
     b.f1("ln", T::Float8, T::Float8, ln_f);
-    b.f1("ln", T::Numeric, T::Numeric, ln_n);
+    b.f1("ln", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).ln()?)));
     b.f1("log", T::Float8, T::Float8, log10_f);
     b.f1("log", T::Numeric, T::Numeric, log10_n);
-    b.f2("log", T::Numeric, T::Numeric, T::Numeric, log_n2);
+    b.f2("log", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).log(n(b))?)));
     b.f1("log10", T::Float8, T::Float8, log10_f);
     b.f1("log10", T::Numeric, T::Numeric, log10_n);
     for t in [T::Int2, T::Int4, T::Int8] {
         b.f2("mod", t.clone(), t.clone(), t.clone(), mod_int);
     }
-    b.f2("mod", T::Numeric, T::Numeric, T::Numeric, mod_n);
-    b.f2("div", T::Numeric, T::Numeric, T::Numeric, div_n);
-    b.fnn("pi", vec![], T::Float8, pi);
-    b.f1("degrees", T::Float8, T::Float8, degrees);
-    b.f1("radians", T::Float8, T::Float8, radians);
+    b.f2("mod", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).rem(n(b))?)));
+    b.f2("div", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).div_trunc(n(b))?)));
+    b.fnn("pi", vec![], T::Float8, |_| f8(std::f64::consts::PI));
+    b.f1("degrees", T::Float8, T::Float8, |a| f8(f(a).to_degrees()));
+    b.f1("radians", T::Float8, T::Float8, |a| f8(f(a).to_radians()));
     b.f1("sin", T::Float8, T::Float8, sin);
     b.f1("cos", T::Float8, T::Float8, cos);
     b.f1("tan", T::Float8, T::Float8, tan);
@@ -1463,7 +1145,7 @@ pub fn register(b: &mut Builder) {
     b.f1("asin", T::Float8, T::Float8, asin);
     b.f1("acos", T::Float8, T::Float8, acos);
     b.f1("atan", T::Float8, T::Float8, atan);
-    b.f2("atan2", T::Float8, T::Float8, T::Float8, atan2);
+    b.f2("atan2", T::Float8, T::Float8, T::Float8, |a, b| f8(f(a).atan2(f(b))));
     b.f1("sinh", T::Float8, T::Float8, sinh);
     b.f1("cosh", T::Float8, T::Float8, cosh);
     b.f1("tanh", T::Float8, T::Float8, tanh);
@@ -1474,17 +1156,17 @@ pub fn register(b: &mut Builder) {
         b.f2("gcd", t.clone(), t.clone(), t.clone(), gcd_int);
         b.f2("lcm", t.clone(), t.clone(), t.clone(), lcm_int);
     }
-    b.f2("gcd", T::Numeric, T::Numeric, T::Numeric, gcd_n);
-    b.f2("lcm", T::Numeric, T::Numeric, T::Numeric, lcm_n);
-    b.f1("factorial", T::Int8, T::Numeric, factorial);
+    b.f2("gcd", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).gcd(n(b))?)));
+    b.f2("lcm", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).lcm(n(b))?)));
+    b.f1("factorial", T::Int8, T::Numeric, |a| Ok(Datum::numeric(Numeric::factorial(i(a))?)));
     for name in ["power", "pow"] {
-        b.f2(name, T::Float8, T::Float8, T::Float8, pow_f);
-        b.f2(name, T::Numeric, T::Numeric, T::Numeric, pow_n);
+        b.f2(name, T::Float8, T::Float8, T::Float8, super::ops::float8_pow);
+        b.f2(name, T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).pow(n(b))?)));
     }
-    b.f1("trim_scale", T::Numeric, T::Numeric, trim_scale);
-    b.f1("scale", T::Numeric, T::Int4, scale);
+    b.f1("trim_scale", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).normalize())));
+    b.f1("scale", T::Numeric, T::Int4, |a| Ok(n(a).scale().map(Datum::Int4).unwrap_or(Datum::Null)));
     b.last().can_return_null = true;
-    b.f1("min_scale", T::Numeric, T::Int4, min_scale);
+    b.f1("min_scale", T::Numeric, T::Int4, |a| Ok(n(a).min_scale().map(Datum::Int4).unwrap_or(Datum::Null)));
     b.last().can_return_null = true;
     b.fnn("width_bucket", vec![T::Float8, T::Float8, T::Float8, T::Int4], T::Int4, width_bucket_f);
     b.fnn("width_bucket", vec![T::Numeric, T::Numeric, T::Numeric, T::Int4], T::Int4, width_bucket_n);
@@ -1500,13 +1182,14 @@ pub fn register(b: &mut Builder) {
     // character(n) counts its padding in octet_length (length() does not:
     // it applies to the value cast to text)
     b.f1("octet_length", T::Bpchar, T::Int4, octet_length);
-    b.f1("text", T::Bpchar, T::Text, bpchar_text);
+    // text(bpchar) drops the padding of character(n).
+    b.f1("text", T::Bpchar, T::Text, |a| Ok(txt(s(a).trim_end_matches(' ').to_string())));
     b.f1("octet_length", T::Bytea, T::Int4, octet_length);
     b.f1("bit_length", T::Text, T::Int4, bit_length);
     b.f1("bit_length", T::Bytea, T::Int4, bit_length);
     b.f1("lower", T::Text, T::Text, lower);
     b.f1("upper", T::Text, T::Text, upper);
-    b.f1("initcap", T::Text, T::Text, initcap);
+    b.f1("initcap", T::Text, T::Text, |a| Ok(txt(pgfuncs::text::initcap(s(a)))));
     for name in ["substr", "substring"] {
         b.f2(name, T::Text, T::Int4, T::Text, substr2);
         b.fnn(name, vec![T::Text, T::Int4, T::Int4], T::Text, substr3);
@@ -1515,41 +1198,61 @@ pub fn register(b: &mut Builder) {
     }
     b.f2("substring", T::Text, T::Text, T::Text, substring_re);
     b.last().can_return_null = true;
-    b.f2("strpos", T::Text, T::Text, T::Int4, strpos);
-    b.fnn("overlay", vec![T::Text, T::Text, T::Int4], T::Text, overlay3);
-    b.fnn("overlay", vec![T::Text, T::Text, T::Int4, T::Int4], T::Text, overlay4);
-    b.f1("btrim", T::Text, T::Text, btrim1);
-    b.f2("btrim", T::Text, T::Text, T::Text, btrim2);
-    b.f1("ltrim", T::Text, T::Text, ltrim1);
-    b.f2("ltrim", T::Text, T::Text, T::Text, ltrim2);
-    b.f1("rtrim", T::Text, T::Text, rtrim1);
-    b.f2("rtrim", T::Text, T::Text, T::Text, rtrim2);
-    b.fnn("replace", vec![T::Text, T::Text, T::Text], T::Text, replace);
-    b.fnn("split_part", vec![T::Text, T::Text, T::Int4], T::Text, split_part);
-    b.f2("left", T::Text, T::Int4, T::Text, left);
-    b.f2("right", T::Text, T::Int4, T::Text, right);
-    b.f2("lpad", T::Text, T::Int4, T::Text, lpad2);
-    b.fnn("lpad", vec![T::Text, T::Int4, T::Text], T::Text, lpad3);
-    b.f2("rpad", T::Text, T::Int4, T::Text, rpad2);
-    b.fnn("rpad", vec![T::Text, T::Int4, T::Text], T::Text, rpad3);
-    b.f2("repeat", T::Text, T::Int4, T::Text, repeat);
-    b.f1("reverse", T::Text, T::Text, reverse);
-    b.fnn("translate", vec![T::Text, T::Text, T::Text], T::Text, translate);
-    b.f1("ascii", T::Text, T::Int4, ascii);
-    b.f1("chr", T::Int4, T::Text, chr);
-    b.f2("starts_with", T::Text, T::Text, T::Bool, starts_with);
+    b.f2("strpos", T::Text, T::Text, T::Int4, |a, b| Ok(Datum::Int4(pgfuncs::text::strpos(s(a), s(b)))));
+    b.fnn("overlay", vec![T::Text, T::Text, T::Int4], T::Text, |args| {
+        Ok(txt(pgfuncs::text::overlay(s(&args[0]), s(&args[1]), i(&args[2]), None)?))
+    });
+    b.fnn("overlay", vec![T::Text, T::Text, T::Int4, T::Int4], T::Text, |args| {
+        Ok(txt(pgfuncs::text::overlay(s(&args[0]), s(&args[1]), i(&args[2]), Some(i(&args[3])))?))
+    });
+    b.f1("btrim", T::Text, T::Text, |a| Ok(txt(pgfuncs::text::btrim(s(a), " "))));
+    b.f2("btrim", T::Text, T::Text, T::Text, |a, b| Ok(txt(pgfuncs::text::btrim(s(a), s(b)))));
+    b.f1("ltrim", T::Text, T::Text, |a| Ok(txt(pgfuncs::text::ltrim(s(a), " "))));
+    b.f2("ltrim", T::Text, T::Text, T::Text, |a, b| Ok(txt(pgfuncs::text::ltrim(s(a), s(b)))));
+    b.f1("rtrim", T::Text, T::Text, |a| Ok(txt(pgfuncs::text::rtrim(s(a), " "))));
+    b.f2("rtrim", T::Text, T::Text, T::Text, |a, b| Ok(txt(pgfuncs::text::rtrim(s(a), s(b)))));
+    b.fnn("replace", vec![T::Text, T::Text, T::Text], T::Text, |args| {
+        Ok(txt(pgfuncs::text::replace(s(&args[0]), s(&args[1]), s(&args[2]))))
+    });
+    b.fnn("split_part", vec![T::Text, T::Text, T::Int4], T::Text, |args| {
+        Ok(txt(pgfuncs::text::split_part(s(&args[0]), s(&args[1]), i(&args[2]) as i32)?))
+    });
+    b.f2("left", T::Text, T::Int4, T::Text, |a, b| Ok(txt(pgfuncs::text::left(s(a), i(b) as i32))));
+    b.f2("right", T::Text, T::Int4, T::Text, |a, b| Ok(txt(pgfuncs::text::right(s(a), i(b) as i32))));
+    b.f2("lpad", T::Text, T::Int4, T::Text, |a, b| Ok(txt(pgfuncs::text::lpad_checked(s(a), i(b) as i32, " ")?)));
+    b.fnn("lpad", vec![T::Text, T::Int4, T::Text], T::Text, |args| {
+        Ok(txt(pgfuncs::text::lpad_checked(s(&args[0]), i(&args[1]) as i32, s(&args[2]))?))
+    });
+    b.f2("rpad", T::Text, T::Int4, T::Text, |a, b| Ok(txt(pgfuncs::text::rpad_checked(s(a), i(b) as i32, " ")?)));
+    b.fnn("rpad", vec![T::Text, T::Int4, T::Text], T::Text, |args| {
+        Ok(txt(pgfuncs::text::rpad_checked(s(&args[0]), i(&args[1]) as i32, s(&args[2]))?))
+    });
+    b.f2("repeat", T::Text, T::Int4, T::Text, |a, b| Ok(txt(pgfuncs::text::repeat(s(a), i(b) as i32)?)));
+    b.f1("reverse", T::Text, T::Text, |a| Ok(txt(pgfuncs::text::reverse(s(a)))));
+    b.fnn("translate", vec![T::Text, T::Text, T::Text], T::Text, |args| {
+        Ok(txt(pgfuncs::text::translate(s(&args[0]), s(&args[1]), s(&args[2]))))
+    });
+    b.f1("ascii", T::Text, T::Int4, |a| Ok(Datum::Int4(pgfuncs::text::ascii(s(a)))));
+    b.f1("chr", T::Int4, T::Text, |a| Ok(txt(pgfuncs::text::chr(i(a) as i32)?)));
+    b.f2("starts_with", T::Text, T::Text, T::Bool, |a, b| Ok(Datum::Bool(pgfuncs::text::starts_with(s(a), s(b)))));
     b.f1("md5", T::Text, T::Text, md5);
     b.f1("md5", T::Bytea, T::Text, md5);
-    b.f1("sha224", T::Bytea, T::Bytea, sha224);
-    b.f1("sha256", T::Bytea, T::Bytea, sha256);
-    b.f1("sha384", T::Bytea, T::Bytea, sha384);
-    b.f1("sha512", T::Bytea, T::Bytea, sha512);
-    b.f1("quote_ident", T::Text, T::Text, quote_ident);
+    b.f1("sha224", T::Bytea, T::Bytea, |a| Ok(Datum::bytea(pgfuncs::text::sha224(a.as_bytes().unwrap()))));
+    b.f1("sha256", T::Bytea, T::Bytea, |a| Ok(Datum::bytea(pgfuncs::text::sha256(a.as_bytes().unwrap()))));
+    b.f1("sha384", T::Bytea, T::Bytea, |a| Ok(Datum::bytea(pgfuncs::text::sha384(a.as_bytes().unwrap()))));
+    b.f1("sha512", T::Bytea, T::Bytea, |a| Ok(Datum::bytea(pgfuncs::text::sha512(a.as_bytes().unwrap()))));
+    b.f1("quote_ident", T::Text, T::Text, |a| Ok(txt(pgfuncs::text::quote_ident(s(a)))));
     b.f1("quote_literal", T::Text, T::Text, quote_literal);
     b.poly("quote_literal", vec![P::AnyElement], Ret::T(T::Text), Imp::F1(quote_literal));
     b.poly("quote_nullable", vec![P::AnyElement], Ret::T(T::Text), Imp::FN(quote_nullable)).strict = false;
     b.f1("quote_literal", T::Bpchar, T::Text, quote_literal_bpchar);
-    b.poly("quote_nullable", vec![P::T(T::Bpchar)], Ret::T(T::Text), Imp::FN(quote_nullable_bpchar)).strict = false;
+    b.poly(
+        "quote_nullable",
+        vec![P::T(T::Bpchar)],
+        Ret::T(T::Text),
+        Imp::FN(|args| if args[0].is_null() { Ok(txt("NULL".into())) } else { quote_literal_bpchar(&args[0]) }),
+    )
+    .strict = false;
     b.f1("to_hex", T::Int4, T::Text, to_hex);
     b.f1("to_hex", T::Int8, T::Text, to_hex);
     {
@@ -1578,8 +1281,13 @@ pub fn register(b: &mut Builder) {
     b.last().strict = false;
     b.last().can_return_null = true;
     b.poly("array_to_string", vec![P::AnyArray, P::T(T::Text)], Ret::T(T::Text), Imp::FN(array_to_string));
-    b.poly("array_to_string", vec![P::AnyArray, P::T(T::Text), P::T(T::Text)], Ret::T(T::Text), Imp::FN(array_to_string))
-        .strict = false;
+    b.poly(
+        "array_to_string",
+        vec![P::AnyArray, P::T(T::Text), P::T(T::Text)],
+        Ret::T(T::Text),
+        Imp::FN(array_to_string),
+    )
+    .strict = false;
     b.fnn("regexp_replace", vec![T::Text, T::Text, T::Text], T::Text, regexp_replace);
     b.fnn("regexp_replace", vec![T::Text, T::Text, T::Text, T::Text], T::Text, regexp_replace);
     b.fnn("regexp_match", vec![T::Text, T::Text], text_arr.clone(), regexp_match);
@@ -1599,24 +1307,34 @@ pub fn register(b: &mut Builder) {
     b.last().can_return_null = true;
     b.fnn("regexp_split_to_array", vec![T::Text, T::Text], text_arr.clone(), regexp_split_to_array);
     b.fnn("regexp_split_to_array", vec![T::Text, T::Text, T::Text], text_arr.clone(), regexp_split_to_array);
-    b.f2("encode", T::Bytea, T::Text, T::Text, encode);
-    b.f2("decode", T::Text, T::Text, T::Bytea, decode);
-    b.f1("unistr", T::Text, T::Text, unistr);
+    b.f2("encode", T::Bytea, T::Text, T::Text, |a, b| Ok(txt(pgfuncs::bytea::encode(a.as_bytes().unwrap(), s(b))?)));
+    b.f2("decode", T::Text, T::Text, T::Bytea, |a, b| Ok(Datum::bytea(pgfuncs::bytea::decode(s(a), s(b))?)));
+    b.f1("unistr", T::Text, T::Text, |a| Ok(txt(pgfuncs::text::unistr(s(a))?)));
     {
-        let d = b.poly("num_nulls", vec![P::Any], Ret::T(T::Int4), Imp::FN(num_nulls));
+        let d = b.poly(
+            "num_nulls",
+            vec![P::Any],
+            Ret::T(T::Int4),
+            Imp::FN(|args| Ok(Datum::Int4(args.iter().filter(|a| a.is_null()).count() as i32))),
+        );
         d.variadic = true;
         d.strict = false;
     }
     {
-        let d = b.poly("num_nonnulls", vec![P::Any], Ret::T(T::Int4), Imp::FN(num_nonnulls));
+        let d = b.poly(
+            "num_nonnulls",
+            vec![P::Any],
+            Ret::T(T::Int4),
+            Imp::FN(|args| Ok(Datum::Int4(args.iter().filter(|a| !a.is_null()).count() as i32))),
+        );
         d.variadic = true;
         d.strict = false;
     }
     // catalog helpers used by client tools (see sysrel)
     for name in ["pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible"] {
-        b.f1(name, T::Oid, T::Bool, always_true1);
+        b.f1(name, T::Oid, T::Bool, |_| Ok(Datum::Bool(true)));
     }
-    b.f1("pg_get_userbyid", T::Oid, T::Name, owner_name);
+    b.f1("pg_get_userbyid", T::Oid, T::Name, |_| Ok(Datum::text("ivm")));
     b.fnn("format_type", vec![T::Oid, T::Int4], T::Text, format_type_fn);
     b.last().strict = false;
     b.last().can_return_null = true;
@@ -1642,23 +1360,29 @@ pub fn register(b: &mut Builder) {
         ("pg_get_function_arguments", vec![P::T(T::Oid)]),
         ("pg_get_function_identity_arguments", vec![P::T(T::Oid)]),
     ] {
-        let d = b.poly(name, params, Ret::T(T::Text), Imp::FN(null_text));
+        let d = b.poly(name, params, Ret::T(T::Text), Imp::FN(|_| Ok(Datum::Null)));
         d.can_return_null = true;
     }
-    b.f1("pg_relation_is_publishable", T::Oid, T::Bool, always_false1);
+    b.f1("pg_relation_is_publishable", T::Oid, T::Bool, |_| Ok(Datum::Bool(false)));
     // storage sizes are not visible to expressions; report zero
     for name in ["pg_table_size", "pg_relation_size", "pg_total_relation_size", "pg_indexes_size"] {
-        b.f1(name, T::Oid, T::Int8, zero_size);
+        b.f1(name, T::Oid, T::Int8, |_| Ok(Datum::Int8(0)));
     }
-    b.f2("pg_relation_size", T::Oid, T::Text, T::Int8, zero_size2);
+    b.f2("pg_relation_size", T::Oid, T::Text, T::Int8, |_, _| Ok(Datum::Int8(0)));
     b.f1("pg_size_pretty", T::Int8, T::Text, size_pretty);
     b.f1("pg_size_pretty", T::Numeric, T::Text, size_pretty);
     b.f1("current_schemas", T::Bool, T::Array(Box::new(T::Name)), current_schemas);
-    for name in ["has_table_privilege", "has_schema_privilege", "has_database_privilege", "has_column_privilege", "has_any_column_privilege"] {
+    for name in [
+        "has_table_privilege",
+        "has_schema_privilege",
+        "has_database_privilege",
+        "has_column_privilege",
+        "has_any_column_privilege",
+    ] {
         b.poly(name, vec![P::Any, P::Any], Ret::T(T::Bool), Imp::FN(always_true));
         b.poly(name, vec![P::Any, P::Any, P::Any], Ret::T(T::Bool), Imp::FN(always_true));
     }
-    b.f1("pg_encoding_to_char", T::Int4, T::Name, encoding_name);
+    b.f1("pg_encoding_to_char", T::Int4, T::Name, |_| Ok(Datum::text("UTF8")));
     b.fnn("set_config", vec![T::Text, T::Text, T::Bool], T::Text, set_config);
     b.last().volatility = Volatility::Volatile;
     for params in [vec![T::Text], vec![T::Text, T::Bool]] {
@@ -1668,12 +1392,17 @@ pub fn register(b: &mut Builder) {
     }
     // the process id changes when the server restarts (stable, as in
     // PostgreSQL: maintained views must not store it)
-    b.fnn("pg_backend_pid", vec![], T::Int4, backend_pid);
+    b.fnn("pg_backend_pid", vec![], T::Int4, |_| Ok(Datum::Int4(std::process::id() as i32)));
     b.last().volatility = Volatility::Stable;
-    b.fnn("pg_is_in_recovery", vec![], T::Bool, always_false);
+    b.fnn("pg_is_in_recovery", vec![], T::Bool, |_| Ok(Datum::Bool(false)));
     {
         // GROUPING(...): replaced by the binder after aggregation
-        let d = b.poly("grouping", vec![P::Any], Ret::T(T::Int4), Imp::FN(grouping_misplaced));
+        let d = b.poly(
+            "grouping",
+            vec![P::Any],
+            Ret::T(T::Int4),
+            Imp::FN(|_| Err(SqlError::new(codes::GROUPING_ERROR, "GROUPING is only allowed in queries with GROUP BY"))),
+        );
         d.variadic = true;
         d.strict = false;
     }
@@ -1707,10 +1436,19 @@ pub fn register(b: &mut Builder) {
     b.fnn("date_bin", vec![T::Interval, T::TimestampTz, T::TimestampTz], T::TimestampTz, date_bin);
     b.f2("age", T::Timestamp, T::Timestamp, T::Interval, age);
     b.f2("age", T::TimestampTz, T::TimestampTz, T::Interval, age);
-    b.fnn("make_date", vec![T::Int4, T::Int4, T::Int4], T::Date, make_date);
-    b.fnn("make_time", vec![T::Int4, T::Int4, T::Float8], T::Time, make_time);
+    b.fnn("make_date", vec![T::Int4, T::Int4, T::Int4], T::Date, |args| {
+        Ok(Datum::Date(pgdatetime::make_date(i(&args[0]) as i32, i(&args[1]) as i32, i(&args[2]) as i32)?))
+    });
+    b.fnn("make_time", vec![T::Int4, T::Int4, T::Float8], T::Time, |args| {
+        Ok(Datum::Time(pgdatetime::make_time(i(&args[0]) as i32, i(&args[1]) as i32, f(&args[2]))?))
+    });
     b.fnn("make_timestamp", vec![T::Int4, T::Int4, T::Int4, T::Int4, T::Int4, T::Float8], T::Timestamp, make_timestamp);
-    b.fnn("make_timestamptz", vec![T::Int4, T::Int4, T::Int4, T::Int4, T::Int4, T::Float8], T::TimestampTz, make_timestamptz);
+    b.fnn(
+        "make_timestamptz",
+        vec![T::Int4, T::Int4, T::Int4, T::Int4, T::Int4, T::Float8],
+        T::TimestampTz,
+        make_timestamptz,
+    );
     b.fnn(
         "make_timestamptz",
         vec![T::Int4, T::Int4, T::Int4, T::Int4, T::Int4, T::Float8, T::Text],
@@ -1724,18 +1462,28 @@ pub fn register(b: &mut Builder) {
         }
         b.fnn("make_interval", params, T::Interval, make_interval);
     }
-    b.f1("to_timestamp", T::Float8, T::TimestampTz, to_timestamp_epoch);
-    b.f2("to_timestamp", T::Text, T::Text, T::TimestampTz, to_timestamp_fmt);
-    b.f2("to_date", T::Text, T::Text, T::Date, to_date);
+    b.f1("to_timestamp", T::Float8, T::TimestampTz, |a| Ok(Datum::TimestampTz(pgdatetime::to_timestamp_epoch(f(a))?)));
+    b.f2("to_timestamp", T::Text, T::Text, T::TimestampTz, |a, b| {
+        Ok(Datum::TimestampTz(pgdatetime::to_timestamp(s(a), s(b), &SESSION_TZ)?))
+    });
+    b.f2("to_date", T::Text, T::Text, T::Date, |a, b| Ok(Datum::Date(pgdatetime::to_date(s(a), s(b))?)));
     for t in [T::Timestamp, T::TimestampTz, T::Interval, T::Numeric, T::Int8, T::Int4, T::Float8, T::Float4] {
         b.f2("to_char", t.clone(), T::Text, T::Text, to_char);
     }
     b.last().can_return_null = true;
-    b.f2("to_number", T::Text, T::Text, T::Numeric, to_number);
+    b.f2("to_number", T::Text, T::Text, T::Numeric, |a, b| {
+        Ok(pgnumeric::to_number(s(a), s(b))?.map(Datum::numeric).unwrap_or(Datum::Null))
+    });
     b.last().can_return_null = true;
-    b.f1("justify_hours", T::Interval, T::Interval, justify_hours);
-    b.f1("justify_days", T::Interval, T::Interval, justify_days);
-    b.f1("justify_interval", T::Interval, T::Interval, justify_interval);
+    b.f1("justify_hours", T::Interval, T::Interval, |a| {
+        Ok(Datum::Interval(pgdatetime::justify_hours(a.as_interval().unwrap())?))
+    });
+    b.f1("justify_days", T::Interval, T::Interval, |a| {
+        Ok(Datum::Interval(pgdatetime::justify_days(a.as_interval().unwrap())?))
+    });
+    b.f1("justify_interval", T::Interval, T::Interval, |a| {
+        Ok(Datum::Interval(pgdatetime::justify_interval(a.as_interval().unwrap())?))
+    });
     for t in [T::Date, T::Timestamp, T::TimestampTz, T::Interval] {
         b.f1("isfinite", t.clone(), T::Bool, isfinite);
     }
@@ -1745,26 +1493,35 @@ pub fn register(b: &mut Builder) {
     // json
     b.poly("to_jsonb", vec![P::AnyElement], Ret::T(T::Jsonb), Imp::F1(to_jsonb));
     b.poly("to_json", vec![P::AnyElement], Ret::T(T::Json), Imp::F1(to_json));
-    for (name, fun) in [("jsonb_build_object", jsonb_build_object as super::func::FnN), ("json_build_object", json_build_object)] {
-        let ret = if name.starts_with("jsonb") { T::Jsonb } else { T::Json };
-        let d = b.poly(name, vec![P::Any], Ret::T(ret.clone()), Imp::FN(fun));
-        d.variadic = true;
-        d.strict = false;
-        b.poly(name, vec![], Ret::T(ret), Imp::FN(fun)).strict = false;
-    }
-    for (name, fun) in [("jsonb_build_array", jsonb_build_array as super::func::FnN), ("json_build_array", json_build_array)] {
-        let ret = if name.starts_with("jsonb") { T::Jsonb } else { T::Json };
-        let d = b.poly(name, vec![P::Any], Ret::T(ret.clone()), Imp::FN(fun));
-        d.variadic = true;
-        d.strict = false;
-        b.poly(name, vec![], Ret::T(ret), Imp::FN(fun)).strict = false;
-    }
-    b.f1("jsonb_typeof", T::Jsonb, T::Text, jsonb_typeof);
-    b.f1("json_typeof", T::Json, T::Text, json_typeof);
-    b.f1("jsonb_array_length", T::Jsonb, T::Int4, jsonb_array_length);
-    b.f1("json_array_length", T::Json, T::Int4, json_array_length);
+    for (name, fun) in
+        [("jsonb_build_object", jsonb_build_object as super::func::FnN), ("json_build_object", json_build_object)]
     {
-        let d = b.poly("jsonb_extract_path", vec![P::T(T::Jsonb), P::T(T::Text)], Ret::T(T::Jsonb), Imp::FN(jsonb_extract_path));
+        let ret = if name.starts_with("jsonb") { T::Jsonb } else { T::Json };
+        let d = b.poly(name, vec![P::Any], Ret::T(ret.clone()), Imp::FN(fun));
+        d.variadic = true;
+        d.strict = false;
+        b.poly(name, vec![], Ret::T(ret), Imp::FN(fun)).strict = false;
+    }
+    for (name, fun) in
+        [("jsonb_build_array", jsonb_build_array as super::func::FnN), ("json_build_array", json_build_array)]
+    {
+        let ret = if name.starts_with("jsonb") { T::Jsonb } else { T::Json };
+        let d = b.poly(name, vec![P::Any], Ret::T(ret.clone()), Imp::FN(fun));
+        d.variadic = true;
+        d.strict = false;
+        b.poly(name, vec![], Ret::T(ret), Imp::FN(fun)).strict = false;
+    }
+    b.f1("jsonb_typeof", T::Jsonb, T::Text, |a| Ok(txt(jsonb(a).type_name().to_string())));
+    b.f1("json_typeof", T::Json, T::Text, |a| Ok(txt(Jsonb::parse(s(a))?.type_name().to_string())));
+    b.f1("jsonb_array_length", T::Jsonb, T::Int4, |a| Ok(Datum::Int4(jsonb(a).array_length()?)));
+    b.f1("json_array_length", T::Json, T::Int4, |a| Ok(Datum::Int4(Jsonb::parse(s(a))?.array_length()?)));
+    {
+        let d = b.poly(
+            "jsonb_extract_path",
+            vec![P::T(T::Jsonb), P::T(T::Text)],
+            Ret::T(T::Jsonb),
+            Imp::FN(jsonb_extract_path),
+        );
         d.variadic = true;
         d.strict = false;
         d.can_return_null = true;
@@ -1780,29 +1537,33 @@ pub fn register(b: &mut Builder) {
     }
     let path4 = || vec![T::Jsonb, T::JsonPath, T::Jsonb, T::Bool];
     let path_fns: [(&'static str, T, super::func::FnN); 8] = [
-        ("jsonb_path_exists", T::Bool, jsonb_path_exists),
-        ("jsonb_path_exists_tz", T::Bool, jsonb_path_exists_tz),
-        ("jsonb_path_match", T::Bool, jsonb_path_match),
-        ("jsonb_path_match_tz", T::Bool, jsonb_path_match_tz),
-        ("jsonb_path_query_array", T::Jsonb, jsonb_path_query_array),
-        ("jsonb_path_query_array_tz", T::Jsonb, jsonb_path_query_array_tz),
-        ("jsonb_path_query_first", T::Jsonb, jsonb_path_query_first),
-        ("jsonb_path_query_first_tz", T::Jsonb, jsonb_path_query_first_tz),
+        ("jsonb_path_exists", T::Bool, |args| path_exists_impl(false, args)),
+        ("jsonb_path_exists_tz", T::Bool, |args| path_exists_impl(true, args)),
+        ("jsonb_path_match", T::Bool, |args| path_match_impl(false, args)),
+        ("jsonb_path_match_tz", T::Bool, |args| path_match_impl(true, args)),
+        ("jsonb_path_query_array", T::Jsonb, |args| path_query_array_impl(false, args)),
+        ("jsonb_path_query_array_tz", T::Jsonb, |args| path_query_array_impl(true, args)),
+        ("jsonb_path_query_first", T::Jsonb, |args| path_query_first_impl(false, args)),
+        ("jsonb_path_query_first_tz", T::Jsonb, |args| path_query_first_impl(true, args)),
     ];
     for (name, ret, f) in path_fns {
         b.fnn(name, path4(), ret, f);
         b.last().can_return_null = true;
     }
-    b.op2("@?", T::Jsonb, T::JsonPath, T::Bool, jsonb_path_exists_opr);
+    b.op2("@?", T::Jsonb, T::JsonPath, T::Bool, |a, b| {
+        Ok(opt_bool(pgfuncs::json::path_exists_op(jsonb(a), &*jsonpath(b)?)?))
+    });
     b.last().can_return_null = true;
-    b.op2("@@", T::Jsonb, T::JsonPath, T::Bool, jsonb_path_match_opr);
+    b.op2("@@", T::Jsonb, T::JsonPath, T::Bool, |a, b| {
+        Ok(opt_bool(pgfuncs::json::path_match_op(jsonb(a), &*jsonpath(b)?)?))
+    });
     b.last().can_return_null = true;
     b.fnn("jsonb_set", vec![T::Jsonb, text_arr.clone(), T::Jsonb], T::Jsonb, jsonb_set);
     b.fnn("jsonb_set", vec![T::Jsonb, text_arr.clone(), T::Jsonb, T::Bool], T::Jsonb, jsonb_set);
     b.fnn("jsonb_insert", vec![T::Jsonb, text_arr.clone(), T::Jsonb], T::Jsonb, jsonb_insert);
     b.fnn("jsonb_insert", vec![T::Jsonb, text_arr.clone(), T::Jsonb, T::Bool], T::Jsonb, jsonb_insert);
-    b.f1("jsonb_strip_nulls", T::Jsonb, T::Jsonb, jsonb_strip_nulls);
-    b.f1("jsonb_pretty", T::Jsonb, T::Text, jsonb_pretty);
+    b.f1("jsonb_strip_nulls", T::Jsonb, T::Jsonb, |a| Ok(Datum::jsonb(jsonb(a).strip_nulls())));
+    b.f1("jsonb_pretty", T::Jsonb, T::Text, |a| Ok(txt(jsonb(a).to_pretty())));
 
     // arrays
     b.poly("array_length", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(array_length)).can_return_null =
@@ -1811,7 +1572,7 @@ pub fn register(b: &mut Builder) {
         true;
     b.poly("array_lower", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(array_lower)).can_return_null =
         true;
-    b.poly("cardinality", vec![P::AnyArray], Ret::T(T::Int4), Imp::F1(cardinality));
+    b.poly("cardinality", vec![P::AnyArray], Ret::T(T::Int4), Imp::F1(|a| Ok(Datum::Int4(arr(a).elems.len() as i32))));
     b.poly("array_ndims", vec![P::AnyArray], Ret::T(T::Int4), Imp::F1(array_ndims)).can_return_null = true;
     b.poly("array_dims", vec![P::AnyArray], Ret::T(T::Text), Imp::F1(array_dims)).can_return_null = true;
     b.poly("array_to_json", vec![P::AnyArray], Ret::T(T::Json), Imp::FN(array_to_json));
@@ -1830,13 +1591,34 @@ pub fn register(b: &mut Builder) {
         d.variadic = true;
         d.can_return_null = true;
     }
-    b.poly("array_replace", vec![P::AnyArray, P::AnyElement, P::AnyElement], Ret::ArrayOfElem, Imp::FN(array_replace))
-        .strict = false;
-    b.poly("array_append", vec![P::AnyArray, P::AnyElement], Ret::ArrayOfElem, Imp::FN(array_append_f)).strict = false;
-    b.poly("array_prepend", vec![P::AnyElement, P::AnyArray], Ret::ArrayOfElem, Imp::FN(array_prepend_f)).strict =
-        false;
+    b.poly(
+        "array_replace",
+        vec![P::AnyArray, P::AnyElement, P::AnyElement],
+        Ret::ArrayOfElem,
+        Imp::FN(array_replace),
+    )
+    .strict = false;
+    b.poly(
+        "array_append",
+        vec![P::AnyArray, P::AnyElement],
+        Ret::ArrayOfElem,
+        Imp::FN(|args| array_append2(&args[0], &args[1])),
+    )
+    .strict = false;
+    b.poly(
+        "array_prepend",
+        vec![P::AnyElement, P::AnyArray],
+        Ret::ArrayOfElem,
+        Imp::FN(|args| array_prepend2(&args[0], &args[1])),
+    )
+    .strict = false;
     {
-        let d = b.poly("array_cat", vec![P::AnyArray, P::AnyArray], Ret::ArrayOfElem, Imp::FN(array_cat_f));
+        let d = b.poly(
+            "array_cat",
+            vec![P::AnyArray, P::AnyArray],
+            Ret::ArrayOfElem,
+            Imp::FN(|args| array_cat2(&args[0], &args[1])),
+        );
         d.strict = false;
         d.can_return_null = true;
     }

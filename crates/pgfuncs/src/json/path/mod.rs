@@ -43,14 +43,12 @@
 
 mod ast;
 mod datetime;
-mod dtformat;
 mod exec;
 mod gram;
 mod layout;
 mod scan;
 #[rustfmt::skip]
 mod tables;
-mod tzabbrev;
 
 pub use datetime::SessionTz;
 

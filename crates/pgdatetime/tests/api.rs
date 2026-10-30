@@ -7,6 +7,43 @@ fn iv(s: &str) -> Interval {
 }
 
 #[test]
+fn datetime_template_modes() {
+    let fmt = "YYYY-MM-DD";
+    let template = DateTimeTemplate::parse(fmt).unwrap();
+    let day = parse_date("2024-02-29").unwrap();
+    assert_eq!(
+        template.parse_value("2024-02-29").unwrap(),
+        (ParsedDateTime::Date(day), -1)
+    );
+    for input in ["2024/02/29", "2024-02-29extra", "2024-02"] {
+        assert!(template.parse_value(input).is_err(), "{input}");
+        assert!(to_date(input, fmt).is_ok(), "{input}");
+    }
+    assert!(template.parse_value("2023-02-29").is_err());
+    assert!(DateTimeTemplate::parse("YYYYxMMxDD").is_err());
+    let quoted = DateTimeTemplate::parse("YYYY\"年\"MM\"月\"DD").unwrap();
+    assert_eq!(
+        quoted.parse_value("2024年02月29").unwrap().0,
+        ParsedDateTime::Date(day)
+    );
+    assert!(quoted.parse_value("2024月02年29").is_err());
+
+    let time = DateTimeTemplate::parse("HH24:MI:SS.FF3TZH:TZM").unwrap();
+    assert_eq!(
+        time.parse_value("12:34:56.123+05:30").unwrap(),
+        (ParsedDateTime::TimeTz(45_296_123_000, -19_800), 3)
+    );
+    let fmt = "YYYY-MM-DD HH24:MI:SS TZ";
+    let zoned = DateTimeTemplate::parse(fmt).unwrap();
+    for input in ["2000-01-01 12:00:00 UTC", "2014-10-26 01:30:00 MSK"] {
+        let (ParsedDateTime::TimestampTz(value, _), _) = zoned.parse_value(input).unwrap() else {
+            panic!("expected a zoned timestamp");
+        };
+        assert_eq!(value, to_timestamp(input, fmt, &TimeZone::Utc).unwrap());
+    }
+}
+
+#[test]
 fn interval_agg_inverse_transition() {
     let vals = [
         "1 day",

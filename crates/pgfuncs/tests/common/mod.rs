@@ -1,4 +1,4 @@
-//! Shared helpers for golden tests (text/pattern). Golden files are JSON lines
+//! Shared helpers for golden tests. Golden files are JSON lines
 //! written by tests/gen/pgeval.py: {"fn", "args", "result"} or {"fn", "args",
 //! "error": {"sqlstate", "message", "detail"}}.
 #![allow(dead_code)]
@@ -32,11 +32,14 @@ impl Golden {
     /// Runs `f(fn_name, args)` for every record and compares with the
     /// expected result (`Ok(None)` = SQL NULL).
     pub fn run(&mut self, mut f: impl FnMut(&str, &[Value]) -> pgfuncs::Result<Option<String>>) {
+        self.run_records(|rec| f(s(&rec["fn"]), rec["args"].as_array().unwrap()));
+    }
+
+    /// As `run`, with access to per-case settings such as the session timezone.
+    pub fn run_records(&mut self, mut f: impl FnMut(&Value) -> pgfuncs::Result<Option<String>>) {
         let records = std::mem::take(&mut self.records);
         for rec in &records {
-            let fn_name = rec["fn"].as_str().unwrap();
-            let args = rec["args"].as_array().unwrap();
-            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(fn_name, args)));
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(rec)));
             let got = match got {
                 Ok(g) => g,
                 Err(p) => {
@@ -126,36 +129,9 @@ pub fn unhex(s: &str) -> Vec<u8> {
 
 /// Renders like PostgreSQL's `to_json(text[])::text` for a 1-D array.
 pub fn json_text_array(v: &[Option<String>]) -> String {
-    let mut out = String::from("[");
-    for (k, e) in v.iter().enumerate() {
-        if k > 0 {
-            out.push(',');
-        }
-        match e {
-            None => out.push_str("null"),
-            Some(s) => out.push_str(&json_escape(s)),
-        }
-    }
-    out.push(']');
-    out
+    serde_json::to_string(v).unwrap()
 }
 
-/// PostgreSQL escape_json.
 pub fn json_escape(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    serde_json::to_string(s).unwrap()
 }

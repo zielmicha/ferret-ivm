@@ -227,70 +227,13 @@ static KEYWORDS: &[KeyWord] = &[
     kw!("y", Y, true, Gregorian),
 ];
 
-/// DCH_index[]: first keyword index for each starting character.
-fn keyword_start(c: u8) -> Option<usize> {
-    let name: &str = match c {
-        b'A' => "A.D.",
-        b'B' => "B.C.",
-        b'C' => "CC",
-        b'D' => "DAY",
-        b'F' => "FF1",
-        b'H' => "HH24",
-        b'I' => "IDDD",
-        b'J' => "J",
-        b'M' => "MI",
-        b'O' => "OF",
-        b'P' => "P.M.",
-        b'Q' => "Q",
-        b'R' => "RM",
-        b'S' => "SSSSS",
-        b'T' => "TZH",
-        b'U' => "US",
-        b'W' => "WW",
-        b'Y' => "Y,YYY",
-        b'a' => "a.d.",
-        b'b' => "b.c.",
-        b'c' => "cc",
-        b'd' => "day",
-        b'f' => "ff1",
-        b'h' => "hh24",
-        b'i' => "iddd",
-        b'j' => "j",
-        b'm' => "mi",
-        b'o' => "of",
-        b'p' => "p.m.",
-        b'q' => "q",
-        b'r' => "rm",
-        b's' => "sssss",
-        b't' => "tzh",
-        b'u' => "us",
-        b'w' => "ww",
-        b'y' => "y,yyy",
-        _ => return None,
-    };
-    KEYWORDS.iter().position(|k| k.name == name)
-}
-
-/// index_seq_search()
 fn index_seq_search(s: &[u8]) -> Option<&'static KeyWord> {
     let c = *s.first()?;
-    if c <= b' ' || c >= b'~' {
-        return None;
-    }
-    let mut i = keyword_start(c)?;
-    loop {
-        let k = &KEYWORDS[i];
-        if s.starts_with(k.name.as_bytes()) {
-            return Some(k);
-        }
-        i += 1;
-        if i >= KEYWORDS.len() {
-            return None;
-        }
-        if c != KEYWORDS[i].name.as_bytes()[0] {
-            return None;
-        }
-    }
+    let start = KEYWORDS.iter().position(|k| k.name.as_bytes()[0] == c)?;
+    KEYWORDS[start..]
+        .iter()
+        .take_while(|k| k.name.as_bytes()[0] == c)
+        .find(|k| s.starts_with(k.name.as_bytes()))
 }
 
 const S_FM: u8 = 0x01;
@@ -349,7 +292,7 @@ fn cached_format(fmt: &str) -> std::rc::Rc<Vec<Node>> {
             c.insert(0, e);
             return nodes;
         }
-        let nodes = Rc::new(parse_format(fmt));
+        let nodes = Rc::new(parse_format(fmt, false).expect("permissive format"));
         if fmt.len() <= 256 {
             if c.len() >= ENTRIES {
                 c.pop();
@@ -360,8 +303,8 @@ fn cached_format(fmt: &str) -> std::rc::Rc<Vec<Node>> {
     })
 }
 
-/// parse_format() for DCH (non-standard mode)
-fn parse_format(fmt: &str) -> Vec<Node> {
+/// Parse DCH fields, optionally requiring standard datetime separators.
+fn parse_format(fmt: &str, strict: bool) -> Result<Vec<Node>> {
     let s = fmt.as_bytes();
     let mut nodes = Vec::new();
     let mut i = 0;
@@ -409,6 +352,12 @@ fn parse_format(fmt: &str) -> Vec<Node> {
                     i += l;
                 }
             } else {
+                if strict && !b"-./,':; ".contains(&s[i]) {
+                    return Err(Error::new(
+                        INVALID_DATETIME_FORMAT,
+                        format!("invalid datetime format separator: \"{}\"", mb_char(s, i).0),
+                    ));
+                }
                 if s[i] == b'\\' && i + 1 < s.len() && s[i + 1] == b'"' {
                     i += 1;
                 }
@@ -425,7 +374,7 @@ fn parse_format(fmt: &str) -> Vec<Node> {
             }
         }
     }
-    nodes
+    Ok(nodes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,8 +1134,8 @@ fn parse_int_len(
     }
     let avail = &src[*pos..];
     let copy_len = len.min(avail.len());
-    let copy: Vec<u8> = avail[..copy_len].to_vec();
-    let copy_str = String::from_utf8_lossy(&copy).into_owned();
+    let copy = &avail[..copy_len];
+    let copy_str = String::from_utf8_lossy(copy);
     let result: i64;
     let erange: bool;
     if suffix & S_FM != 0 || is_next_separator(nodes, idx) {
@@ -1211,7 +1160,7 @@ fn parse_int_len(
                 len, copy_len
             )));
         }
-        let (v, used, er) = c_strtol(&copy);
+        let (v, used, er) = c_strtol(copy);
         result = v;
         erange = er;
         if used > 0 && used < len {
@@ -1364,9 +1313,9 @@ fn scan_y_yyy(s: &[u8]) -> Option<(i32, i32, usize)> {
     Some((m as i32, y, q))
 }
 
-/// DCH_from_char() in non-standard mode
-fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()> {
-    let mut fx_mode = false;
+/// DCH_from_char(), with exact separators and complete input required in strict mode.
+fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar, strict: bool) -> Result<()> {
+    let mut fx_mode = strict;
     let mut extra_skip: i32 = 0;
     let mut pos = 0usize;
     let mut idx = 0usize;
@@ -1381,7 +1330,13 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
             }
         }
         match n {
-            Node::Space(_) | Node::Separator(_) => {
+            Node::Space(c) | Node::Separator(c) => {
+                if strict && !src[pos..].starts_with(c.as_bytes()) {
+                    return Err(Error::new(
+                        INVALID_DATETIME_FORMAT,
+                        format!("unmatched format separator \"{c}\""),
+                    ));
+                }
                 if !fx_mode {
                     extra_skip -= 1;
                     if pos < src.len() && (c_isspace(src[pos]) || is_separator_char(src[pos])) {
@@ -1394,7 +1349,13 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
                 idx += 1;
                 continue;
             }
-            Node::Char(_) => {
+            Node::Char(c) => {
+                if strict && !src[pos..].starts_with(c.as_bytes()) {
+                    return Err(Error::new(
+                        INVALID_DATETIME_FORMAT,
+                        format!("unmatched format character \"{c}\""),
+                    ));
+                }
                 if !fx_mode {
                     if extra_skip > 0 {
                         extra_skip -= 1;
@@ -1445,13 +1406,11 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
             }
             Dch::MS => {
                 let len = parse_int_len(Some(&mut out.ms), src, &mut pos, 3, nodes, idx)?;
-                out.ms *= if len == 1 {
-                    100
-                } else if len == 2 {
-                    10
-                } else {
-                    1
-                };
+                out.ms = out.ms.wrapping_mul(match len {
+                    1 => 100,
+                    2 => 10,
+                    _ => 1,
+                });
                 skip_th(src, &mut pos, suffix);
             }
             Dch::FF1 | Dch::FF2 | Dch::FF3 | Dch::FF4 | Dch::FF5 | Dch::FF6 | Dch::US => {
@@ -1469,14 +1428,14 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
                 }
                 let want = if k.id == Dch::US { 6 } else { out.ff as usize };
                 let len = parse_int_len(Some(&mut out.us), src, &mut pos, want, nodes, idx)?;
-                out.us *= match len {
+                out.us = out.us.wrapping_mul(match len {
                     1 => 100000,
                     2 => 10000,
                     3 => 1000,
                     4 => 100,
                     5 => 10,
                     _ => 1,
-                };
+                });
                 skip_th(src, &mut pos, suffix);
             }
             Dch::SSSS => {
@@ -1576,12 +1535,12 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
             Dch::DAY | Dch::Day | Dch::day => {
                 let v = seq_search_field(src, &mut pos, &DAYS, k)?;
                 set_int(&mut out.d, v as i32, k)?;
-                out.d += 1;
+                out.d = out.d.wrapping_add(1);
             }
             Dch::DY | Dch::Dy | Dch::dy => {
                 let v = seq_search_field(src, &mut pos, &DAYS_SHORT, k)?;
                 set_int(&mut out.d, v as i32, k)?;
-                out.d += 1;
+                out.d = out.d.wrapping_add(1);
             }
             Dch::DDD => {
                 parse_int_len(Some(&mut out.ddd), src, &mut pos, k.name.len(), nodes, idx)?;
@@ -1601,7 +1560,7 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
             }
             Dch::ID => {
                 parse_int_len(Some(&mut out.d), src, &mut pos, 1, nodes, idx)?;
-                out.d += 1;
+                out.d = out.d.wrapping_add(1);
                 if out.d > 7 {
                     out.d = 1;
                 }
@@ -1637,31 +1596,13 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
                 out.yysz = 4;
                 skip_th(src, &mut pos, suffix);
             }
-            Dch::YYY | Dch::IYY => {
+            Dch::YYY | Dch::IYY | Dch::YY | Dch::IY | Dch::Y | Dch::I => {
                 let len =
                     parse_int_len(Some(&mut out.year), src, &mut pos, k.name.len(), nodes, idx)?;
                 if len < 4 {
                     out.year = adjust_partial_year_to_2020(out.year);
                 }
-                out.yysz = 3;
-                skip_th(src, &mut pos, suffix);
-            }
-            Dch::YY | Dch::IY => {
-                let len =
-                    parse_int_len(Some(&mut out.year), src, &mut pos, k.name.len(), nodes, idx)?;
-                if len < 4 {
-                    out.year = adjust_partial_year_to_2020(out.year);
-                }
-                out.yysz = 2;
-                skip_th(src, &mut pos, suffix);
-            }
-            Dch::Y | Dch::I => {
-                let len =
-                    parse_int_len(Some(&mut out.year), src, &mut pos, k.name.len(), nodes, idx)?;
-                if len < 4 {
-                    out.year = adjust_partial_year_to_2020(out.year);
-                }
-                out.yysz = 1;
+                out.yysz = k.name.len() as i32;
                 skip_th(src, &mut pos, suffix);
             }
             Dch::RM | Dch::rm => {
@@ -1685,6 +1626,20 @@ fn dch_from_char(nodes: &[Node], src: &[u8], out: &mut TmFromChar) -> Result<()>
             }
         }
         idx += 1;
+    }
+    if strict {
+        if idx < nodes.len() {
+            return Err(Error::new(
+                INVALID_DATETIME_FORMAT,
+                "input string is too short for datetime format",
+            ));
+        }
+        if src[pos..].iter().any(|&c| !c_isspace(c)) {
+            return Err(Error::new(
+                INVALID_DATETIME_FORMAT,
+                "trailing characters remain in input string after datetime format",
+            ));
+        }
     }
     Ok(())
 }
@@ -1742,7 +1697,7 @@ fn field_overflow(date_str: &str) -> Error {
 }
 
 /// do_to_timestamp()
-fn do_to_timestamp(date_str: &str, fmt: &str) -> Result<ToTs> {
+fn do_to_timestamp(date_str: &str, nodes: &[Node], strict: bool, empty: bool) -> Result<ToTs> {
     let mut tmfc = TmFromChar::default();
     let mut tm = Tm {
         mday: 1,
@@ -1751,9 +1706,8 @@ fn do_to_timestamp(date_str: &str, fmt: &str) -> Result<ToTs> {
     };
     let mut fsec: i32 = 0;
     let mut fmask: i32 = 0;
-    if !fmt.is_empty() {
-        let nodes = cached_format(fmt);
-        dch_from_char(&nodes, date_str.as_bytes(), &mut tmfc)?;
+    if !empty {
+        dch_from_char(nodes, date_str.as_bytes(), &mut tmfc, strict)?;
     }
     if tmfc.ssss != 0 {
         let mut x = tmfc.ssss;
@@ -1873,8 +1827,8 @@ fn do_to_timestamp(date_str: &str, fmt: &str) -> Result<ToTs> {
             ));
         }
         if tmfc.mode == Some(DateMode::IsoWeek) {
-            let j0 = isoweek2j(tm.year, 1) - 1;
-            let (y, m, d) = j2date(j0 + tmfc.ddd);
+            let j0 = isoweek2j(tm.year, 1).wrapping_sub(1);
+            let (y, m, d) = j2date(j0.wrapping_add(tmfc.ddd));
             tm.year = y;
             tm.mon = m;
             tm.mday = d;
@@ -1960,8 +1914,11 @@ fn do_to_timestamp(date_str: &str, fmt: &str) -> Result<ToTs> {
 
 /// to_date()
 pub fn to_date(s: &str, fmt: &str) -> Result<Date> {
-    let r = do_to_timestamp(s, fmt)?;
-    let tm = r.tm;
+    let r = do_to_timestamp(s, &cached_format(fmt), false, fmt.is_empty())?;
+    date_from_tm(&r.tm, s)
+}
+
+fn date_from_tm(tm: &Tm, s: &str) -> Result<Date> {
     let oor = || {
         Error::new(
             DATETIME_VALUE_OUT_OF_RANGE,
@@ -1981,7 +1938,7 @@ pub fn to_date(s: &str, fmt: &str) -> Result<Date> {
 /// to_timestamp(text, text): fields without an explicit zone are local
 /// time in `tz` (the session time zone).
 pub fn to_timestamp(s: &str, fmt: &str, tz: &TimeZone) -> Result<TimestampTz> {
-    let r = do_to_timestamp(s, fmt)?;
+    let r = do_to_timestamp(s, &cached_format(fmt), false, fmt.is_empty())?;
     let mut tm = r.tm;
     let tzo = if r.has_tz {
         r.gmtoffset
@@ -1993,4 +1950,103 @@ pub fn to_timestamp(s: &str, fmt: &str, tz: &TimeZone) -> Result<TimestampTz> {
         result = crate::io::adjust_timestamp(result, r.fprec)?;
     }
     Ok(result)
+}
+
+/// A datetime value parsed from a standard template. Zone offsets are seconds west of UTC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParsedDateTime {
+    Date(Date),
+    Time(crate::Time),
+    TimeTz(crate::Time, i32),
+    Timestamp(Timestamp),
+    TimestampTz(TimestampTz, i32),
+}
+
+/// A compiled, strict datetime template, as used by SQL/JSON path methods.
+pub struct DateTimeTemplate {
+    nodes: Vec<Node>,
+    empty: bool,
+}
+
+impl DateTimeTemplate {
+    /// Compile a template, rejecting unquoted nonstandard separators.
+    pub fn parse(fmt: &str) -> Result<Self> {
+        Ok(Self {
+            nodes: parse_format(fmt, true)?,
+            empty: fmt.is_empty(),
+        })
+    }
+
+    /// Parse the complete input and return its value and fractional precision (-1 if unspecified).
+    pub fn parse_value(&self, input: &str) -> Result<(ParsedDateTime, i32)> {
+        let r = do_to_timestamp(input, &self.nodes, true, self.empty)?;
+        let mut dated = false;
+        let mut timed = false;
+        let mut zoned = false;
+        for node in &self.nodes {
+            let Node::Action(k, _) = node else { continue };
+            use Dch::*;
+            match k.id {
+                // PostgreSQL does not count IW as a date field here.
+                FX | IW => {}
+                A_M | P_M | a_m | p_m | AM | PM | am | pm | HH | HH12 | HH24 | MI | SS | MS
+                | US | FF1 | FF2 | FF3 | FF4 | FF5 | FF6 | SSSS => timed = true,
+                tz | TZ | OF | TZH | TZM => zoned = true,
+                _ => dated = true,
+            }
+        }
+        let typmod = if r.fprec == 0 { -1 } else { r.fprec };
+        let zone = || {
+            if r.has_tz {
+                Ok(r.gmtoffset)
+            } else {
+                Err(Error::new(
+                    INVALID_DATETIME_FORMAT,
+                    format!(
+                        "missing time zone in input string for type {}",
+                        if dated { "timestamptz" } else { "timetz" }
+                    ),
+                ))
+            }
+        };
+        let value = if dated && timed {
+            let offset = if zoned { Some(zone()?) } else { None };
+            let ts = tm2timestamp(&r.tm, r.fsec, offset).map_err(|_| {
+                Error::new(
+                    DATETIME_VALUE_OUT_OF_RANGE,
+                    if zoned {
+                        "timestamptz out of range"
+                    } else {
+                        "timestamp out of range"
+                    },
+                )
+            })?;
+            let ts = crate::adjust_timestamp(ts, typmod)?;
+            match offset {
+                Some(z) => ParsedDateTime::TimestampTz(ts, z),
+                None => ParsedDateTime::Timestamp(ts),
+            }
+        } else if dated {
+            if zoned {
+                return Err(Error::new(
+                    INVALID_DATETIME_FORMAT,
+                    "datetime format is zoned but not timed",
+                ));
+            }
+            ParsedDateTime::Date(date_from_tm(&r.tm, input)?)
+        } else if timed {
+            let time = crate::adjust_time(time2t(r.tm.hour, r.tm.min, r.tm.sec, r.fsec), typmod);
+            if zoned {
+                ParsedDateTime::TimeTz(time, zone()?)
+            } else {
+                ParsedDateTime::Time(time)
+            }
+        } else {
+            return Err(Error::new(
+                INVALID_DATETIME_FORMAT,
+                "datetime format is not dated and not timed",
+            ));
+        };
+        Ok((value, typmod))
+    }
 }

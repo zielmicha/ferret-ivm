@@ -1,17 +1,14 @@
 //! Golden tests for pgfuncs::json::path (jsonpath) against results recorded
 //! from PostgreSQL 17 (see tests/gen/gen_jsonpath.py).
 
+mod common;
+use common::{Golden, s};
 use pgfuncs::Error;
 use pgfuncs::json::Jsonb;
 use pgfuncs::json::path::{self, JsonPath, PathContext, SessionTz};
 use serde_json::Value;
 
 type Res = Result<Option<String>, Error>;
-
-fn s(v: &Value) -> &str {
-    v.as_str()
-        .unwrap_or_else(|| panic!("expected string arg, got {v}"))
-}
 
 fn show_bool(b: Option<bool>) -> Option<String> {
     b.map(|b| b.to_string())
@@ -106,95 +103,24 @@ fn eval(fname: &str, a: &[Value], session: &SessionTz) -> Res {
     }
 }
 
-fn show(r: &Res) -> String {
-    match r {
-        Ok(Some(v)) => {
-            let mut t: String = v.chars().take(300).collect();
-            if v.len() > 300 {
-                t.push_str("...");
-            }
-            format!("{t:?}")
-        }
-        Ok(None) => "NULL".to_owned(),
-        Err(e) => format!("ERROR {} {:?} detail={:?}", e.sqlstate, e.message, e.detail),
-    }
-}
-
-fn line_args(args: &[Value]) -> String {
-    let s = serde_json::to_string(args).unwrap();
-    if s.chars().count() > 300 {
-        format!("{}...", s.chars().take(300).collect::<String>())
-    } else {
-        s
-    }
-}
-
 #[test]
 fn jsonpath_golden() {
-    // JSONPATH_GOLDEN_FILE runs another data file in the same format (e.g.
-    // the output of tests/gen/fuzz_jsonpath.py).
-    let file = std::env::var("JSONPATH_GOLDEN_FILE").unwrap_or_else(|_| {
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/data/jsonpath_golden.jsonl"
-        )
-        .to_owned()
-    });
-    let data = std::fs::read_to_string(&file).unwrap();
-    let mut failures = Vec::new();
-    let mut total = 0;
-    for line in data.lines() {
-        let rec: Value = serde_json::from_str(line).unwrap();
-        let fname = rec["fn"].as_str().unwrap();
-        let args = rec["args"].as_array().unwrap();
-        total += 1;
-        let expected: Res = if let Some(e) = rec.get("error") {
-            Err(Error {
-                sqlstate: Box::leak(e["sqlstate"].as_str().unwrap().to_owned().into_boxed_str()),
-                message: e["message"].as_str().unwrap().to_owned(),
-                detail: e["detail"].as_str().map(str::to_owned),
-            })
-        } else {
-            Ok(rec["result"].as_str().map(str::to_owned))
-        };
+    // Keep the external fuzz-corpus and failure-dump hooks.
+    let mut g = match std::env::var("JSONPATH_GOLDEN_FILE") {
+        Ok(file) => Golden::load_path(&file),
+        Err(_) => Golden::load("jsonpath_golden.jsonl"),
+    };
+    g.run_records(|rec| {
         let session = SessionTz::new(
-            pgdatetime::TimeZone::parse_session(
-                rec.get("tz").and_then(Value::as_str).unwrap_or("UTC"),
-            )
-            .unwrap(),
-            rec.get("today").and_then(Value::as_i64).unwrap_or(0) as i32,
+            pgdatetime::TimeZone::parse_session(rec["tz"].as_str().unwrap_or("UTC")).unwrap(),
+            rec["today"].as_i64().unwrap_or(0) as i32,
         );
-        let got = std::panic::catch_unwind(|| eval(fname, args, &session));
-        let ok = match &got {
-            Ok(g) => *g == expected,
-            Err(_) => false,
-        };
-        if !ok {
-            let got_s = match &got {
-                Ok(g) => show(g),
-                Err(_) => "PANIC".to_owned(),
-            };
-            failures.push(format!(
-                "{fname}({}):\n   expected {}\n   got      {}",
-                line_args(args),
-                show(&expected),
-                got_s
-            ));
-        }
-    }
+        eval(s(&rec["fn"]), rec["args"].as_array().unwrap(), &session)
+    });
     if let Ok(dump) = std::env::var("JSONPATH_GOLDEN_DUMP") {
-        std::fs::write(dump, failures.join("\n")).unwrap();
+        std::fs::write(dump, g.failures.join("\n")).unwrap();
     }
-    for f in failures.iter().take(80) {
-        eprintln!("{f}");
-    }
-    assert!(
-        failures.is_empty(),
-        "{} of {} golden cases failed",
-        failures.len(),
-        total
-    );
-    eprintln!("{total} golden cases passed");
+    g.finish();
 }
 
 /// Prints the deepest accepted level of several recursion patterns (compare
