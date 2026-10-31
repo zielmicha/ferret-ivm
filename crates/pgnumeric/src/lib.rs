@@ -290,6 +290,17 @@ impl Numeric {
         r
     }
 
+    /// Constructs `value * 10^-scale` exactly, preserving the requested
+    /// display scale. Small coefficients use the inline digit storage; no
+    /// decimal text or floating-point conversion is involved.
+    pub fn from_scaled_i128(value: i128, scale: u32) -> Result<Self> {
+        if scale > NUMERIC_DSCALE_MAX as u32 {
+            return Err(err("22003", "value overflows numeric format"));
+        }
+        let scale = scale as i32;
+        make_result(mul_var(&int128_to_var(value), &power_ten_int(-scale), scale))
+    }
+
     /// float8 -> numeric cast (`float8_numeric`): formats with `%.15g` and
     /// parses that; NaN -> NaN, +/-inf -> +/-Infinity.
     pub fn from_f64(v: f64) -> Result<Self> {
@@ -626,7 +637,12 @@ impl Numeric {
     /// The value, if it fits the storage format (the result of unbounded
     /// arithmetic may not): "value overflows numeric format" otherwise.
     pub fn checked(&self) -> Result<Self> {
-        make_result(self.clone())
+        self.clone().into_checked()
+    }
+
+    /// Consuming version of [`Numeric::checked`], without copying digits.
+    pub fn into_checked(self) -> Result<Self> {
+        make_result(self)
     }
 
     /// numeric_div: result scale from select_div_scale; infinity rules.

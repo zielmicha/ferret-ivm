@@ -189,6 +189,36 @@ fn equal_numbers_encode_identically() {
     assert!(Jsonb::decode_key(&[0x02, 0x99]).is_err());
 }
 
+/// Frozen from the original JSON codec, independently of Numeric's key
+/// encoding. Reopening persisted keys must survive changes in representation.
+#[test]
+fn durable_numeric_key_bytes() {
+    for (text, hex) in [
+        ("0", "021202"),
+        ("-0.000", "021202"),
+        ("1", "021203800000010b00"),
+        ("-1", "0212017ffffffef4ff"),
+        ("1.50", "021203800000011000"),
+        ("-1.50", "0212017ffffffeefff"),
+        ("0.00120", "0212037ffffffe0d00"),
+        ("-0.00120", "02120180000001f2ff"),
+        ("100", "021203800000030b00"),
+        ("12345.67890", "021203800000050d23394f5b00"),
+        ("1e131071", "021203800200000b00"),
+        ("1e-16383", "0212037fffc0020b00"),
+    ] {
+        let expected: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let value = Jsonb::parse(text).unwrap();
+        assert_eq!(enc(&value), expected, "{text}");
+        let (decoded, len) = Jsonb::decode_key(&expected).unwrap();
+        assert_eq!(decoded, value, "{text}");
+        assert_eq!(len, expected.len());
+    }
+}
+
 /// Deep values must not overflow a 2MB thread stack in recursive operations.
 #[test]
 fn deep_values_stack_safety() {

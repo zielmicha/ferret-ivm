@@ -585,9 +585,6 @@ fn localtimestamp(a: &[Datum]) -> Result<Datum> {
     Ok(Datum::Timestamp(pgdatetime::timestamptz_to_timestamp(t, &SESSION_TZ)?))
 }
 
-fn decimal_to_numeric(d: pgdatetime::Decimal) -> Result<Datum> {
-    Ok(Datum::numeric(Numeric::parse(&d.to_string())?))
-}
 fn extract(a: &Datum, b: &Datum) -> Result<Datum> {
     let field = s(a).to_ascii_lowercase();
     let d = match b {
@@ -599,7 +596,7 @@ fn extract(a: &Datum, b: &Datum) -> Result<Datum> {
         _ => return Err(SqlError::internal("extract")),
     };
     match d {
-        Some(d) => decimal_to_numeric(d),
+        Some(d) => Ok(Datum::numeric(d)),
         None => Ok(Datum::Null),
     }
 }
@@ -719,7 +716,7 @@ pub fn datum_to_jsonb(d: &Datum) -> Result<Jsonb> {
         }
         Datum::Numeric(n) => {
             if n.is_finite() {
-                Jsonb::Number(JsonNumber::parse(&n.to_string())?)
+                Jsonb::Number(JsonNumber::from_numeric(n.checked()?).expect("finite numeric"))
             } else {
                 Jsonb::String(n.to_string())
             }

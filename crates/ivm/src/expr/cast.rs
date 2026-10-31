@@ -220,7 +220,7 @@ fn jsonb_scalar_cast(j: &pgfuncs::json::Jsonb, to: &SqlType) -> Result<Datum> {
     match (j, to) {
         (Jsonb::Bool(b), SqlType::Bool) => Ok(Datum::Bool(*b)),
         (Jsonb::Number(n), _) if *to != SqlType::Bool => {
-            let num = Numeric::parse(n.as_str())?;
+            let num = n.as_numeric().clone();
             convert(&Datum::numeric(num), to)
         }
         (Jsonb::Null, _) => Ok(Datum::Null),

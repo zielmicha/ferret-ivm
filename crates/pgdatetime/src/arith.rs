@@ -4,8 +4,8 @@
 use std::cmp::Ordering;
 
 use crate::core::*;
-use crate::decimal::c_format_g;
 use crate::error::*;
+use crate::float_format::c_format_g;
 use crate::tz::{self, DecodedTzName, ZoneRef};
 use crate::{Date, Error, Interval, Result, Time, TimeZone, Timestamp, TimestampTz};
 

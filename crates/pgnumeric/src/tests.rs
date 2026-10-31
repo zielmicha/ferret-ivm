@@ -219,3 +219,41 @@ fn unbounded_arithmetic_beyond_the_range() {
     assert_eq!(Numeric::nan().add_unbounded(&a).to_string(), "NaN");
     assert_eq!(Numeric::infinity().sub_unbounded(&Numeric::infinity()).to_string(), "NaN");
 }
+
+#[test]
+fn scaled_integer_construction() {
+    for value in [
+        0,
+        1,
+        -1,
+        10000,
+        -123456789,
+        i64::MAX as i128,
+        i128::MIN,
+        i128::MAX,
+    ] {
+        for scale in [0, 1, 2, 3, 4, 6, 19, 38, 100, 16383] {
+            let numeric = Numeric::from_scaled_i128(value, scale).unwrap();
+            let parsed = Numeric::parse(&format!("{value}e-{scale}")).unwrap();
+            assert_eq!(numeric, parsed);
+            assert_eq!(numeric.to_string(), parsed.to_string());
+            assert_eq!(numeric.dscale(), scale);
+            assert_normalized(&numeric, "scaled integer");
+        }
+    }
+    for value in [0, 1, -123456789, i64::MIN as i128, i64::MAX as i128] {
+        for scale in [0, 3, 6] {
+            assert!(
+                !Numeric::from_scaled_i128(value, scale)
+                    .unwrap()
+                    .digits
+                    .spilled()
+            );
+        }
+    }
+    for scale in [16384, u32::MAX] {
+        let err = Numeric::from_scaled_i128(1, scale).unwrap_err();
+        assert_eq!(err.sqlstate, "22003");
+        assert_eq!(err.message, "value overflows numeric format");
+    }
+}

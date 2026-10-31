@@ -73,3 +73,23 @@ The [documentation](docs/README.md) covers:
 | `crates/pgnumeric` | PostgreSQL-compatible `numeric` and float text conversions |
 | `crates/pgdatetime` | PostgreSQL-compatible date/time types and functions |
 | `crates/pgfuncs` | PostgreSQL-compatible string, pattern, `bytea`, `uuid`, array, JSON and jsonpath functions |
+
+The semantic crates share `pgnumeric::Numeric`: date/time `EXTRACT` returns
+it through the `pgdatetime::Decimal` alias, and `JsonNumber` wraps a finite,
+storable numeric. `JsonNumber::as_numeric()` and `from_numeric()` provide
+direct conversions; `as_str()` still returns PostgreSQL numeric text with
+the original display scale. JSON's number grammar and durable key encoding
+remain unchanged.
+
+For Rust callers migrating from the former `Decimal` struct:
+
+| Previous API | Shared numeric API |
+|---|---|
+| `Decimal::new(value, scale)` | `Decimal::from_scaled_i128(value, scale)?` |
+| `Decimal::INFINITY`, `Decimal::NEG_INFINITY` | `Decimal::infinity()`, `Decimal::neg_infinity()` |
+| `.scale` field | `.dscale()` |
+| `.to_f64()` returning `f64` | `.to_f64()` returning `Result<f64>` |
+
+`Decimal` now implements `Clone` rather than `Copy`, has no public
+coefficient fields, and compares by numeric value (`1.0 == 1.00`). Display
+scale remains available independently of equality.

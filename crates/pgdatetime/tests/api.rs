@@ -145,7 +145,7 @@ fn null_results() {
     assert_eq!(extract_timestamp_opt("month", inf).unwrap(), None);
     assert_eq!(
         extract_timestamp_opt("year", inf).unwrap(),
-        Some(Decimal::INFINITY)
+        Some(Decimal::infinity())
     );
     assert!(
         extract_timestamp("month", inf)
@@ -198,7 +198,7 @@ fn helpers() {
         interval_cmp(iv("1 day"), iv("24 hours")),
         std::cmp::Ordering::Equal
     );
-    assert_eq!(Decimal::new(-123456, 3).to_string(), "-123.456");
+    assert_eq!(Decimal::from_scaled_i128(-123456, 3).unwrap().to_string(), "-123.456");
     assert_eq!(overlaps(Some(1), Some(5), Some(5), Some(9)), Some(false));
     assert_eq!(overlaps(Some(1), None, Some(0), Some(9)), Some(true));
     assert_eq!(overlaps::<i64>(None, None, Some(0), Some(9)), None);

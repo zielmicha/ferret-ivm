@@ -291,14 +291,9 @@ fn err(code: &'static str, msg: impl Into<String>) -> Error {
     Error::new(code, msg)
 }
 
-/// numeric value of a JSON number (always finite and valid).
-fn to_numeric(n: &JsonNumber) -> Numeric {
-    Numeric::parse(n.as_str()).expect("jsonb number is a valid numeric")
-}
-
 /// A finite numeric as a JSON number.
-fn from_numeric(n: &Numeric) -> JsonNumber {
-    JsonNumber::from_numeric_text(n.to_string())
+fn from_numeric(n: Numeric) -> JsonNumber {
+    JsonNumber::from_numeric(n).expect("finite jsonpath numeric result")
 }
 
 fn num_val<'a>(n: JsonNumber) -> Val<'a> {
@@ -787,7 +782,7 @@ impl<'a> Exec<'a> {
                         Ok(f) if !f.is_finite() => return_error!(self, nan_inf_error(name)),
                         Ok(f) => {
                             let n = Numeric::from_f64(f).map_err(exec_error)?;
-                            num_val(from_numeric(&n))
+                            num_val(from_numeric(n))
                         }
                     },
                     _ => return_error!(
@@ -825,7 +820,7 @@ impl<'a> Exec<'a> {
                     });
                 }
                 let v = match jb {
-                    Val::Num(n) => match to_numeric(n).to_i64() {
+                    Val::Num(n) => match n.as_numeric().to_i64() {
                         Ok(i) => i,
                         Err(_) => {
                             return_error!(self, invalid_arg_error(n.as_str(), name, "bigint"))
@@ -885,7 +880,7 @@ impl<'a> Exec<'a> {
                     });
                 }
                 let v = match jb {
-                    Val::Num(n) => match to_numeric(n).to_i32() {
+                    Val::Num(n) => match n.as_numeric().to_i32() {
                         Ok(i) => i,
                         Err(_) => {
                             return_error!(self, invalid_arg_error(n.as_str(), name, "integer"))
@@ -954,7 +949,7 @@ impl<'a> Exec<'a> {
             Val::Str(s) => match Numeric::parse(s) {
                 Err(_) => return_error!(self, invalid_arg_error(s, name, "numeric")),
                 Ok(n) if !n.is_finite() => return_error!(self, nan_inf_error(name)),
-                Ok(n) => (Cow::Owned(from_numeric(&n)), s.to_string()),
+                Ok(n) => (Cow::Owned(from_numeric(n)), s.to_string()),
             },
             _ => return_error!(
                 self,
@@ -1014,8 +1009,8 @@ impl<'a> Exec<'a> {
                     format!("NUMERIC scale {scale} must be between -1000 and 1000"),
                 ));
             }
-            match Numeric::parse_with_typmod(&numstr, precision, scale) {
-                Ok(n) => num = Cow::Owned(from_numeric(&n)),
+            match num.as_numeric().apply_typmod(precision, scale) {
+                Ok(n) => num = Cow::Owned(from_numeric(n)),
                 Err(_) => return_error!(self, invalid_arg_error(&numstr, name, "numeric")),
             }
         }
@@ -1025,7 +1020,7 @@ impl<'a> Exec<'a> {
     /// numeric_int4_opt_error() on a numeric literal of the path.
     fn literal_int4(&self, id: NodeId) -> Option<i32> {
         match &self.node(id).kind {
-            Kind::Numeric(n) => to_numeric(n).to_i32().ok(),
+            Kind::Numeric(n) => n.as_numeric().to_i32().ok(),
             _ => None,
         }
     }
@@ -1458,7 +1453,7 @@ impl<'a> Exec<'a> {
                 )
             ),
         };
-        let (a, b) = (to_numeric(lval), to_numeric(rval));
+        let (a, b) = (lval.as_numeric(), rval.as_numeric());
         let r = match op {
             BinOp::Add => a.add(&b),
             BinOp::Sub => a.sub(&b),
@@ -1480,7 +1475,7 @@ impl<'a> Exec<'a> {
         if next.is_none() && found.is_none() {
             return Ok(Jper::Ok);
         }
-        self.exec_next(next, num_val(from_numeric(&res)), found)
+        self.exec_next(next, num_val(from_numeric(res)), found)
     }
 
     /// executeUnaryArithmExpr()
@@ -1613,7 +1608,7 @@ impl<'a> Exec<'a> {
                 )
             );
         };
-        let v = to_numeric(n);
+        let v = n.as_numeric();
         let datum = match m {
             Method::Abs => v.abs(),
             Method::Floor => v.try_floor().map_err(exec_error)?,
@@ -1623,7 +1618,7 @@ impl<'a> Exec<'a> {
         if next.is_none() && found.is_none() {
             return Ok(Jper::Ok);
         }
-        self.exec_next(next, num_val(from_numeric(&datum)), found)
+        self.exec_next(next, num_val(from_numeric(datum)), found)
     }
 
     /// executeDateTimeMethod()
@@ -1842,7 +1837,7 @@ impl<'a> Exec<'a> {
                 return Ok(Err(Jper::Error));
             }
         };
-        let t = to_numeric(n).trunc(0).map_err(exec_error)?;
+        let t = n.as_numeric().trunc(0).map_err(exec_error)?;
         match t.to_i32() {
             Ok(i) => Ok(Ok(i)),
             Err(_) => {

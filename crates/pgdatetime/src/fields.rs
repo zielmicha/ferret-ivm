@@ -5,7 +5,6 @@
 
 use crate::core::*;
 use crate::datetime::*;
-use crate::decimal::numeric_div_i64;
 use crate::error::*;
 use crate::io::EPOCH_TIMESTAMP;
 use crate::tz::{self, ZoneRef};
@@ -18,13 +17,13 @@ const T_TIME: &str = "time without time zone";
 const T_INTERVAL: &str = "interval";
 
 /// A date_part / extract result before conversion to numeric or float8.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Part {
     Int(i64),
     /// value / 10^scale computed exactly (int64_div_fast_to_numeric)
     Scaled(i64, u32),
-    /// numeric with explicit (value, scale) and an independently computed float
-    Numeric(i128, u32, f64),
+    /// An exact numeric result, used only for EXTRACT.
+    Numeric(Decimal),
     Float(f64),
     PosInf,
     NegInf,
@@ -58,12 +57,14 @@ fn lookup_units(field: &str) -> (String, i32, i32) {
 
 fn to_decimal(p: Part) -> Option<Decimal> {
     match p {
-        Part::Int(v) => Some(Decimal::new(v as i128, 0)),
-        Part::Scaled(v, s) => Some(Decimal::new(v as i128, s)),
-        Part::Numeric(v, s, _) => Some(Decimal::new(v, s)),
-        Part::Float(f) => Some(Decimal::new(f as i128, 0)),
-        Part::PosInf => Some(Decimal::INFINITY),
-        Part::NegInf => Some(Decimal::NEG_INFINITY),
+        Part::Int(v) => Some(Decimal::from_i64(v)),
+        Part::Scaled(v, s) => {
+            Some(Decimal::from_scaled_i128(v as i128, s).expect("date/time scale"))
+        }
+        Part::Numeric(v) => Some(v),
+        Part::Float(f) => Some(Decimal::from_i128(f as i128)),
+        Part::PosInf => Some(Decimal::infinity()),
+        Part::NegInf => Some(Decimal::neg_infinity()),
         Part::Null => None,
     }
 }
@@ -72,7 +73,7 @@ fn to_float(p: Part) -> Option<f64> {
     match p {
         Part::Int(v) => Some(v as f64),
         Part::Scaled(v, _) => Some(v as f64),
-        Part::Numeric(_, _, f) => Some(f),
+        Part::Numeric(_) => unreachable!("numeric results are only requested by EXTRACT"),
         Part::Float(f) => Some(f),
         Part::PosInf => Some(f64::INFINITY),
         Part::NegInf => Some(f64::NEG_INFINITY),
@@ -163,8 +164,14 @@ fn tm_part(val: i32, tm: &Tm, fsec: i32, retnumeric: bool) -> Option<Part> {
                     + (fsec as f64 / 1_000_000.0))
                     / SECS_PER_DAY as f64;
             if retnumeric {
-                let (q, scale) = numeric_div_i64(usecs, SECS_PER_DAY * 1_000_000);
-                Part::Numeric(jd as i128 * 10i128.pow(scale) + q, scale, fl)
+                let fraction = Decimal::from_i64(usecs)
+                    .div(&Decimal::from_i64(SECS_PER_DAY * 1_000_000))
+                    .expect("bounded Julian fraction");
+                Part::Numeric(
+                    Decimal::from_i64(jd)
+                        .add(&fraction)
+                        .expect("bounded Julian day"),
+                )
             } else {
                 Part::Float(fl)
             }
@@ -192,25 +199,22 @@ fn epoch_part(timestamp: i64, retnumeric: bool) -> Part {
     let epoch = EPOCH_TIMESTAMP;
     if retnumeric {
         if timestamp < i64::MAX + epoch {
-            Part::Scaled128(timestamp as i128 - epoch as i128, 6)
+            Part::Numeric(
+                Decimal::from_scaled_i128(timestamp as i128 - epoch as i128, 6)
+                    .expect("date/time scale"),
+            )
         } else {
             // numeric_div() then numeric_round(..., 6), as PostgreSQL does
-            let (q, s) =
-                crate::decimal::numeric_div_i128(timestamp as i128 - epoch as i128, 1_000_000);
-            let (v, s) = crate::decimal::numeric_round_to(q, s, 6);
-            Part::Scaled128(v, s)
+            let value = Decimal::from_i128(timestamp as i128 - epoch as i128)
+                .div(&Decimal::from_i64(1_000_000))
+                .and_then(|n| n.round(6))
+                .expect("bounded timestamp epoch");
+            Part::Numeric(value)
         }
     } else if timestamp < i64::MAX + epoch {
         Part::Float((timestamp - epoch) as f64 / 1_000_000.0)
     } else {
         Part::Float((timestamp as f64 - epoch as f64) / 1_000_000.0)
-    }
-}
-
-#[allow(non_snake_case)]
-impl Part {
-    fn Scaled128(v: i128, s: u32) -> Part {
-        Part::Numeric(v, s, 0.0)
     }
 }
 
@@ -452,9 +456,11 @@ fn interval_part(field: &str, interval: Interval, retnumeric: bool) -> Result<Pa
                 + 4 * interval.days as i64)
                 * (SECS_PER_DAY / 4);
             Ok(Part::Numeric(
-                secs_from_day_month as i128 * 1_000_000 + interval.micros as i128,
-                6,
-                0.0,
+                Decimal::from_scaled_i128(
+                    secs_from_day_month as i128 * 1_000_000 + interval.micros as i128,
+                    6,
+                )
+                .expect("date/time scale"),
             ))
         } else {
             let mut result = interval.micros as f64 / 1_000_000.0;

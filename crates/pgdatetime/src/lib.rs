@@ -21,8 +21,8 @@
 //!   empty format, timestamp → time of infinite values) have `_opt` variants
 //!   returning `Option`; the plain variants return an error for which
 //!   [`Error::is_null_result`] is true (SQLSTATE [`SQLSTATE_NULL_RESULT`]).
-//! * Numeric infinities from EXTRACT are [`Decimal::INFINITY`] /
-//!   [`Decimal::NEG_INFINITY`] (Display prints `Infinity` / `-Infinity`).
+//! * Numeric infinities from EXTRACT are [`Decimal::infinity()`] /
+//!   [`Decimal::neg_infinity()`] (Display prints `Infinity` / `-Infinity`).
 //! * [`Interval`]'s derived `PartialEq`/`Hash` compare raw fields; SQL equality
 //!   and hashing use [`interval_cmp`] / [`interval_cmp_value`]
 //!   (`'1 mon' = '30 days'`).
@@ -92,10 +92,10 @@
 mod arith;
 mod core;
 mod datetime;
-mod decimal;
 mod encode;
 pub(crate) mod error;
 mod fields;
+mod float_format;
 mod formatting;
 mod io;
 mod tz;
@@ -172,14 +172,9 @@ impl Interval {
     };
 }
 
-/// value * 10^-scale; EXTRACT's numeric result; Display = PG numeric text.
-/// Numeric infinities are represented by [`Decimal::INFINITY`] and
-/// [`Decimal::NEG_INFINITY`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Decimal {
-    pub value: i128,
-    pub scale: u32,
-}
+/// EXTRACT's numeric result, with PostgreSQL value semantics and display
+/// scale. This is the same numeric type used by SQL and JSON arithmetic.
+pub use pgnumeric::Numeric as Decimal;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {

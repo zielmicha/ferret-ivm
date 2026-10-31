@@ -59,23 +59,41 @@ fn put_string(out: &mut Vec<u8>, s: &str) {
 }
 
 fn put_number(out: &mut Vec<u8>, n: &JsonNumber) {
-    let Some(d) = n.decompose() else {
+    if n.is_zero() {
         out.push(N_ZERO);
         return;
+    }
+    // Keep the durable JSON key format: its decimal exponent and digit
+    // pairs differ from Numeric::encode_key's base-100 exponent format.
+    let text = n.as_str();
+    let neg = n.as_numeric().is_negative();
+    let text = text.strip_prefix('-').unwrap_or(text);
+    let (int, frac) = text.split_once('.').unwrap_or((text, ""));
+    let digit = |i: usize| {
+        (if i < int.len() {
+            int.as_bytes()[i]
+        } else {
+            frac.as_bytes()[i - int.len()]
+        }) - b'0'
     };
-    out.push(if d.neg { N_NEG } else { N_POS });
+    let mut first = 0;
+    let mut end = int.len() + frac.len();
+    while digit(first) == 0 {
+        first += 1;
+    }
+    while digit(end - 1) == 0 {
+        end -= 1;
+    }
+    let exp = int.len() as i32 - first as i32;
+    out.push(if neg { N_NEG } else { N_POS });
     let start = out.len();
-    out.extend_from_slice(&((d.exp as i32 as u32) ^ 0x8000_0000).to_be_bytes());
-    let len = d.len();
-    let mut i = 0;
-    while i < len {
-        let hi = d.digit(i);
-        let lo = if i + 1 < len { d.digit(i + 1) } else { 0 };
-        out.push(1 + 10 * hi + lo);
-        i += 2;
+    out.extend_from_slice(&((exp as u32) ^ 0x8000_0000).to_be_bytes());
+    for i in (first..end).step_by(2) {
+        let lo = if i + 1 < end { digit(i + 1) } else { 0 };
+        out.push(1 + 10 * digit(i) + lo);
     }
     out.push(0);
-    if d.neg {
+    if neg {
         for b in &mut out[start..] {
             *b = !*b;
         }
@@ -247,7 +265,19 @@ impl Reader<'_> {
         if digits.last() == Some(&0) {
             digits.pop();
         }
-        JsonNumber::from_decomposed(neg, exp, &digits).ok_or_else(corrupt)
+        if digits.is_empty() || digits[0] == 0 || digits.last() == Some(&0) {
+            return Err(corrupt());
+        }
+        // Scientific input reconstructs the minimal display scale without
+        // duplicating Numeric's range checks or decimal normalization.
+        let mut text = String::with_capacity(digits.len() + 16);
+        if neg {
+            text.push('-');
+        }
+        text.extend(digits.iter().map(|d| (b'0' + d) as char));
+        text.push('e');
+        text.push_str(&(exp - digits.len() as i64).to_string());
+        JsonNumber::parse(&text).map_err(|_| corrupt())
     }
 
     fn scalar(&mut self, tag: u8) -> Result<Jsonb> {

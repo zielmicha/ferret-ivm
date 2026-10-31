@@ -595,5 +595,5 @@ fn to_val(p: Parsed) -> DtVal {
 
 /// numeric_int4_opt_error()
 fn numeric_int4(n: &JsonNumber) -> Option<i32> {
-    pgnumeric::Numeric::parse(n.as_str()).ok()?.to_i32().ok()
+    n.as_numeric().to_i32().ok()
 }
