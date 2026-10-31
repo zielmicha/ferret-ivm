@@ -1,17 +1,19 @@
 # Planner: binder, decorrelation, optimizer, lowering
 
-A query goes through four stages:
+A query is bound, rewritten over stable column identities, then assigned
+execution slots:
 
 ```
-SQL text ──sqlparser──▶ AST ──binder──▶ Rel ──decorrelate──▶ Rel ──optimize──▶ Rel ─┬─lower──▶ dataflow (maintained views, SUBSCRIBE)
-                                                                                   └─exec───▶ rows (ad hoc reads, DML)
+SQL → AST → bound Rel → LogicalRel → decorrelate → optimize → dense Rel
+                                                              ├─ dataflow
+                                                              └─ batch execution
 ```
 
-`sql::plan_query` runs the first three (`crates/ivm/src/sql/mod.rs`);
-materialized views and subscriptions are then lowered into dataflow
-(`dataflow/lower.rs`), while ad hoc queries are evaluated by the batch
-executor (`exec.rs`). This chapter follows the code in
-`crates/ivm/src/sql/` and `crates/ivm/src/dataflow/lower.rs`.
+`sql::plan_query` runs through dense-slot assignment
+(`crates/ivm/src/sql/mod.rs`). Materialized views and subscriptions are then
+lowered into dataflow (`dataflow/lower.rs`), while ad hoc queries are
+evaluated by the batch executor (`exec.rs`). This chapter follows the code
+in `crates/ivm/src/sql/` and `crates/ivm/src/dataflow/lower.rs`.
 
 Planning runs on the engine thread, where a panic would stop the engine for
 every session. Planning only reads the catalog, so `plan_query` catches a
@@ -50,8 +52,27 @@ empty statement when nothing else is left.
 
 ## The logical plan
 
-`sql::plan::Rel` is a relational algebra over bound expressions
-(`expr::Expr`, columns referenced by position):
+`sql::logical::LogicalRel` wraps relational operators with their ordered
+output `ColumnId`s. Expressions, aggregate arguments, grouping keys, window
+arguments and sort keys refer to these identities throughout decorrelation
+and optimization. Moving a predicate or pruning an input does not require
+renumbering references.
+
+The binder constructs positional `sql::plan::Rel` syntax. `logical::bind`
+resolves those slots once, allocating distinct identities for each table or
+CTE occurrence and each set-operation output position. Projections can
+repeat an identity when they expose the same value twice; a union's output
+positions get separate identities because another branch may supply
+different values in those positions. Outer references become
+`LogicalOuter(depth, ColumnId, type)`.
+
+The two phases share their operator definition, traversal and schema rules
+in `plan.rs`. Column types are derived in each operator's context, so an
+outer join can make an existing identity nullable without changing it.
+After rewriting, `LogicalRel::into_dense` resolves identities to local row
+offsets for execution. It rejects remaining subqueries, outer references
+or `Apply` operators. Logical allocation identities never enter execution
+or persisted structural fingerprints.
 
 | `Rel` | Meaning |
 |---|---|
@@ -164,14 +185,16 @@ columns (the rest are sort helpers), and the top-level `ORDER BY`, `LIMIT`,
 
 ## Decorrelation
 
-`sql::decorrelate` removes every subquery expression in two phases.
+Subqueries are removed in two phases across `sql::logical::bind` and
+`sql::decorrelate`.
 
-**Phase 1 — subqueries to `Apply`.** In a `Filter`, a top-level `EXISTS`,
+**Phase 1 — bind identities and extract `Apply`.** In a `Filter`, a top-level `EXISTS`,
 `IN` (or their negations) becomes `Apply(Semi { lhs, negated, null_aware })`
 (`null_aware` implements `NOT IN`). Any other subquery in a `Filter` or a
 `Map` is lifted into an `Apply(Mark)` (appends the boolean result of
 `EXISTS` / `IN` / `ANY` / `ALL` with three-valued logic) or `Apply(Scalar)`
-whose new columns replace the subquery. `Apply(Scalar)` appends the
+whose new column identities replace the subquery. Existing references stay
+unchanged when an `Apply` introduces columns. `Apply(Scalar)` appends the
 subquery's value and its number of rows, and the subquery is replaced at its
 position by `CASE WHEN rows > 1 THEN <error 21000 more than one row returned
 by a subquery used as an expression> ELSE value END`: the cardinality error
@@ -205,7 +228,8 @@ rejected. `LATERAL` items are bound directly as `Apply(Lateral)`.
   joined row.
 - Everything else uses the general **dependent join**: `D = DISTINCT` of the
   outer columns the subquery references is pushed down through the subquery
-  plan (`push_dep`), so that the subquery is computed once for every value of
+  plan (`push_dep`), carrying explicit domain bindings alongside the
+  original column identities, so that the subquery is computed once for every value of
   `D`, and the result is joined with the outer side on `D` with
   `IS NOT DISTINCT FROM`. For correlated columns of types whose equal values
   can differ in representation (`numeric`, floats, `interval`, `jsonb` and
@@ -237,7 +261,7 @@ If an outer reference survives, the query fails with
    constant NULL argument to its first argument.
 2. **Predicate push-down** (`push`): filter conjuncts move below `Project`,
    `Distinct`, `UnionAll`, `SetOp`, `Negate`; below `Map` — a conjunct over
-   computed columns with their expressions inlined (`plan::Inliner`), as
+   computed columns with their expressions inlined (`optimize::Inliner`), as
    PostgreSQL pushes conditions into subqueries, unless an expression may
    change from one evaluation to the next (a non-immutable function,
    `now()`, a subquery, an outer reference), so the other columns are only
@@ -268,9 +292,15 @@ If an outer reference survives, the query fails with
    true for `ALL`.)
 3. **Column pruning** (`prune`): every operator computes only the columns
    its consumers demand, so that joins and arrangements carry fewer columns
-   and changes to unused columns cancel before they reach a join.
+   and changes to unused columns cancel before they reach a join. Demand
+   propagates as sets of `ColumnId`s; retained expressions keep their
+   original references.
 4. **Projection merging**: stacked projections are combined and identity
    projections and empty filters removed.
+
+Dense-slot assignment also removes maps used only to copy selected columns.
+Doing this at the boundary preserves logical identities during rewriting
+and the canonical execution shape used by checkpoint fingerprints.
 
 There is no cost-based join reordering at this stage; the join order of
 maintained views is chosen per delta path during lowering, and ad hoc
@@ -450,8 +480,7 @@ starts with and that a sink resynchronises its target from are read the
 same way (`Engine::snapshot_stream`): within the budget on the engine
 thread, else on a reader thread from a fork as of the GSN the subscription
 or snapshot starts at, as the consumer takes them. The consumer gets the
-snapshot as one event in its queue at that GSN (`SubEvent::Snapshot`,
-`SinkMsg::Snapshot`), before the changes after it, which the engine
+snapshot as one event in its queue at that GSN (`ChangeEvent::Snapshot`), before the changes after it, which the engine
 delivers as usual meanwhile: it keeps nothing for the snapshot.
 
 Because the executor and the dataflow share the aggregate, window and

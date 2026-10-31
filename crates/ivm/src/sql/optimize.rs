@@ -1,96 +1,75 @@
-//! Logical rewrites: constant folding, predicate pushdown, outer-join
-//! simplification, column pruning, projection merging.
+//! Logical rewrites over stable bindings. Moving an operator or pruning its
+//! inputs never changes the identities referenced by expressions.
 
-use super::plan::*;
+use super::logical::{self, ColumnId, LogicalKind as K, LogicalRel as Rel};
+use super::plan::{AggCall, INLINE_COPIES, JoinKind, WindowCall};
 use crate::error::Result;
-use crate::expr::func::func_def;
 use crate::expr::Expr;
-use crate::types::Datum;
-use std::collections::BTreeSet;
+use crate::expr::func::func_def;
+use std::collections::{BTreeMap, BTreeSet};
+
+type Columns = BTreeSet<ColumnId>;
 
 pub fn optimize(rel: Rel) -> Result<Rel> {
     let rel = fold_all(rel)?;
     let rel = push(rel, vec![])?;
-    let rel = prune_all(rel);
-    merge_projects(rel)
+    merge_projects(prune_all(rel))
 }
 
 fn fold_all(rel: Rel) -> Result<Rel> {
     let mut rel = rel.map_inputs(fold_all)?;
     for e in rel.exprs_mut() {
-        let t = std::mem::replace(e, Expr::bool(true));
-        *e = t.fold()?;
+        *e = std::mem::replace(e, Expr::bool(true)).fold()?;
     }
     Ok(rel)
 }
 
-fn cols_of(e: &Expr) -> Vec<usize> {
-    e.column_set()
+fn within(e: &Expr, columns: &Columns) -> bool {
+    logical::columns(e).is_subset(columns)
 }
 
-fn all_below(e: &Expr, n: usize) -> bool {
-    cols_of(e).iter().all(|c| *c < n)
-}
-
-fn all_at_or_above(e: &Expr, n: usize) -> bool {
-    cols_of(e).iter().all(|c| *c >= n)
-}
-
-/// Does `e` evaluate to NULL whenever every column in [lo, hi) is NULL?
-fn null_under(e: &Expr, lo: usize, hi: usize) -> bool {
+/// Whether null-extending these bindings forces an expression to NULL.
+fn null_under(e: &Expr, columns: &Columns) -> bool {
     match e {
-        Expr::Column(c) => *c >= lo && *c < hi,
-        Expr::Call(c) => func_def(c.func).strict && c.args.iter().any(|a| null_under(a, lo, hi)),
-        Expr::Cast(x, ..) | Expr::Not(x) => null_under(x, lo, hi),
-        Expr::Like(l) => null_under(&l.expr, lo, hi) || null_under(&l.pattern, lo, hi),
-        Expr::InList(x, _, _) => null_under(x, lo, hi),
-        Expr::And(v) => v.iter().all(|x| null_under(x, lo, hi)),
-        Expr::Or(v) => v.iter().all(|x| null_under(x, lo, hi)),
-        // a NULL left operand still gives false (ANY) or true (ALL) when
-        // the array is empty, so only a NULL array guarantees NULL
-        Expr::AnyAll { array, .. } => null_under(array, lo, hi),
+        Expr::LogicalColumn(c) => columns.contains(c),
+        Expr::Call(c) => func_def(c.func).strict && c.args.iter().any(|a| null_under(a, columns)),
+        Expr::Cast(x, ..) | Expr::Not(x) => null_under(x, columns),
+        Expr::Like(l) => null_under(&l.expr, columns) || null_under(&l.pattern, columns),
+        Expr::InList(x, _, _) => null_under(x, columns),
+        Expr::And(v) | Expr::Or(v) => v.iter().all(|x| null_under(x, columns)),
+        // A NULL left operand still gives false/true for an empty ANY/ALL array.
+        Expr::AnyAll { array, .. } => null_under(array, columns),
         _ => false,
     }
 }
 
-/// Is predicate `p` false or NULL whenever every column in [lo, hi) is NULL?
-fn rejects_nulls(p: &Expr, lo: usize, hi: usize) -> bool {
+fn rejects_nulls(p: &Expr, columns: &Columns) -> bool {
     match p {
-        Expr::IsNotNull(x) => null_under(x, lo, hi),
-        Expr::And(v) => v.iter().any(|x| rejects_nulls(x, lo, hi)),
-        Expr::Or(v) => v.iter().all(|x| rejects_nulls(x, lo, hi)),
-        Expr::BoolTest(x, crate::expr::BoolTest::IsTrue) => null_under(x, lo, hi),
-        other => null_under(other, lo, hi),
+        Expr::IsNotNull(x) => null_under(x, columns),
+        Expr::And(v) => v.iter().any(|x| rejects_nulls(x, columns)),
+        Expr::Or(v) => v.iter().all(|x| rejects_nulls(x, columns)),
+        Expr::BoolTest(x, crate::expr::BoolTest::IsTrue) => null_under(x, columns),
+        other => null_under(other, columns),
     }
 }
 
-fn finish(rel: Rel, preds: Vec<Expr>) -> Rel {
-    rel.filter(preds)
+/// Set-operation branches bind their corresponding outputs independently.
+fn branch_preds(preds: &[Expr], from: &[ColumnId], to: &[ColumnId]) -> Vec<Expr> {
+    let bindings: BTreeMap<_, _> = from.iter().copied().zip(to.iter().copied()).collect();
+    preds.iter().map(|p| logical::rename(p, &|c| bindings[&c])).collect()
 }
 
-/// Push `preds` (over rel's output) as far down as possible.
-fn push(rel: Rel, mut preds: Vec<Expr>) -> Result<Rel> {
-    // constant-false predicate: keep (can't drop the subtree's schema)
-    match rel {
-        Rel::Filter { input, preds: p } => {
-            let mut all = preds;
-            all.extend(p);
-            push(*input, all)
-        }
-        Rel::Map { input, exprs } => {
-            let n = input.arity();
-            // A predicate over computed columns moves below the map with
-            // their expressions inlined, as PostgreSQL pushes quals into
-            // subqueries: the other columns are then computed only for the
-            // rows that pass, and raise errors only where PostgreSQL does.
-            // (Not through expressions whose value may change from one
-            // evaluation to the next.) Where inlining would copy expressions
-            // too often (`Inliner`), the predicate stays at the map, which
-            // computes the columns it needs before it and the others after.
-            let (mut down, mut up, mut at) = (Vec::new(), Vec::new(), Vec::new());
-            let inliner = Inliner::new(n, &exprs);
+fn push(rel: Rel, preds: Vec<Expr>) -> Result<Rel> {
+    let Rel { kind, columns } = rel;
+    Ok(match kind {
+        K::Filter { input, preds: own } => push(*input, preds.into_iter().chain(own).collect())?,
+        K::Map { input, exprs } => {
+            let input_columns = input.column_set();
+            let ids = columns[input.arity()..].to_vec();
+            let inliner = Inliner::new(&ids, &exprs);
+            let (mut down, mut up, mut at) = (vec![], vec![], vec![]);
             for p in preds {
-                if all_below(&p, n) {
+                if within(&p, &input_columns) {
                     down.push(p);
                 } else if !inliner.stable(&p) {
                     up.push(p);
@@ -101,428 +80,293 @@ fn push(rel: Rel, mut preds: Vec<Expr>) -> Result<Rel> {
                 }
             }
             let input = push(*input, down)?;
-            let rel = if at.is_empty() { Rel::Map { input: Box::new(input), exprs } } else { split_map(input, exprs, at) };
-            Ok(finish(rel, up))
+            let r = if at.is_empty() { input.map_with(ids, exprs) } else { split_map(input, ids, exprs, at) };
+            r.filter(up)
         }
-        Rel::Project { input, cols } => {
-            let down: Vec<Expr> = preds.into_iter().map(|p| p.remapped(&|c| cols[c])).collect();
-            let input = push(*input, down)?;
-            Ok(Rel::Project { input: Box::new(input), cols })
+        K::Project { input, .. } => push(*input, preds)?.project(columns),
+        K::Join { left, right, kind, on } => push_join(*left, *right, kind, on, preds)?,
+        K::Aggregate { input, group, aggs } => {
+            let group_columns = group.iter().copied().collect();
+            // A scalar aggregate yields a row for empty input, so even a
+            // constant HAVING false must stay above it.
+            let (down, up) = preds.into_iter().partition(|p| !group.is_empty() && within(p, &group_columns));
+            Rel::new(K::Aggregate { input: Box::new(push(*input, down)?), group, aggs }, columns).filter(up)
         }
-        Rel::Join { left, right, kind, on } => push_join(*left, *right, kind, on, preds),
-        Rel::Aggregate { input, group, aggs } => {
-            let ng = group.len();
-            // without GROUP BY the aggregate yields a row even for empty
-            // input, so even a constant predicate (HAVING false) must stay
-            // above it
-            let (down, up): (Vec<Expr>, Vec<Expr>) = preds.into_iter().partition(|p| ng > 0 && all_below(p, ng));
-            let down: Vec<Expr> = down.into_iter().map(|p| p.remapped(&|c| group[c])).collect();
-            let input = push(*input, down)?;
-            Ok(finish(Rel::Aggregate { input: Box::new(input), group, aggs }, up))
-        }
-        Rel::Distinct { .. } | Rel::Negate { .. } | Rel::UnionAll { .. } | Rel::SetOp { .. } => {
-            let mut remaining = match &rel {
-                Rel::UnionAll { inputs } => inputs.len(),
-                Rel::SetOp { .. } => 2,
-                _ => 1,
-            };
-            rel.map_inputs(|input| {
-                remaining -= 1;
-                push(input, if remaining == 0 { std::mem::take(&mut preds) } else { preds.clone() })
-            })
-        }
-        Rel::TopK { input, group, order, limit, offset, with_ties } => {
-            let (down, up): (Vec<Expr>, Vec<Expr>) =
-                preds.into_iter().partition(|p| !cols_of(p).is_empty() && cols_of(p).iter().all(|c| group.contains(c)));
-            let input = push(*input, down)?;
-            Ok(finish(Rel::TopK { input: Box::new(input), group, order, limit, offset, with_ties }, up))
-        }
-        Rel::Window { input, funcs } => {
-            let n = input.arity();
-            // predicates over columns that partition every window function
-            let common: Vec<usize> = (0..n).filter(|c| funcs.iter().all(|f| f.partition.contains(c))).collect();
-            let (down, up): (Vec<Expr>, Vec<Expr>) = preds
+        K::Distinct { input } => push(*input, preds)?.distinct(),
+        K::Negate { input } => Rel::new(K::Negate { input: Box::new(push(*input, preds)?) }, columns),
+        K::UnionAll { inputs } => {
+            let inputs = inputs
                 .into_iter()
-                .partition(|p| !cols_of(p).is_empty() && cols_of(p).iter().all(|c| common.contains(c)));
-            let input = push(*input, down)?;
-            Ok(finish(Rel::Window { input: Box::new(input), funcs }, up))
+                .map(|i| {
+                    let p = branch_preds(&preds, &columns, &i.columns);
+                    push(i, p)
+                })
+                .collect::<Result<_>>()?;
+            Rel::new(K::UnionAll { inputs }, columns)
         }
-        Rel::FlatMap { input, funcs, out, ordinality } => {
-            let n = input.arity();
-            let (down, up): (Vec<Expr>, Vec<Expr>) = preds.into_iter().partition(|p| all_below(p, n));
-            let input = push(*input, down)?;
-            Ok(finish(Rel::FlatMap { input: Box::new(input), funcs, out, ordinality }, up))
+        K::SetOp { op, all, left, right } => {
+            let lp = branch_preds(&preds, &columns, &left.columns);
+            let rp = branch_preds(&preds, &columns, &right.columns);
+            Rel::new(K::SetOp { op, all, left: Box::new(push(*left, lp)?), right: Box::new(push(*right, rp)?) }, columns)
         }
-        Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } | Rel::Apply { .. } | Rel::Recursive { .. } => {
-            Ok(finish(rel.map_inputs(|input| push(input, vec![]))?, preds))
+        K::TopK { input, group, order, limit, offset, with_ties } => {
+            let group_columns = group.iter().copied().collect();
+            let (down, up) = preds.into_iter().partition(|p| !logical::columns(p).is_empty() && within(p, &group_columns));
+            Rel::new(K::TopK { input: Box::new(push(*input, down)?), group, order, limit, offset, with_ties }, columns).filter(up)
         }
-    }
-}
-
-/// `Map(exprs)` over `input` with `preds` (over its output) checked after
-/// the computed columns they need, directly or through others, and before
-/// the other ones, which are computed only for the rows that pass.
-fn split_map(input: Rel, exprs: Vec<Expr>, preds: Vec<Expr>) -> Rel {
-    let n = input.arity();
-    let k = exprs.len();
-    let mut need = vec![false; k];
-    for c in preds.iter().flat_map(|p| p.column_set()) {
-        if c >= n {
-            need[c - n] = true;
+        K::Window { input, funcs } => {
+            let common = input.columns.iter().copied().filter(|c| funcs.iter().all(|f| f.partition.contains(c))).collect();
+            let (down, up) = preds.into_iter().partition(|p| !logical::columns(p).is_empty() && within(p, &common));
+            Rel::new(K::Window { input: Box::new(push(*input, down)?), funcs }, columns).filter(up)
         }
-    }
-    for i in (0..k).rev() {
-        if need[i] {
-            for c in exprs[i].column_set() {
-                if c >= n {
-                    need[c - n] = true;
-                }
-            }
+        K::FlatMap { input, funcs, out, ordinality } => {
+            let input_columns = input.column_set();
+            let (down, up) = preds.into_iter().partition(|p| within(p, &input_columns));
+            Rel::new(K::FlatMap { input: Box::new(push(*input, down)?), funcs, out, ordinality }, columns).filter(up)
         }
-    }
-    // where each column goes: the input's, the needed ones, the others (an
-    // expression still follows those it references)
-    let mut pos: Vec<usize> = (0..n).collect();
-    let (mut a, mut b) = (n, n + need.iter().filter(|x| **x).count());
-    for &nd in &need {
-        let slot = if nd { &mut a } else { &mut b };
-        pos.push(*slot);
-        *slot += 1;
-    }
-    let (mut first, mut rest) = (Vec::new(), Vec::new());
-    for (e, nd) in exprs.iter().zip(&need) {
-        let e = e.remapped(&|c| pos[c]);
-        if *nd { first.push(e) } else { rest.push(e) }
-    }
-    let preds = preds.iter().map(|p| p.remapped(&|c| pos[c])).collect();
-    input.map(first).filter(preds).map(rest).project(pos)
-}
-
-fn push_join(left: Rel, right: Rel, mut kind: JoinKind, on: Vec<Expr>, preds: Vec<Expr>) -> Result<Rel> {
-    let nl = left.arity();
-    let nr = right.arity();
-    let total = nl + nr;
-    // outer join simplification from null-rejecting WHERE predicates
-    if matches!(kind, JoinKind::Left | JoinKind::Full) && preds.iter().any(|p| rejects_nulls(p, nl, total)) {
-        kind = if kind == JoinKind::Left { JoinKind::Inner } else { JoinKind::Right };
-    }
-    if matches!(kind, JoinKind::Right | JoinKind::Full) && preds.iter().any(|p| rejects_nulls(p, 0, nl)) {
-        kind = if kind == JoinKind::Right { JoinKind::Inner } else { JoinKind::Left };
-    }
-    let shift_r = |e: Expr| e.remapped(&|c| c - nl);
-    let mut lp = Vec::new();
-    let mut rp = Vec::new();
-    let mut new_on = Vec::new();
-    let mut up = Vec::new();
-    match kind {
-        JoinKind::Inner => {
-            for p in on.into_iter().chain(preds) {
-                let cs = cols_of(&p);
-                if cs.is_empty() {
-                    new_on.push(p);
-                } else if all_below(&p, nl) {
-                    lp.push(p);
-                } else if all_at_or_above(&p, nl) {
-                    rp.push(shift_r(p));
-                } else {
-                    new_on.push(p);
-                }
-            }
-        }
-        JoinKind::Left => {
-            for p in preds {
-                if all_below(&p, nl) && !cols_of(&p).is_empty() {
-                    lp.push(p);
-                } else {
-                    up.push(p);
-                }
-            }
-            for p in on {
-                if all_at_or_above(&p, nl) && !cols_of(&p).is_empty() {
-                    rp.push(shift_r(p));
-                } else {
-                    new_on.push(p);
-                }
-            }
-        }
-        JoinKind::Right => {
-            for p in preds {
-                if all_at_or_above(&p, nl) && !cols_of(&p).is_empty() {
-                    rp.push(shift_r(p));
-                } else {
-                    up.push(p);
-                }
-            }
-            for p in on {
-                if all_below(&p, nl) && !cols_of(&p).is_empty() {
-                    lp.push(p);
-                } else {
-                    new_on.push(p);
-                }
-            }
-        }
-        JoinKind::Full => {
-            up = preds;
-            new_on = on;
-        }
-        JoinKind::Semi | JoinKind::Anti => {
-            // output = left columns only
-            for p in preds {
-                lp.push(p);
-            }
-            for p in on {
-                let cs = cols_of(&p);
-                if !cs.is_empty() && all_at_or_above(&p, nl) {
-                    rp.push(shift_r(p));
-                } else if kind == JoinKind::Semi && !cs.is_empty() && all_below(&p, nl) {
-                    lp.push(p);
-                } else {
-                    new_on.push(p);
-                }
-            }
-        }
-    }
-    let left = push(left, lp)?;
-    let right = push(right, rp)?;
-    Ok(finish(Rel::Join { left: Box::new(left), right: Box::new(right), kind, on: new_on }, up))
-}
-
-/// Merge stacked projections and drop identity projections.
-fn merge_projects(rel: Rel) -> Result<Rel> {
-    Ok(match rel.map_inputs(merge_projects)? {
-        Rel::Project { input, cols } => {
-            // columns copied by a Map are columns of its input
-            let (input, cols) = match *input {
-                Rel::Map { input: inner, exprs } => {
-                    let n = inner.arity();
-                    let resolve = |c: usize| -> Option<usize> {
-                        if c < n {
-                            return Some(c);
-                        }
-                        match &exprs[c - n] {
-                            Expr::Column(k) if *k < n => Some(*k),
-                            _ => None,
-                        }
-                    };
-                    match cols.iter().map(|c| resolve(*c)).collect::<Option<Vec<usize>>>() {
-                        Some(direct) => (inner, direct),
-                        None => (Box::new(Rel::Map { input: inner, exprs }), cols),
-                    }
-                }
-                other => (Box::new(other), cols),
-            };
-            input.project(cols)
-        }
-        Rel::Filter { input, preds } if preds.is_empty() => *input,
-        Rel::Filter { input, preds } if preds.iter().all(|p| matches!(p, Expr::Literal(Datum::Bool(true), _))) => *input,
-        other => other,
+        kind => Rel::new(kind, columns).map_inputs(|i| push(i, vec![]))?.filter(preds),
     })
 }
 
-// ---------------------------------------------------------------- pruning
-
-/// Old output column -> new position (None: dropped).
-type ColMap = Vec<Option<usize>>;
-
-fn identity(n: usize) -> ColMap {
-    (0..n).map(Some).collect()
-}
-
-fn map_from(arity: usize, kept: &[usize]) -> ColMap {
-    let mut m = vec![None; arity];
-    for (i, c) in kept.iter().enumerate() {
-        m[*c] = Some(i);
+/// Evaluate the columns required by predicates first, and the rest only
+/// after those predicates pass. Stable bindings need no offset repair.
+fn split_map(input: Rel, ids: Vec<ColumnId>, exprs: Vec<Expr>, preds: Vec<Expr>) -> Rel {
+    let mut need: Columns = preds.iter().flat_map(logical::columns).collect();
+    for (id, expr) in ids.iter().zip(&exprs).rev() {
+        if need.contains(id) {
+            need.extend(logical::columns(expr));
+        }
     }
-    m
+    let original = input.columns.iter().copied().chain(ids.iter().copied()).collect();
+    let (mut first_ids, mut first, mut rest_ids, mut rest) = (vec![], vec![], vec![], vec![]);
+    for (id, expr) in ids.into_iter().zip(exprs) {
+        if need.contains(&id) {
+            first_ids.push(id);
+            first.push(expr);
+        } else {
+            rest_ids.push(id);
+            rest.push(expr);
+        }
+    }
+    input.map_with(first_ids, first).filter(preds).map_with(rest_ids, rest).project(original)
 }
 
-fn remap(e: &Expr, m: &ColMap) -> Expr {
-    e.remapped(&|c| m[c].expect("pruned column still referenced"))
+fn push_join(left: Rel, right: Rel, mut kind: JoinKind, on: Vec<Expr>, preds: Vec<Expr>) -> Result<Rel> {
+    let lc = left.column_set();
+    let rc = right.column_set();
+    if matches!(kind, JoinKind::Left | JoinKind::Full) && preds.iter().any(|p| rejects_nulls(p, &rc)) {
+        kind = if kind == JoinKind::Left { JoinKind::Inner } else { JoinKind::Right };
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) && preds.iter().any(|p| rejects_nulls(p, &lc)) {
+        kind = if kind == JoinKind::Right { JoinKind::Inner } else { JoinKind::Left };
+    }
+    let (mut lp, mut rp, mut new_on, mut up) = (vec![], vec![], vec![], vec![]);
+    let predicates = if kind == JoinKind::Inner { [(on, true), (preds, false)] } else { [(preds, false), (on, true)] };
+    for (p, is_on) in predicates.into_iter().flat_map(|(ps, is_on)| ps.into_iter().map(move |p| (p, is_on))) {
+        let cs = logical::columns(&p);
+        let only_left = !cs.is_empty() && cs.is_subset(&lc);
+        let only_right = !cs.is_empty() && cs.is_subset(&rc);
+        let move_left = match kind {
+            JoinKind::Inner => only_left,
+            JoinKind::Left => !is_on && only_left,
+            JoinKind::Semi | JoinKind::Anti => !is_on || (kind == JoinKind::Semi && only_left),
+            JoinKind::Right => is_on && only_left,
+            JoinKind::Full => false,
+        };
+        let move_right = match kind {
+            JoinKind::Inner => only_right,
+            JoinKind::Left => is_on && only_right,
+            JoinKind::Right => !is_on && only_right,
+            JoinKind::Semi | JoinKind::Anti => is_on && only_right,
+            JoinKind::Full => false,
+        };
+        if move_left {
+            lp.push(p);
+        } else if move_right {
+            rp.push(p);
+        } else if is_on || kind == JoinKind::Inner {
+            new_on.push(p);
+        } else {
+            up.push(p);
+        }
+    }
+    Ok(push(left, lp)?.join(push(right, rp)?, kind, new_on).filter(up))
 }
 
-/// Prune below `rel` while keeping all of its columns in order.
+fn merge_projects(rel: Rel) -> Result<Rel> {
+    let Rel { kind, columns } = rel.map_inputs(merge_projects)?;
+    Ok(match kind {
+        K::Project { input, .. } => input.project(columns),
+        K::Filter { input, preds } => input.filter(preds),
+        kind => Rel::new(kind, columns),
+    })
+}
+
 fn prune_all(rel: Rel) -> Rel {
-    let n = rel.arity();
-    let (r, m) = prune(rel, &(0..n).collect());
-    let cols: Vec<usize> = m.iter().map(|c| c.expect("demanded column dropped")).collect();
-    r.project(cols)
+    let columns = rel.columns.clone();
+    prune(rel, &columns.iter().copied().collect()).project(columns)
 }
 
-/// Keep only the demanded columns of a leaf relation.
-fn restrict(rel: Rel, demand: &BTreeSet<usize>) -> (Rel, ColMap) {
-    let n = rel.arity();
-    if demand.len() == n {
-        return (rel, identity(n));
-    }
-    let cols: Vec<usize> = demand.iter().copied().collect();
-    let m = map_from(n, &cols);
-    (rel.project(cols), m)
-}
-
-/// Column pruning: rewrite `rel` to compute only what its `demand`ed output
-/// columns need, so that joins and arrangements carry fewer columns and
-/// changes confined to unused columns cancel before they reach a join.
-/// Returns the new relation and where each old column went. Columns beyond
-/// the demand may survive (e.g. ones a filter needs).
-fn prune(rel: Rel, demand: &BTreeSet<usize>) -> (Rel, ColMap) {
-    let arity = rel.arity();
-    // keep one column rather than produce zero-width intermediate rows
-    let one: BTreeSet<usize>;
-    let demand = if demand.is_empty() && arity > 0 {
-        one = BTreeSet::from([0]);
+/// Keep demanded bindings and dependencies; the surviving expressions and
+/// aggregate/window arguments retain their identities unchanged.
+fn prune(rel: Rel, demand: &Columns) -> Rel {
+    let one;
+    let demand = if demand.is_empty() && !rel.columns.is_empty() {
+        one = BTreeSet::from([rel.columns[0]]);
         &one
     } else {
         demand
     };
-    match rel {
-        Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } => restrict(rel, demand),
-        Rel::Map { input, exprs } => {
-            let n = input.arity();
-            // appended expressions may reference earlier ones
-            let mut need_expr = vec![false; exprs.len()];
-            let mut need_in: BTreeSet<usize> = BTreeSet::new();
-            for c in demand {
-                if *c < n {
-                    need_in.insert(*c);
-                } else {
-                    need_expr[c - n] = true;
-                }
-            }
-            for i in (0..exprs.len()).rev() {
-                if need_expr[i] {
-                    for c in exprs[i].column_set() {
-                        if c < n {
-                            need_in.insert(c);
-                        } else {
-                            need_expr[c - n] = true;
-                        }
-                    }
-                }
-            }
-            let (input, imap) = prune(*input, &need_in);
-            let n2 = input.arity();
-            let mut m: ColMap = imap;
-            m.resize(arity, None);
-            let mut kept = Vec::new();
-            for (i, e) in exprs.into_iter().enumerate() {
-                if need_expr[i] {
-                    let e2 = remap(&e, &m);
-                    m[n + i] = Some(n2 + kept.len());
-                    kept.push(e2);
-                }
-            }
-            (input.map(kept), m)
+    let Rel { kind, columns } = rel;
+    match kind {
+        K::Get { .. } | K::Values { .. } | K::RecRef { .. } => {
+            let kept = columns.iter().copied().filter(|c| demand.contains(c)).collect();
+            Rel::new(kind, columns).project(kept)
         }
-        Rel::Filter { input, preds } => {
+        K::Map { input, exprs } => {
+            let ids = &columns[input.arity()..];
             let mut need = demand.clone();
-            for p in &preds {
-                need.extend(p.column_set());
-            }
-            let (input, m) = prune(*input, &need);
-            let preds = preds.iter().map(|p| remap(p, &m)).collect();
-            (input.filter(preds), m)
-        }
-        Rel::Project { input, cols } => {
-            let need: BTreeSet<usize> = demand.iter().map(|d| cols[*d]).collect();
-            let (input, imap) = prune(*input, &need);
-            let kept: Vec<usize> = demand.iter().copied().collect();
-            let new_cols = kept.iter().map(|d| imap[cols[*d]].expect("projected column dropped")).collect();
-            (input.project(new_cols), map_from(arity, &kept))
-        }
-        Rel::Join { left, right, kind, on } => {
-            let nl = left.arity();
-            let (mut need_l, mut need_r) = (BTreeSet::new(), BTreeSet::new());
-            for c in demand.iter().copied().chain(on.iter().flat_map(|p| p.column_set())) {
-                if c < nl {
-                    need_l.insert(c);
-                } else {
-                    need_r.insert(c - nl);
+            for (id, e) in ids.iter().zip(&exprs).rev() {
+                if need.contains(id) {
+                    need.extend(logical::columns(e));
                 }
             }
-            let (left, lmap) = prune(*left, &need_l);
-            let (right, rmap) = prune(*right, &need_r);
-            let nl2 = left.arity();
-            let jm: ColMap = lmap.iter().copied().chain(rmap.iter().map(|r| r.map(|r| nl2 + r))).collect();
-            let on = on.iter().map(|p| remap(p, &jm)).collect();
-            let m = jm[..arity].to_vec();
-            (Rel::Join { left: Box::new(left), right: Box::new(right), kind, on }, m)
+            let input_need = need.intersection(&input.column_set()).copied().collect();
+            let (ids, exprs) = ids.iter().copied().zip(exprs).filter(|(id, _)| need.contains(id)).unzip();
+            prune(*input, &input_need).map_with(ids, exprs)
         }
-        Rel::Aggregate { input, group, mut aggs } => {
-            let mut need: BTreeSet<usize> = group.iter().copied().collect();
+        K::Filter { input, preds } => {
+            let mut need = demand.clone();
+            need.extend(preds.iter().flat_map(logical::columns));
+            prune(*input, &need).filter(preds)
+        }
+        K::Project { input, .. } => {
+            let kept: Vec<_> = columns.into_iter().filter(|c| demand.contains(c)).collect();
+            prune(*input, &kept.iter().copied().collect()).project(kept)
+        }
+        K::Join { left, right, kind, on } => {
+            let mut need = demand.clone();
+            need.extend(on.iter().flat_map(logical::columns));
+            let ln = need.intersection(&left.column_set()).copied().collect();
+            let rn = need.intersection(&right.column_set()).copied().collect();
+            prune(*left, &ln).join(prune(*right, &rn), kind, on)
+        }
+        K::Aggregate { input, group, aggs } => {
+            let mut need: Columns = group.iter().copied().collect();
             need.extend(aggs.iter().flat_map(AggCall::columns));
-            let (input, im) = prune(*input, &need);
-            let at = |c: usize| im[c].expect("aggregate input dropped");
-            let group = group.iter().map(|c| at(*c)).collect();
-            for a in &mut aggs {
-                a.remap(&at);
-            }
-            (Rel::Aggregate { input: Box::new(input), group, aggs }, identity(arity))
+            Rel::new(K::Aggregate { input: Box::new(prune(*input, &need)), group, aggs }, columns)
         }
-        Rel::TopK { input, group, order, limit, offset, with_ties } => {
+        K::TopK { input, group, order, limit, offset, with_ties } => {
             let mut need = demand.clone();
             need.extend(group.iter().copied());
             need.extend(order.iter().map(|k| k.col));
-            let (input, m) = prune(*input, &need);
-            let at = |c: usize| m[c].expect("top-k column dropped");
-            let group = group.iter().map(|c| at(*c)).collect();
-            let order = order.iter().map(|k| SortKey { col: at(k.col), spec: k.spec }).collect();
-            (Rel::TopK { input: Box::new(input), group, order, limit, offset, with_ties }, m)
+            let input = prune(*input, &need);
+            let columns = input.columns.clone();
+            Rel::new(K::TopK { input: Box::new(input), group, order, limit, offset, with_ties }, columns)
         }
-        Rel::Window { input, mut funcs } => {
-            let n = input.arity();
-            let mut need: BTreeSet<usize> = demand.iter().copied().filter(|c| *c < n).collect();
+        K::Window { input, funcs } => {
+            let appended = columns[input.arity()..].to_vec();
+            let mut need: Columns = demand.intersection(&input.column_set()).copied().collect();
             need.extend(funcs.iter().flat_map(WindowCall::columns));
-            let (input, im) = prune(*input, &need);
-            let n2 = input.arity();
-            let at = |c: usize| im[c].expect("window input dropped");
-            for f in &mut funcs {
-                f.remap(&at);
-            }
-            let m = (0..arity).map(|c| if c < n { im[c] } else { Some(n2 + c - n) }).collect();
-            (Rel::Window { input: Box::new(input), funcs }, m)
+            let input = prune(*input, &need);
+            let columns = input.columns.iter().copied().chain(appended).collect();
+            Rel::new(K::Window { input: Box::new(input), funcs }, columns)
         }
-        Rel::FlatMap { input, mut funcs, out, ordinality } => {
-            let n = input.arity();
-            let mut need: BTreeSet<usize> = demand.iter().copied().filter(|c| *c < n).collect();
-            for a in funcs.iter().flat_map(|f| f.args.iter()) {
-                need.extend(a.column_set());
-            }
-            let (input, im) = prune(*input, &need);
-            let n2 = input.arity();
-            for f in funcs.iter_mut() {
-                f.args = f.args.iter().map(|a| remap(a, &im)).collect();
-            }
-            let m = (0..arity).map(|c| if c < n { im[c] } else { Some(n2 + c - n) }).collect();
-            (Rel::FlatMap { input: Box::new(input), funcs, out, ordinality }, m)
+        K::FlatMap { input, funcs, out, ordinality } => {
+            let appended = columns[input.arity()..].to_vec();
+            let mut need: Columns = demand.intersection(&input.column_set()).copied().collect();
+            need.extend(funcs.iter().flat_map(|f| &f.args).flat_map(logical::columns));
+            let input = prune(*input, &need);
+            let columns = input.columns.iter().copied().chain(appended).collect();
+            Rel::new(K::FlatMap { input: Box::new(input), funcs, out, ordinality }, columns)
         }
-        Rel::UnionAll { inputs } => {
-            let cols: Vec<usize> = demand.iter().copied().collect();
+        K::UnionAll { inputs } => {
+            let kept: Vec<_> = columns.iter().enumerate().filter_map(|(i, c)| demand.contains(c).then_some(i)).collect();
             let inputs = inputs
                 .into_iter()
-                .map(|i| {
-                    let (r, m) = prune(i, demand);
-                    r.project(cols.iter().map(|c| m[*c].expect("union column dropped")).collect())
+                .map(|input| {
+                    let selected: Vec<_> = kept.iter().map(|i| input.columns[*i]).collect();
+                    prune(input, &selected.iter().copied().collect()).project(selected)
                 })
                 .collect();
-            (Rel::UnionAll { inputs }, map_from(arity, &cols))
+            let columns = kept.into_iter().map(|i| columns[i]).collect();
+            Rel::new(K::UnionAll { inputs }, columns)
         }
-        Rel::Negate { input } => {
-            let (input, m) = prune(*input, demand);
-            (Rel::Negate { input: Box::new(input) }, m)
+        K::Negate { input } => {
+            let input = prune(*input, demand);
+            let columns = input.columns.clone();
+            Rel::new(K::Negate { input: Box::new(input) }, columns)
         }
-        // multiplicities depend on every column
-        Rel::Distinct { input } => (Rel::Distinct { input: Box::new(prune_all(*input)) }, identity(arity)),
-        Rel::SetOp { op, all, left, right } => (
-            Rel::SetOp { op, all, left: Box::new(prune_all(*left)), right: Box::new(prune_all(*right)) },
-            identity(arity),
-        ),
-        Rel::Recursive { id, base, step, distinct, columns } => (
-            Rel::Recursive { id, base: Box::new(prune_all(*base)), step: Box::new(prune_all(*step)), distinct, columns },
-            identity(arity),
-        ),
-        Rel::Apply { left, right, kind } => (
-            Rel::Apply { left: Box::new(prune_all(*left)), right: Box::new(prune_all(*right)), kind },
-            identity(arity),
-        ),
+        // Set multiplicities, recursive bindings and Apply depend on the
+        // whole row. Prune their children without changing those outputs.
+        kind => {
+            let mut rel = Rel::new(kind, columns);
+            for child in rel.inputs_mut() {
+                *child = prune_all(std::mem::replace(child, Rel::values(vec![], vec![])));
+            }
+            rel
+        }
     }
+}
+
+/// Bounded substitution of computed bindings. The size budget prevents
+/// nested maps such as SELECT x+x from growing expressions exponentially.
+pub(crate) struct Inliner<'a> {
+    ids: &'a [ColumnId],
+    exprs: &'a [Expr],
+    slots: BTreeMap<ColumnId, usize>,
+    sizes: Vec<u64>,
+    stable: Vec<bool>,
+}
+impl<'a> Inliner<'a> {
+    pub(crate) fn new(ids: &'a [ColumnId], exprs: &'a [Expr]) -> Self {
+        let slots = ids.iter().copied().enumerate().map(|(i, c)| (c, i)).collect();
+        let mut this = Self { ids, exprs, slots, sizes: vec![], stable: vec![] };
+        for e in exprs {
+            let stable = e.is_deterministic() && !e.contains_now() && !e.has_subquery() && !e.has_outer() && this.stable(e);
+            this.sizes.push(this.inlined_size(e));
+            this.stable.push(stable);
+        }
+        this
+    }
+    pub(crate) fn stable(&self, e: &Expr) -> bool {
+        logical::columns(e).iter().all(|c| self.slots.get(c).is_none_or(|i| self.stable[*i]))
+    }
+    fn inlined_size(&self, e: &Expr) -> u64 {
+        if let Expr::LogicalColumn(c) = e
+            && let Some(i) = self.slots.get(c)
+        {
+            return self.sizes[*i];
+        }
+        e.children().iter().fold(1u64, |n, c| n.saturating_add(self.inlined_size(c)))
+    }
+    pub(crate) fn inline(&self, e: &Expr) -> Option<Expr> {
+        let mut need = logical::columns(e);
+        let mut bound = expr_size(e);
+        for (id, expr) in self.ids.iter().zip(self.exprs).rev() {
+            if need.contains(id) {
+                need.extend(logical::columns(expr));
+                bound = bound.saturating_add(INLINE_COPIES.saturating_mul(expr_size(expr)));
+            }
+        }
+        if self.inlined_size(e) > bound {
+            return None;
+        }
+        let mut out = e.clone();
+        self.inline_into(&mut out);
+        Some(out)
+    }
+    fn inline_into(&self, e: &mut Expr) {
+        while let Expr::LogicalColumn(c) = e
+            && let Some(i) = self.slots.get(c)
+        {
+            *e = self.exprs[*i].clone();
+        }
+        for child in e.children_mut() {
+            self.inline_into(child);
+        }
+    }
+}
+fn expr_size(e: &Expr) -> u64 {
+    e.children().iter().fold(1u64, |n, c| n.saturating_add(expr_size(c)))
 }

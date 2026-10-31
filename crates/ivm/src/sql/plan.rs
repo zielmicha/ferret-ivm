@@ -3,7 +3,6 @@
 use crate::expr::{Expr, SubqueryKind};
 use crate::types::encoding::SortSpec;
 use crate::types::{ColumnType, SqlType};
-use smallvec::{smallvec, SmallVec};
 use std::fmt::Write;
 
 /// Catalog object id.
@@ -110,32 +109,32 @@ impl AggFunc {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SortKey {
-    pub col: usize,
+pub struct SortKey<C = usize> {
+    pub col: C,
     pub spec: SortSpec,
 }
 
 #[derive(Clone, Debug)]
-pub struct AggCall {
+pub struct AggCall<C = usize> {
     pub func: AggFunc,
     /// Argument columns of the input.
-    pub args: Vec<usize>,
+    pub args: Vec<C>,
     pub distinct: bool,
     /// Boolean input column for FILTER (WHERE ...).
-    pub filter: Option<usize>,
+    pub filter: Option<C>,
     /// ORDER BY within the aggregate (input columns).
-    pub order: Vec<SortKey>,
+    pub order: Vec<SortKey<C>>,
     /// Constant direct argument (percentile fraction).
     pub fraction: Option<f64>,
     pub ret: ColumnType,
 }
 
-impl AggCall {
-    pub fn columns(&self) -> impl Iterator<Item = usize> + '_ {
+impl<C: Copy> AggCall<C> {
+    pub fn columns(&self) -> impl Iterator<Item = C> + '_ {
         self.args.iter().copied().chain(self.filter).chain(self.order.iter().map(|k| k.col))
     }
 
-    pub fn remap(&mut self, f: &impl Fn(usize) -> usize) {
+    pub fn remap(&mut self, f: &impl Fn(C) -> C) {
         for c in self.args.iter_mut().chain(self.filter.iter_mut()).chain(self.order.iter_mut().map(|k| &mut k.col)) {
             *c = f(*c);
         }
@@ -189,22 +188,22 @@ impl Frame {
 }
 
 #[derive(Clone, Debug)]
-pub struct WindowCall {
+pub struct WindowCall<C = usize> {
     pub func: WindowFunc,
-    pub args: Vec<usize>,
-    pub partition: Vec<usize>,
-    pub order: Vec<SortKey>,
+    pub args: Vec<C>,
+    pub partition: Vec<C>,
+    pub order: Vec<SortKey<C>>,
     pub frame: Frame,
     pub ret: ColumnType,
     pub range: Option<RangeOffsets>,
 }
 
-impl WindowCall {
-    pub fn columns(&self) -> impl Iterator<Item = usize> + '_ {
+impl<C: Copy> WindowCall<C> {
+    pub fn columns(&self) -> impl Iterator<Item = C> + '_ {
         self.args.iter().chain(&self.partition).copied().chain(self.order.iter().map(|k| k.col))
     }
 
-    pub fn remap(&mut self, f: &impl Fn(usize) -> usize) {
+    pub fn remap(&mut self, f: &impl Fn(C) -> C) {
         for c in self.args.iter_mut().chain(&mut self.partition).chain(self.order.iter_mut().map(|k| &mut k.col)) {
             *c = f(*c);
         }
@@ -237,7 +236,9 @@ pub enum TableFunc {
     RegexpSplitToTable,
     RegexpMatches,
     /// jsonb_path_query[_tz](target, path, vars, silent)
-    JsonbPathQuery { tz: bool },
+    JsonbPathQuery {
+        tz: bool,
+    },
 }
 
 /// One table function of a FlatMap.
@@ -267,37 +268,274 @@ pub enum ApplyKind {
 }
 
 /// Logical relational operator.
-#[derive(Clone, Debug)]
-pub enum Rel {
-    Get { id: ObjectId, name: String, columns: Vec<ColumnType>, keys: Vec<Vec<usize>> },
-    Values { rows: Vec<Vec<Expr>>, columns: Vec<ColumnType> },
-    /// Append computed columns (each may reference earlier appended ones).
-    Map { input: Box<Rel>, exprs: Vec<Expr> },
-    Filter { input: Box<Rel>, preds: Vec<Expr> },
-    Project { input: Box<Rel>, cols: Vec<usize> },
-    /// `on` refers to left columns followed by right columns.
-    Join { left: Box<Rel>, right: Box<Rel>, kind: JoinKind, on: Vec<Expr> },
-    /// Output: group columns, then one column per aggregate.
-    Aggregate { input: Box<Rel>, group: Vec<usize>, aggs: Vec<AggCall> },
-    Distinct { input: Box<Rel> },
-    SetOp { op: SetOpKind, all: bool, left: Box<Rel>, right: Box<Rel> },
-    UnionAll { inputs: Vec<Rel> },
-    /// Per-group top-k by `order` (limit None = all rows after offset).
-    TopK { input: Box<Rel>, group: Vec<usize>, order: Vec<SortKey>, limit: Option<u64>, offset: u64, with_ties: bool },
-    /// Append one column per window function.
-    Window { input: Box<Rel>, funcs: Vec<WindowCall> },
-    /// Append the output columns of table functions evaluated per row; with
-    /// several, their results are zipped (shorter ones padded with NULLs).
-    /// (`ordinality`: the last output column numbers each row's results.)
-    FlatMap { input: Box<Rel>, funcs: Vec<SrfCall>, out: Vec<ColumnType>, ordinality: bool },
-    /// WITH RECURSIVE: `base` UNION [ALL] `step`, where `step` references the
-    /// recursive relation through `RecRef { id }`.
-    Recursive { id: u64, base: Box<Rel>, step: Box<Rel>, distinct: bool, columns: Vec<ColumnType> },
-    RecRef { id: u64, columns: Vec<ColumnType> },
-    /// Correlated subquery application (removed by decorrelation).
-    Apply { left: Box<Rel>, right: Box<Rel>, kind: ApplyKind },
-    Negate { input: Box<Rel> },
+// Both planner phases use the same operator shape and semantics. Concrete
+// expansion keeps recursive Clone/Debug derives finite (a recursive associated
+// Input type would make their trait bounds overflow).
+macro_rules! relational_node {
+    ($name:ident, $column:ty, $input:ty) => {
+        #[derive(Clone, Debug)]
+        pub enum $name {
+            Get {
+                id: ObjectId,
+                name: String,
+                columns: Vec<ColumnType>,
+                keys: Vec<Vec<usize>>,
+            },
+            Values {
+                rows: Vec<Vec<Expr>>,
+                columns: Vec<ColumnType>,
+            },
+            /// Append computed columns (each may reference earlier appended ones).
+            Map {
+                input: Box<$input>,
+                exprs: Vec<Expr>,
+            },
+            Filter {
+                input: Box<$input>,
+                preds: Vec<Expr>,
+            },
+            Project {
+                input: Box<$input>,
+                cols: Vec<$column>,
+            },
+            /// `on` refers to left columns followed by right columns.
+            Join {
+                left: Box<$input>,
+                right: Box<$input>,
+                kind: JoinKind,
+                on: Vec<Expr>,
+            },
+            /// Output: group columns, then one column per aggregate.
+            Aggregate {
+                input: Box<$input>,
+                group: Vec<$column>,
+                aggs: Vec<AggCall<$column>>,
+            },
+            Distinct {
+                input: Box<$input>,
+            },
+            SetOp {
+                op: SetOpKind,
+                all: bool,
+                left: Box<$input>,
+                right: Box<$input>,
+            },
+            UnionAll {
+                inputs: Vec<$input>,
+            },
+            /// Per-group top-k by `order` (limit None = all rows after offset).
+            TopK {
+                input: Box<$input>,
+                group: Vec<$column>,
+                order: Vec<SortKey<$column>>,
+                limit: Option<u64>,
+                offset: u64,
+                with_ties: bool,
+            },
+            /// Append one column per window function.
+            Window {
+                input: Box<$input>,
+                funcs: Vec<WindowCall<$column>>,
+            },
+            /// Append the output columns of table functions evaluated per row; with
+            /// several, their results are zipped (shorter ones padded with NULLs).
+            /// (`ordinality`: the last output column numbers each row's results.)
+            FlatMap {
+                input: Box<$input>,
+                funcs: Vec<SrfCall>,
+                out: Vec<ColumnType>,
+                ordinality: bool,
+            },
+            /// WITH RECURSIVE: `base` UNION [ALL] `step`, where `step` references the
+            /// recursive relation through `RecRef { id }`.
+            Recursive {
+                id: u64,
+                base: Box<$input>,
+                step: Box<$input>,
+                distinct: bool,
+                columns: Vec<ColumnType>,
+            },
+            RecRef {
+                id: u64,
+                columns: Vec<ColumnType>,
+            },
+            /// Correlated subquery application (removed by decorrelation).
+            Apply {
+                left: Box<$input>,
+                right: Box<$input>,
+                kind: ApplyKind,
+            },
+            Negate {
+                input: Box<$input>,
+            },
+        }
+        impl $name {
+            pub fn schema_with(&self, expression_type: impl Fn(&Expr, &[ColumnType]) -> ColumnType) -> Vec<ColumnType> {
+                match self {
+                    Self::Get { columns, .. } | Self::Values { columns, .. } | Self::RecRef { columns, .. } => columns.clone(),
+                    Self::Recursive { columns, .. } => columns.clone(),
+                    Self::Map { input, exprs } => {
+                        let mut s = input.schema();
+                        for e in exprs {
+                            let t = expression_type(e, &s);
+                            s.push(t);
+                        }
+                        s
+                    }
+                    Self::Filter { input, .. } | Self::Distinct { input } | Self::TopK { input, .. } | Self::Negate { input } => {
+                        input.schema()
+                    }
+                    Self::Project { input, cols } => {
+                        let s = input.schema();
+                        cols.iter().map(|c| s[input.column_offset(*c)].clone()).collect()
+                    }
+                    Self::Join { left, right, kind, .. } => {
+                        let mut l = left.schema();
+                        match kind {
+                            JoinKind::Semi | JoinKind::Anti => l,
+                            _ => {
+                                let mut r = right.schema();
+                                if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                                    for c in l.iter_mut() {
+                                        c.nullable = true;
+                                    }
+                                }
+                                if matches!(kind, JoinKind::Left | JoinKind::Full) {
+                                    for c in r.iter_mut() {
+                                        c.nullable = true;
+                                    }
+                                }
+                                l.extend(r);
+                                l
+                            }
+                        }
+                    }
+                    Self::Aggregate { input, group, aggs } => {
+                        let s = input.schema();
+                        let mut out: Vec<ColumnType> = group.iter().map(|g| s[input.column_offset(*g)].clone()).collect();
+                        out.extend(aggs.iter().map(|a| a.ret.clone()));
+                        out
+                    }
+                    Self::SetOp { left, right, .. } => $crate::sql::plan::merge_nullability(left.schema(), &right.schema()),
+                    Self::UnionAll { inputs } => {
+                        let mut s = inputs[0].schema();
+                        for i in &inputs[1..] {
+                            s = $crate::sql::plan::merge_nullability(s, &i.schema());
+                        }
+                        s
+                    }
+                    Self::Window { input, funcs } => {
+                        let mut s = input.schema();
+                        s.extend(funcs.iter().map(|f| f.ret.clone()));
+                        s
+                    }
+                    Self::FlatMap { input, out, .. } => {
+                        let mut s = input.schema();
+                        s.extend(out.iter().cloned());
+                        s
+                    }
+                    Self::Apply { left, right, kind } => {
+                        let mut s = left.schema();
+                        match kind {
+                            ApplyKind::Semi { .. } => {}
+                            ApplyKind::Mark { .. } => s.push(ColumnType::new(SqlType::Bool)),
+                            ApplyKind::Scalar => {
+                                let r = right.schema();
+                                let mut c = r[0].clone();
+                                c.nullable = true;
+                                s.push(c);
+                                s.push(ColumnType::new(SqlType::Int8));
+                            }
+                            ApplyKind::Lateral { left_outer } => {
+                                let mut r = right.schema();
+                                if *left_outer {
+                                    for c in r.iter_mut() {
+                                        c.nullable = true;
+                                    }
+                                }
+                                s.extend(r);
+                            }
+                        }
+                        s
+                    }
+                }
+            }
+            pub fn inputs(&self) -> smallvec::SmallVec<[&$input; 2]> {
+                match self {
+                    Self::Get { .. } | Self::Values { .. } | Self::RecRef { .. } => smallvec::smallvec![],
+                    Self::Map { input, .. }
+                    | Self::Filter { input, .. }
+                    | Self::Project { input, .. }
+                    | Self::Aggregate { input, .. }
+                    | Self::Distinct { input }
+                    | Self::TopK { input, .. }
+                    | Self::Window { input, .. }
+                    | Self::FlatMap { input, .. }
+                    | Self::Negate { input } => smallvec::smallvec![input.as_ref()],
+                    Self::Join { left, right, .. } | Self::SetOp { left, right, .. } | Self::Apply { left, right, .. } => {
+                        smallvec::smallvec![left.as_ref(), right.as_ref()]
+                    }
+                    Self::UnionAll { inputs } => inputs.iter().collect(),
+                    Self::Recursive { base, step, .. } => smallvec::smallvec![base.as_ref(), step.as_ref()],
+                }
+            }
+            pub fn inputs_mut(&mut self) -> smallvec::SmallVec<[&mut $input; 2]> {
+                match self {
+                    Self::Get { .. } | Self::Values { .. } | Self::RecRef { .. } => smallvec::smallvec![],
+                    Self::Map { input, .. }
+                    | Self::Filter { input, .. }
+                    | Self::Project { input, .. }
+                    | Self::Aggregate { input, .. }
+                    | Self::Distinct { input }
+                    | Self::TopK { input, .. }
+                    | Self::Window { input, .. }
+                    | Self::FlatMap { input, .. }
+                    | Self::Negate { input } => smallvec::smallvec![input.as_mut()],
+                    Self::Join { left, right, .. } | Self::SetOp { left, right, .. } | Self::Apply { left, right, .. } => {
+                        smallvec::smallvec![left.as_mut(), right.as_mut()]
+                    }
+                    Self::UnionAll { inputs } => inputs.iter_mut().collect(),
+                    Self::Recursive { base, step, .. } => smallvec::smallvec![base.as_mut(), step.as_mut()],
+                }
+            }
+            pub fn exprs(&self) -> Vec<&Expr> {
+                match self {
+                    Self::Values { rows, .. } => rows.iter().flatten().collect(),
+                    Self::Map { exprs, .. } => exprs.iter().collect(),
+                    Self::Filter { preds, .. } => preds.iter().collect(),
+                    Self::Join { on, .. } => on.iter().collect(),
+                    Self::FlatMap { funcs, .. } => funcs.iter().flat_map(|f| f.args.iter()).collect(),
+                    Self::Apply { kind: ApplyKind::Semi { lhs, .. }, .. } => lhs.iter().collect(),
+                    Self::Apply { kind: ApplyKind::Mark { kind }, .. } => match kind {
+                        SubqueryKind::In(l) => l.iter().collect(),
+                        SubqueryKind::AnyAll { lhs, .. } => vec![lhs],
+                        _ => vec![],
+                    },
+                    _ => vec![],
+                }
+            }
+            pub fn exprs_mut(&mut self) -> Vec<&mut Expr> {
+                match self {
+                    Self::Values { rows, .. } => rows.iter_mut().flatten().collect(),
+                    Self::Map { exprs, .. } => exprs.iter_mut().collect(),
+                    Self::Filter { preds, .. } => preds.iter_mut().collect(),
+                    Self::Join { on, .. } => on.iter_mut().collect(),
+                    Self::FlatMap { funcs, .. } => funcs.iter_mut().flat_map(|f| f.args.iter_mut()).collect(),
+                    Self::Apply { kind: ApplyKind::Semi { lhs, .. }, .. } => lhs.iter_mut().collect(),
+                    Self::Apply { kind: ApplyKind::Mark { kind }, .. } => match kind {
+                        SubqueryKind::In(l) => l.iter_mut().collect(),
+                        SubqueryKind::AnyAll { lhs, .. } => vec![lhs],
+                        _ => vec![],
+                    },
+                    _ => vec![],
+                }
+            }
+        }
+    };
 }
+pub(crate) use relational_node;
+
+relational_node!(Rel, usize, Rel);
 
 impl Rel {
     pub fn empty(columns: Vec<ColumnType>) -> Rel {
@@ -336,103 +574,18 @@ impl Rel {
             return self;
         }
         match self {
-            Rel::Project { input, cols: inner } => {
-                Rel::Project { input, cols: cols.iter().map(|c| inner[*c]).collect() }
-            }
+            Rel::Project { input, cols: inner } => Rel::Project { input, cols: cols.iter().map(|c| inner[*c]).collect() },
             other => Rel::Project { input: Box::new(other), cols },
         }
     }
 
     /// Output column types.
     pub fn schema(&self) -> Vec<ColumnType> {
-        match self {
-            Rel::Get { columns, .. } | Rel::Values { columns, .. } | Rel::RecRef { columns, .. } => columns.clone(),
-            Rel::Recursive { columns, .. } => columns.clone(),
-            Rel::Map { input, exprs } => {
-                let mut s = input.schema();
-                for e in exprs {
-                    let t = e.column_type(&s);
-                    s.push(t);
-                }
-                s
-            }
-            Rel::Filter { input, .. } | Rel::Distinct { input } | Rel::TopK { input, .. } | Rel::Negate { input } => {
-                input.schema()
-            }
-            Rel::Project { input, cols } => {
-                let s = input.schema();
-                cols.iter().map(|c| s[*c].clone()).collect()
-            }
-            Rel::Join { left, right, kind, .. } => {
-                let mut l = left.schema();
-                match kind {
-                    JoinKind::Semi | JoinKind::Anti => l,
-                    _ => {
-                        let mut r = right.schema();
-                        if matches!(kind, JoinKind::Right | JoinKind::Full) {
-                            for c in l.iter_mut() {
-                                c.nullable = true;
-                            }
-                        }
-                        if matches!(kind, JoinKind::Left | JoinKind::Full) {
-                            for c in r.iter_mut() {
-                                c.nullable = true;
-                            }
-                        }
-                        l.extend(r);
-                        l
-                    }
-                }
-            }
-            Rel::Aggregate { input, group, aggs } => {
-                let s = input.schema();
-                let mut out: Vec<ColumnType> = group.iter().map(|g| s[*g].clone()).collect();
-                out.extend(aggs.iter().map(|a| a.ret.clone()));
-                out
-            }
-            Rel::SetOp { left, right, .. } => merge_nullability(left.schema(), &right.schema()),
-            Rel::UnionAll { inputs } => {
-                let mut s = inputs[0].schema();
-                for i in &inputs[1..] {
-                    s = merge_nullability(s, &i.schema());
-                }
-                s
-            }
-            Rel::Window { input, funcs } => {
-                let mut s = input.schema();
-                s.extend(funcs.iter().map(|f| f.ret.clone()));
-                s
-            }
-            Rel::FlatMap { input, out, .. } => {
-                let mut s = input.schema();
-                s.extend(out.iter().cloned());
-                s
-            }
-            Rel::Apply { left, right, kind } => {
-                let mut s = left.schema();
-                match kind {
-                    ApplyKind::Semi { .. } => {}
-                    ApplyKind::Mark { .. } => s.push(ColumnType::new(SqlType::Bool)),
-                    ApplyKind::Scalar => {
-                        let r = right.schema();
-                        let mut c = r[0].clone();
-                        c.nullable = true;
-                        s.push(c);
-                        s.push(ColumnType::new(SqlType::Int8));
-                    }
-                    ApplyKind::Lateral { left_outer } => {
-                        let mut r = right.schema();
-                        if *left_outer {
-                            for c in r.iter_mut() {
-                                c.nullable = true;
-                            }
-                        }
-                        s.extend(r);
-                    }
-                }
-                s
-            }
-        }
+        self.schema_with(|e, schema| e.column_type(schema))
+    }
+
+    pub fn column_offset(&self, column: usize) -> usize {
+        column
     }
 
     pub fn arity(&self) -> usize {
@@ -440,9 +593,7 @@ impl Rel {
             Rel::Get { columns, .. } | Rel::Values { columns, .. } | Rel::RecRef { columns, .. } => columns.len(),
             Rel::Recursive { columns, .. } => columns.len(),
             Rel::Map { input, exprs } => input.arity() + exprs.len(),
-            Rel::Filter { input, .. } | Rel::Distinct { input } | Rel::TopK { input, .. } | Rel::Negate { input } => {
-                input.arity()
-            }
+            Rel::Filter { input, .. } | Rel::Distinct { input } | Rel::TopK { input, .. } | Rel::Negate { input } => input.arity(),
             Rel::Project { cols, .. } => cols.len(),
             Rel::Join { left, right, kind, .. } => match kind {
                 JoinKind::Semi | JoinKind::Anti => left.arity(),
@@ -462,26 +613,6 @@ impl Rel {
                         ApplyKind::Lateral { .. } => right.arity(),
                     }
             }
-        }
-    }
-
-    pub fn inputs(&self) -> SmallVec<[&Rel; 2]> {
-        match self {
-            Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } => smallvec![],
-            Rel::Map { input, .. }
-            | Rel::Filter { input, .. }
-            | Rel::Project { input, .. }
-            | Rel::Aggregate { input, .. }
-            | Rel::Distinct { input }
-            | Rel::TopK { input, .. }
-            | Rel::Window { input, .. }
-            | Rel::FlatMap { input, .. }
-            | Rel::Negate { input } => smallvec![input.as_ref()],
-            Rel::Join { left, right, .. } | Rel::SetOp { left, right, .. } | Rel::Apply { left, right, .. } => {
-                smallvec![left.as_ref(), right.as_ref()]
-            }
-            Rel::UnionAll { inputs } => inputs.iter().collect(),
-            Rel::Recursive { base, step, .. } => smallvec![base.as_ref(), step.as_ref()],
         }
     }
 
@@ -518,69 +649,6 @@ impl Rel {
         self
     }
 
-    pub fn inputs_mut(&mut self) -> SmallVec<[&mut Rel; 2]> {
-        match self {
-            Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } => smallvec![],
-            Rel::Map { input, .. }
-            | Rel::Filter { input, .. }
-            | Rel::Project { input, .. }
-            | Rel::Aggregate { input, .. }
-            | Rel::Distinct { input }
-            | Rel::TopK { input, .. }
-            | Rel::Window { input, .. }
-            | Rel::FlatMap { input, .. }
-            | Rel::Negate { input } => smallvec![input.as_mut()],
-            Rel::Join { left, right, .. } | Rel::SetOp { left, right, .. } | Rel::Apply { left, right, .. } => {
-                smallvec![left.as_mut(), right.as_mut()]
-            }
-            Rel::UnionAll { inputs } => inputs.iter_mut().collect(),
-            Rel::Recursive { base, step, .. } => smallvec![base.as_mut(), step.as_mut()],
-        }
-    }
-
-    /// Transform each direct relational input, preserving this operator.
-    pub fn map_inputs(mut self, mut f: impl FnMut(Rel) -> crate::error::Result<Rel>) -> crate::error::Result<Rel> {
-        for input in self.inputs_mut() {
-            *input = f(std::mem::replace(input, Rel::empty(vec![])))?;
-        }
-        Ok(self)
-    }
-
-    /// Expressions held directly by this operator (not children).
-    pub fn exprs(&self) -> Vec<&Expr> {
-        match self {
-            Rel::Values { rows, .. } => rows.iter().flatten().collect(),
-            Rel::Map { exprs, .. } => exprs.iter().collect(),
-            Rel::Filter { preds, .. } => preds.iter().collect(),
-            Rel::Join { on, .. } => on.iter().collect(),
-            Rel::FlatMap { funcs, .. } => funcs.iter().flat_map(|f| f.args.iter()).collect(),
-            Rel::Apply { kind: ApplyKind::Semi { lhs, .. }, .. } => lhs.iter().collect(),
-            Rel::Apply { kind: ApplyKind::Mark { kind }, .. } => match kind {
-                SubqueryKind::In(l) => l.iter().collect(),
-                SubqueryKind::AnyAll { lhs, .. } => vec![lhs],
-                _ => vec![],
-            },
-            _ => vec![],
-        }
-    }
-
-    pub fn exprs_mut(&mut self) -> Vec<&mut Expr> {
-        match self {
-            Rel::Values { rows, .. } => rows.iter_mut().flatten().collect(),
-            Rel::Map { exprs, .. } => exprs.iter_mut().collect(),
-            Rel::Filter { preds, .. } => preds.iter_mut().collect(),
-            Rel::Join { on, .. } => on.iter_mut().collect(),
-            Rel::FlatMap { funcs, .. } => funcs.iter_mut().flat_map(|f| f.args.iter_mut()).collect(),
-            Rel::Apply { kind: ApplyKind::Semi { lhs, .. }, .. } => lhs.iter_mut().collect(),
-            Rel::Apply { kind: ApplyKind::Mark { kind }, .. } => match kind {
-                SubqueryKind::In(l) => l.iter_mut().collect(),
-                SubqueryKind::AnyAll { lhs, .. } => vec![lhs],
-                _ => vec![],
-            },
-            _ => vec![],
-        }
-    }
-
     /// Search expressions across nested query scopes. The callback receives
     /// the depth of the starting scope; subqueries and Apply right inputs add one.
     pub fn any_expr_scoped(&self, depth: usize, f: &mut dyn FnMut(&Expr, usize) -> bool) -> bool {
@@ -591,16 +659,16 @@ impl Rel {
         }
         let apply = matches!(self, Rel::Apply { .. });
         self.exprs().iter().any(|e| in_expr(e, depth, f))
-            || self.inputs().iter().enumerate().any(|(i, input)| {
-                input.any_expr_scoped(depth + usize::from(apply && i == 1), f)
-            })
+            || self.inputs().iter().enumerate().any(|(i, input)| input.any_expr_scoped(depth + usize::from(apply && i == 1), f))
     }
 
     /// Mutate expressions with the same scope rules as `any_expr_scoped`.
     /// Returning false skips an expression's children, including its subquery.
     pub fn visit_exprs_scoped_mut(&mut self, depth: usize, f: &mut dyn FnMut(&mut Expr, usize) -> bool) {
         fn in_expr(e: &mut Expr, depth: usize, f: &mut dyn FnMut(&mut Expr, usize) -> bool) {
-            if !f(e, depth) { return; }
+            if !f(e, depth) {
+                return;
+            }
             if let Expr::Subquery(s) = e {
                 s.rel.visit_exprs_scoped_mut(depth + 1, f);
             }
@@ -678,108 +746,7 @@ impl Rel {
 /// `Inliner` may hold, by size.
 pub const INLINE_COPIES: u64 = 4;
 
-/// Inlines the computed columns of a `Map` into an expression over its
-/// output (a predicate pushed below it, an expression over its result):
-/// each reference to a computed column is replaced by the column's
-/// expression, with the computed columns that one references inlined in
-/// turn. A copy per reference can grow exponentially — each level of
-/// `SELECT x + x AS x FROM (...)` doubles `x` — so an expression is inlined
-/// only if that makes it larger by at most `INLINE_COPIES` times the size of
-/// the expressions it inlines. Inlining through any number of maps then adds
-/// at most that multiple of their size: expressions stay linear in the size
-/// of the plan, and so does the work of inlining them.
-pub struct Inliner<'a> {
-    /// Arity of the map's input (columns that are not inlined).
-    n: usize,
-    exprs: &'a [Expr],
-    /// Per computed column: its size with the computed columns it references
-    /// inlined (saturating).
-    sizes: Vec<u64>,
-    /// Per computed column: whether a copy of it has the same value (no
-    /// non-immutable function, `now()`, subquery or outer reference, also in
-    /// the computed columns it references).
-    stable: Vec<bool>,
-}
-
-impl<'a> Inliner<'a> {
-    /// For a map of `exprs` over an input of arity `n` (an expression may
-    /// reference the ones before it).
-    pub fn new(n: usize, exprs: &'a [Expr]) -> Inliner<'a> {
-        let mut sizes = Vec::with_capacity(exprs.len());
-        let mut stable: Vec<bool> = Vec::with_capacity(exprs.len());
-        for e in exprs {
-            let ok = e.is_deterministic()
-                && !e.contains_now()
-                && !e.has_subquery()
-                && !e.has_outer()
-                && e.column_set().iter().all(|&c| c < n || stable[c - n]);
-            sizes.push(inlined_size(e, n, &sizes));
-            stable.push(ok);
-        }
-        Inliner { n, exprs, sizes, stable }
-    }
-
-    /// Are the computed columns `e` references stable (may be copied)?
-    pub fn stable(&self, e: &Expr) -> bool {
-        e.column_set().iter().all(|&c| c < self.n || self.stable[c - self.n])
-    }
-
-    /// `e` with the computed columns inlined, or None if that would exceed
-    /// the bound. (Stability is the caller's concern.)
-    pub fn inline(&self, e: &Expr) -> Option<Expr> {
-        // the expressions inlined: the computed columns e references,
-        // directly or through other computed columns
-        let mut need = vec![false; self.exprs.len()];
-        for c in e.column_set() {
-            if c >= self.n {
-                need[c - self.n] = true;
-            }
-        }
-        let mut bound = expr_size(e);
-        for i in (0..self.exprs.len()).rev() {
-            if need[i] {
-                bound = bound.saturating_add(INLINE_COPIES.saturating_mul(expr_size(&self.exprs[i])));
-                for c in self.exprs[i].column_set() {
-                    if c >= self.n {
-                        need[c - self.n] = true;
-                    }
-                }
-            }
-        }
-        if inlined_size(e, self.n, &self.sizes) > bound {
-            return None;
-        }
-        let mut out = e.clone();
-        self.inline_into(&mut out);
-        Some(out)
-    }
-
-    fn inline_into(&self, e: &mut Expr) {
-        while let Expr::Column(c) = *e
-            && c >= self.n
-        {
-            *e = self.exprs[c - self.n].clone();
-        }
-        for x in e.children_mut() {
-            self.inline_into(x);
-        }
-    }
-}
-
-/// Number of nodes of `e` (saturating).
-fn expr_size(e: &Expr) -> u64 {
-    e.children().iter().fold(1, |s, x| s.saturating_add(expr_size(x)))
-}
-
-/// Size of `e` with the columns from `n` on (`sizes[c - n]` large) inlined.
-fn inlined_size(e: &Expr, n: usize, sizes: &[u64]) -> u64 {
-    match e {
-        Expr::Column(c) if *c >= n => sizes[c - n],
-        _ => e.children().iter().fold(1, |s, x| s.saturating_add(inlined_size(x, n, sizes))),
-    }
-}
-
-fn merge_nullability(mut a: Vec<ColumnType>, b: &[ColumnType]) -> Vec<ColumnType> {
+pub(crate) fn merge_nullability(mut a: Vec<ColumnType>, b: &[ColumnType]) -> Vec<ColumnType> {
     for (x, y) in a.iter_mut().zip(b) {
         x.nullable |= y.nullable;
         if x.typmod != y.typmod {

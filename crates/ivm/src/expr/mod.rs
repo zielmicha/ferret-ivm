@@ -91,6 +91,9 @@ impl fmt::Debug for LikeExpr {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Column(usize),
+    /// Stable binding during logical rewrites; resolved to Column at lowering.
+    LogicalColumn(crate::sql::logical::ColumnId),
+    LogicalOuter(usize, crate::sql::logical::ColumnId, SqlType),
     Literal(Datum, SqlType),
     Call(Box<Call>),
     /// Cast to type with typmod; `explicit` controls truncation semantics.
@@ -182,6 +185,8 @@ impl Expr {
     pub fn ty(&self, input: &[ColumnType]) -> SqlType {
         match self {
             Expr::Column(i) => input.get(*i).map(|c| c.ty.clone()).unwrap_or(SqlType::Unknown),
+            Expr::LogicalColumn(_) => panic!("logical column type requires its relation schema"),
+            Expr::LogicalOuter(_, _, t) => t.clone(),
             Expr::Literal(_, t) => t.clone(),
             Expr::Call(c) => c.ret.clone(),
             Expr::Cast(_, t, _, _) => t.clone(),
@@ -245,6 +250,8 @@ impl Expr {
     pub fn children(&self) -> Vec<&Expr> {
         match self {
             Expr::Column(_)
+            | Expr::LogicalColumn(_)
+            | Expr::LogicalOuter(..)
             | Expr::Literal(..)
             | Expr::Error(..)
             | Expr::Outer(..)
@@ -285,6 +292,8 @@ impl Expr {
     pub fn children_mut(&mut self) -> Vec<&mut Expr> {
         match self {
             Expr::Column(_)
+            | Expr::LogicalColumn(_)
+            | Expr::LogicalOuter(..)
             | Expr::Literal(..)
             | Expr::Error(..)
             | Expr::Outer(..)
@@ -379,11 +388,6 @@ impl Expr {
         }
     }
 
-    /// Replace column references by expressions (substitution).
-    pub fn substitute(&self, cols: &[Expr]) -> Expr {
-        self.rewritten(&mut |e| e.as_column().map(|i| cols[i].clone()))
-    }
-
     /// Whether the expression contains binder placeholders of the given kinds.
     pub fn contains(&self, pred: &dyn Fn(&Expr) -> bool) -> bool {
         pred(self) || self.children().iter().any(|c| c.contains(pred))
@@ -395,7 +399,7 @@ impl Expr {
 
     pub fn has_outer(&self) -> bool {
         self.contains(&|e| match e {
-            Expr::Outer(..) => true,
+            Expr::Outer(..) | Expr::LogicalOuter(..) => true,
             Expr::Subquery(s) => s.rel.has_outer_refs(1),
             _ => false,
         })
@@ -488,6 +492,7 @@ impl Expr {
         }
         match self {
             Expr::Column(i) => tag(out, 1, *i),
+            Expr::LogicalColumn(_) | Expr::LogicalOuter(..) => panic!("logical bindings must be lowered before fingerprinting"),
             Expr::Literal(d, t) => {
                 tag(out, 2, 0);
                 crate::types::codec::encode_type(t, out);
@@ -557,6 +562,8 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Column(i) => write!(f, "#{i}"),
+            Expr::LogicalColumn(c) => write!(f, "binding#{}", c.0),
+            Expr::LogicalOuter(d, c, _) => write!(f, "outer{d}binding#{}", c.0),
             Expr::Literal(d, t) => {
                 if d.is_null() {
                     write!(f, "NULL")

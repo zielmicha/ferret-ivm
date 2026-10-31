@@ -1171,3 +1171,35 @@ fn array_type_modifiers_apply_to_elements() {
     );
     running.shutdown();
 }
+
+#[test]
+fn column_bindings_survive_aliases_branches_and_correlated_rewrites() {
+    let running = start("column-bindings");
+    let h = &running.handle;
+    exec(h, "CREATE TABLE bindings (id int PRIMARY KEY, x int, y int)");
+    exec(h, "INSERT INTO bindings VALUES (1, 1, 10), (2, 2, 20)");
+    let cases = [
+        ("SELECT a,b FROM (SELECT x AS a,x AS b FROM bindings WHERE id=1 UNION ALL SELECT x,y FROM bindings WHERE id=2) s WHERE b>5", vec!["2|20"]),
+        ("SELECT b FROM (SELECT x AS a,x AS b FROM bindings WHERE id=1 UNION ALL SELECT x,y FROM bindings WHERE id=2) s WHERE a=2", vec!["20"]),
+        ("SELECT t.id,(SELECT sum(b) FROM (SELECT t.x AS a,t.x AS b UNION ALL SELECT t.x,t.y) s WHERE a<3) FROM bindings t ORDER BY t.id", vec!["1|11", "2|22"]),
+        ("SELECT a,b FROM (SELECT x AS a,x AS b FROM bindings EXCEPT ALL SELECT x,y FROM bindings) s WHERE b=2", vec!["2|2"]),
+        ("WITH c AS (SELECT x,x+1 AS y FROM bindings) SELECT a.x,b.x,b.y FROM c a JOIN c b ON a.x=b.x WHERE b.y=3", vec!["2|2|3"]),
+        ("SELECT a.id,l.b FROM bindings a LEFT JOIN LATERAL (SELECT a.x+1 AS a,b.y AS b FROM bindings b WHERE b.x=a.x AND b.id=2) l ON true ORDER BY a.id", vec!["1|", "2|20"]),
+        ("WITH RECURSIVE r(a,b) AS (SELECT x,x FROM bindings WHERE id=1 UNION ALL SELECT a+1,b+10 FROM r WHERE a<3) SELECT a,b FROM r WHERE b>1 ORDER BY a", vec!["2|11", "3|21"]),
+        ("SELECT a.id,(SELECT sum(b.y) FROM bindings b WHERE b.x=a.x) FROM bindings a ORDER BY a.id", vec!["1|10", "2|20"]),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(rows(h, sql), expected, "{sql}");
+    }
+    // A left-only correlated ON predicate becomes a semijoin input
+    // filter. The guarding WHERE predicate must still run before it.
+    exec(h, "INSERT INTO bindings VALUES (3, 0, 30)");
+    let guarded = "SELECT a.id FROM bindings a WHERE a.x<>0 AND EXISTS (SELECT 1 FROM bindings b WHERE 10/a.x>0)";
+    assert_eq!(rows(h, &format!("{guarded} ORDER BY a.id")), vec!["1", "2"]);
+    exec(h, &format!("CREATE MATERIALIZED VIEW guarded_binding AS {guarded}"));
+    assert_eq!(rows(h, "SELECT * FROM guarded_binding ORDER BY id"), vec!["1", "2"]);
+    exec(h, "UPDATE bindings SET x=0 WHERE id=1");
+    assert_eq!(rows(h, &format!("{guarded} ORDER BY a.id")), vec!["2"]);
+    assert_eq!(rows(h, "SELECT * FROM guarded_binding ORDER BY id"), vec!["2"]);
+    running.shutdown();
+}

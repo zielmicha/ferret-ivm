@@ -190,7 +190,7 @@ impl Expr {
                 }), *all)
             }
             Expr::Error(code, msg) => Err(SqlError::new(code, msg.clone())),
-            Expr::Outer(..) | Expr::Subquery(_) | Expr::AggRef(..) | Expr::WindowRef(..) | Expr::SrfRef(..) => {
+            Expr::LogicalColumn(_) | Expr::LogicalOuter(..) | Expr::Outer(..) | Expr::Subquery(_) | Expr::AggRef(..) | Expr::WindowRef(..) | Expr::SrfRef(..) => {
                 Err(SqlError::internal(format!("unplanned expression {self}")))
             }
         }
@@ -300,6 +300,8 @@ impl Expr {
             e,
             Expr::Literal(..)
                 | Expr::Column(_)
+                | Expr::LogicalColumn(_)
+                | Expr::LogicalOuter(..)
                 | Expr::Error(..)
                 | Expr::Outer(..)
                 | Expr::Subquery(_)

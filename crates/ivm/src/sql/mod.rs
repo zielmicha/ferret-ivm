@@ -4,6 +4,7 @@ pub mod binder;
 pub mod binder_expr;
 pub mod decorrelate;
 pub mod optimize;
+pub mod logical;
 pub mod parser;
 pub mod plan;
 pub mod scope;
@@ -46,8 +47,9 @@ fn plan_query_unguarded(catalog: &dyn Catalog, q: &sqlparser::ast::Query, params
     let mut bq = b.bind_query(q)?.resolve_unknowns(&mut b)?;
     bq.catalog_reads = b.catalog_reads.take();
     let rel = std::mem::replace(&mut bq.rel, Rel::unit());
-    let rel = decorrelate::decorrelate(rel)?;
-    bq.rel = optimize::optimize(rel)?;
+    let rel = logical::bind(rel)?;
+    let rel = decorrelate::decorrelate_logical(rel)?;
+    bq.rel = optimize::optimize(rel)?.into_dense();
     Ok(bq)
 }
 
@@ -98,7 +100,11 @@ mod tests {
         assert!(rel.has_outer_refs(0));
         // Substitution must not substitute the columns of its own replacements.
         let e = Expr::And(vec![Expr::Column(0), Expr::Column(1)]);
-        let Expr::And(args) = e.substitute(&[Expr::Column(1), Expr::Column(0)]) else { panic!() };
+        let replacements = [Expr::Column(1), Expr::Column(0)];
+        let Expr::And(args) = e.rewritten(&mut |e| match e {
+            Expr::Column(c) => Some(replacements[*c].clone()),
+            _ => None,
+        }) else { panic!() };
         assert!(matches!(args.as_slice(), [Expr::Column(1), Expr::Column(0)]));
     }
 
@@ -133,6 +139,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dense_lowering_restores_alias_plan_normalization() {
+        let plan = |sql: &str| {
+            let Statement::Select { query, .. } = parse_statement(sql).unwrap() else { panic!() };
+            plan_query(&Nests { levels: 0 }, &query, vec![]).unwrap().rel
+        };
+        let direct = plan("SELECT x FROM t");
+        let aliased = plan("SELECT a FROM (SELECT x AS a,x+1 AS b FROM t) s");
+        assert_eq!(aliased.explain(), direct.explain());
+        assert_eq!(aliased.schema(), direct.schema());
+    }
+
+    #[test]
+    #[should_panic(expected = "unbound logical column")]
+    fn dense_lowering_rejects_logical_columns_in_values() {
+        use crate::expr::Expr;
+        use crate::types::{ColumnType, SqlType};
+        logical::LogicalRel::values(
+            vec![vec![Expr::LogicalColumn(logical::ColumnId::fresh())]],
+            vec![ColumnType::new(SqlType::Int4)],
+        ).into_dense();
     }
 
     fn nest(q: &str, levels: usize) -> String {
