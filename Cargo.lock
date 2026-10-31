@@ -920,6 +920,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "pgnumeric",
 ]
 
 [[package]]
@@ -938,6 +939,7 @@ dependencies = [
 name = "pgnumeric"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "smallvec",
 ]
 

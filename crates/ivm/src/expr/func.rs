@@ -205,44 +205,33 @@ fn try_match(def: &FuncDef, args: &[SqlType]) -> Option<(i32, Vec<SqlType>, SqlT
     let param = |i: usize| -> &P { if i < n { &def.params[i] } else { &def.params[n - 1] } };
     // unify polymorphic element type
     let mut elem: Option<SqlType> = None;
-    for (i, a) in args.iter().enumerate() {
-        match param(i) {
-            P::AnyElement | P::AnyNonArray if *a != SqlType::Unknown => {
-                if let P::AnyNonArray = param(i)
-                    && matches!(a, SqlType::Array(_))
-                {
-                    return None;
-                }
-                match &elem {
-                    None => elem = Some(a.clone()),
-                    Some(e) if e == a => {}
-                    Some(e) => {
-                        // allow implicit promotion between candidates
-                        if implicit_castable(a, e) {
-                        } else if implicit_castable(e, a) {
-                            elem = Some(a.clone());
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-            }
-            P::AnyArray if *a != SqlType::Unknown => match a {
-                SqlType::Array(e) => match &elem {
-                    None => elem = Some((**e).clone()),
-                    Some(x) if x == &**e => {}
-                    Some(x) => {
-                        if implicit_castable(x, e) {
-                            elem = Some((**e).clone());
-                        } else if !implicit_castable(e, x) {
-                            return None;
-                        }
-                    }
-                },
-                _ => return None,
-            },
-            _ => {}
-        }
+    for (i, a) in args.iter().enumerate().filter(|(_, a)| **a != SqlType::Unknown) {
+        let candidate = match param(i) {
+            P::AnyElement => a,
+            P::AnyNonArray if !matches!(a, SqlType::Array(_)) => a,
+            P::AnyArray => a.elem()?,
+            P::AnyNonArray => return None,
+            _ => continue,
+        };
+        let Some(current) = &elem else {
+            elem = Some(candidate.clone());
+            continue;
+        };
+        if current == candidate { continue; }
+        // Array arguments prefer their element type when both directions
+        // coerce; scalar arguments prefer the type already chosen.
+        let (preferred, other) = if matches!(param(i), P::AnyArray) {
+            (candidate, current)
+        } else {
+            (current, candidate)
+        };
+        elem = Some(if implicit_castable(other, preferred) {
+            preferred.clone()
+        } else if implicit_castable(preferred, other) {
+            other.clone()
+        } else {
+            return None;
+        });
     }
     let has_poly = (0..args.len()).any(|i| matches!(param(i), P::AnyElement | P::AnyNonArray | P::AnyArray));
     if has_poly && elem.is_none() {

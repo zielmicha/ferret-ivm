@@ -617,22 +617,22 @@ impl Graph {
         }
         let afp = hash128(&afp).to_vec();
         let layout = Arc::new(Layout::new(key, specs, &state_schema, vec![]));
+        let arr = self.insert_arr(env, id, layout, afp);
+        patch(&mut kind, arr);
+        self.link(id, kind);
+        id
+    }
+
+    /// Restore or create an arrangement's tree, then store it in a free slot.
+    fn insert_arr(&mut self, env: &mut Env, node: NodeId, layout: Arc<Layout>, fp: Vec<u8>) -> ArrId {
         let summarizer = Arc::new(LayoutSummarizer { layout: layout.clone() });
-        let (tree, hydrated) = match self.recovery.remove(&afp) {
+        let (tree, hydrated) = match self.recovery.remove(&fp) {
             Some(t) if env.has_tree(t) => {
                 env.attach_tree(t, summarizer).ok();
                 (t, true)
             }
             _ => (env.create_tree(summarizer), false),
         };
-        let arr = self.insert_arr(id, layout, tree, afp, hydrated);
-        patch(&mut kind, arr);
-        self.link(id, kind);
-        id
-    }
-
-    /// Store a new (unreferenced) arrangement in a free slot.
-    fn insert_arr(&mut self, node: NodeId, layout: Arc<Layout>, tree: TreeId, fp: Vec<u8>, hydrated: bool) -> ArrId {
         let id = match self.free_arrs.pop() {
             Some(id) => id,
             None => {
@@ -749,15 +749,7 @@ impl Graph {
         }
         let schema = self.node(node).schema.clone();
         let layout = Arc::new(Layout::new(key, specs, &schema, summaries));
-        let summarizer = Arc::new(LayoutSummarizer { layout: layout.clone() });
-        let (tree, hydrated) = match self.recovery.remove(&full_fp) {
-            Some(t) if env.has_tree(t) => {
-                env.attach_tree(t, summarizer).ok();
-                (t, true)
-            }
-            _ => (env.create_tree(summarizer), false),
-        };
-        let id = self.insert_arr(node, layout, tree, full_fp, hydrated);
+        let id = self.insert_arr(env, node, layout, full_fp);
         self.node_mut(node).arrangements.push(id);
         id
     }

@@ -91,10 +91,7 @@ impl<'a> Reader<'a> {
 }
 
 pub(crate) fn lossy(b: &[u8]) -> String {
-    match std::str::from_utf8(b) {
-        Ok(s) => s.to_owned(),
-        Err(_) => String::from_utf8_lossy(b).into_owned(),
-    }
+    String::from_utf8_lossy(b).into_owned()
 }
 
 /// Starts a tagged message; returns the offset of the length field.

@@ -9,6 +9,9 @@
 //! process is killed while forks keep dead segments: the next open deletes
 //! them and recovers the last checkpoint.
 
+mod common;
+use common::temp_dir as tmpdir;
+
 use ivm::storage::{CountSummarizer, Env, EnvOptions, MaintBudget, TreeId};
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
@@ -29,13 +32,6 @@ const SPAN: u64 = 8;
 const DROPPED: u64 = 3000;
 /// The child process kills itself (`CHILD` names its store directory).
 const CHILD: &str = "IVM_DESCRIPTORS_CHILD";
-
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-descriptors-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
 
 fn set_limit() {
     let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };

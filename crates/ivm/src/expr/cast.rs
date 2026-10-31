@@ -5,6 +5,7 @@ use crate::types::text::{apply_typmod, format_datum, parse_datum, SESSION_TZ};
 use crate::types::{ArrayValue, Datum, SqlType};
 use pgnumeric::Numeric;
 use std::sync::Arc;
+use super::ops::{overflow, range_err, underflow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CastContext {
@@ -63,20 +64,16 @@ pub fn cast_context(from: &SqlType, to: &SqlType) -> Option<CastContext> {
     Some(ctx)
 }
 
-fn out_of_range(tyname: &str) -> SqlError {
-    SqlError::new(codes::NUMERIC_VALUE_OUT_OF_RANGE, format!("{tyname} out of range"))
-}
-
 /// Integer to integer type with range check.
 pub fn int_to(v: i64, to: &SqlType) -> Result<Datum> {
     Ok(match to {
-        SqlType::Int2 => Datum::Int2(i16::try_from(v).map_err(|_| out_of_range("smallint"))?),
-        SqlType::Int4 => Datum::Int4(i32::try_from(v).map_err(|_| out_of_range("integer"))?),
+        SqlType::Int2 => Datum::Int2(i16::try_from(v).map_err(|_| range_err("smallint"))?),
+        SqlType::Int4 => Datum::Int4(i32::try_from(v).map_err(|_| range_err("integer"))?),
         SqlType::Int8 => Datum::Int8(v),
         SqlType::Oid => Datum::Oid(if (i32::MIN as i64..=u32::MAX as i64).contains(&v) {
             v as u32
         } else {
-            return Err(out_of_range("OID"));
+            return Err(range_err("OID"));
         }),
         _ => return Err(SqlError::internal("int_to non-integer")),
     })
@@ -91,7 +88,7 @@ pub fn float_to_int(f: f64, to: &SqlType) -> Result<Datum> {
         _ => (i64::MIN as f64, -(i64::MIN as f64), "bigint"),
     };
     if r.is_nan() || r < lo || r >= hi {
-        return Err(out_of_range(name));
+        return Err(range_err(name));
     }
     int_to(r as i64, to)
 }
@@ -99,10 +96,10 @@ pub fn float_to_int(f: f64, to: &SqlType) -> Result<Datum> {
 fn float4_from_f64(v: f64) -> Result<f32> {
     let r = v as f32;
     if r.is_infinite() && !v.is_infinite() {
-        return Err(SqlError::new(codes::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: overflow"));
+        return Err(overflow());
     }
     if r == 0.0 && v != 0.0 {
-        return Err(SqlError::new(codes::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: underflow"));
+        return Err(underflow());
     }
     Ok(r)
 }

@@ -5,7 +5,7 @@ use super::plan::*;
 use super::scope::Scope;
 use crate::error::{codes, Result, SqlError};
 use crate::expr::cast::{cast_context, CastContext};
-use crate::expr::func::{func_def, resolve};
+use crate::expr::func::resolve;
 use crate::expr::{BoolTest, CaseExpr, Expr, LikeExpr, SubqueryExpr, SubqueryKind};
 use crate::sql_bail;
 use crate::types::encoding::SortSpec;
@@ -2584,8 +2584,4 @@ pub fn datetime_field_name(f: &ast::DateTimeField) -> String {
         F::Custom(i) => i.value.to_lowercase(),
         other => other.to_string().to_lowercase(),
     }
-}
-
-pub(crate) fn _func_name(id: crate::expr::FuncId) -> &'static str {
-    func_def(id).name
 }

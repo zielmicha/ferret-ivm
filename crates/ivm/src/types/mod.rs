@@ -90,114 +90,67 @@ impl Column {
 
 pub const VARHDRSZ: i32 = 4;
 
-impl SqlType {
-    pub fn oid(&self) -> u32 {
-        use SqlType::*;
-        match self {
-            Bool => 16,
-            Bytea => 17,
-            Name => 19,
-            Int8 => 20,
-            Int2 => 21,
-            Int4 => 23,
-            Text => 25,
-            Oid => 26,
-            Json => 114,
-            Float4 => 700,
-            Float8 => 701,
-            Unknown => 705,
-            Bpchar => 1042,
-            Varchar => 1043,
-            Date => 1082,
-            Time => 1083,
-            Timestamp => 1114,
-            TimestampTz => 1184,
-            Interval => 1186,
-            Numeric => 1700,
-            Uuid => 2950,
-            Jsonb => 3802,
-            JsonPath => 4072,
-            Array(e) => match **e {
-                Bool => 1000,
-                Bytea => 1001,
-                Name => 1003,
-                Int2 => 1005,
-                Int4 => 1007,
-                Text => 1009,
-                Bpchar => 1014,
-                Varchar => 1015,
-                Int8 => 1016,
-                Float4 => 1021,
-                Float8 => 1022,
-                Oid => 1028,
-                Timestamp => 1115,
-                Date => 1182,
-                Time => 1183,
-                TimestampTz => 1185,
-                Interval => 1187,
-                Numeric => 1231,
-                Uuid => 2951,
-                Json => 199,
-                Jsonb => 3807,
-                JsonPath => 4073,
-                _ => 1009,
-            },
+// Declare scalar and array OIDs together so encoding and lookup cannot drift.
+macro_rules! type_metadata {
+    ($($ty:ident => ($oid:literal, $array_oid:literal, $name:literal)),* $(,)?) => {
+        impl SqlType {
+            pub fn oid(&self) -> u32 {
+                match self {
+                    $(Self::$ty => $oid,)*
+                    Self::Unknown => 705,
+                    Self::Array(e) => match e.as_ref() {
+                        $(Self::$ty => $array_oid,)*
+                        _ => 1009,
+                    },
+                }
+            }
+
+            pub fn from_oid(oid: u32) -> Option<Self> {
+                Some(match oid {
+                    $($oid => Self::$ty, $array_oid => Self::$ty.array_of(),)*
+                    18 => Self::Bpchar, // PostgreSQL's internal "char"
+                    705 => Self::Unknown,
+                    _ => return None,
+                })
+            }
+
+            pub fn name(&self) -> String {
+                match self {
+                    $(Self::$ty => $name.into(),)*
+                    Self::Unknown => "unknown".into(),
+                    Self::Array(e) => format!("{}[]", e.name()),
+                }
+            }
         }
-    }
+    };
+}
 
-    pub fn from_oid(oid: u32) -> Option<SqlType> {
-        use SqlType::*;
-        Some(match oid {
-            16 => Bool,
-            17 => Bytea,
-            18 => Bpchar, // "char"
-            19 => Name,
-            20 => Int8,
-            21 => Int2,
-            23 => Int4,
-            25 => Text,
-            26 => Oid,
-            114 => Json,
-            700 => Float4,
-            701 => Float8,
-            705 => Unknown,
-            1042 => Bpchar,
-            1043 => Varchar,
-            1082 => Date,
-            1083 => Time,
-            1114 => Timestamp,
-            1184 => TimestampTz,
-            1186 => Interval,
-            1700 => Numeric,
-            2950 => Uuid,
-            3802 => Jsonb,
-            4072 => JsonPath,
-            1000 => Array(Box::new(Bool)),
-            1001 => Array(Box::new(Bytea)),
-            1003 => Array(Box::new(Name)),
-            1005 => Array(Box::new(Int2)),
-            1007 => Array(Box::new(Int4)),
-            1009 => Array(Box::new(Text)),
-            1014 => Array(Box::new(Bpchar)),
-            1015 => Array(Box::new(Varchar)),
-            1016 => Array(Box::new(Int8)),
-            1021 => Array(Box::new(Float4)),
-            1022 => Array(Box::new(Float8)),
-            1028 => Array(Box::new(Oid)),
-            1115 => Array(Box::new(Timestamp)),
-            1182 => Array(Box::new(Date)),
-            1183 => Array(Box::new(Time)),
-            1185 => Array(Box::new(TimestampTz)),
-            1187 => Array(Box::new(Interval)),
-            1231 => Array(Box::new(Numeric)),
-            2951 => Array(Box::new(Uuid)),
-            199 => Array(Box::new(Json)),
-            3807 => Array(Box::new(Jsonb)),
-            4073 => Array(Box::new(JsonPath)),
-            _ => return None,
-        })
-    }
+type_metadata! {
+    Bool => (16, 1000, "boolean"),
+    Bytea => (17, 1001, "bytea"),
+    Name => (19, 1003, "name"),
+    Int8 => (20, 1016, "bigint"),
+    Int2 => (21, 1005, "smallint"),
+    Int4 => (23, 1007, "integer"),
+    Text => (25, 1009, "text"),
+    Oid => (26, 1028, "oid"),
+    Json => (114, 199, "json"),
+    Float4 => (700, 1021, "real"),
+    Float8 => (701, 1022, "double precision"),
+    Bpchar => (1042, 1014, "character"),
+    Varchar => (1043, 1015, "character varying"),
+    Date => (1082, 1182, "date"),
+    Time => (1083, 1183, "time without time zone"),
+    Timestamp => (1114, 1115, "timestamp without time zone"),
+    TimestampTz => (1184, 1185, "timestamp with time zone"),
+    Interval => (1186, 1187, "interval"),
+    Numeric => (1700, 1231, "numeric"),
+    Uuid => (2950, 2951, "uuid"),
+    Jsonb => (3802, 3807, "jsonb"),
+    JsonPath => (4072, 4073, "jsonpath"),
+}
 
+impl SqlType {
     /// Fixed size for RowDescription (-1 = variable).
     pub fn type_size(&self) -> i16 {
         use SqlType::*;
@@ -210,36 +163,6 @@ impl SqlType {
             Name => 64,
             Unknown => -2,
             _ => -1,
-        }
-    }
-
-    pub fn name(&self) -> String {
-        use SqlType::*;
-        match self {
-            Bool => "boolean".into(),
-            Int2 => "smallint".into(),
-            Int4 => "integer".into(),
-            Int8 => "bigint".into(),
-            Float4 => "real".into(),
-            Float8 => "double precision".into(),
-            Numeric => "numeric".into(),
-            Text => "text".into(),
-            Varchar => "character varying".into(),
-            Bpchar => "character".into(),
-            Name => "name".into(),
-            Bytea => "bytea".into(),
-            Date => "date".into(),
-            Time => "time without time zone".into(),
-            Timestamp => "timestamp without time zone".into(),
-            TimestampTz => "timestamp with time zone".into(),
-            Interval => "interval".into(),
-            Uuid => "uuid".into(),
-            Json => "json".into(),
-            Jsonb => "jsonb".into(),
-            JsonPath => "jsonpath".into(),
-            Oid => "oid".into(),
-            Array(e) => format!("{}[]", e.name()),
-            Unknown => "unknown".into(),
         }
     }
 

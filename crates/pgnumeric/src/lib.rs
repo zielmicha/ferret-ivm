@@ -293,23 +293,15 @@ impl Numeric {
     /// float8 -> numeric cast (`float8_numeric`): formats with `%.15g` and
     /// parses that; NaN -> NaN, +/-inf -> +/-Infinity.
     pub fn from_f64(v: f64) -> Result<Self> {
-        if v.is_nan() {
-            return Ok(Self::nan());
-        }
-        if v.is_infinite() {
-            return Ok(if v < 0.0 {
-                Self::neg_infinity()
-            } else {
-                Self::infinity()
-            });
-        }
-        let s = format_g_for_numeric(v, 15);
-        let (var, _) = set_var_from_str(&s, s.as_bytes(), 0)?;
-        make_result(var)
+        Self::from_float(v, 15)
     }
 
     /// float4 -> numeric cast (`float4_numeric`): formats with `%.6g`.
     pub fn from_f32(v: f32) -> Result<Self> {
+        Self::from_float(v as f64, 6)
+    }
+
+    fn from_float(v: f64, precision: usize) -> Result<Self> {
         if v.is_nan() {
             return Ok(Self::nan());
         }
@@ -320,7 +312,7 @@ impl Numeric {
                 Self::infinity()
             });
         }
-        let s = format_g_for_numeric(v as f64, 6);
+        let s = format_g_for_numeric(v, precision);
         let (var, _) = set_var_from_str(&s, s.as_bytes(), 0)?;
         make_result(var)
     }
@@ -525,85 +517,17 @@ impl Numeric {
 
     /// numeric_add
     pub fn add(&self, o: &Self) -> Result<Self> {
-        if self.is_special() || o.is_special() {
-            if self.is_nan() || o.is_nan() {
-                return Ok(Self::nan());
-            }
-            if self.sign == NUMERIC_PINF {
-                return Ok(if o.sign == NUMERIC_NINF {
-                    Self::nan()
-                } else {
-                    Self::infinity()
-                });
-            }
-            if self.sign == NUMERIC_NINF {
-                return Ok(if o.sign == NUMERIC_PINF {
-                    Self::nan()
-                } else {
-                    Self::neg_infinity()
-                });
-            }
-            return Ok(if o.sign == NUMERIC_PINF {
-                Self::infinity()
-            } else {
-                Self::neg_infinity()
-            });
-        }
-        make_result(add_var(self, o))
+        make_result(self.add_unbounded(o))
     }
 
     /// numeric_sub
     pub fn sub(&self, o: &Self) -> Result<Self> {
-        if self.is_special() || o.is_special() {
-            if self.is_nan() || o.is_nan() {
-                return Ok(Self::nan());
-            }
-            if self.sign == NUMERIC_PINF {
-                return Ok(if o.sign == NUMERIC_PINF {
-                    Self::nan()
-                } else {
-                    Self::infinity()
-                });
-            }
-            if self.sign == NUMERIC_NINF {
-                return Ok(if o.sign == NUMERIC_NINF {
-                    Self::nan()
-                } else {
-                    Self::neg_infinity()
-                });
-            }
-            return Ok(if o.sign == NUMERIC_PINF {
-                Self::neg_infinity()
-            } else {
-                Self::infinity()
-            });
-        }
-        make_result(sub_var(self, o))
+        make_result(self.sub_unbounded(o))
     }
 
     /// numeric_mul
     pub fn mul(&self, o: &Self) -> Result<Self> {
-        if self.is_special() || o.is_special() {
-            if self.is_nan() || o.is_nan() {
-                return Ok(Self::nan());
-            }
-            let (inf, other) = if self.is_infinite() {
-                (self, o)
-            } else {
-                (o, self)
-            };
-            let s = sign_internal(other);
-            return Ok(match (inf.sign == NUMERIC_PINF, s) {
-                (_, 0) => Self::nan(),
-                (true, 1) | (false, -1) => Self::infinity(),
-                _ => Self::neg_infinity(),
-            });
-        }
-        let mut result = mul_var(self, o, self.dscale + o.dscale);
-        if result.dscale > NUMERIC_DSCALE_MAX {
-            round_var(&mut result, NUMERIC_DSCALE_MAX);
-        }
-        make_result(result)
+        make_result(self.mul_unbounded(o))
     }
 
     /// `self + o`, exact, without the storage format's range check. For
@@ -613,28 +537,83 @@ impl Numeric {
     /// as in [`Numeric::add`].
     pub fn add_unbounded(&self, o: &Self) -> Self {
         if self.is_special() || o.is_special() {
-            return self.add(o).unwrap_or_else(|_| Self::nan());
+            if self.is_nan() || o.is_nan() {
+                return Self::nan();
+            }
+            if self.sign == NUMERIC_PINF {
+                return if o.sign == NUMERIC_NINF {
+                    Self::nan()
+                } else {
+                    Self::infinity()
+                };
+            }
+            if self.sign == NUMERIC_NINF {
+                return if o.sign == NUMERIC_PINF {
+                    Self::nan()
+                } else {
+                    Self::neg_infinity()
+                };
+            }
+            return if o.sign == NUMERIC_PINF {
+                Self::infinity()
+            } else {
+                Self::neg_infinity()
+            };
         }
-        let mut v = add_var(self, o);
-        strip_var(&mut v);
-        v
+        let mut result = add_var(self, o);
+        strip_var(&mut result);
+        result
     }
 
     /// `self - o`, as [`Numeric::add_unbounded`].
     pub fn sub_unbounded(&self, o: &Self) -> Self {
         if self.is_special() || o.is_special() {
-            return self.sub(o).unwrap_or_else(|_| Self::nan());
+            if self.is_nan() || o.is_nan() {
+                return Self::nan();
+            }
+            if self.sign == NUMERIC_PINF {
+                return if o.sign == NUMERIC_PINF {
+                    Self::nan()
+                } else {
+                    Self::infinity()
+                };
+            }
+            if self.sign == NUMERIC_NINF {
+                return if o.sign == NUMERIC_NINF {
+                    Self::nan()
+                } else {
+                    Self::neg_infinity()
+                };
+            }
+            return if o.sign == NUMERIC_PINF {
+                Self::neg_infinity()
+            } else {
+                Self::infinity()
+            };
         }
-        let mut v = sub_var(self, o);
-        strip_var(&mut v);
-        v
+        let mut result = sub_var(self, o);
+        strip_var(&mut result);
+        result
     }
 
     /// `self * o` as [`Numeric::mul`] (with its display scale limit), but
     /// without the range check, as [`Numeric::add_unbounded`].
     pub fn mul_unbounded(&self, o: &Self) -> Self {
         if self.is_special() || o.is_special() {
-            return self.mul(o).unwrap_or_else(|_| Self::nan());
+            if self.is_nan() || o.is_nan() {
+                return Self::nan();
+            }
+            let (inf, other) = if self.is_infinite() {
+                (self, o)
+            } else {
+                (o, self)
+            };
+            let s = sign_internal(other);
+            return match (inf.sign == NUMERIC_PINF, s) {
+                (_, 0) => Self::nan(),
+                (true, 1) | (false, -1) => Self::infinity(),
+                _ => Self::neg_infinity(),
+            };
         }
         let mut result = mul_var(self, o, self.dscale + o.dscale);
         if result.dscale > NUMERIC_DSCALE_MAX {

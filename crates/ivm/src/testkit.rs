@@ -72,13 +72,18 @@ pub fn proptest_cases(default: u32) -> u32 {
 /// A fresh scratch directory, removed on drop unless the test is failing.
 pub struct TempDir(PathBuf);
 
+/// A fresh scratch directory with cleanup managed by the caller.
+pub fn temp_dir(name: &str) -> PathBuf {
+    let base = std::env::var_os("IVM_TEST_TMP").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let d = base.join(format!("ivm-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("creating {}: {e}", d.display()));
+    d
+}
+
 impl TempDir {
     pub fn new(name: &str) -> TempDir {
-        let base = std::env::var_os("IVM_TEST_TMP").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        let d = base.join(format!("ivm-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("creating {}: {e}", d.display()));
-        TempDir(d)
+        TempDir(temp_dir(name))
     }
 
     pub fn path(&self) -> &Path {

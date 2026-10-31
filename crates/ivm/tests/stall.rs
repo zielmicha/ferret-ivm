@@ -4,10 +4,12 @@
 //! Measured in counts of things that happened meanwhile (records applied,
 //! statements answered), not in wall-clock time.
 
+mod common;
+use common::{exec, start_in as start, temp_dir as tmpdir};
+
 use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
 use ivm::types::text::format_datum;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// These tests measure what happens meanwhile: one at a time, so that they
@@ -18,37 +20,16 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-stall-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
-
-fn start(dir: &Path) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
-    coord::start(cfg).expect("engine starts")
-}
-
 fn try_exec(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {
     let stmt = ivm::sql::parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     h.execute(stmt, vec![], SessionVars::default(), String::new()).map_err(|e| format!("{sql}: {e}"))
 }
 
-fn exec(h: &EngineHandle, sql: &str) -> ExecResult {
-    try_exec(h, sql).unwrap_or_else(|e| panic!("{e}"))
-}
-
 /// Result rows as text, sorted.
 fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
-    match exec(h, sql) {
-        ExecResult::Query { rows, .. } => {
-            let mut v: Vec<String> = rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect();
-            v.sort();
-            v
-        }
-        other => panic!("{sql}: expected rows, got {other:?}"),
-    }
+    let mut rows = common::rows(h, sql);
+    rows.sort();
+    rows
 }
 
 /// Rows in table `big` (enough that hydrating the view below takes a

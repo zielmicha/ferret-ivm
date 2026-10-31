@@ -6,7 +6,7 @@
 //! into the consumer. Semijoins use presence (count) lookups; antijoins,
 //! outer joins and NOT EXISTS are built from semijoins.
 
-use super::agg::AggSpec;
+use super::agg::AggSpecs;
 use super::join::{DeltaPath, JoinInput, JoinPlan, JoinTracker, LookupStep};
 use super::mfp::Mfp;
 use super::ops::{RecursivePlan, TopKPlan};
@@ -15,7 +15,7 @@ use super::window::{WinSpec, WindowPlan};
 use super::*;
 use crate::error::codes;
 use crate::expr::func::func_def;
-use crate::sql::plan::{AggCall, AggFunc, JoinKind, Rel, SetOpKind, SortKey, WindowFunc};
+use crate::sql::plan::{AggCall, JoinKind, Rel, SetOpKind, SortKey, WindowFunc};
 use crate::sql_bail;
 use crate::types::{Datum, SqlType};
 
@@ -66,6 +66,13 @@ impl<'a> Lowerer<'a> {
         self.g.add_arrangement(self.env, node, key, specs, summaries)
     }
 
+    /// Arrange grouped operators by their group columns followed by ORDER BY.
+    fn arrange_ordered(&mut self, node: NodeId, group: &[usize], order: &[SortKey], summaries: Vec<(AggKind, Expr)>) -> ArrId {
+        let key = group.iter().copied().chain(order.iter().map(|k| k.col)).map(Expr::Column).collect();
+        let specs = std::iter::repeat_n(SortSpec::ASC, group.len()).chain(order.iter().map(|k| k.spec)).collect();
+        self.arrange(node, key, specs, summaries)
+    }
+
     pub fn lower(&mut self, rel: &Rel) -> Result<Lowered> {
         match rel {
             Rel::Get { id, name, .. } => {
@@ -74,15 +81,7 @@ impl<'a> Lowerer<'a> {
                 Ok(self.base(node))
             }
             Rel::Values { rows, columns } => {
-                let mut out = Vec::with_capacity(rows.len());
-                for r in rows {
-                    let mut row = Vec::with_capacity(r.len());
-                    for e in r {
-                        row.push(e.eval(&[])?);
-                    }
-                    out.push(row);
-                }
-                let node = self.g.add_node(NodeKind::Constant { rows: out }, vec![], columns.clone());
+                let node = self.g.add_node(NodeKind::Constant { rows: values_rows(rows).collect::<Result<_>>()? }, vec![], columns.clone());
                 Ok(self.base(node))
             }
             Rel::Map { input, exprs } => {
@@ -183,13 +182,7 @@ impl<'a> Lowerer<'a> {
                 let l = self.lower(input)?;
                 let schema = l.schema.clone();
                 let node = self.materialize(l);
-                let mut key: Vec<Expr> = group.iter().map(|c| Expr::Column(*c)).collect();
-                let mut specs = vec![SortSpec::ASC; group.len()];
-                for k in order {
-                    key.push(Expr::Column(k.col));
-                    specs.push(k.spec);
-                }
-                let arr = self.arrange(node, key, specs, vec![]);
+                let arr = self.arrange_ordered(node, group, order, vec![]);
                 let plan = TopKPlan { group_key: group.clone(), limit: *limit, offset: *offset, with_ties: *with_ties, input_arr: arr };
                 let n = self.g.add_node(NodeKind::TopK(plan), vec![node], schema);
                 Ok(self.base(n))
@@ -210,40 +203,18 @@ impl<'a> Lowerer<'a> {
                     })
                     .collect();
                 let mut node = self.materialize(l);
-                let mut i = 0;
-                while i < funcs.len() {
-                    let (part, order) = (&funcs[i].partition, &funcs[i].order);
-                    let mut j = i;
-                    while j < funcs.len() && funcs[j].partition == *part && funcs[j].order == *order {
-                        j += 1;
-                    }
-                    let mut key: Vec<Expr> = part.iter().map(|c| Expr::Column(*c)).collect();
-                    let mut specs = vec![SortSpec::ASC; part.len()];
-                    for k in order {
-                        key.push(Expr::Column(k.col));
-                        specs.push(k.spec);
-                    }
-                    let specs_w: Vec<WinSpec> = funcs[i..j]
-                        .iter()
-                        .zip(&constant_args[i..j])
-                        .map(|(f, constant_arg)| WinSpec {
-                            func: f.func,
-                            args: f.args.clone(),
-                            frame: f.frame,
-                            arg_types: f.args.iter().map(|a| cur_schema[*a].ty.clone()).collect(),
-                            ret: f.ret.clone(),
-                            range: f.range.clone(),
-                            constant_arg: constant_arg.clone(),
-                        })
-                        .collect();
+                let mut constant_args = constant_args.into_iter();
+                for funcs in funcs.chunk_by(|a, b| a.partition == b.partition && a.order == b.order) {
+                    let (part, order) = (&funcs[0].partition, &funcs[0].order);
+                    let specs_w: Vec<WinSpec> = funcs.iter()
+                        .map(|f| WinSpec::new(f, &cur_schema, constant_args.next().unwrap())).collect();
                     // (summaries for the parts of frames up to the partitions' ends)
-                    let arr = self.arrange(node, key, specs, super::window::input_summaries(&specs_w));
+                    let arr = self.arrange_ordered(node, part, order, super::window::input_summaries(&specs_w));
                     let mut schema = cur_schema.clone();
-                    schema.extend(funcs[i..j].iter().map(|f| f.ret.clone()));
+                    schema.extend(funcs.iter().map(|f| f.ret.clone()));
                     let plan = WindowPlan::new(part.clone(), order.clone(), specs_w, arr);
                     node = self.g.add_node(NodeKind::Window(plan), vec![node], schema.clone());
                     cur_schema = schema;
-                    i = j;
                 }
                 Ok(self.base(node))
             }
@@ -264,9 +235,7 @@ impl<'a> Lowerer<'a> {
                 Ok(self.base(n))
             }
             Rel::Recursive { id, base, step, distinct, columns } => {
-                let mut ids = Vec::new();
-                collect_gets(base, &mut ids);
-                collect_gets(step, &mut ids);
+                let mut ids: Vec<_> = base.reads().chain(step.reads()).collect();
                 ids.sort();
                 ids.dedup();
                 let mut sources = Vec::new();
@@ -863,36 +832,9 @@ impl<'a> Lowerer<'a> {
         let (group, aggs) = (&group[..], &aggs[..]);
         let in_schema = l.schema.clone();
         let node = self.materialize(l);
-        let mut key: Vec<Expr> = group.iter().map(|c| Expr::Column(*c)).collect();
-        let mut specs = vec![SortSpec::ASC; group.len()];
-        if let Some(a) = aggs.iter().find(|a| a.func.is_ordered()) {
-            for k in &a.order {
-                key.push(Expr::Column(k.col));
-                specs.push(k.spec);
-            }
-        }
-        let mut agg_specs = Vec::with_capacity(aggs.len());
-        let mut summaries: Vec<(AggKind, Expr)> = Vec::new();
-        let mut slots = Vec::with_capacity(aggs.len());
-        for a in aggs {
-            let spec = AggSpec {
-                func: a.func,
-                arg: a.args.first().copied(),
-                arg2: a.args.get(1).copied(),
-                filter: a.filter,
-                arg_type: a.args.first().map(|c| in_schema[*c].ty.clone()).unwrap_or(SqlType::Int8),
-                ret: a.ret.clone(),
-                fraction: a.fraction,
-            };
-            let mut s = Vec::new();
-            for sm in spec.summaries() {
-                s.push(summaries.len());
-                summaries.push(sm);
-            }
-            slots.push(s);
-            agg_specs.push(spec);
-        }
-        let input_arr = self.arrange(node, key, specs, summaries);
+        let order = aggs.iter().find(|a| a.func.is_ordered()).map_or(&[][..], |a| a.order.as_slice());
+        let AggSpecs { aggs: agg_specs, summaries, slots } = AggSpecs::new(aggs, &in_schema);
+        let input_arr = self.arrange_ordered(node, group, order, summaries);
         // output: group columns then aggregates
         let mut out_schema: Vec<ColumnType> = group.iter().map(|c| in_schema[*c].clone()).collect();
         out_schema.extend(aggs.iter().map(|a| a.ret.clone()));
@@ -1022,21 +964,7 @@ fn make_eq(a: Expr, b: Expr, t: &SqlType) -> Expr {
     }
 }
 
-fn collect_gets(rel: &Rel, out: &mut Vec<u64>) {
-    if let Rel::Get { id, .. } = rel {
-        out.push(*id);
-    }
-    for i in rel.inputs() {
-        collect_gets(i, out);
-    }
-}
-
-/// Constant rows of a Values node (helper for callers).
-pub fn values_rows(rows: &[Vec<Expr>]) -> Result<Vec<Row>> {
-    rows.iter().map(|r| r.iter().map(|e| e.eval(&[] as &[Datum])).collect()).collect()
-}
-
-#[allow(dead_code)]
-fn _agg_name(f: AggFunc) -> &'static str {
-    f.name()
+/// Evaluate constant rows without an intermediate collection.
+pub fn values_rows(rows: &[Vec<Expr>]) -> impl Iterator<Item = Result<Row>> + '_ {
+    rows.iter().map(|r| r.iter().map(|e| e.eval(&[])).collect())
 }

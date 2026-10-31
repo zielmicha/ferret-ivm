@@ -1,6 +1,9 @@
 //! Replication regression tests against a private PostgreSQL cluster
 //! (pgproto's TempCluster; PostgreSQL binaries from `PG_BIN`).
 
+mod common;
+use common::temp_dir as tmpdir;
+
 use ivm::coord::{self, Config};
 use ivm::server::{self, ServerConfig};
 use pgproto::testutil::{ClusterOptions, TempCluster};
@@ -8,13 +11,6 @@ use pgproto::{Client, Config as PgConfig};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-repl-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
 
 fn connect(conninfo: &str) -> Client {
     Client::connect(&PgConfig::parse(conninfo).expect("conninfo")).expect("connect")

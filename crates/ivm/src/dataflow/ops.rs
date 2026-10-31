@@ -254,46 +254,21 @@ pub fn snapshot_stream(g: &Graph, env: &mut Env, id: NodeId, sink: &mut RowSink)
             })?;
             out.errs(input);
         }
-        NodeKind::Join(p) => {
+        kind @ (NodeKind::Join(_) | NodeKind::Reduce(_) | NodeKind::Distinct { .. } | NodeKind::SetOp { .. }
+            | NodeKind::TopK(_) | NodeKind::Window(_) | NodeKind::Recursive(_)) => {
             for i in &node.inputs {
-                let s = snapshot_errs(g, env, *i)?;
-                out.errs(s);
+                out.errs(snapshot_errs(g, env, *i)?);
             }
-            join::snapshot(g, env, p, &mut out)?;
-        }
-        NodeKind::Reduce(p) => {
-            let errs = snapshot_errs(g, env, node.inputs[0])?;
-            out.errs(errs);
-            reduce::snapshot(g, env, p, &mut out)?;
-        }
-        NodeKind::Distinct { arr } => {
-            let errs = snapshot_errs(g, env, node.inputs[0])?;
-            out.errs(errs);
-            distinct_snapshot(g, env, *arr, &mut out)?;
-        }
-        NodeKind::SetOp { op, all, left_arr, right_arr } => {
-            let errs = snapshot_errs(g, env, node.inputs[0])?;
-            out.errs(errs);
-            let errs = snapshot_errs(g, env, node.inputs[1])?;
-            out.errs(errs);
-            setop_snapshot(g, env, *op, *all, *left_arr, *right_arr, &mut out)?;
-        }
-        NodeKind::TopK(p) => {
-            let errs = snapshot_errs(g, env, node.inputs[0])?;
-            out.errs(errs);
-            topk_snapshot(g, env, p, &mut out)?;
-        }
-        NodeKind::Window(p) => {
-            let errs = snapshot_errs(g, env, node.inputs[0])?;
-            out.errs(errs);
-            window::snapshot(g, env, p, &mut out)?;
-        }
-        NodeKind::Recursive(p) => {
-            for i in &node.inputs {
-                let s = snapshot_errs(g, env, *i)?;
-                out.errs(s);
+            match kind {
+                NodeKind::Join(p) => join::snapshot(g, env, p, &mut out)?,
+                NodeKind::Reduce(p) => reduce::snapshot(g, env, p, &mut out)?,
+                NodeKind::Distinct { arr } => distinct_snapshot(g, env, *arr, &mut out)?,
+                NodeKind::SetOp { op, all, left_arr, right_arr } => setop_snapshot(g, env, *op, *all, *left_arr, *right_arr, &mut out)?,
+                NodeKind::TopK(p) => topk_snapshot(g, env, p, &mut out)?,
+                NodeKind::Window(p) => window::snapshot(g, env, p, &mut out)?,
+                NodeKind::Recursive(p) => recursive_snapshot(g, env, p, &mut out)?,
+                _ => unreachable!(),
             }
-            recursive_snapshot(g, env, p, &mut out)?;
         }
         NodeKind::Temporal(p) => {
             let errs = snapshot_stream(g, env, node.inputs[0], &mut |env, batch| temporal::snapshot(g, env, p, batch, &mut out))?;

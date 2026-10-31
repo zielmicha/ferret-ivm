@@ -177,6 +177,17 @@ fn result_format(formats: &[i16], i: usize) -> i16 {
     }
 }
 
+/// SUBSCRIBE's metadata is identical for Describe and actual delivery.
+fn subscription_columns(columns: &[ResultColumn], progress: bool) -> Vec<ResultColumn> {
+    let mut cols = vec![ResultColumn { name: "gsn".into(), ty: SqlType::Int8, typmod: -1 }];
+    if progress {
+        cols.push(ResultColumn { name: "progressed".into(), ty: SqlType::Bool, typmod: -1 });
+    }
+    cols.push(ResultColumn { name: "diff".into(), ty: SqlType::Int8, typmod: -1 });
+    cols.extend_from_slice(columns);
+    cols
+}
+
 fn encode_value(d: &Datum, ty: &SqlType, binary: bool) -> Option<Vec<u8>> {
     if d.is_null() {
         return None;
@@ -693,7 +704,7 @@ impl Session {
             self.pending_copy = matches!(stmt, Statement::Subscribe { copy: true, .. });
             match self.run_statement(stmt, vec![]) {
                 Ok(res) => {
-                    if !self.send_result(res, &[], 0, true)? {
+                    if !self.send_result(res, &[], true)? {
                         return Ok(());
                     }
                 }
@@ -709,7 +720,7 @@ impl Session {
 
     /// Send a result. Returns false if the statement ended with an error
     /// that aborts the rest of a multi-statement query.
-    fn send_result(&mut self, res: ExecResult, formats: &[i16], _max_rows: i32, describe: bool) -> Result<bool> {
+    fn send_result(&mut self, res: ExecResult, formats: &[i16], describe: bool) -> Result<bool> {
         match res {
             ExecResult::Command { tag } => {
                 if tag.is_empty() {
@@ -829,12 +840,7 @@ impl Session {
             }));
         }
         let copy = self.pending_copy;
-        let mut cols = vec![ResultColumn { name: "gsn".into(), ty: SqlType::Int8, typmod: -1 }];
-        if progress {
-            cols.push(ResultColumn { name: "progressed".into(), ty: SqlType::Bool, typmod: -1 });
-        }
-        cols.push(ResultColumn { name: "diff".into(), ty: SqlType::Int8, typmod: -1 });
-        cols.extend(columns.iter().cloned());
+        let cols = subscription_columns(columns, progress);
         let binary: Vec<bool> = (0..cols.len()).map(|i| !copy && result_format(formats, i) == 1).collect();
         if copy {
             self.out.copy_out_response(0, &vec![0i16; cols.len()]);
@@ -1000,11 +1006,7 @@ impl Session {
         let mut slots = Vec::with_capacity(params.len());
         for (i, v) in params.iter().enumerate() {
             let ty = p.param_types.get(i).cloned().unwrap_or(SqlType::Unknown);
-            let fmt = match formats.len() {
-                0 => 0,
-                1 => formats[0],
-                _ => formats.get(i).copied().unwrap_or(0),
-            };
+            let fmt = result_format(formats, i);
             let value = match v {
                 None => Datum::Null,
                 Some(b) if fmt == 1 && ty != SqlType::Unknown => recv_datum(b, &ty)?,
@@ -1055,13 +1057,7 @@ impl Session {
                 };
                 let query = Box::new(crate::sql::parser::parse_single_query(&text)?);
                 let (columns, ptypes) = self.engine.describe(Statement::Select { query, as_of: AsOf::Default, text }, params)?;
-                let mut cols = vec![ResultColumn { name: "gsn".into(), ty: SqlType::Int8, typmod: -1 }];
-                if *progress {
-                    cols.push(ResultColumn { name: "progressed".into(), ty: SqlType::Bool, typmod: -1 });
-                }
-                cols.push(ResultColumn { name: "diff".into(), ty: SqlType::Int8, typmod: -1 });
-                cols.extend(columns);
-                (cols, ptypes)
+                (subscription_columns(&columns, *progress), ptypes)
             }
             _ => self.engine.describe(stmt, params)?,
         };
@@ -1084,12 +1080,7 @@ impl Session {
         if cols.is_empty() {
             self.out.no_data();
         } else {
-            let fields: Vec<FieldDescription> = cols
-                .iter()
-                .enumerate()
-                .map(|(i, c)| field(c, result_format(&formats, i)))
-                .collect();
-            self.out.row_description(&fields);
+            self.row_description(&cols, &formats);
         }
         Ok(())
     }
@@ -1112,7 +1103,7 @@ impl Session {
                     portal.pending = Some((columns, rows))
                 }
                 other => {
-                    self.send_result(other, &portal.result_formats, max_rows, false)?;
+                    self.send_result(other, &portal.result_formats, false)?;
                     return Ok(());
                 }
             }

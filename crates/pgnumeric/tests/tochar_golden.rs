@@ -13,181 +13,6 @@ use pgnumeric::{
     to_char_numeric, to_number,
 };
 
-/// Minimal JSON reader for the golden files (objects, arrays, strings,
-/// null; no numbers or booleans are needed).
-mod json {
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum Value {
-        Null,
-        Str(String),
-        Arr(Vec<Value>),
-        Obj(Vec<(String, Value)>),
-    }
-
-    impl Value {
-        pub fn get(&self, key: &str) -> Option<&Value> {
-            match self {
-                Value::Obj(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-                _ => None,
-            }
-        }
-
-        pub fn str(&self) -> Option<&str> {
-            match self {
-                Value::Str(s) => Some(s),
-                _ => None,
-            }
-        }
-
-        pub fn arr(&self) -> &[Value] {
-            match self {
-                Value::Arr(a) => a,
-                _ => panic!("expected array, got {self:?}"),
-            }
-        }
-    }
-
-    pub fn parse(s: &str) -> Value {
-        let mut p = Parser {
-            b: s.as_bytes(),
-            i: 0,
-        };
-        let v = p.value();
-        p.ws();
-        assert_eq!(p.i, p.b.len(), "trailing data in {s}");
-        v
-    }
-
-    struct Parser<'a> {
-        b: &'a [u8],
-        i: usize,
-    }
-
-    impl Parser<'_> {
-        fn ws(&mut self) {
-            while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
-                self.i += 1;
-            }
-        }
-
-        fn eat(&mut self, c: u8) {
-            self.ws();
-            assert_eq!(
-                self.b.get(self.i),
-                Some(&c),
-                "expected {:?} at {}",
-                c as char,
-                self.i
-            );
-            self.i += 1;
-        }
-
-        fn value(&mut self) -> Value {
-            self.ws();
-            match self.b[self.i] {
-                b'"' => Value::Str(self.string()),
-                b'n' => {
-                    assert!(self.b[self.i..].starts_with(b"null"));
-                    self.i += 4;
-                    Value::Null
-                }
-                b'[' => {
-                    self.i += 1;
-                    let mut items = Vec::new();
-                    self.ws();
-                    if self.b[self.i] == b']' {
-                        self.i += 1;
-                        return Value::Arr(items);
-                    }
-                    loop {
-                        items.push(self.value());
-                        self.ws();
-                        let c = self.b[self.i];
-                        self.i += 1;
-                        match c {
-                            b',' => continue,
-                            b']' => return Value::Arr(items),
-                            _ => panic!("bad array at {}", self.i),
-                        }
-                    }
-                }
-                b'{' => {
-                    self.i += 1;
-                    let mut fields = Vec::new();
-                    self.ws();
-                    if self.b[self.i] == b'}' {
-                        self.i += 1;
-                        return Value::Obj(fields);
-                    }
-                    loop {
-                        self.ws();
-                        let k = self.string();
-                        self.eat(b':');
-                        let v = self.value();
-                        fields.push((k, v));
-                        self.ws();
-                        let c = self.b[self.i];
-                        self.i += 1;
-                        match c {
-                            b',' => continue,
-                            b'}' => return Value::Obj(fields),
-                            _ => panic!("bad object at {}", self.i),
-                        }
-                    }
-                }
-                c => panic!("unexpected {:?} at {}", c as char, self.i),
-            }
-        }
-
-        fn hex4(&mut self) -> u32 {
-            let h = std::str::from_utf8(&self.b[self.i..self.i + 4]).unwrap();
-            self.i += 4;
-            u32::from_str_radix(h, 16).unwrap()
-        }
-
-        fn string(&mut self) -> String {
-            assert_eq!(self.b[self.i], b'"');
-            self.i += 1;
-            let mut out = Vec::new();
-            loop {
-                let c = self.b[self.i];
-                self.i += 1;
-                match c {
-                    b'"' => return String::from_utf8(out).unwrap(),
-                    b'\\' => {
-                        let e = self.b[self.i];
-                        self.i += 1;
-                        let ch = match e {
-                            b'"' => '"',
-                            b'\\' => '\\',
-                            b'/' => '/',
-                            b'b' => '\u{8}',
-                            b'f' => '\u{c}',
-                            b'n' => '\n',
-                            b'r' => '\r',
-                            b't' => '\t',
-                            b'u' => {
-                                let mut cp = self.hex4();
-                                if (0xD800..0xDC00).contains(&cp) {
-                                    assert_eq!(&self.b[self.i..self.i + 2], b"\\u");
-                                    self.i += 2;
-                                    let lo = self.hex4();
-                                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                }
-                                char::from_u32(cp).unwrap()
-                            }
-                            _ => panic!("bad escape"),
-                        };
-                        let mut buf = [0u8; 4];
-                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    }
-                    _ => out.push(c),
-                }
-            }
-        }
-    }
-}
-
 type Outcome = Result<Option<String>, Error>;
 
 fn eval(f: &str, value: &str, fmt: &str) -> Outcome {
@@ -212,12 +37,12 @@ fn run_path(path: &str) {
         if line.trim().is_empty() {
             continue;
         }
-        let rec = json::parse(line);
-        let f = rec.get("fn").and_then(|v| v.str()).expect("fn");
-        let args = rec.get("args").expect("args").arr();
+        let rec: serde_json::Value = serde_json::from_str(line).expect("golden JSON");
+        let f = rec.get("fn").and_then(|v| v.as_str()).expect("fn");
+        let args = rec.get("args").expect("args").as_array().expect("array");
         let (value, fmt) = (
-            args[0].str().expect("value"),
-            args[1].str().expect("format"),
+            args[0].as_str().expect("value"),
+            args[1].as_str().expect("format"),
         );
         let got = std::panic::catch_unwind(|| eval(f, value, fmt));
         count += 1;
@@ -231,14 +56,14 @@ fn run_path(path: &str) {
         let ok = match rec.get("error") {
             Some(e) => match &got {
                 Err(g) => {
-                    g.sqlstate == e.get("sqlstate").and_then(|v| v.str()).unwrap()
-                        && g.message == e.get("message").and_then(|v| v.str()).unwrap()
-                        && g.detail.as_deref() == e.get("detail").and_then(|v| v.str())
+                    g.sqlstate == e.get("sqlstate").and_then(|v| v.as_str()).unwrap()
+                        && g.message == e.get("message").and_then(|v| v.as_str()).unwrap()
+                        && g.detail.as_deref() == e.get("detail").and_then(|v| v.as_str())
                 }
                 Ok(_) => false,
             },
             None => {
-                let want = rec.get("result").expect("result").str();
+                let want = rec.get("result").expect("result").as_str();
                 matches!(&got, Ok(r) if r.as_deref() == want)
             }
         };

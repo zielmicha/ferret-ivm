@@ -2,72 +2,12 @@
 //! tools/gen_golden.py (no PostgreSQL needed at test time).
 
 use pgdatetime::*;
-use std::fmt::Write as _;
+use pgnumeric::float::format_f64 as float8_out;
 
 type R = std::result::Result<Option<String>, Error>;
 
 fn tz_of(s: &str) -> std::result::Result<TimeZone, Error> {
     TimeZone::parse_session(s)
-}
-
-/// float8out() with extra_float_digits = 1 (shortest round-trip).
-fn float8_out(v: f64) -> String {
-    if v.is_nan() {
-        return "NaN".into();
-    }
-    if v.is_infinite() {
-        return if v > 0.0 {
-            "Infinity".into()
-        } else {
-            "-Infinity".into()
-        };
-    }
-    if v == 0.0 {
-        return if v.is_sign_negative() {
-            "-0".into()
-        } else {
-            "0".into()
-        };
-    }
-    // shortest digits via Rust's exponent formatting
-    let e = format!("{:e}", v);
-    let (mant, exp) = e.split_once('e').unwrap();
-    let exp: i32 = exp.parse().unwrap();
-    let neg = mant.starts_with('-');
-    let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
-    let olength = digits.len() as i32;
-    // decimal point position relative to the start of digits
-    let dexp = exp + 1;
-    let mut out = String::new();
-    if neg {
-        out.push('-');
-    }
-    if -4 < dexp && dexp <= 15 {
-        if dexp <= 0 {
-            out.push_str("0.");
-            for _ in 0..(-dexp) {
-                out.push('0');
-            }
-            out.push_str(&digits);
-        } else if dexp >= olength {
-            out.push_str(&digits);
-            for _ in 0..(dexp - olength) {
-                out.push('0');
-            }
-        } else {
-            out.push_str(&digits[..dexp as usize]);
-            out.push('.');
-            out.push_str(&digits[dexp as usize..]);
-        }
-    } else {
-        out.push_str(&digits[..1]);
-        if olength > 1 {
-            out.push('.');
-            out.push_str(&digits[1..]);
-        }
-        let _ = write!(out, "e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
-    }
-    out
 }
 
 fn ok(s: String) -> R {

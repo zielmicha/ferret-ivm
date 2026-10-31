@@ -2,22 +2,12 @@
 //! executor: maintained views must equal a recompute (an ad hoc query or a
 //! freshly hydrated copy) after every change.
 
+mod common;
+use common::{exec, rows, start_in as start, temp_dir as tmpdir};
+
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
 use ivm::types::text::format_datum;
-use std::path::PathBuf;
-
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-dataflow-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
-
-fn start(dir: &PathBuf) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
-    coord::start(cfg).expect("engine starts")
-}
 
 fn try_exec(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {
     let stmt = ivm::sql::parse_statement(sql).map_err(|e| format!("parse: {e}"))?;
@@ -29,14 +19,6 @@ fn rows_of(h: &EngineHandle, sql: &str) -> Result<Vec<String>, String> {
         ExecResult::Query { rows, .. } => Ok(rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect()),
         other => Err(format!("{other:?}")),
     }
-}
-
-fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
-    rows_of(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
-}
-
-fn exec(h: &EngineHandle, sql: &str) {
-    try_exec(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
 
 /// Frames that start past the end of the partition are empty (they used to

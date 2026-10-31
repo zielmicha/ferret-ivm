@@ -442,13 +442,6 @@ impl Engine {
         let mut n = 0;
         let mut new_keys: rustc_hash::FxHashMap<Vec<u8>, ()> = Default::default();
         let mut old_keys: rustc_hash::FxHashMap<Vec<u8>, ()> = Default::default();
-        let enc = |key: &[Datum]| {
-            let mut b = Vec::new();
-            for k in key {
-                crate::types::encoding::encode_key(k, Default::default(), &mut b);
-            }
-            b
-        };
         let mut pending = Vec::new();
         for (r, w) in rows {
             let old: Row = r[..ncols].to_vec();
@@ -464,7 +457,7 @@ impl Engine {
             }
             if !def.pk.is_empty() {
                 let ok: Vec<Datum> = def.pk.iter().map(|c| old[*c].clone()).collect();
-                old_keys.insert(enc(&ok), ());
+                old_keys.insert(key_bytes(&ok), ());
             }
             pending.push((old, new, w));
         }
@@ -478,11 +471,11 @@ impl Engine {
             }
             let ok: Vec<Datum> = def.pk.iter().map(|c| old[*c].clone()).collect();
             let nk: Vec<Datum> = def.pk.iter().map(|c| new[*c].clone()).collect();
-            let nkb = enc(&nk);
+            let nkb = key_bytes(&nk);
             if new_keys.insert(nkb.clone(), ()).is_some() {
                 return Err(Self::dup_key_error(&tname, &def, &nk));
             }
-            if enc(&ok) != nkb {
+            if key_bytes(&ok) != nkb {
                 // key change: the new key must be free (or vacated by this update)
                 if !old_keys.contains_key(&nkb) && self.stored_row(id, &nk)?.is_some() {
                     return Err(Self::dup_key_error(&tname, &def, &nk));
@@ -528,9 +521,6 @@ impl Engine {
         Ok((changes, format!("DELETE {n}")))
     }
 }
-
-#[allow(dead_code)]
-fn _unused(_: &Rel, _: &Expr) {}
 
 /// now() in DML: the statement's start time (the resulting values are
 /// logged, so replay does not depend on the clock).

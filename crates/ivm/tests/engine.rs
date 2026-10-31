@@ -11,14 +11,8 @@ use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
 use ivm::log::LogRecord;
 use ivm::types::text::format_datum;
-use std::path::PathBuf;
 
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-engine-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
+use common::temp_dir as tmpdir;
 
 /// Log a clock tick at `secs` seconds after 2026-01-01 00:00:00 UTC.
 fn tick(h: &EngineHandle, secs: i64) {

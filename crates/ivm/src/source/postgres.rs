@@ -2202,11 +2202,6 @@ fn stream_once(src: &mut PgSource, ctl: &Receiver<SourceCtl>) -> Result<bool> {
     }
 }
 
-#[allow(dead_code)]
-fn _fmt(d: &Datum) -> String {
-    format_datum(d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

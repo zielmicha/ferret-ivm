@@ -3,7 +3,7 @@
 
 use crate::error::{codes, Result, SqlError};
 use crate::expr::Expr;
-use crate::sql::plan::AggFunc;
+use crate::sql::plan::{AggCall, AggFunc};
 use crate::storage::{AggKind, AggState, FloatSum, Summary};
 use crate::types::{ArrayValue, ColumnType, Datum, Row, SqlType};
 use pgfuncs::json::Jsonb;
@@ -20,6 +20,35 @@ pub struct AggSpec {
     pub arg_type: SqlType,
     pub ret: ColumnType,
     pub fraction: Option<f64>,
+}
+
+/// Aggregate specs and the summary slots each reads, shared by both executors.
+pub struct AggSpecs {
+    pub aggs: Vec<AggSpec>,
+    pub summaries: Vec<(AggKind, Expr)>,
+    pub slots: Vec<Vec<usize>>,
+}
+
+impl AggSpecs {
+    pub fn new(calls: &[AggCall], schema: &[ColumnType]) -> Self {
+        let mut plan = Self { aggs: Vec::with_capacity(calls.len()), summaries: Vec::new(), slots: Vec::with_capacity(calls.len()) };
+        for a in calls {
+            let spec = AggSpec {
+                func: a.func,
+                arg: a.args.first().copied(),
+                arg2: a.args.get(1).copied(),
+                filter: a.filter,
+                arg_type: a.args.first().map(|c| schema[*c].ty.clone()).unwrap_or(SqlType::Int8),
+                ret: a.ret.clone(),
+                fraction: a.fraction,
+            };
+            let start = plan.summaries.len();
+            plan.summaries.extend(spec.summaries());
+            plan.slots.push((start..plan.summaries.len()).collect());
+            plan.aggs.push(spec);
+        }
+        plan
+    }
 }
 
 impl AggSpec {

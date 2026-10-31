@@ -8,7 +8,7 @@
 //! input (joins' build sides, DISTINCT, set operations, window functions,
 //! recursion, sorts) hold it.
 
-use crate::dataflow::agg::AggSpec;
+use crate::dataflow::agg::{AggSpec, AggSpecs};
 use crate::dataflow::ops::{RecursivePlan, setop_mult};
 use crate::dataflow::{consolidate, Graph, NodeId};
 use crate::error::{codes, Result, SqlError};
@@ -40,16 +40,12 @@ pub struct ExecCtx<'a> {
 
 const MAX_RECURSION: usize = 1_000_000;
 
-fn key_bytes(vals: &[Datum]) -> Vec<u8> {
+fn key_bytes<'a>(vals: impl IntoIterator<Item = &'a Datum>) -> Vec<u8> {
     let mut out = Vec::new();
     for v in vals {
         encoding::encode_key(v, SortSpec::ASC, &mut out);
     }
     out
-}
-
-fn row_key(row: &[Datum]) -> Vec<u8> {
-    key_bytes(row)
 }
 
 /// Canonical row encoding with fidelity (exact identity).
@@ -69,14 +65,7 @@ impl<'a> ExecCtx<'a> {
                     .ok_or_else(|| SqlError::new(codes::UNDEFINED_TABLE, format!("relation \"{name}\" is not readable")))?;
                 self.read_node(node)
             }
-            Rel::Values { rows, .. } => {
-                let mut out = Vec::with_capacity(rows.len());
-                for r in rows {
-                    let row: Row = r.iter().map(|e| e.eval(&[])).collect::<Result<_>>()?;
-                    out.push((row, 1));
-                }
-                Ok(out)
-            }
+            Rel::Values { rows, .. } => crate::dataflow::lower::values_rows(rows).map(|r| r.map(|r| (r, 1))).collect(),
             Rel::Aggregate { input, group, aggs } => {
                 // (the input is aggregated as it is read, not collected)
                 let in_schema = input.schema();
@@ -93,7 +82,7 @@ impl<'a> ExecCtx<'a> {
                     if w <= 0 {
                         continue;
                     }
-                    let k = row_key(&r);
+                    let k = key_bytes(&r);
                     if seen.insert(k, ()).is_none() {
                         out.push((r, 1));
                     }
@@ -105,30 +94,19 @@ impl<'a> ExecCtx<'a> {
                 let mut r = self.execute(right)?;
                 consolidate(&mut l);
                 consolidate(&mut r);
-                let mut counts: Vec<(Row, i64, i64)> = Vec::new();
+                let mut counts: Vec<(Row, [i64; 2])> = Vec::new();
                 let mut idx: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
-                for (row, w) in l {
-                    let k = row_key(&row);
-                    match idx.get(&k) {
-                        Some(&i) => counts[i].1 += w,
-                        None => {
-                            idx.insert(k, counts.len());
-                            counts.push((row, w, 0));
-                        }
-                    }
-                }
-                for (row, w) in r {
-                    let k = row_key(&row);
-                    match idx.get(&k) {
-                        Some(&i) => counts[i].2 += w,
-                        None => {
-                            idx.insert(k, counts.len());
-                            counts.push((row, 0, w));
-                        }
+                for (side, rows) in [l, r].into_iter().enumerate() {
+                    for (row, w) in rows {
+                        let i = *idx.entry(key_bytes(&row)).or_insert_with(|| {
+                            counts.push((row, [0, 0]));
+                            counts.len() - 1
+                        });
+                        counts[i].1[side] += w;
                     }
                 }
                 let mut out = Vec::new();
-                for (row, a, b) in counts {
+                for (row, [a, b]) in counts {
                     let m = setop_mult(*op, *all, a, b);
                     if m > 0 {
                         out.push((row, m));
@@ -171,18 +149,12 @@ impl<'a> ExecCtx<'a> {
     }
 
     fn read_node(&mut self, node: NodeId) -> Result<Rows> {
-        match self.g.any_arrangement(node) {
-            Some(a) => {
-                let mut rows = self.g.scan_arr(self.env, a)?;
-                rows.retain(|(_, w)| *w > 0);
-                Ok(rows)
-            }
-            None => {
-                let mut rows = self.g.snapshot(self.env, node)?.data;
-                rows.retain(|(_, w)| *w > 0);
-                Ok(rows)
-            }
-        }
+        let mut rows = match self.g.any_arrangement(node) {
+            Some(a) => self.g.scan_arr(self.env, a)?,
+            None => self.g.snapshot(self.env, node)?.data,
+        };
+        rows.retain(|(_, w)| *w > 0);
+        Ok(rows)
     }
 
     /// The arrangement and key range of `node` to read for rows passing
@@ -804,7 +776,7 @@ impl<'a> ExecCtx<'a> {
             consolidate(&mut produced);
             let mut working = Vec::new();
             for (r, w) in produced {
-                if w <= 0 || (distinct && seen.insert(row_key(&r), ()).is_some()) {
+                if w <= 0 || (distinct && seen.insert(key_bytes(&r), ()).is_some()) {
                     continue;
                 }
                 let w = if distinct { 1 } else { w };
@@ -931,7 +903,7 @@ pub fn eval_recursive(g: &Graph, env: &mut Env, p: &RecursivePlan) -> Result<Row
     Ok(rows)
 }
 
-/// Compare rows by sort keys (with full-row tiebreak for determinism).
+/// Compare rows by sort keys; equal keys remain peers.
 pub fn compare_rows(a: &Row, b: &Row, order: &[SortKey]) -> Ordering {
     for k in order {
         let (x, y) = (&a[k.col], &b[k.col]);
@@ -955,23 +927,24 @@ pub fn sort_rows(rows: &mut [(Row, i64)], order: &[SortKey]) {
     rows.sort_by(|a, b| compare_rows(&a.0, &b.0, order).then_with(|| row_identity(&a.0).cmp(&row_identity(&b.0))));
 }
 
-fn topk(rows: Rows, group: &[usize], order: &[SortKey], limit: Option<u64>, offset: u64, with_ties: bool) -> Rows {
-    let mut groups: FxHashMap<Vec<u8>, Rows> = FxHashMap::default();
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    for (r, w) in rows {
-        if w <= 0 {
-            continue;
-        }
-        let kv: Vec<Datum> = group.iter().map(|c| r[*c].clone()).collect();
-        let k = key_bytes(&kv);
-        if !groups.contains_key(&k) {
-            keys.push(k.clone());
-        }
-        groups.entry(k).or_default().push((r, w));
+/// Group live rows by SQL equality, retaining each group's first-seen order.
+fn partition_rows(rows: Rows, columns: &[usize]) -> Vec<Rows> {
+    let mut groups: Vec<Rows> = Vec::new();
+    let mut slots = FxHashMap::default();
+    for (r, w) in rows.into_iter().filter(|(_, w)| *w > 0) {
+        let key = key_bytes(columns.iter().map(|c| &r[*c]));
+        let i = *slots.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[i].push((r, w));
     }
+    groups
+}
+
+fn topk(rows: Rows, group: &[usize], order: &[SortKey], limit: Option<u64>, offset: u64, with_ties: bool) -> Rows {
     let mut out = Vec::new();
-    for k in keys {
-        let mut g = groups.remove(&k).unwrap();
+    for mut g in partition_rows(rows, group) {
         consolidate(&mut g);
         sort_rows(&mut g, order);
         let mut skipped = 0u64;
@@ -1035,28 +1008,7 @@ struct Aggregator<'a> {
 
 impl<'a> Aggregator<'a> {
     fn new(group: &'a [usize], aggs: &'a [crate::sql::plan::AggCall], in_schema: &[crate::types::ColumnType]) -> Aggregator<'a> {
-        let specs: Vec<AggSpec> = aggs
-            .iter()
-            .map(|a| AggSpec {
-                func: a.func,
-                arg: a.args.first().copied(),
-                arg2: a.args.get(1).copied(),
-                filter: a.filter,
-                arg_type: a.args.first().map(|c| in_schema[*c].ty.clone()).unwrap_or(SqlType::Int8),
-                ret: a.ret.clone(),
-                fraction: a.fraction,
-            })
-            .collect();
-        let mut kinds: Vec<(AggKind, Expr)> = Vec::new();
-        let mut slots = Vec::new();
-        for s in &specs {
-            let mut sl = Vec::new();
-            for k in s.summaries() {
-                sl.push(kinds.len());
-                kinds.push(k);
-            }
-            slots.push(sl);
-        }
+        let AggSpecs { aggs: specs, summaries: kinds, slots } = AggSpecs::new(aggs, in_schema);
         let spec_kinds: Vec<AggKind> = kinds.iter().map(|(k, _)| *k).collect();
         let any_ordered = specs.iter().any(|s| s.func.is_ordered());
         let distinct_seen = specs.iter().map(|_| FxHashMap::default()).collect();
@@ -1089,9 +1041,8 @@ impl<'a> Aggregator<'a> {
                 {
                     continue;
                 }
-                let args: Vec<Datum> = agg.args.iter().map(|c| r[*c].clone()).collect();
                 let mut dk = k.clone();
-                dk.extend(key_bytes(&args));
+                dk.extend(key_bytes(agg.args.iter().map(|c| &r[*c])));
                 if self.distinct_seen[i].insert(dk, ()).is_some() {
                     continue;
                 }
@@ -1136,7 +1087,7 @@ impl<'a> Aggregator<'a> {
                         .rows
                         .iter()
                         .filter(|(r, _)| aggs[i].filter.is_none_or(|f| matches!(r[f], Datum::Bool(true))))
-                        .filter(|(r, _)| seen.insert(key_bytes(&a.iter().map(|c| r[*c].clone()).collect::<Vec<_>>()), ()).is_none())
+                        .filter(|(r, _)| seen.insert(key_bytes(a.iter().map(|c| &r[*c])), ()).is_none())
                         .map(|(r, _)| (r.clone(), 1))
                         .collect();
                     sort_rows(&mut rs, &aggs[i].order);
@@ -1292,7 +1243,7 @@ struct OrderedRead<'r> {
 /// Can the plan produce negative weights (which must cancel positive ones
 /// before the result is read)?
 fn has_negate(rel: &Rel) -> bool {
-    matches!(rel, Rel::Negate { .. }) || rel.inputs().into_iter().any(has_negate)
+    rel.walk().any(|r| matches!(r, Rel::Negate { .. }))
 }
 
 fn window(rows: Rows, funcs: &[crate::sql::plan::WindowCall], schema: &[crate::types::ColumnType]) -> Result<Rows> {
@@ -1301,45 +1252,17 @@ fn window(rows: Rows, funcs: &[crate::sql::plan::WindowCall], schema: &[crate::t
     consolidate(&mut cur);
     cur.retain(|(_, w)| *w > 0);
     let mut cur_schema = schema.to_vec();
-    let mut i = 0;
-    while i < funcs.len() {
-        let (part, order) = (&funcs[i].partition, &funcs[i].order);
-        let mut j = i;
-        while j < funcs.len() && funcs[j].partition == *part && funcs[j].order == *order {
-            j += 1;
-        }
-        let specs: Vec<WinSpec> = funcs[i..j]
-            .iter()
-            .map(|f| WinSpec {
-                func: f.func,
-                args: f.args.clone(),
-                frame: f.frame,
-                arg_types: f.args.iter().map(|a| cur_schema[*a].ty.clone()).collect(),
-                ret: f.ret.clone(),
-                range: f.range.clone(),
-                // (only bounds what a change reaches)
-                constant_arg: None,
-            })
-            .collect();
-        let mut groups: FxHashMap<Vec<u8>, Rows> = FxHashMap::default();
-        let mut keys = Vec::new();
-        for (r, w) in cur {
-            let kv: Vec<Datum> = part.iter().map(|c| r[*c].clone()).collect();
-            let k = key_bytes(&kv);
-            if !groups.contains_key(&k) {
-                keys.push(k.clone());
-            }
-            groups.entry(k).or_default().push((r, w));
-        }
+    for funcs in funcs.chunk_by(|a, b| a.partition == b.partition && a.order == b.order) {
+        let (part, order) = (&funcs[0].partition, &funcs[0].order);
+        // constant_arg only bounds incremental updates, not batch evaluation.
+        let specs: Vec<WinSpec> = funcs.iter().map(|f| WinSpec::new(f, &cur_schema, None)).collect();
         let mut next = Vec::new();
-        for k in keys {
-            let mut g = groups.remove(&k).unwrap();
+        for mut g in partition_rows(cur, part) {
             sort_rows(&mut g, order);
             next.extend(compute_partition(&g, order, &specs)?);
         }
-        cur_schema.extend(funcs[i..j].iter().map(|f| f.ret.clone()));
+        cur_schema.extend(funcs.iter().map(|f| f.ret.clone()));
         cur = next;
-        i = j;
     }
     Ok(cur)
 }

@@ -265,7 +265,7 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
     if !correlated {
         let mut right = right;
         shift_outer_depth(&mut right, 1);
-        return uncorrelated(left, right, kind);
+        return finish_apply(left, right, kind, &[]);
     }
     if let Some(r) = try_simple(&left, &right, &kind)? {
         return Ok(r);
@@ -289,6 +289,13 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
     let d = Rel::Distinct { input: Box::new(left.clone().map(dkeys.clone()).project((nl..nl + k).collect())) };
     let mut r2 = push_dep(right, &d, k, &dpos)?;
     shift_outer_depth(&mut r2, 1);
+    finish_apply(left, r2, kind, &dkeys)
+}
+
+/// Finish either a dependent or an uncorrelated apply. Dependent inputs
+/// carry the leading D keys; an uncorrelated input has none.
+fn finish_apply(left: Rel, r2: Rel, kind: ApplyKind, dkeys: &[Expr]) -> Result<Rel> {
+    let (nl, k) = (left.arity(), dkeys.len());
     let nr = r2.arity() - k;
     let d_cond = |offset: usize| -> Vec<Expr> {
         dkeys.iter().enumerate().map(|(i, e)| nd_eq(e.clone(), Expr::Column(offset + i))).collect()
@@ -297,11 +304,12 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
         ApplyKind::Semi { lhs, negated, null_aware } => {
             if null_aware {
                 // NOT IN: keep rows whose IN-mark is false
-                let marked = mark_join(left, r2, k, &dkeys, SubqueryKind::In(lhs))?;
+                let marked = mark_join(left, r2, k, dkeys, SubqueryKind::In(lhs))?;
                 let m = marked.arity() - 1;
                 return Ok(marked.filter(vec![Expr::Not(Box::new(Expr::Column(m)))]).project((0..nl).collect()));
             }
             let mut on = d_cond(nl);
+            let left_types = left.schema();
             let rtypes = r2.schema();
             for (j, l) in lhs.into_iter().enumerate() {
                 let lt = l.ty(&left_types);
@@ -309,11 +317,13 @@ fn apply_to_join(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
             }
             Ok(Rel::Join { left: Box::new(left), right: Box::new(r2), kind: if negated { JoinKind::Anti } else { JoinKind::Semi }, on })
         }
-        ApplyKind::Mark { kind: sk } => mark_join(left, r2, k, &dkeys, sk),
+        ApplyKind::Mark { kind: sk } => mark_join(left, r2, k, dkeys, sk),
         ApplyKind::Scalar => {
-            // per D value: the value and the number of rows
+            // An uncorrelated aggregate always supplies its value and count;
+            // a dependent one needs a left join for missing D groups.
             let r3 = scalar_value_and_count(r2, k);
-            let j = Rel::Join { left: Box::new(left), right: Box::new(r3), kind: JoinKind::Left, on: d_cond(nl) };
+            let kind = if k == 0 { JoinKind::Inner } else { JoinKind::Left };
+            let j = Rel::Join { left: Box::new(left), right: Box::new(r3), kind, on: d_cond(nl) };
             let mut proj: Vec<usize> = (0..nl).collect();
             proj.extend([nl + k, nl + k + 1]);
             Ok(j.project(proj))
@@ -534,39 +544,6 @@ fn quantified_join(
     let mut proj: Vec<usize> = (0..nl).collect();
     proj.push(nl + n1 + ga - 1);
     Ok(back.project(proj))
-}
-
-fn uncorrelated(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
-    let nl = left.arity();
-    match kind {
-        ApplyKind::Semi { lhs, negated, null_aware } => {
-            if null_aware {
-                let marked = mark_join(left, right, 0, &[], SubqueryKind::In(lhs))?;
-                let m = marked.arity() - 1;
-                return Ok(marked.filter(vec![Expr::Not(Box::new(Expr::Column(m)))]).project((0..nl).collect()));
-            }
-            let left_types = left.schema();
-            let rtypes = right.schema();
-            let mut on = Vec::new();
-            for (j, l) in lhs.into_iter().enumerate() {
-                let lt = l.ty(&left_types);
-                on.push(sql_eq(l, &lt, Expr::Column(nl + j), &rtypes[j].ty)?);
-            }
-            Ok(Rel::Join { left: Box::new(left), right: Box::new(right), kind: if negated { JoinKind::Anti } else { JoinKind::Semi }, on })
-        }
-        ApplyKind::Mark { kind } => mark_join(left, right, 0, &[], kind),
-        ApplyKind::Scalar => {
-            // exactly one row: the value (NULL when empty) and the row count
-            let single = scalar_value_and_count(right, 0);
-            Ok(Rel::Join { left: Box::new(left), right: Box::new(single), kind: JoinKind::Inner, on: vec![] })
-        }
-        ApplyKind::Lateral { left_outer } => Ok(Rel::Join {
-            left: Box::new(left),
-            right: Box::new(right),
-            kind: if left_outer { JoinKind::Left } else { JoinKind::Inner },
-            on: vec![],
-        }),
-    }
 }
 
 /// Rewrite an expression of an operator whose input gained k leading D columns.
@@ -862,38 +839,29 @@ fn to_join_cond(e: &Expr, nl: usize) -> Expr {
 fn try_simple(left: &Rel, right: &Rel, kind: &ApplyKind) -> Result<Option<Rel>> {
     let nl = left.arity();
     match kind {
-        ApplyKind::Semi { lhs, negated, null_aware: false } => {
+        ApplyKind::Semi { null_aware: false, .. } | ApplyKind::Lateral { left_outer: false } => {
             let Some((mut base, lifted, vis)) = lift_filters(right) else { return Ok(None) };
             if base.has_outer_refs(1) || lifted.is_empty() {
                 return Ok(None);
             }
             shift_outer_depth(&mut base, 1);
-            let left_types = left.schema();
-            let btypes = base.schema();
             let mut on: Vec<Expr> = lifted.iter().map(|p| to_join_cond(p, nl)).collect();
-            for (j, l) in lhs.iter().enumerate() {
-                if j >= vis {
-                    return Ok(None);
+            let join_kind = if let ApplyKind::Semi { lhs, negated, .. } = kind {
+                let left_types = left.schema();
+                let btypes = base.schema();
+                for (j, l) in lhs.iter().enumerate() {
+                    if j >= vis {
+                        return Ok(None);
+                    }
+                    let lt = l.ty(&left_types);
+                    on.push(sql_eq(l.clone(), &lt, Expr::Column(nl + j), &btypes[j].ty)?);
                 }
-                let lt = l.ty(&left_types);
-                on.push(sql_eq(l.clone(), &lt, Expr::Column(nl + j), &btypes[j].ty)?);
-            }
-            Ok(Some(Rel::Join {
-                left: Box::new(left.clone()),
-                right: Box::new(base),
-                kind: if *negated { JoinKind::Anti } else { JoinKind::Semi },
-                on,
-            }))
-        }
-        ApplyKind::Lateral { left_outer: false } => {
-            let Some((mut base, lifted, vis)) = lift_filters(right) else { return Ok(None) };
-            if base.has_outer_refs(1) || lifted.is_empty() {
-                return Ok(None);
-            }
-            shift_outer_depth(&mut base, 1);
-            let on: Vec<Expr> = lifted.iter().map(|p| to_join_cond(p, nl)).collect();
-            let j = Rel::Join { left: Box::new(left.clone()), right: Box::new(base), kind: JoinKind::Inner, on };
-            Ok(Some(j.project((0..nl + vis).collect())))
+                if *negated { JoinKind::Anti } else { JoinKind::Semi }
+            } else {
+                JoinKind::Inner
+            };
+            let j = Rel::Join { left: Box::new(left.clone()), right: Box::new(base), kind: join_kind, on };
+            Ok(Some(if join_kind == JoinKind::Inner { j.project((0..nl + vis).collect()) } else { j }))
         }
         ApplyKind::Scalar => simple_scalar_agg(left, right),
         _ => Ok(None),

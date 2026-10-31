@@ -289,15 +289,6 @@ impl Graph {
         }
     }
 
-    #[allow(dead_code)]
-    fn copyins(&mut self, old: u32, new: u32) {
-        let ins = self.states[old as usize].ins.clone();
-        for a in ins {
-            let from = self.arcs[a as usize].from;
-            self.cparc(a, from, new);
-        }
-    }
-
     fn moveouts(&mut self, old: u32, new: u32) {
         debug_assert!(old != new);
         let outs = self.states[old as usize].outs.clone();

@@ -54,7 +54,7 @@ fn int_div(a: &Datum, b: &Datum) -> Result<Datum> {
     }
     int_binop(a, b, "/", |x, y| x.checked_div(y))
 }
-fn int_mod(a: &Datum, b: &Datum) -> Result<Datum> {
+pub(super) fn int_mod(a: &Datum, b: &Datum) -> Result<Datum> {
     if b.as_i64() == Some(0) {
         return Err(div_zero());
     }
@@ -96,14 +96,6 @@ fn int_neg(a: &Datum) -> Result<Datum> {
         Datum::Int4(x) => Datum::Int4(x.checked_neg().ok_or_else(|| range_err("integer"))?),
         Datum::Int8(x) => Datum::Int8(x.checked_neg().ok_or_else(|| range_err("bigint"))?),
         _ => return Err(SqlError::internal("int_neg")),
-    })
-}
-fn int_abs(a: &Datum) -> Result<Datum> {
-    Ok(match a {
-        Datum::Int2(x) => Datum::Int2(x.checked_abs().ok_or_else(|| range_err("smallint"))?),
-        Datum::Int4(x) => Datum::Int4(x.checked_abs().ok_or_else(|| range_err("integer"))?),
-        Datum::Int8(x) => Datum::Int8(x.checked_abs().ok_or_else(|| range_err("bigint"))?),
-        _ => return Err(SqlError::internal("int_abs")),
     })
 }
 fn int_not(a: &Datum) -> Result<Datum> {
@@ -225,13 +217,6 @@ fn float_neg(a: &Datum) -> Result<Datum> {
         _ => return Err(SqlError::internal("float_neg")),
     })
 }
-fn float_abs(a: &Datum) -> Result<Datum> {
-    Ok(match a {
-        Datum::Float4(x) => Datum::Float4(x.abs()),
-        Datum::Float8(x) => Datum::Float8(x.abs()),
-        _ => return Err(SqlError::internal("float_abs")),
-    })
-}
 
 /// PostgreSQL dpow semantics.
 pub fn float8_pow(a: &Datum, b: &Datum) -> Result<Datum> {
@@ -290,9 +275,6 @@ fn num_pow(a: &Datum, b: &Datum) -> Result<Datum> {
 }
 fn num_neg(a: &Datum) -> Result<Datum> {
     Ok(Datum::numeric(num(a).neg()))
-}
-fn num_abs(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).abs()))
 }
 
 // ---------------------------------------------------------------- comparison
@@ -559,8 +541,9 @@ pub fn text_array(d: &Datum) -> Vec<Option<String>> {
     }
 }
 
-fn opt_jsonb(j: Option<&Jsonb>) -> Datum {
+pub(super) fn jsonb_result(j: Option<&Jsonb>, text: bool) -> Datum {
     match j {
+        Some(j) if text => opt_text(j.as_text()),
         Some(j) => Datum::jsonb(j.clone()),
         None => Datum::Null,
     }
@@ -572,39 +555,17 @@ fn opt_text(s: Option<String>) -> Datum {
     }
 }
 
-fn jsonb_get(a: &Datum, b: &Datum) -> Result<Datum> {
-    let j = jsonb(a);
-    Ok(match b {
-        Datum::Text(k) => opt_jsonb(j.get_key(k)),
-        Datum::Int4(i) => opt_jsonb(j.get_index(*i as i64)),
-        _ => Datum::Null,
-    })
-}
-fn jsonb_get_text(a: &Datum, b: &Datum) -> Result<Datum> {
+fn jsonb_get(a: &Datum, b: &Datum, text: bool) -> Result<Datum> {
     let j = jsonb(a);
     let v = match b {
         Datum::Text(k) => j.get_key(k),
         Datum::Int4(i) => j.get_index(*i as i64),
         _ => None,
     };
-    Ok(opt_text(v.and_then(|v| v.as_text())))
+    Ok(jsonb_result(v, text))
 }
 fn path_strs(d: &Datum) -> Option<Vec<String>> {
-    let v = text_array(d);
-    if v.iter().any(|e| e.is_none()) {
-        return None;
-    }
-    Some(v.into_iter().map(|e| e.unwrap()).collect())
-}
-fn jsonb_path(a: &Datum, b: &Datum) -> Result<Datum> {
-    let Some(p) = path_strs(b) else { return Ok(Datum::Null) };
-    let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
-    Ok(opt_jsonb(jsonb(a).get_path(&refs)))
-}
-fn jsonb_path_text(a: &Datum, b: &Datum) -> Result<Datum> {
-    let Some(p) = path_strs(b) else { return Ok(Datum::Null) };
-    let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
-    Ok(opt_text(jsonb(a).get_path(&refs).and_then(|v| v.as_text())))
+    text_array(d).into_iter().collect()
 }
 fn jsonb_contains(a: &Datum, b: &Datum) -> Result<Datum> {
     Ok(Datum::Bool(jsonb(a).contains(jsonb(b))))
@@ -648,7 +609,7 @@ fn jsonb_delete_path(a: &Datum, b: &Datum) -> Result<Datum> {
     let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
     Ok(Datum::jsonb(jsonb(a).delete_path(&refs)?))
 }
-fn json_get(a: &Datum, b: &Datum) -> Result<Datum> {
+fn json_get(a: &Datum, b: &Datum, text: bool) -> Result<Datum> {
     let s = a.as_str().unwrap();
     let r = match b {
         Datum::Text(k) => pgfuncs::json::json_text_get_key(s, k)?,
@@ -656,19 +617,8 @@ fn json_get(a: &Datum, b: &Datum) -> Result<Datum> {
         _ => None,
     };
     Ok(match r {
+        Some(v) if text => opt_text(pgfuncs::json::json_text_as_text(&v)?),
         Some(v) => Datum::Json(Arc::from(v.as_str())),
-        None => Datum::Null,
-    })
-}
-fn json_get_text(a: &Datum, b: &Datum) -> Result<Datum> {
-    let s = a.as_str().unwrap();
-    let r = match b {
-        Datum::Text(k) => pgfuncs::json::json_text_get_key(s, k)?,
-        Datum::Int4(i) => pgfuncs::json::json_text_get_index(s, *i as i64)?,
-        _ => None,
-    };
-    Ok(match r {
-        Some(v) => opt_text(pgfuncs::json::json_text_as_text(&v)?),
         None => Datum::Null,
     })
 }
@@ -711,7 +661,7 @@ pub fn register(b: &mut Builder) {
         b.op2(">>", t.clone(), T::Int4, t.clone(), int_shr);
         b.op1("-", t.clone(), t.clone(), int_neg);
         b.op1("+", t.clone(), t.clone(), identity);
-        b.op1("@", t.clone(), t.clone(), int_abs);
+        b.op1("@", t.clone(), t.clone(), super::builtins::abs_any);
         b.op1("~", t.clone(), t.clone(), int_not);
     }
     for t in [T::Float4, T::Float8] {
@@ -721,7 +671,7 @@ pub fn register(b: &mut Builder) {
         b.op2("/", t.clone(), t.clone(), t.clone(), float_div);
         b.op1("-", t.clone(), t.clone(), float_neg);
         b.op1("+", t.clone(), t.clone(), identity);
-        b.op1("@", t.clone(), t.clone(), float_abs);
+        b.op1("@", t.clone(), t.clone(), super::builtins::abs_any);
     }
     // mixed float4/float8 arithmetic is float8; these operators also make
     // float4 op integer/numeric resolve to float8, as in PostgreSQL (no
@@ -741,7 +691,7 @@ pub fn register(b: &mut Builder) {
     b.op2("^", T::Numeric, T::Numeric, T::Numeric, num_pow);
     b.op1("-", T::Numeric, T::Numeric, num_neg);
     b.op1("+", T::Numeric, T::Numeric, identity);
-    b.op1("@", T::Numeric, T::Numeric, num_abs);
+    b.op1("@", T::Numeric, T::Numeric, super::builtins::abs_any);
 
     // comparisons
     let comparable = [
@@ -832,12 +782,12 @@ pub fn register(b: &mut Builder) {
 
     // jsonb / json
     let text_arr = T::Array(Box::new(T::Text));
-    b.op2("->", T::Jsonb, T::Text, T::Jsonb, jsonb_get);
-    b.op2("->", T::Jsonb, T::Int4, T::Jsonb, jsonb_get);
-    b.op2("->>", T::Jsonb, T::Text, T::Text, jsonb_get_text);
-    b.op2("->>", T::Jsonb, T::Int4, T::Text, jsonb_get_text);
-    b.op2("#>", T::Jsonb, text_arr.clone(), T::Jsonb, jsonb_path);
-    b.op2("#>>", T::Jsonb, text_arr.clone(), T::Text, jsonb_path_text);
+    b.op2("->", T::Jsonb, T::Text, T::Jsonb, |a, b| jsonb_get(a, b, false));
+    b.op2("->", T::Jsonb, T::Int4, T::Jsonb, |a, b| jsonb_get(a, b, false));
+    b.op2("->>", T::Jsonb, T::Text, T::Text, |a, b| jsonb_get(a, b, true));
+    b.op2("->>", T::Jsonb, T::Int4, T::Text, |a, b| jsonb_get(a, b, true));
+    b.op2("#>", T::Jsonb, text_arr.clone(), T::Jsonb, |a, b| super::builtins::jsonb_extract_path(a, std::slice::from_ref(b), false));
+    b.op2("#>>", T::Jsonb, text_arr.clone(), T::Text, |a, b| super::builtins::jsonb_extract_path(a, std::slice::from_ref(b), true));
     b.op2("@>", T::Jsonb, T::Jsonb, T::Bool, jsonb_contains);
     b.op2("<@", T::Jsonb, T::Jsonb, T::Bool, jsonb_contained);
     b.op2("?", T::Jsonb, T::Text, T::Bool, jsonb_exists);
@@ -848,10 +798,10 @@ pub fn register(b: &mut Builder) {
     b.op2("-", T::Jsonb, T::Int4, T::Jsonb, jsonb_delete);
     b.op2("-", T::Jsonb, text_arr.clone(), T::Jsonb, jsonb_delete);
     b.op2("#-", T::Jsonb, text_arr.clone(), T::Jsonb, jsonb_delete_path);
-    b.op2("->", T::Json, T::Text, T::Json, json_get);
-    b.op2("->", T::Json, T::Int4, T::Json, json_get);
-    b.op2("->>", T::Json, T::Text, T::Text, json_get_text);
-    b.op2("->>", T::Json, T::Int4, T::Text, json_get_text);
+    b.op2("->", T::Json, T::Text, T::Json, |a, b| json_get(a, b, false));
+    b.op2("->", T::Json, T::Int4, T::Json, |a, b| json_get(a, b, false));
+    b.op2("->>", T::Json, T::Text, T::Text, |a, b| json_get(a, b, true));
+    b.op2("->>", T::Json, T::Int4, T::Text, |a, b| json_get(a, b, true));
 
     // arrays
     // not strict, like array_cat / array_append / array_prepend

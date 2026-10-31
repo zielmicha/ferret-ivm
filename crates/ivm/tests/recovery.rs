@@ -6,15 +6,10 @@ use common::{exec, rows, start_in as start};
 
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-recovery-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
+use common::temp_dir as tmpdir;
 
 /// CREATE OR REPLACE keeps a view's object id, so a replaced view can read
 /// from a view created after it. Recovery re-plans the checkpointed catalog

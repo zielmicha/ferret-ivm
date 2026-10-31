@@ -76,7 +76,10 @@ impl<T> ChunkSender<T> {
     /// the chunks before it. False once the stream should end: the
     /// consumer is gone, or `stop` says so.
     pub fn send(&self, rows: T, bytes: usize) -> bool {
-        let mut msg = Ok(Chunk::new(rows, self.meter.charge(bytes)));
+        self.send_message(Ok(Chunk::new(rows, self.meter.charge(bytes))))
+    }
+
+    fn send_message(&self, mut msg: Result<Chunk<T>>) -> bool {
         loop {
             match self.tx.send_timeout(msg, POLL) {
                 Ok(()) => return true,
@@ -94,13 +97,7 @@ impl<T> ChunkSender<T> {
     /// End the stream with an error (the consumer gets it after the chunks
     /// sent before), waiting for room as `send` does.
     pub fn fail(&self, e: SqlError) {
-        let mut msg = Err(e);
-        while let Err(SendTimeoutError::Timeout(m)) = self.tx.send_timeout(msg, POLL) {
-            if (self.stop)() {
-                return;
-            }
-            msg = m;
-        }
+        self.send_message(Err(e));
     }
 }
 

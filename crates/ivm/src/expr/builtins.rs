@@ -1,7 +1,7 @@
 //! Built-in scalar functions.
 
 use super::func::{Builder, Imp, Ret, Volatility, P};
-use super::ops::{as_text, div_zero, jsonb, overflow, range_err, regex, text_array, underflow};
+use super::ops::{as_text, jsonb, jsonb_result, overflow, range_err, regex, text_array, underflow};
 use crate::error::{codes, Result, SqlError};
 use crate::types::text::{format_datum, SESSION_TZ};
 use crate::types::{ArrayValue, Datum, SqlType};
@@ -35,7 +35,7 @@ fn log_err(msg: &str) -> SqlError {
 
 // ---------------------------------------------------------------- math
 
-fn abs_any(a: &Datum) -> Result<Datum> {
+pub(super) fn abs_any(a: &Datum) -> Result<Datum> {
     Ok(match a {
         Datum::Int2(x) => Datum::Int2(x.checked_abs().ok_or_else(|| range_err("smallint"))?),
         Datum::Int4(x) => Datum::Int4(x.checked_abs().ok_or_else(|| range_err("integer"))?),
@@ -107,7 +107,7 @@ fn exp_f(a: &Datum) -> Result<Datum> {
     }
     f8(r)
 }
-fn ln_f(a: &Datum) -> Result<Datum> {
+fn log_f(a: &Datum, base10: bool) -> Result<Datum> {
     let x = f(a);
     if x == 0.0 {
         return Err(log_err("cannot take logarithm of zero"));
@@ -115,27 +115,10 @@ fn ln_f(a: &Datum) -> Result<Datum> {
     if x < 0.0 {
         return Err(log_err("cannot take logarithm of a negative number"));
     }
-    f8(x.ln())
-}
-fn log10_f(a: &Datum) -> Result<Datum> {
-    let x = f(a);
-    if x == 0.0 {
-        return Err(log_err("cannot take logarithm of zero"));
-    }
-    if x < 0.0 {
-        return Err(log_err("cannot take logarithm of a negative number"));
-    }
-    f8(x.log10())
+    f8(if base10 { x.log10() } else { x.ln() })
 }
 fn log10_n(a: &Datum) -> Result<Datum> {
     Ok(Datum::numeric(n(a).log10()?))
-}
-fn mod_int(a: &Datum, b: &Datum) -> Result<Datum> {
-    if i(b) == 0 {
-        return Err(div_zero());
-    }
-    let r = if i(b) == -1 { 0 } else { i(a) % i(b) };
-    super::cast::int_to(r, &datum_int_type(a))
 }
 fn datum_int_type(d: &Datum) -> SqlType {
     match d {
@@ -883,27 +866,13 @@ fn path_args(args: &[Datum]) -> Option<Vec<String>> {
     }
     Some(out)
 }
-fn jsonb_extract_path(args: &[Datum]) -> Result<Datum> {
-    if args[0].is_null() {
+pub(super) fn jsonb_extract_path(a: &Datum, path: &[Datum], text: bool) -> Result<Datum> {
+    if a.is_null() {
         return Ok(Datum::Null);
     }
-    let Some(p) = path_args(&args[1..]) else { return Ok(Datum::Null) };
+    let Some(p) = path_args(path) else { return Ok(Datum::Null) };
     let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
-    Ok(match jsonb(&args[0]).get_path(&refs) {
-        Some(j) => Datum::jsonb(j.clone()),
-        None => Datum::Null,
-    })
-}
-fn jsonb_extract_path_text(args: &[Datum]) -> Result<Datum> {
-    if args[0].is_null() {
-        return Ok(Datum::Null);
-    }
-    let Some(p) = path_args(&args[1..]) else { return Ok(Datum::Null) };
-    let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
-    Ok(match jsonb(&args[0]).get_path(&refs).and_then(|j| j.as_text()) {
-        Some(t) => txt(t),
-        None => Datum::Null,
-    })
+    Ok(jsonb_result(jsonb(a).get_path(&refs), text))
 }
 fn jsonb_set(args: &[Datum]) -> Result<Datum> {
     let Some(p) = path_args(&args[1..2]) else { return Ok(Datum::Null) };
@@ -980,27 +949,10 @@ fn arr(d: &Datum) -> &ArrayValue {
         _ => panic!("array argument expected"),
     }
 }
-fn array_length(a: &Datum, b: &Datum) -> Result<Datum> {
-    let x = arr(a);
+fn array_bound(a: &Datum, b: &Datum, value: fn(i32, i32) -> i32) -> Result<Datum> {
     let dim = i(b);
-    Ok(match x.dims.get((dim - 1).max(0) as usize) {
-        Some((_, len)) if dim >= 1 => Datum::Int4(*len),
-        _ => Datum::Null,
-    })
-}
-fn array_upper(a: &Datum, b: &Datum) -> Result<Datum> {
-    let x = arr(a);
-    let dim = i(b);
-    Ok(match x.dims.get((dim - 1).max(0) as usize) {
-        Some((lb, len)) if dim >= 1 => Datum::Int4(lb + len - 1),
-        _ => Datum::Null,
-    })
-}
-fn array_lower(a: &Datum, b: &Datum) -> Result<Datum> {
-    let x = arr(a);
-    let dim = i(b);
-    Ok(match x.dims.get((dim - 1).max(0) as usize) {
-        Some((lb, _)) if dim >= 1 => Datum::Int4(*lb),
+    Ok(match arr(a).dims.get((dim - 1).max(0) as usize) {
+        Some(&(lb, len)) if dim >= 1 => Datum::Int4(value(lb, len)),
         _ => Datum::Null,
     })
 }
@@ -1123,15 +1075,15 @@ pub fn register(b: &mut Builder) {
     b.f1("cbrt", T::Float8, T::Float8, |a| f8(glibc_cbrt(f(a))));
     b.f1("exp", T::Float8, T::Float8, exp_f);
     b.f1("exp", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).exp()?)));
-    b.f1("ln", T::Float8, T::Float8, ln_f);
+    b.f1("ln", T::Float8, T::Float8, |a| log_f(a, false));
     b.f1("ln", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(n(a).ln()?)));
-    b.f1("log", T::Float8, T::Float8, log10_f);
+    b.f1("log", T::Float8, T::Float8, |a| log_f(a, true));
     b.f1("log", T::Numeric, T::Numeric, log10_n);
     b.f2("log", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).log(n(b))?)));
-    b.f1("log10", T::Float8, T::Float8, log10_f);
+    b.f1("log10", T::Float8, T::Float8, |a| log_f(a, true));
     b.f1("log10", T::Numeric, T::Numeric, log10_n);
     for t in [T::Int2, T::Int4, T::Int8] {
-        b.f2("mod", t.clone(), t.clone(), t.clone(), mod_int);
+        b.f2("mod", t.clone(), t.clone(), t.clone(), super::ops::int_mod);
     }
     b.f2("mod", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).rem(n(b))?)));
     b.f2("div", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(n(a).div_trunc(n(b))?)));
@@ -1493,18 +1445,12 @@ pub fn register(b: &mut Builder) {
     // json
     b.poly("to_jsonb", vec![P::AnyElement], Ret::T(T::Jsonb), Imp::F1(to_jsonb));
     b.poly("to_json", vec![P::AnyElement], Ret::T(T::Json), Imp::F1(to_json));
-    for (name, fun) in
-        [("jsonb_build_object", jsonb_build_object as super::func::FnN), ("json_build_object", json_build_object)]
-    {
-        let ret = if name.starts_with("jsonb") { T::Jsonb } else { T::Json };
-        let d = b.poly(name, vec![P::Any], Ret::T(ret.clone()), Imp::FN(fun));
-        d.variadic = true;
-        d.strict = false;
-        b.poly(name, vec![], Ret::T(ret), Imp::FN(fun)).strict = false;
-    }
-    for (name, fun) in
-        [("jsonb_build_array", jsonb_build_array as super::func::FnN), ("json_build_array", json_build_array)]
-    {
+    for (name, fun) in [
+        ("jsonb_build_object", jsonb_build_object as super::func::FnN),
+        ("json_build_object", json_build_object),
+        ("jsonb_build_array", jsonb_build_array),
+        ("json_build_array", json_build_array),
+    ] {
         let ret = if name.starts_with("jsonb") { T::Jsonb } else { T::Json };
         let d = b.poly(name, vec![P::Any], Ret::T(ret.clone()), Imp::FN(fun));
         d.variadic = true;
@@ -1520,7 +1466,7 @@ pub fn register(b: &mut Builder) {
             "jsonb_extract_path",
             vec![P::T(T::Jsonb), P::T(T::Text)],
             Ret::T(T::Jsonb),
-            Imp::FN(jsonb_extract_path),
+            Imp::FN(|args| jsonb_extract_path(&args[0], &args[1..], false)),
         );
         d.variadic = true;
         d.strict = false;
@@ -1529,7 +1475,7 @@ pub fn register(b: &mut Builder) {
             "jsonb_extract_path_text",
             vec![P::T(T::Jsonb), P::T(T::Text)],
             Ret::T(T::Text),
-            Imp::FN(jsonb_extract_path_text),
+            Imp::FN(|args| jsonb_extract_path(&args[0], &args[1..], true)),
         );
         d.variadic = true;
         d.strict = false;
@@ -1566,11 +1512,11 @@ pub fn register(b: &mut Builder) {
     b.f1("jsonb_pretty", T::Jsonb, T::Text, |a| Ok(txt(jsonb(a).to_pretty())));
 
     // arrays
-    b.poly("array_length", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(array_length)).can_return_null =
+    b.poly("array_length", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(|a, b| array_bound(a, b, |_, len| len))).can_return_null =
         true;
-    b.poly("array_upper", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(array_upper)).can_return_null =
+    b.poly("array_upper", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(|a, b| array_bound(a, b, |lb, len| lb + len - 1))).can_return_null =
         true;
-    b.poly("array_lower", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(array_lower)).can_return_null =
+    b.poly("array_lower", vec![P::AnyArray, P::T(T::Int4)], Ret::T(T::Int4), Imp::F2(|a, b| array_bound(a, b, |lb, _| lb))).can_return_null =
         true;
     b.poly("cardinality", vec![P::AnyArray], Ret::T(T::Int4), Imp::F1(|a| Ok(Datum::Int4(arr(a).elems.len() as i32))));
     b.poly("array_ndims", vec![P::AnyArray], Ret::T(T::Int4), Imp::F1(array_ndims)).can_return_null = true;
@@ -1602,14 +1548,14 @@ pub fn register(b: &mut Builder) {
         "array_append",
         vec![P::AnyArray, P::AnyElement],
         Ret::ArrayOfElem,
-        Imp::FN(|args| array_append2(&args[0], &args[1])),
+        Imp::F2(array_append2),
     )
     .strict = false;
     b.poly(
         "array_prepend",
         vec![P::AnyElement, P::AnyArray],
         Ret::ArrayOfElem,
-        Imp::FN(|args| array_prepend2(&args[0], &args[1])),
+        Imp::F2(array_prepend2),
     )
     .strict = false;
     {
@@ -1617,7 +1563,7 @@ pub fn register(b: &mut Builder) {
             "array_cat",
             vec![P::AnyArray, P::AnyArray],
             Ret::ArrayOfElem,
-            Imp::FN(|args| array_cat2(&args[0], &args[1])),
+            Imp::F2(array_cat2),
         );
         d.strict = false;
         d.can_return_null = true;

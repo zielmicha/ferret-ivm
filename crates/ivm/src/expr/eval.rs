@@ -11,6 +11,19 @@ use std::cmp::Ordering;
 #[derive(Default)]
 pub struct EvalScratch;
 
+// AND / OR and ANY / ALL use the same three-valued, short-circuit fold.
+fn eval_bool(values: impl Iterator<Item = Result<Datum>>, all: bool) -> Result<Datum> {
+    let mut saw_null = false;
+    for value in values {
+        match value?.as_bool() {
+            Some(b) if b != all => return Ok(Datum::Bool(b)),
+            None => saw_null = true,
+            _ => {}
+        }
+    }
+    Ok(if saw_null { Datum::Null } else { Datum::Bool(all) })
+}
+
 impl Expr {
     /// Evaluate against one input row.
     pub fn eval(&self, row: &[Datum]) -> Result<Datum> {
@@ -52,27 +65,8 @@ impl Expr {
                 Datum::Bool(b) => Datum::Bool(!b),
                 _ => Datum::Null,
             }),
-            Expr::And(v) => {
-                let mut saw_null = false;
-                for e in v {
-                    match e.eval(row)? {
-                        Datum::Bool(false) => return Ok(Datum::Bool(false)),
-                        Datum::Bool(true) => {}
-                        _ => saw_null = true,
-                    }
-                }
-                Ok(if saw_null { Datum::Null } else { Datum::Bool(true) })
-            }
-            Expr::Or(v) => {
-                let mut saw_null = false;
-                for e in v {
-                    match e.eval(row)? {
-                        Datum::Bool(true) => return Ok(Datum::Bool(true)),
-                        Datum::Bool(false) => {}
-                        _ => saw_null = true,
-                    }
-                }
-                Ok(if saw_null { Datum::Null } else { Datum::Bool(false) })
+            Expr::And(v) | Expr::Or(v) => {
+                eval_bool(v.iter().map(|e| e.eval(row)), matches!(self, Expr::And(_)))
             }
             Expr::IsNull(e) => Ok(Datum::Bool(e.eval(row)?.is_null())),
             Expr::IsNotNull(e) => Ok(Datum::Bool(!e.eval(row)?.is_null())),
@@ -196,17 +190,9 @@ impl Expr {
                 let Datum::Array(arr) = av else { return Ok(Datum::Null) };
                 let def = func_def(*func);
                 let Imp::F2(f) = def.imp else { return Err(SqlError::internal("ANY/ALL operator")) };
-                let mut saw_null = false;
-                for e in &arr.elems {
-                    let r = if x.is_null() || e.is_null() { Datum::Null } else { f(&x, e)? };
-                    match (r.as_bool(), all) {
-                        (Some(true), false) => return Ok(Datum::Bool(true)),
-                        (Some(false), true) => return Ok(Datum::Bool(false)),
-                        (None, _) => saw_null = true,
-                        _ => {}
-                    }
-                }
-                Ok(if saw_null { Datum::Null } else { Datum::Bool(*all) })
+                eval_bool(arr.elems.iter().map(|e| {
+                    if x.is_null() || e.is_null() { Ok(Datum::Null) } else { f(&x, e) }
+                }), *all)
             }
             Expr::Error(code, msg) => Err(SqlError::new(code, msg.clone())),
             Expr::Outer(..) | Expr::Subquery(_) | Expr::AggRef(..) | Expr::WindowRef(..) | Expr::SrfRef(..) => {
@@ -230,36 +216,23 @@ impl Expr {
     /// constant, AND / OR arguments after a constant false / true.
     pub fn fold(self) -> Result<Expr> {
         let mut e = self;
+        let and = matches!(e, Expr::And(_));
         match e {
-            Expr::And(v) => {
+            Expr::And(v) | Expr::Or(v) => {
                 let mut out = Vec::new();
                 for x in v {
                     match x.fold()? {
-                        Expr::Literal(Datum::Bool(true), _) => {}
-                        Expr::Literal(Datum::Bool(false), _) => return Ok(Expr::bool(false)),
-                        Expr::And(inner) => out.extend(inner),
+                        Expr::Literal(Datum::Bool(b), _) if b != and => return Ok(Expr::bool(b)),
+                        Expr::Literal(Datum::Bool(_), _) => {}
+                        Expr::And(inner) if and => out.extend(inner),
+                        Expr::Or(inner) if !and => out.extend(inner),
                         other => out.push(other),
                     }
                 }
                 return Ok(match out.len() {
-                    0 => Expr::bool(true),
+                    0 => Expr::bool(and),
                     1 => out.pop().unwrap(),
-                    _ => Expr::And(out),
-                });
-            }
-            Expr::Or(v) => {
-                let mut out = Vec::new();
-                for x in v {
-                    match x.fold()? {
-                        Expr::Literal(Datum::Bool(false), _) => {}
-                        Expr::Literal(Datum::Bool(true), _) => return Ok(Expr::bool(true)),
-                        Expr::Or(inner) => out.extend(inner),
-                        other => out.push(other),
-                    }
-                }
-                return Ok(match out.len() {
-                    0 => Expr::bool(false),
-                    1 => out.pop().unwrap(),
+                    _ if and => Expr::And(out),
                     _ => Expr::Or(out),
                 });
             }

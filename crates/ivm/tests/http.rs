@@ -2,6 +2,9 @@
 //! PostgreSQL needed). Requests go over raw TCP (or a Unix-domain socket)
 //! so malformed ones can be sent too.
 
+mod common;
+use common::temp_dir as tmpdir;
+
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
 use ivm::http::{HttpConfig, HttpServer};
@@ -14,13 +17,6 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-http-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
 
 struct Fixture {
     running: Option<coord::Running>,

@@ -184,7 +184,7 @@ pub(crate) fn decode_key(buf: &[u8]) -> Result<(Numeric, usize)> {
     if v.weight > NUMERIC_WEIGHT_MAX || v.weight < NUMERIC_WEIGHT_MIN {
         return Err(key_error("weight out of range"));
     }
-    v.dscale = min_scale_of(&v);
+    v.dscale = crate::get_min_scale(&v);
     if v.dscale > NUMERIC_DSCALE_MAX {
         return Err(key_error("scale out of range"));
     }
@@ -218,22 +218,6 @@ pub(crate) fn key_len(buf: &[u8], complemented: bool) -> Result<usize> {
         if b & 1 == 0 {
             return Ok(pos);
         }
-    }
-}
-
-fn min_scale_of(v: &Numeric) -> i32 {
-    // digits are stripped, so the last digit is nonzero
-    let last = v.nd() - 1;
-    let mut min_scale = (last - v.weight) * DEC_DIGITS;
-    if min_scale > 0 {
-        let mut d = v.dig(last);
-        while d % 10 == 0 {
-            min_scale -= 1;
-            d /= 10;
-        }
-        min_scale
-    } else {
-        0
     }
 }
 
@@ -389,7 +373,7 @@ fn decode_binary_checked(buf: &[u8], check_range: bool) -> Result<(Numeric, usiz
         strip_var(&mut v);
         v
     };
-    if !v.digits.is_empty() && min_scale_of(&v) > v.dscale {
+    if !v.digits.is_empty() && crate::get_min_scale(&v) > v.dscale {
         return Err(bin_error("scale hides digits"));
     }
     Ok((v, pos))

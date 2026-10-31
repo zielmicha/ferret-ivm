@@ -17,7 +17,8 @@
 use super::agg::AggSpec;
 use super::delta::{EntryDeltas, NodeDelta, StepOut, Version};
 use super::*;
-use crate::sql::plan::{FrameBound, FrameUnits, RangeOffsets, SortKey, WindowFunc};
+use crate::sql::plan::{FrameBound, FrameUnits, RangeOffsets, SortKey, WindowCall, WindowFunc};
+use crate::exec::compare_rows as order_cmp;
 use crate::storage::{AggKind, Summary};
 use crate::types::{Datum, SqlType};
 use std::cmp::Ordering;
@@ -40,6 +41,18 @@ pub struct WinSpec {
 }
 
 impl WinSpec {
+    pub fn new(call: &WindowCall, schema: &[ColumnType], constant_arg: Option<Datum>) -> Self {
+        Self {
+            func: call.func,
+            args: call.args.clone(),
+            frame: call.frame,
+            arg_types: call.args.iter().map(|a| schema[*a].ty.clone()).collect(),
+            ret: call.ret.clone(),
+            range: call.range.clone(),
+            constant_arg,
+        }
+    }
+
     fn agg(&self) -> Option<AggSpec> {
         let WindowFunc::Agg(func) = self.func else { return None };
         Some(AggSpec {
@@ -147,25 +160,6 @@ impl WindowPlan {
             })
             .collect()
     }
-}
-
-fn order_cmp(a: &Row, b: &Row, order: &[SortKey]) -> Ordering {
-    for k in order {
-        let (x, y) = (&a[k.col], &b[k.col]);
-        let c = match (x.is_null(), y.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => if k.spec.nulls_first { Ordering::Less } else { Ordering::Greater },
-            (false, true) => if k.spec.nulls_first { Ordering::Greater } else { Ordering::Less },
-            _ => {
-                let c = x.sql_cmp(y);
-                if k.spec.desc { c.reverse() } else { c }
-            }
-        };
-        if c != Ordering::Equal {
-            return c;
-        }
-    }
-    Ordering::Equal
 }
 
 // ------------------------------------------------------------------ runs

@@ -1,9 +1,9 @@
 //! Integration-test engine lifecycle and SQL assertions.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 #[path = "../../src/testkit.rs"]
 mod testkit;
-pub use testkit::TempDir;
+pub use testkit::{TempDir, temp_dir};
 
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, Config, EngineHandle};

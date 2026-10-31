@@ -152,7 +152,7 @@ impl NameIndex {
 
 impl Catalog {
     pub fn new() -> Catalog {
-        Catalog { objects: BTreeMap::new(), next_id: 1000, history: Vec::new(), instance_id: None, changed: BTreeSet::new(), names: Default::default() }
+        Catalog { next_id: 1000, ..Default::default() }
     }
 
     pub fn alloc_id(&mut self) -> ObjectId {

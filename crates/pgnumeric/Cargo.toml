@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 smallvec = { version = "1.16.4", features = ["union", "const_generics"] }
+
+[dev-dependencies]
+serde_json = "1"

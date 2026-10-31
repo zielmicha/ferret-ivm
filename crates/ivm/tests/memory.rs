@@ -13,15 +13,16 @@
 //! key's heap block, so 128 MiB of accounted cache took over 500 MiB; and a
 //! full scan loaded the whole tree before evicting anything.
 
+mod common;
+use common::{exec, rows, temp_dir as dir};
+
 use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
 use ivm::storage::{AggKind, CountSummarizer, Env, EnvOptions, Summarizer, Summary};
-use ivm::types::text::format_datum;
 use ivm::types::Datum;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ops::Bound;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -103,13 +104,6 @@ fn heap() -> (usize, usize) {
 }
 
 const MB: usize = 1 << 20;
-
-fn dir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-    let d = base.join(format!("ivm-memory-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
 
 /// MAX over the key's bytes as text: every child pointer of an internal
 /// node carries one key-sized value.
@@ -333,17 +327,6 @@ fn a_scan_keeps_the_working_set() {
 fn try_exec(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {
     let stmt = ivm::sql::parse_statement(sql).map_err(|e| format!("parse: {e}"))?;
     h.execute(stmt, vec![], SessionVars::default(), String::new()).map_err(|e| format!("{} {}", e.code, e.message))
-}
-
-fn exec(h: &EngineHandle, sql: &str) {
-    try_exec(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-}
-
-fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
-    match try_exec(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
-        ExecResult::Query { rows, .. } => rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect(),
-        other => panic!("{sql}: {other:?}"),
-    }
 }
 
 #[test]

@@ -323,16 +323,6 @@ fn own_bound(b: Bound<&[u8]>) -> Bound<Vec<u8>> {
 }
 
 #[inline]
-#[allow(dead_code)]
-fn above_lo(key: &[u8], lo: Bound<&[u8]>) -> bool {
-    match lo {
-        Bound::Unbounded => true,
-        Bound::Included(a) => key >= a,
-        Bound::Excluded(a) => key > a,
-    }
-}
-
-#[inline]
 fn below_hi(key: &[u8], hi: Bound<&[u8]>) -> bool {
     match hi {
         Bound::Unbounded => true,
@@ -2359,33 +2349,12 @@ impl Env {
         let segs = self.segs.share();
         self.frozen_at = Some(self.stamp);
         let env = Env {
-            dir: self.dir.clone(),
-            opts: self.opts.clone(),
-            segs,
             slots,
-            free_slots: Vec::new(),
             mem_bytes,
             dirty_bytes,
-            clock_hand: 0,
-            evict_stall: None,
-            swept_slots: 0,
-            work: self.work.clone(),
-            trees: self.trees.clone(),
-            next_tree_id: self.next_tree_id,
-            seg_live: self.seg_live.clone(),
-            checkpoint_seq: self.checkpoint_seq,
-            checkpoint_gsn: self.checkpoint_gsn,
-            fg_appended: 0,
-            legacy_format: self.legacy_format,
             manifest: self.manifest.take(),
-            stamp: self.stamp,
             flushed: Some(Vec::new()),
-            reads: 0,
-            read_bytes: 0,
-            read_budget: None,
-            frozen_at: None,
-            inherited: (0, 0),
-            held: crate::memory::Charge::none(),
+            ..self.snapshot_base(segs)
         };
         Ok(CheckpointJob { env, gsn })
     }
@@ -2582,13 +2551,26 @@ impl Env {
             s.inherited = true;
         }
         Ok(Env {
-            dir: self.dir.clone(),
-            opts: self.opts.clone(),
-            segs: self.segs.fork(),
             slots,
             free_slots: self.free_slots.clone(),
             mem_bytes: self.mem_bytes,
             dirty_bytes: self.dirty_bytes,
+            inherited: (self.mem_bytes, self.dirty_bytes),
+            ..self.snapshot_base(self.segs.fork())
+        })
+    }
+
+    /// Copy the tree version and shared configuration. Checkpoints and forks
+    /// supply their own node arenas; empty placeholders allocate no memory.
+    fn snapshot_base(&self, segs: SegmentStore) -> Env {
+        Env {
+            dir: self.dir.clone(),
+            opts: self.opts.clone(),
+            segs,
+            slots: Vec::new(),
+            free_slots: Vec::new(),
+            mem_bytes: 0,
+            dirty_bytes: 0,
             clock_hand: 0,
             evict_stall: None,
             swept_slots: 0,
@@ -2607,9 +2589,9 @@ impl Env {
             read_bytes: 0,
             read_budget: None,
             frozen_at: None,
-            inherited: (self.mem_bytes, self.dirty_bytes),
+            inherited: (0, 0),
             held: crate::memory::Charge::none(),
-        })
+        }
     }
 
     /// Move trees `ids` from fork `from`, where they were filled, into this

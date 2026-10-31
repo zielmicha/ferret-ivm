@@ -182,15 +182,17 @@ pub fn parse_timestamp(s: &str) -> Result<Timestamp> {
     {
         return Ok(ts);
     }
-    parse_timestamp_general(s)
+    parse_timestamp_general(s, None)
 }
 
-fn parse_timestamp_general(s: &str) -> Result<Timestamp> {
+fn parse_timestamp_general(s: &str, tz: Option<&TimeZone>) -> Result<Timestamp> {
+    let dt = if tz.is_some() { "timestamp with time zone" } else { "timestamp" };
+    let zone = tz.map(TimeZone::zone_ref);
     let (mut f, mut t) =
-        parse_date_time(s, MAXDATELEN + MAXDATEFIELDS).map_err(|e| e.to_error(s, "timestamp"))?;
-    let d = decode_date_time(&mut f, &mut t, None).map_err(|e| e.to_error(s, "timestamp"))?;
+        parse_date_time(s, MAXDATELEN + MAXDATEFIELDS).map_err(|e| e.to_error(s, dt))?;
+    let d = decode_date_time(&mut f, &mut t, zone.as_ref()).map_err(|e| e.to_error(s, dt))?;
     match d.dtype {
-        DTK_DATE => tm2timestamp(&d.tm, d.fsec, None).map_err(|_| {
+        DTK_DATE => tm2timestamp(&d.tm, d.fsec, tz.map(|_| d.tz)).map_err(|_| {
             Error::new(
                 DATETIME_VALUE_OUT_OF_RANGE,
                 format!("timestamp out of range: \"{}\"", s),
@@ -199,7 +201,7 @@ fn parse_timestamp_general(s: &str) -> Result<Timestamp> {
         DTK_EPOCH => Ok(EPOCH_TIMESTAMP),
         DTK_LATE => Ok(DT_NOEND),
         DTK_EARLY => Ok(DT_NOBEGIN),
-        _ => Err(DtErr::Code(DTERR_BAD_FORMAT).to_error(s, "timestamp")),
+        _ => Err(DtErr::Code(DTERR_BAD_FORMAT).to_error(s, dt)),
     }
 }
 
@@ -222,27 +224,7 @@ pub fn parse_timestamptz(s: &str, tz: &TimeZone) -> Result<TimestampTz> {
     {
         return Ok(ts);
     }
-    parse_timestamptz_general(s, tz)
-}
-
-fn parse_timestamptz_general(s: &str, tz: &TimeZone) -> Result<TimestampTz> {
-    let dt = "timestamp with time zone";
-    let zone = tz.zone_ref();
-    let (mut f, mut t) =
-        parse_date_time(s, MAXDATELEN + MAXDATEFIELDS).map_err(|e| e.to_error(s, dt))?;
-    let d = decode_date_time(&mut f, &mut t, Some(&zone)).map_err(|e| e.to_error(s, dt))?;
-    match d.dtype {
-        DTK_DATE => tm2timestamp(&d.tm, d.fsec, Some(d.tz)).map_err(|_| {
-            Error::new(
-                DATETIME_VALUE_OUT_OF_RANGE,
-                format!("timestamp out of range: \"{}\"", s),
-            )
-        }),
-        DTK_EPOCH => Ok(EPOCH_TIMESTAMP),
-        DTK_LATE => Ok(DT_NOEND),
-        DTK_EARLY => Ok(DT_NOBEGIN),
-        _ => Err(DtErr::Code(DTERR_BAD_FORMAT).to_error(s, dt)),
-    }
+    parse_timestamp_general(s, Some(tz))
 }
 
 pub fn format_timestamptz(t: TimestampTz, tz: &TimeZone) -> String {
@@ -546,11 +528,11 @@ mod tests {
             let b = parse_date_general(&date).map_err(|e| e.message);
             assert_eq!(a, b, "{date}");
             let a = parse_timestamp(&ts).map_err(|e| e.message);
-            let b = parse_timestamp_general(&ts).map_err(|e| e.message);
+            let b = parse_timestamp_general(&ts, None).map_err(|e| e.message);
             assert_eq!(a, b, "{ts}");
         }
         for s in ["2024-01-01 24:00:00", "2024-02-29 23:59:60", " 2024-01-01", "2024-1-01", "2024-01-01T00:00:00", "2024-01-01 00:00:00.1234567"] {
-            assert_eq!(parse_timestamp(s).map_err(|e| e.message), parse_timestamp_general(s).map_err(|e| e.message), "{s}");
+            assert_eq!(parse_timestamp(s).map_err(|e| e.message), parse_timestamp_general(s, None).map_err(|e| e.message), "{s}");
         }
         let zone = TimeZone::Utc;
         for _ in 0..20000 {
@@ -566,7 +548,7 @@ mod tests {
             let s = format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02}{frac}{zone_text}");
             assert_eq!(
                 parse_timestamptz(&s, &zone).map_err(|e| e.message),
-                parse_timestamptz_general(&s, &zone).map_err(|e| e.message),
+                parse_timestamp_general(&s, Some(&zone)).map_err(|e| e.message),
                 "{s}"
             );
         }

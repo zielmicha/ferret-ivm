@@ -954,170 +954,143 @@ impl Conn {
             .get_or_insert_with(|| "connection closed".into());
     }
 
+    /// Run a simple query through ReadyForQuery, preserving the first server
+    /// or consumer error while draining its response. Decode failures poison
+    /// the connection; ordinary query errors leave it reusable.
+    fn query_response(
+        &mut self,
+        sql: &str,
+        copy_out: bool,
+        mut consume: impl FnMut(u8, &[u8], &mut Option<Error>) -> Result<()>,
+    ) -> Result<()> {
+        self.check()?;
+        self.put_query(sql)?;
+        self.send()?;
+        let mut error = None;
+        loop {
+            let m = self.recv()?;
+            match m.0 {
+                b'E' => {
+                    let e = self.server_error(&m);
+                    if self.broken.is_some() {
+                        return Err(e);
+                    }
+                    error.get_or_insert(e);
+                }
+                b'Z' => {
+                    self.txn_status = self.body(&m).first().copied().unwrap_or(b'I');
+                    return error.map_or(Ok(()), Err);
+                }
+                b'G' | b'H' if m.0 == b'G' || !copy_out => {
+                    let message = if copy_out {
+                        "COPY FROM STDIN is not supported by this client"
+                    } else {
+                        "COPY is not supported by simple_query_rows"
+                    };
+                    if m.0 == b'G' {
+                        let at = wire::begin(&mut self.wbuf, b'f');
+                        wire::put_cstr(&mut self.wbuf, message);
+                        wire::finish(&mut self.wbuf, at);
+                        self.send()?;
+                    }
+                    if !copy_out {
+                        error.get_or_insert(Error::new(ErrorKind::Protocol, message));
+                    }
+                }
+                b'T' | b'D' | b'C' | b'I' | b'H' | b'd' | b'c' => {
+                    if let Err(e) = consume(m.0, self.body(&m), &mut error) {
+                        return Err(self.fail(e));
+                    }
+                }
+                _ if self.handle_async(&m) => {}
+                _ => return Err(self.unexpected(&m, "in simple query response")),
+            }
+        }
+    }
+
     fn simple_query_rows(
         &mut self,
         sql: &str,
         on_row: &mut OnRow<'_>,
     ) -> Result<Vec<String>> {
-        self.check()?;
-        self.put_query(sql)?;
-        self.send()?;
         let mut tags = Vec::new();
-        let mut columns: Vec<Column> = Vec::new();
-        let mut fields: Vec<(u32, i32)> = Vec::new();
-        let mut error: Option<Error> = None;
-        loop {
-            let m = self.recv()?;
-            match m.0 {
-                b'T' => match parse_row_description(self.body(&m)) {
-                    Ok(c) => columns = c,
-                    Err(e) => return Err(self.fail(e)),
-                },
+        let mut columns = Vec::new();
+        let mut fields = Vec::new();
+        self.query_response(sql, false, |tag, body, error| {
+            match tag {
+                b'T' => columns = parse_row_description(body)?,
                 b'D' => {
-                    let body = self.body(&m);
                     fields.clear();
                     let mut r = Reader::new(body);
-                    let parsed: Result<()> = (|| {
-                        let n = r.u16()? as usize;
-                        for _ in 0..n {
-                            let len = r.i32()?;
-                            let off = body.len() - r.remaining();
-                            if len > 0 {
-                                r.bytes(len as usize)?;
-                            }
-                            fields.push((off as u32, len));
+                    let n = r.u16()? as usize;
+                    for _ in 0..n {
+                        let len = r.i32()?;
+                        let off = body.len() - r.remaining();
+                        if len > 0 {
+                            r.bytes(len as usize)?;
                         }
-                        Ok(())
-                    })();
-                    if let Err(e) = parsed {
-                        return Err(self.fail(e));
+                        fields.push((off as u32, len));
                     }
                     if error.is_none()
                         && let Err(msg) = on_row(&columns, RowRef { body, fields: &fields })
                     {
-                        error = Some(Error::new(ErrorKind::Protocol, msg));
+                        *error = Some(Error::new(ErrorKind::Protocol, msg));
                     }
                 }
                 b'C' => {
-                    tags.push(Reader::new(self.body(&m)).cstr().unwrap_or_default());
+                    tags.push(Reader::new(body).cstr().unwrap_or_default());
                     columns.clear();
                 }
                 b'I' => columns.clear(),
-                b'E' => {
-                    let e = self.server_error(&m);
-                    if self.broken.is_some() {
-                        return Err(e);
-                    }
-                    error.get_or_insert(e);
-                }
-                b'Z' => {
-                    self.txn_status = self.body(&m).first().copied().unwrap_or(b'I');
-                    break;
-                }
-                b'G' | b'H' => {
-                    // COPY is not supported here: end it and report
-                    if m.0 == b'G' {
-                        let at = wire::begin(&mut self.wbuf, b'f');
-                        wire::put_cstr(&mut self.wbuf, "COPY is not supported by simple_query_rows");
-                        wire::finish(&mut self.wbuf, at);
-                        self.send()?;
-                    }
-                    error.get_or_insert(Error::new(ErrorKind::Protocol, "COPY is not supported by simple_query_rows"));
-                }
-                b'd' | b'c' => {}
-                _ if self.handle_async(&m) => {}
-                _ => return Err(self.unexpected(&m, "in simple query response")),
+                _ => {}
             }
-        }
-        match error {
-            Some(e) => Err(e),
-            None => Ok(tags),
-        }
+            Ok(())
+        })?;
+        Ok(tags)
     }
 
     fn simple_query(&mut self, sql: &str) -> Result<Vec<SimpleQueryResult>> {
-        self.check()?;
-        self.put_query(sql)?;
-        self.send()?;
         let mut results = Vec::new();
         let mut cur: Option<SimpleQueryResult> = None;
-        let mut error: Option<Error> = None;
-        loop {
-            let m = self.recv()?;
-            match m.0 {
-                b'T' => match parse_row_description(self.body(&m)) {
-                    Ok(columns) => {
-                        cur = Some(SimpleQueryResult {
-                            columns,
-                            ..Default::default()
-                        })
-                    }
-                    Err(e) => return Err(self.fail(e)),
-                },
-                b'D' => match parse_data_row(self.body(&m)) {
-                    Ok(row) => cur.get_or_insert_with(Default::default).rows.push(row),
-                    Err(e) => return Err(self.fail(e)),
-                },
+        self.query_response(sql, true, |tag, body, _| {
+            match tag {
+                b'T' => cur = Some(SimpleQueryResult {
+                    columns: parse_row_description(body)?,
+                    ..Default::default()
+                }),
+                b'D' => cur.get_or_insert_with(Default::default).rows.push(parse_data_row(body)?),
                 b'C' => {
                     let mut res = cur.take().unwrap_or_default();
-                    res.tag = Reader::new(self.body(&m)).cstr().unwrap_or_default();
+                    res.tag = Reader::new(body).cstr().unwrap_or_default();
                     results.push(res);
                 }
                 b'I' => cur = None,
-                b'E' => {
-                    let e = self.server_error(&m);
-                    if self.broken.is_some() {
-                        return Err(e);
-                    }
-                    error.get_or_insert(e);
-                }
-                b'Z' => {
-                    self.txn_status = self.body(&m).first().copied().unwrap_or(b'I');
-                    break;
-                }
-                // COPY FROM STDIN is not supported: refuse it.
-                b'G' => {
-                    let at = wire::begin(&mut self.wbuf, b'f');
-                    wire::put_cstr(
-                        &mut self.wbuf,
-                        "COPY FROM STDIN is not supported by this client",
-                    );
-                    wire::finish(&mut self.wbuf, at);
-                    self.send()?;
-                }
                 // COPY TO STDOUT: each CopyData becomes a one-column row.
-                b'H' => {
-                    cur = Some(SimpleQueryResult {
-                        columns: vec![Column {
-                            name: "COPY".into(),
-                            table_oid: 0,
-                            column_attr: 0,
-                            type_oid: 25,
-                            type_size: -1,
-                            type_modifier: -1,
-                        }],
-                        ..Default::default()
-                    })
-                }
+                b'H' => cur = Some(SimpleQueryResult {
+                    columns: vec![Column {
+                        name: "COPY".into(),
+                        table_oid: 0,
+                        column_attr: 0,
+                        type_oid: 25,
+                        type_size: -1,
+                        type_modifier: -1,
+                    }],
+                    ..Default::default()
+                }),
                 b'd' => {
-                    let mut line = wire::lossy(self.body(&m));
+                    let mut line = wire::lossy(body);
                     if line.ends_with('\n') {
                         line.pop();
                     }
-                    cur.get_or_insert_with(Default::default)
-                        .rows
-                        .push(vec![Some(line)]);
+                    cur.get_or_insert_with(Default::default).rows.push(vec![Some(line)]);
                 }
-                b'c' => {}
-                _ if self.handle_async(&m) => {}
-                _ => return Err(self.unexpected(&m, "in simple query response")),
+                _ => {}
             }
-        }
-        match error {
-            Some(e) => Err(e),
-            None => Ok(results),
-        }
+            Ok(())
+        })?;
+        Ok(results)
     }
+
 }
 
 fn parse_row_description(body: &[u8]) -> Result<Vec<Column>> {

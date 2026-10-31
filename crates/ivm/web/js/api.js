@@ -24,10 +24,10 @@ async function handle(res) {
   return body;
 }
 
-export async function get(path, { signal } = {}) {
+async function request(path, options) {
   let res;
   try {
-    res = await fetch(path, { headers: { Accept: 'application/json' }, signal, cache: 'no-store' });
+    res = await fetch(path, options);
   } catch (e) {
     if (e.name === 'AbortError') throw e;
     throw new ApiError(0, 'the server is not reachable');
@@ -35,20 +35,17 @@ export async function get(path, { signal } = {}) {
   return handle(res);
 }
 
+export async function get(path, { signal } = {}) {
+  return request(path, { headers: { Accept: 'application/json' }, signal, cache: 'no-store' });
+}
+
 export async function post(path, body, { signal } = {}) {
-  let res;
-  try {
-    res = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    throw new ApiError(0, 'the server is not reachable');
-  }
-  return handle(res);
+  return request(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
 }
 
 export const api = {
