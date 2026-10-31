@@ -168,6 +168,7 @@ impl Sub {
                     }
                 }
                 SubEvent::Progress { .. } => {}
+                SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
                 SubEvent::Error(e) => self.failed = Some(e.message),
             }
         }

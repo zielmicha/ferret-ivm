@@ -3,7 +3,7 @@
 This chapter describes how the parts of the engine fit together: the
 threads, the messages between them, the GSN clock and the frontiers derived
 from it, and group commit. It describes the code in `crates/ivm/src/coord/`
-(`mod.rs`, `seq.rs`, `api.rs`, `read.rs`), `source/`, `sink/` and
+(`mod.rs`, `seq.rs`, `api.rs`, `feed.rs`, `read.rs`), `source/`, `sink/` and
 `server/`.
 
 The design follows [doc.md](../../doc.md): one representation (rows with an
@@ -27,7 +27,7 @@ Where the ideas of the design live in the code (paths relative to
 | Shared, reference-counted arrangements; the primary index as a table's first arrangement | `dataflow/mod.rs` (hash-consed nodes and arrangements) |
 | Delta joins; anti-joins for outer joins and `NOT EXISTS` | `dataflow/join.rs`, `dataflow/lower.rs` |
 | Changing views: shared fragments, hydration from arrangements, catalog in storage | `dataflow/mod.rs` (`Graph::hydrate`), `coord/ddl.rs`; the catalog and its DDL history in a storage tree, versioned by GSN (`coord/meta.rs`) |
-| Outputs: reads (fresh, latest, at least an LSN), `SUBSCRIBE` with progress, idempotent sinks | `coord/read.rs`, `server/`, `sink/postgres.rs` |
+| Outputs: reads (fresh, latest, at least an LSN), `SUBSCRIBE` with progress, idempotent sinks | `coord/read.rs`, `coord/feed.rs`, `server/`, `sink/postgres.rs` |
 | `EXPLAIN MAINTENANCE` | `coord/read.rs` |
 | Expression semantics exactly PostgreSQL's | `expr/`, and the ports `crates/pgnumeric`, `crates/pgdatetime`, `crates/pgfuncs` |
 
@@ -139,8 +139,9 @@ snapshot requests queued at the engine.
                                   │                                │
                            log/*.ivl (input log)        store/ (indexes, manifest)
                                                                    │
-                                     SubEvent (subscriptions) ◀────┤
-                                     SinkMsg  (sink threads)  ◀────┘
+                                   ChangeEvent (change feeds) ◀────┘
+                                     ├─ subscriptions (SubEvent alias)
+                                     └─ sink threads
 ```
 
 ### Upstream transactions
@@ -336,25 +337,32 @@ checkpoint.
 | `Schema` | rebuild the table in its new shape and re-plan dependent views, both hydrated off the engine thread ([Sources](../user-guide/sources.md#upstream-schema-changes), [Dataflow](dataflow.md#hydration-off-the-engine-thread)); mark the table's snapshot to be done again in the source's stored state, so that a restart before the re-snapshot logs progress still redoes it. A failure is only logged. Then, as for `Ddl`, `persist_meta` |
 | `Tick` | advance the logical clock, step the dataflow (temporal filters), deliver outputs |
 
-Delivering outputs (`deliver`) visits only the consumers of the nodes that
-produced something (subscriptions and sinks are indexed by node, an index
-kept until one of them is added, removed or moved; its set of nodes is the
-`observed` set steps return the rows of): the error records
-of each materialized view's root are merged into the view's error counts
-(views are only visited for records with errors); each subscription gets
-the data changes of its node and ends at the first error record that is
-added (retracted ones do not end it); each subscription with `PROGRESS`
-gets a progress mark; each sink gets the changes of its node. Sinks learn
-of the GSNs without changes to their relation from the progress sent after
-each batch of records (and after replay), not from a message per record. A
-node's changes go to all of its consumers as shared copies (`SharedRows`)
-of chunks: those the step kept in memory as one chunk (moved, not copied),
-those it spilled into temporary trees a batch at a time (`Output::spilled`,
-read and then released), so that a large output is never in memory whole
-for its consumers; a sink writes a GSN's changes once all of its chunks
-have come. Each queued event, progress marks included, holds a charge on
-its consumer's queue until the consumer drops it, and a consumer whose
-queue would exceed its limit is not sent the event ([Memory](#memory)).
+Subscriptions and sinks register in one change-feed registry
+(`coord/feed.rs`). Each registration owns its node, generation, queue,
+cancellation flag and delivery state; subscription metadata owns query
+pins and relation dependencies, while sink handles own the external writer
+thread and status. A cached node index lets `deliver` visit only feeds of
+nodes that produced something, and supplies the nodes observed by steps.
+Live delivery and replay after hydration use the same error, chunk and
+progress operations.
+
+`ChangeEvent` carries snapshots, deltas and progress (`SubEvent` is its
+public subscription alias). Snapshot chunks are consumed before later
+events. Deltas are shared (`SharedRows`) among feeds, with spilled outputs
+read and released a chunk at a time. Subscriptions with `PROGRESS` receive
+a mark after each complete GSN; sinks receive batch progress, including
+at the end of replacement replay, and write only complete GSNs. Data and
+progress both respect the queue limit ([Memory](#memory)). A new positive
+error record ends a subscription; retracted errors do not. Sink feeds
+continue following their relation when error records change.
+
+Replacement holds a feed until the new version is hydrated. Its state
+retains whether it had fallen behind and whether a snapshot was requested
+meanwhile. A held or behind feed receives neither deltas nor progress;
+a deferred snapshot comes from the new version, before subsequent changes.
+Removing a registration invalidates its generation, so a replaced sink's
+old thread cannot request a snapshot for the new one. PostgreSQL retries
+and the idempotent progress-row writer remain in `sink/postgres.rs`.
 
 Records at or below the last applied GSN are ignored, which makes replay
 idempotent.
@@ -370,8 +378,7 @@ do not depend on how wide rows are or how they serialize:
 | Part | Meter | Limit | At the limit |
 |---|---|---|---|
 | records submitted to the log and not yet applied | `MemBudget::input` | an eighth, at least 4 MiB | sources stop reading their streams ([Group commit](#group-commit)) |
-| changes queued for a subscription, and the chunks of its snapshot in flight | `Subscription::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB | the subscription ends with `53000` |
-| changes queued for a sink, until written, and the chunks of its snapshot in flight | `SinkHandle::queue` (likewise) | a sixteenth, at least 4 MiB | the sink falls behind and resynchronises its target |
+| changes and progress queued for a change feed, including unwritten sink changes and snapshot chunks in flight | `Feed::queue` (a child of `MemBudget::outputs`) | a sixteenth, at least 4 MiB per feed | terminate a subscription with `53000`; mark a sink behind until it resynchronises |
 | query results in flight to sessions | `MemBudget::outputs` | a few chunks per read on a reader thread (it waits for its session); what a read on the engine thread returns, within its budget | the read goes on off the engine thread |
 | aggregation group caches | `Graph::group_caches` | an eighth | the group is not cached, and all caches shrink after the record ([Dataflow](dataflow.md#reduce)) |
 | transient working memory: in-memory deltas and key sets of a GSN, sort buffers of `TreeBuilder`s (the engine's and its forks') | `MemBudget::work` (`memory::Work`, which the engine gives its `Env`, `Env::set_work`, and forks share) | an eighth, set aside from the pool's share | a buffer spills to temporary trees (or applies to its index) beyond half the share (`Work::buffer`, within per-use bounds), or beyond a sixteenth of that while the buffers together exceed the share (`Work::full`) |
@@ -409,7 +416,7 @@ once written. Consumers never make the engine wait:
   client has taken what was written. Large changes are written as they are
   encoded (every 1 MiB), so a session buffers little of its own.
 - **Sinks.** When an event would take a sink's queue over its limit, the
-  sink falls behind: it is told so (`SinkMsg::Behind`) and sent nothing
+  sink falls behind: it is told so (`ChangeEvent::Behind`) and sent nothing
   more, not even progress marks (a progress row past changes the target
   did not get would let a restarted sink resume without resynchronising).
   Its thread drops the changes it held (releasing them) and, once it can

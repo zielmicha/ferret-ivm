@@ -798,7 +798,10 @@ impl Engine {
         match self.rt.broken.get(&id) {
             Some(reason) => format!("error: broken: {reason}"),
             None => match self.sink_handles.get(&id) {
-                Some(h) => h.status(),
+                Some(h) => {
+                    let status = h.status();
+                    if self.feeds[h.feed].behind() { format!("behind ({status})") } else { status }
+                },
                 None => "stopped".into(),
             },
         }
@@ -831,7 +834,7 @@ impl Engine {
         if let Some(a) = self.rt.indexes.get(&id) {
             return self.graph.arrs.get(*a)?.as_ref().map(|a| a.node);
         }
-        self.sink_handles.get(&id).map(|s| s.node)
+        self.sink_handles.get(&id).map(|s| self.feeds[s.feed].node)
     }
 
     fn source_info(&mut self, id: ObjectId) -> Option<SourceInfo> {
@@ -1045,7 +1048,7 @@ impl Engine {
                     None => continue,
                 },
                 ObjectKind::Sink(_) => match self.sink_handles.get(&o.id) {
-                    Some(s) => ("sink", s.node, None),
+                    Some(s) => ("sink", self.feeds[s.feed].node, None),
                     None => continue,
                 },
                 _ => continue,
@@ -1053,10 +1056,10 @@ impl Engine {
             out.push(DataflowObject { id: Some(o.id), name: o.name.clone(), kind, node, arrangement });
         }
         for (i, s) in self.subs.iter().enumerate() {
-            if s.cancel.load(Ordering::Acquire) {
+            if self.feeds[s.feed].cancel.load(Ordering::Acquire) {
                 continue;
             }
-            let target = self.node_target(s.node);
+            let target = self.node_target(self.feeds[s.feed].node);
             out.push(DataflowObject {
                 id: None,
                 name: match target {
@@ -1064,7 +1067,7 @@ impl Engine {
                     None => format!("subscription {} (query)", i + 1),
                 },
                 kind: "subscription",
-                node: s.node,
+                node: self.feeds[s.feed].node,
                 arrangement: None,
             });
         }
@@ -1693,10 +1696,10 @@ impl Engine {
             .subs
             .iter()
             .map(|s| SubscriptionInfo {
-                node: s.node,
-                target: if s.pinned.is_some() { None } else { self.node_target(s.node) },
-                progress: s.progress,
-                cancelled: s.cancel.load(Ordering::Acquire),
+                node: self.feeds[s.feed].node,
+                target: if s.pinned.is_some() { None } else { self.node_target(self.feeds[s.feed].node) },
+                progress: self.feeds[s.feed].progress == super::Progress::Record,
+                cancelled: self.feeds[s.feed].cancel.load(Ordering::Acquire),
             })
             .collect();
         let parked = self

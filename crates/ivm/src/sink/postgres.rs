@@ -10,7 +10,8 @@
 //! keeps while it cannot write are bounded too (beyond the bound it
 //! resynchronizes instead).
 
-use super::{SinkLimits, SinkMsg};
+use super::SinkLimits;
+use crate::coord::feed::ChangeEvent;
 use crate::catalog::SinkDef;
 use crate::coord::api::{Chunks, SharedRows};
 use crate::dataflow::Delta;
@@ -394,9 +395,9 @@ struct Sink<'a> {
     def: SinkDef,
     columns: Vec<Column>,
     limits: SinkLimits,
-    rx: Receiver<SinkMsg>,
+    rx: Receiver<ChangeEvent>,
     status: Arc<Mutex<String>>,
-    /// Ask the engine for a snapshot (`SinkMsg::Snapshot`).
+    /// Ask the engine for a snapshot (`ChangeEvent::Snapshot`).
     ask: &'a dyn Fn(),
     writer: Option<Writer>,
     /// Changes received and not written yet, in GSN order (a GSN's changes
@@ -425,11 +426,11 @@ struct Sink<'a> {
     /// The GSN of the last changes received.
     last_data: Gsn,
     /// The target has to be rewritten from a snapshot: it was behind `base`
-    /// at the first connection, or the sink fell behind (`SinkMsg::Behind`)
+    /// at the first connection, or the sink fell behind (`ChangeEvent::Behind`)
     /// and its changes were dropped.
     resync_needed: bool,
     resync: Resync,
-    /// The sink was asked to stop (`SinkHandle::stop`): set before the
+    /// The change feed was stopped (`Feed::stop`): set before the
     /// `Stop` message, for a snapshot being written to give up.
     stopping: Arc<std::sync::atomic::AtomicBool>,
     backoff: Duration,
@@ -452,7 +453,7 @@ pub fn run(
     columns: Vec<Column>,
     start_gsn: Gsn,
     limits: SinkLimits,
-    rx: Receiver<SinkMsg>,
+    rx: Receiver<ChangeEvent>,
     status: Arc<Mutex<String>>,
     stopping: Arc<std::sync::atomic::AtomicBool>,
     ask: &dyn Fn(),
@@ -617,16 +618,16 @@ impl Sink<'_> {
         let deadline = Instant::now() + self.backoff;
         loop {
             match self.rx.recv_deadline(deadline) {
-                Ok(SinkMsg::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+                Ok(ChangeEvent::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
                 Ok(m) => self.receive(m),
                 Err(RecvTimeoutError::Timeout) => return true,
             }
         }
     }
 
-    fn receive(&mut self, m: SinkMsg) {
+    fn receive(&mut self, m: ChangeEvent) {
         match m {
-            SinkMsg::Data(g, d) => {
+            ChangeEvent::Data { gsn: g, rows: d } => {
                 self.seen = self.seen.max(g);
                 if g > self.last_data {
                     self.complete = self.complete.max(self.last_data);
@@ -637,11 +638,11 @@ impl Sink<'_> {
                     self.pending.push_back((g, d));
                 }
             }
-            SinkMsg::Progress(g, _) => {
+            ChangeEvent::Progress { gsn: g, .. } => {
                 self.seen = self.seen.max(g);
                 self.complete = self.complete.max(g);
             }
-            SinkMsg::Behind => {
+            ChangeEvent::Behind => {
                 // (the engine sends nothing more until the snapshot)
                 log::warn!(
                     "sink {}: its unwritten changes reached their memory limit; dropping them and resynchronizing the target from a snapshot",
@@ -650,8 +651,12 @@ impl Sink<'_> {
                 self.clear_pending();
                 self.resync_needed = true;
             }
-            SinkMsg::Snapshot(g, rows) => self.write_snapshot(g, rows),
-            SinkMsg::Stop => self.stop = true,
+            ChangeEvent::Snapshot { gsn: g, rows } => self.write_snapshot(g, rows),
+            ChangeEvent::Stop => self.stop = true,
+            ChangeEvent::Error(e) => {
+                self.set_status(format!("error: {e}"));
+                self.stop = true;
+            }
         }
     }
 

@@ -1132,6 +1132,41 @@ fn a_sink_that_falls_behind_resynchronises_from_a_snapshot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Replacement replay cannot repair missing changes. A sink already
+/// behind must remain behind through the replacement, then snapshot the
+/// new definition before accepting later deltas or progress.
+#[test]
+fn a_behind_sink_resnapshots_the_replaced_view() {
+    let mut up = Upstream::start();
+    let dir = tmpdir("sink-behind-replace");
+    let mut ivm = Ivm::start_with(&dir, |c| c.memory_bytes = 16 << 20);
+    ivm.exec("CREATE TABLE t (id int PRIMARY KEY, s text)");
+    ivm.exec("INSERT INTO t VALUES (0, 'first')");
+    ivm.exec("CREATE MATERIALIZED VIEW v AS SELECT id, s FROM t");
+    ivm.exec(&format!("CREATE SINK sk FROM v INTO POSTGRES CONNECTION '{}' TABLE 'target' KEY (id)", up.conninfo));
+    sink_caught_up(&mut ivm, &mut up.client, "sk");
+    let before = up.rows("SELECT xmin FROM target WHERE id = 0");
+    let mut locker = connect(&up.conninfo);
+    locker.simple_query("BEGIN; LOCK TABLE target IN ACCESS EXCLUSIVE MODE").unwrap();
+    for i in 0..8 {
+        ivm.exec(&format!("INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series({}, {}) g", 1 + i * 1000, (i + 1) * 1000));
+    }
+    let status = |ivm: &mut Ivm| ivm.rows("SHOW SINKS")[0].split('|').nth(3).unwrap().to_string();
+    eventually("the sink to fall behind", || status(&mut ivm).starts_with("behind"));
+    ivm.exec("CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT id, upper(s) AS s FROM t");
+    ivm.exec("UPDATE t SET s = 'after replacement' WHERE id = 0");
+    assert!(status(&mut ivm).starts_with("behind"), "replacement must not restore dropped changes");
+    locker.simple_query("ROLLBACK").unwrap();
+    sink_caught_up(&mut ivm, &mut up.client, "sk");
+    assert_eq!(up.rows("SELECT count(*), sum(length(s)), min(s) FROM target"), ivm.rows("SELECT count(*), sum(length(s)), min(s) FROM v"));
+    assert_ne!(up.rows("SELECT xmin FROM target WHERE id = 0"), before);
+    ivm.exec("UPDATE t SET s = 'next' WHERE id = 1");
+    sink_caught_up(&mut ivm, &mut up.client, "sk");
+    assert_eq!(up.rows("SELECT s FROM target WHERE id = 1"), ["NEXT"]);
+    drop(ivm);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An engine restart does not rewrite a sink's target that is up to date:
 /// every restart used to resynchronize every sink (DELETE and INSERT of the
 /// whole table), because the progress row only recorded GSNs at which the

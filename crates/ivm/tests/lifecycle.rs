@@ -98,6 +98,7 @@ fn events_until(rx: &Receiver<ivm::coord::api::SubEvent>, until: impl Fn(&str) -
                 .map(|(r, w)| format!("{w}:{}", r.iter().map(ivm::types::text::format_datum).collect::<Vec<_>>().join("|")))
                 .collect(),
             SubEvent::Progress { .. } => vec![],
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => vec![format!("error: {}", e.message)],
         };
         for ev in evs {
@@ -254,6 +255,7 @@ fn a_subscription_that_is_not_read_ends_at_its_memory_limit() {
                 rows += ev.rows().unwrap().len();
             }
             SubEvent::Progress { .. } => {}
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => error = Some((e.code, e.message)),
         }
     }

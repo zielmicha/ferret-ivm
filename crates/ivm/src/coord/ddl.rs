@@ -886,14 +886,13 @@ impl Engine {
                 continue;
             }
             if same {
-                s.held = true;
+                self.feeds[s.feed].hold();
             } else {
                 // they were promised the old columns
-                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                self.feeds[s.feed].fail(SqlError::new(
                     codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     format!("materialized view \"{name}\" changed its columns"),
-                )));
-                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+                ));
             }
         }
         // subscriptions to queries reading the view (directly or through
@@ -901,12 +900,11 @@ impl Engine {
         // would go on with (and which receives no more changes when the
         // view was re-planned after an upstream change): they end
         for s in self.subs.iter() {
-            if s.view != Some(id) && s.reads.contains(&id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire) {
-                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+            if s.view != Some(id) && s.reads.contains(&id) && !self.feeds[s.feed].cancel.load(std::sync::atomic::Ordering::Acquire) {
+                self.feeds[s.feed].fail(SqlError::new(
                     codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     format!("materialized view \"{name}\" was replaced"),
-                )));
-                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+                ));
             }
         }
         // the view's sinks (not those of other views sharing the old node)
@@ -918,11 +916,13 @@ impl Engine {
             .collect();
         // (held until then, also those that start over with new columns:
         // their targets must not get the old version's later changes)
-        self.held_sinks.extend(sinks.iter().copied());
+        for sid in &sinks {
+            self.feeds[self.sink_handles[sid].feed].hold();
+        }
         // (no change to compute for nobody, nor when the new version is the
         // old dataflow: the difference of an arrangement with itself)
         let consumers =
-            same && (!sinks.is_empty() || self.subs.iter().any(|s| s.view == Some(id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire)));
+            same && (!sinks.is_empty() || self.subs.iter().any(|s| s.view == Some(id) && !self.feeds[s.feed].cancel.load(std::sync::atomic::Ordering::Acquire)));
         self.record_then.push(hydrate::Then::Replaced(Box::new(hydrate::Replaced { id, old, old_index_arrs, same, sinks, consumers })));
         Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
     }
@@ -1057,12 +1057,11 @@ impl Engine {
         // subscriptions reading it (directly, through views or in a query)
         // end with an error
         for s in self.subs.iter() {
-            if s.reads.contains(&id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire) {
-                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+            if s.reads.contains(&id) && !self.feeds[s.feed].cancel.load(std::sync::atomic::Ordering::Acquire) {
+                self.feeds[s.feed].fail(SqlError::new(
                     codes::UNDEFINED_TABLE,
                     format!("{} \"{}\" was dropped", obj.kind.name(), obj.name),
-                )));
-                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+                ));
             }
         }
         match obj.kind {
@@ -1101,10 +1100,8 @@ impl Engine {
             ObjectKind::Sink(_) => {
                 // (the engine thread does not wait for the sink thread)
                 if let Some(h) = self.sink_handles.remove(&id) {
-                    let _ = h.stop();
+                    self.feeds.remove(h.feed);
                 }
-                self.consumers_changed();
-                self.snapshot_asked.remove(&id);
             }
             ObjectKind::View(_) => {}
         }
@@ -1136,17 +1133,18 @@ impl Engine {
         // queries over it would go on reading the old version)
         for s in self.subs.iter() {
             if s.reads.contains(&table) {
-                let _ = s.tx.send(SubEvent::Error(SqlError::new(
+                self.feeds[s.feed].fail(SqlError::new(
                     codes::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     format!("table \"{}\" changed its columns upstream", obj.name),
-                )));
-                s.cancel.store(true, std::sync::atomic::Ordering::Release);
+                ));
             }
         }
         // sinks from the table start over with the new columns, once it is
         // filled: they get nothing until then
-        let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| h.node == old_node).map(|(id, _)| *id).collect();
-        self.held_sinks.extend(sinks.iter().copied());
+        let sinks: Vec<ObjectId> = self.sink_handles.iter().filter(|(_, h)| self.feeds[h.feed].node == old_node).map(|(id, _)| *id).collect();
+        for sid in &sinks {
+            self.feeds[self.sink_handles[sid].feed].hold();
+        }
         self.replan_dependents(gsn, table)?;
         self.record_then.push(hydrate::Then::Rebuilt(Box::new(hydrate::Rebuilt {
             old_node,
@@ -1164,10 +1162,8 @@ impl Engine {
     pub(crate) fn restart_sinks(&mut self, sinks: Vec<ObjectId>) -> Result<()> {
         for id in sinks {
             if let Some(h) = self.sink_handles.remove(&id) {
-                let _ = h.stop();
+                self.feeds.remove(h.feed);
             }
-            self.consumers_changed();
-            self.snapshot_asked.remove(&id);
             if let (Some(o), Some(handle)) = (self.catalog.get(id).cloned(), self.handle.clone())
                 && let ObjectKind::Sink(sd) = &o.kind
             {
@@ -1188,9 +1184,16 @@ impl Engine {
             _ => vec![],
         };
         // (no snapshot: the sink asks for one when its target is behind)
-        let h = crate::sink::start(id, name.to_string(), def.clone(), node, columns, self.processed, self.cfg.sink_limits, handle.clone())?;
+        let (feed, rx) = self.feeds.register(node, &self.shared.mem.outputs, Overflow::Resnapshot, Progress::Batch);
+        let stopping = self.feeds[feed].cancel.clone();
+        let h = match crate::sink::start(id, name.to_string(), def.clone(), feed, columns, self.processed, self.cfg.sink_limits, handle.clone(), rx, stopping) {
+            Ok(h) => h,
+            Err(e) => {
+                self.feeds.remove(feed);
+                return Err(e);
+            }
+        };
         self.sink_handles.insert(id, h);
-        self.consumers_changed();
         Ok(())
     }
 }

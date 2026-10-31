@@ -134,6 +134,7 @@ fn requests_reading_a_hydrating_view_wait_for_it() {
                     match ev {
                         ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => n += ev.rows().unwrap().iter().map(|(_, w)| w).sum::<i64>(),
                         SubEvent::Progress { .. } => break,
+                        SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
                         SubEvent::Error(e) => panic!("{e}"),
                     }
                 }
@@ -264,6 +265,7 @@ fn replacing_a_view_does_not_hold_up_commits() {
                     break;
                 }
             }
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => panic!("{e}"),
         }
     }
@@ -359,6 +361,7 @@ fn replacing_a_view_by_an_existing_definition_keeps_its_subscription_complete() 
             }
             SubEvent::Progress { gsn, .. } if gsn >= last => break,
             SubEvent::Progress { .. } => {}
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => panic!("{e}"),
         }
     }
@@ -459,6 +462,7 @@ fn subscriptions_to_queries_add_up_while_they_hydrate() {
                     break;
                 }
             }
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => panic!("{e}"),
         }
     }
@@ -725,6 +729,7 @@ fn large_subscription_snapshots_do_not_hold_up_commits() {
             ev @ (SubEvent::Data { .. } | SubEvent::Snapshot { .. }) => n += ev.rows().unwrap().iter().map(|(_, w)| w).sum::<i64>(),
             SubEvent::Progress { gsn, .. } if gsn >= last => break,
             SubEvent::Progress { .. } => {}
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => panic!("{e}"),
         }
     }
@@ -873,6 +878,7 @@ fn concurrent_ddl_dml_reads_and_checkpoints_stay_consistent() {
             }
             SubEvent::Progress { gsn, .. } if gsn >= last => break,
             SubEvent::Progress { .. } => {}
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => panic!("{e}"),
         }
     }

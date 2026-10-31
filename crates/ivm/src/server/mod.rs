@@ -853,6 +853,9 @@ impl Session {
                         self.emit_sub_row(copy, &cols, &binary, &vals);
                     }
                 }
+                SubEvent::Behind | SubEvent::Stop => {
+                    return Err(SqlError::internal("unexpected subscription feed control event"));
+                }
                 SubEvent::Error(e) => {
                     if copy {
                         self.out.copy_done();

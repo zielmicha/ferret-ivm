@@ -1,8 +1,7 @@
 //! Requests from sessions (and sources) to the engine thread.
 
 pub use super::stream::{Chunk, Chunks};
-use crate::dataflow::Delta;
-use crate::error::{Result, SqlError};
+use crate::error::Result;
 use crate::log::LogRecord;
 use crate::memory::Charge;
 use crate::sql::parser::Statement;
@@ -23,37 +22,10 @@ pub struct ResultColumn {
     pub typmod: i32,
 }
 
-#[derive(Debug)]
-pub enum SubEvent {
-    /// Changes at a GSN (row, diff).
-    Data { gsn: Gsn, rows: SharedRows },
-    /// The rows of the relation as of `gsn` (row, multiplicity), the
-    /// subscription's snapshot, read in chunks from `rows` as they come
-    /// (before the events after this one).
-    Snapshot { gsn: Gsn, rows: Chunks<Delta> },
-    /// All changes up to and including `gsn` have been delivered. `charge`
-    /// holds the event's bytes in the subscription's queue.
-    Progress { gsn: Gsn, charge: Charge },
-    Error(SqlError),
-}
-
-impl SubEvent {
-    /// The rows of a `Data` event or of a whole `Snapshot` (read to its
-    /// end), for a consumer that collects them; none for the others.
-    pub fn rows(self) -> Result<Vec<(Row, i64)>> {
-        match self {
-            SubEvent::Data { rows, .. } => Ok(rows.to_vec()),
-            SubEvent::Snapshot { rows, .. } => {
-                let mut all = Vec::new();
-                for c in rows {
-                    all.extend(c?.into_parts().0);
-                }
-                Ok(all)
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
-}
+/// Subscription events use the common change-feed protocol. Subscriptions
+/// emit Data, Snapshot, Progress and Error; Behind and Stop are controls
+/// reserved for sinks that can resynchronize after overflow.
+pub use super::feed::ChangeEvent as SubEvent;
 
 /// The changes of one node at one GSN as delivered to a subscription or a
 /// sink: one copy shared by all of them (not one per consumer), with the
@@ -234,8 +206,7 @@ pub enum Request {
     Checkpoint { reply: Sender<Result<Gsn>> },
     /// A sink's thread asks for its relation's contents, to resynchronize
     /// its target; they are sent through the sink's channel
-    /// (`sink::SinkMsg::Snapshot`). `token` is the thread's
-    /// (`SinkHandle::token`).
+    /// (`SubEvent::Snapshot`). `token` is the thread's feed generation.
     SinkSnapshot { sink: crate::sql::plan::ObjectId, token: u64 },
     /// Introspection snapshot for the web UI (see `coord::inspect`).
     Inspect(super::inspect::InspectRequest),

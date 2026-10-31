@@ -689,6 +689,7 @@ fn dropping_a_view_leaves_subscriptions_to_its_twin_alone() {
                 }
             }
             SubEvent::Progress { .. } => {}
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => panic!("subscription failed: {e}"),
         }
     }
@@ -729,6 +730,7 @@ fn replacing_a_view_with_other_columns_ends_its_subscriptions() {
                 }
             }
             SubEvent::Progress { .. } => {}
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => error = Some(e.code),
         }
     }
@@ -852,6 +854,7 @@ fn subscription_snapshots_come_in_chunks() {
             SubEvent::Data { rows, .. } => sizes.push(rows.len()),
             SubEvent::Snapshot { rows, .. } => sizes.extend(rows.map(|c| c.unwrap().len())),
             SubEvent::Progress { .. } => break,
+            SubEvent::Behind | SubEvent::Stop => panic!("unexpected subscription control event"),
             SubEvent::Error(e) => panic!("subscription failed: {e}"),
         }
     }

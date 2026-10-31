@@ -479,9 +479,6 @@ impl Engine {
     /// version is filled and hydrated: its sinks start over with the new
     /// columns, and the old version is released.
     fn finish_rebuild(&mut self, r: Rebuilt) -> Result<()> {
-        for sid in &r.sinks {
-            self.held_sinks.remove(sid);
-        }
         self.restart_sinks(r.sinks)?;
         for a in r.old_index_arrs {
             self.graph.release_arr(&mut self.env, a)?;
@@ -503,71 +500,45 @@ impl Engine {
         if let Some(new_node) = self.rt.views.get(&r.id).map(|v| v.node) {
             self.take_root_errors(r.id);
             let limit = self.shared.mem.consumer_limit();
-            let subs: Vec<usize> = (0..self.subs.len()).filter(|&i| self.subs[i].view == Some(r.id) && self.subs[i].held).collect();
-            for &i in &subs {
-                self.subs[i].node = new_node;
-                self.subs[i].held = false;
+            let mut ids: Vec<FeedId> = self.subs.iter()
+                .filter(|s| s.view == Some(r.id) && self.feeds[s.feed].held())
+                .map(|s| s.feed)
+                .collect();
+            if r.same {
+                ids.extend(r.sinks.iter().filter_map(|sid| self.sink_handles.get(sid).map(|s| s.feed)));
             }
-            self.consumers_changed();
-            for sid in &r.sinks {
-                self.held_sinks.remove(sid);
+            // A request made during replacement is answered from the new
+            // version. That feed stays behind while the others receive the
+            // kept deltas, so replay cannot cross its missing changes.
+            let mut snapshots = Vec::new();
+            for &id in &ids {
+                if self.feeds.resume(id, new_node) {
+                    snapshots.push(id);
+                }
             }
-            let sinks: Vec<ObjectId> = if r.same { r.sinks.iter().filter(|s| self.sink_handles.contains_key(s)).copied().collect() } else { Vec::new() };
-            for sid in &sinks {
-                self.sink_handles.get_mut(sid).unwrap().node = new_node;
-            }
-            self.consumers_changed();
-            // (one that asked for a snapshot while it was held gets it now)
-            let asked: Vec<ObjectId> = sinks.iter().filter(|s| self.snapshot_asked.remove(s)).copied().collect();
             if let Some(c) = &changes {
-                let (all_subs, all_sinks) = (&self.subs, &mut self.sink_handles);
-                let mut last: Option<Gsn> = None;
+                let feeds = &mut self.feeds;
+                let mut last = None;
                 res = c.for_each(&mut self.env, &mut |_, gsn, errs, rows| {
                     if last != Some(gsn) {
                         if let Some(g) = last {
-                            for &i in &subs {
-                                send_progress(&all_subs[i], g, limit);
-                            }
+                            feeds.progress(&ids, Progress::Record, g, limit);
                         }
-                        for &i in &subs {
-                            deliver_errors(&all_subs[i], errs);
-                        }
+                        feeds.errors(&ids, errs);
                         last = Some(gsn);
                     }
-                    if rows.is_empty() {
-                        return Ok(());
-                    }
-                    let rows = Arc::new(rows);
-                    let bytes = crate::memory::delta_bytes(&rows);
-                    for &i in &subs {
-                        let s = &all_subs[i];
-                        if !s.cancel.load(Ordering::Acquire) {
-                            send_rows(s, gsn, &rows, bytes, limit);
-                        }
-                    }
-                    for sid in sinks.iter().filter(|s| !asked.contains(s)) {
-                        if let Some(sink) = all_sinks.get_mut(sid)
-                            && !sink.behind()
-                            && !sink.send(gsn, &rows, bytes, limit)
-                        {
-                            log::warn!("sink {sid} fell behind: its unwritten changes reached {} MiB; it resynchronises its target from a snapshot", limit >> 20);
-                        }
-                    }
+                    feeds.rows(&ids, gsn, rows, limit);
                     Ok(())
                 });
-                if let Some(g) = last {
-                    for &i in &subs {
-                        send_progress(&self.subs[i], g, limit);
-                    }
-                    for sid in sinks.iter().filter(|s| !asked.contains(s)) {
-                        if let Some(sink) = self.sink_handles.get(sid) {
-                            sink.progress(g);
-                        }
+                if res.is_ok() {
+                    if let Some(g) = last {
+                        feeds.progress(&ids, Progress::Record, g, limit);
+                        feeds.progress(&ids, Progress::Batch, g, limit);
                     }
                 }
             }
-            for sid in asked {
-                self.resync_sink(sid);
+            for id in snapshots {
+                self.resync_feed(id);
             }
             if !r.same {
                 // (re-planned after an upstream change) new rows, new columns
@@ -789,33 +760,14 @@ impl Engine {
     /// (`snapshot_stream`, off the engine thread when large), and the changes
     /// after it.
     pub(crate) fn start_subscription(&mut self, p: PendingSub) {
-        let (tx, rx) = unbounded();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // (changes queued after the snapshot are bounded by its share of the
-        // memory budget; the snapshot's chunks in flight count too)
-        let queue = crate::memory::Meter::child(&self.shared.mem.outputs);
-        let gsn = self.processed;
+        let cadence = if p.progress { Progress::Record } else { Progress::None };
+        let (feed, rx) = self.feeds.register(p.node, &self.shared.mem.outputs, Overflow::Terminate, cadence);
+        let cancel = self.feeds[feed].cancel.clone();
         if p.snapshot {
-            let c = cancel.clone();
-            let rows = self
-                .snapshot_stream(p.node, &queue, Box::new(move || c.load(Ordering::Acquire)))
-                .unwrap_or_else(super::stream::failed);
-            let _ = tx.send(SubEvent::Snapshot { gsn, rows });
+            self.resync_feed(feed);
         }
-        let _ = tx.send(SubEvent::Progress { gsn, charge: crate::memory::Charge::none() });
-        let sub = Subscription {
-            node: p.node,
-            tx,
-            queue,
-            cancel: cancel.clone(),
-            pinned: p.pinned,
-            held: false,
-            progress: p.progress,
-            view: p.view,
-            reads: p.reads,
-        };
-        self.subs.push(sub);
-        self.consumers_changed();
+        self.feeds[feed].boundary(self.processed, self.shared.mem.consumer_limit());
+        self.subs.push(Subscription { feed, pinned: p.pinned, view: p.view, reads: p.reads });
         // (a client that is gone no longer reads it: it ends)
         if p.reply.send(Ok(ExecResult::Subscribe { columns: p.columns, rx, cancel: cancel.clone(), progress: p.progress })).is_err() {
             cancel.store(true, Ordering::Release);
