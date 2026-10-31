@@ -413,10 +413,11 @@ arrangements as they are (their current state):
   rows are read. Multiplicities are expanded, `OFFSET`/`LIMIT`/`WITH TIES`
   applied and the hidden sort columns truncated as the rows go out
   (`Emitter`). They go to the session in chunks of 1,024 rows or about
-  256 KB (`coord/read.rs`, `ChunkedReply`: a result of one chunk as
-  `ExecResult::Query`, a larger one as `ExecResult::Rows`, whose later
-  chunks follow on a stream, `coord::stream`; a closed stream ends the
-  read).
+  256 KB (`coord/read.rs`, `ChunkedReply`). `StreamingResult::Query`
+  exposes a row iterator used by sessions, portals and HTTP; small results
+  need no channel, while larger results receive bounded chunks through
+  `coord::stream`. Dropping the iterator ends the read. The collected
+  `EngineHandle::execute` API reuses the first chunk's allocation.
 
 Before a read runs, `now()` and its relatives are bound to the logical clock,
 and the read fails if it touches a broken view

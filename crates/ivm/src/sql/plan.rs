@@ -3,6 +3,7 @@
 use crate::expr::{Expr, SubqueryKind};
 use crate::types::encoding::SortSpec;
 use crate::types::{ColumnType, SqlType};
+use smallvec::{smallvec, SmallVec};
 use std::fmt::Write;
 
 /// Catalog object id.
@@ -129,6 +130,18 @@ pub struct AggCall {
     pub ret: ColumnType,
 }
 
+impl AggCall {
+    pub fn columns(&self) -> impl Iterator<Item = usize> + '_ {
+        self.args.iter().copied().chain(self.filter).chain(self.order.iter().map(|k| k.col))
+    }
+
+    pub fn remap(&mut self, f: &impl Fn(usize) -> usize) {
+        for c in self.args.iter_mut().chain(self.filter.iter_mut()).chain(self.order.iter_mut().map(|k| &mut k.col)) {
+            *c = f(*c);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WindowFunc {
     RowNumber,
@@ -184,6 +197,18 @@ pub struct WindowCall {
     pub frame: Frame,
     pub ret: ColumnType,
     pub range: Option<RangeOffsets>,
+}
+
+impl WindowCall {
+    pub fn columns(&self) -> impl Iterator<Item = usize> + '_ {
+        self.args.iter().chain(&self.partition).copied().chain(self.order.iter().map(|k| k.col))
+    }
+
+    pub fn remap(&mut self, f: &impl Fn(usize) -> usize) {
+        for c in self.args.iter_mut().chain(&mut self.partition).chain(self.order.iter_mut().map(|k| &mut k.col)) {
+            *c = f(*c);
+        }
+    }
 }
 
 /// RANGE frame offsets: a bound is the current row's ORDER BY value minus
@@ -440,9 +465,9 @@ impl Rel {
         }
     }
 
-    pub fn inputs(&self) -> Vec<&Rel> {
+    pub fn inputs(&self) -> SmallVec<[&Rel; 2]> {
         match self {
-            Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } => vec![],
+            Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } => smallvec![],
             Rel::Map { input, .. }
             | Rel::Filter { input, .. }
             | Rel::Project { input, .. }
@@ -451,12 +476,12 @@ impl Rel {
             | Rel::TopK { input, .. }
             | Rel::Window { input, .. }
             | Rel::FlatMap { input, .. }
-            | Rel::Negate { input } => vec![input],
+            | Rel::Negate { input } => smallvec![input.as_ref()],
             Rel::Join { left, right, .. } | Rel::SetOp { left, right, .. } | Rel::Apply { left, right, .. } => {
-                vec![left, right]
+                smallvec![left.as_ref(), right.as_ref()]
             }
             Rel::UnionAll { inputs } => inputs.iter().collect(),
-            Rel::Recursive { base, step, .. } => vec![base, step],
+            Rel::Recursive { base, step, .. } => smallvec![base.as_ref(), step.as_ref()],
         }
     }
 
@@ -482,7 +507,7 @@ impl Rel {
     /// Replace now()-family calls everywhere by the clock reading `t`.
     pub fn bind_now(mut self, t: i64) -> Rel {
         for i in self.inputs_mut() {
-            let r = std::mem::replace(i, Rel::unit());
+            let r = std::mem::replace(i, Rel::empty(vec![]));
             *i = r.bind_now(t);
         }
         for e in self.exprs_mut() {
@@ -493,9 +518,9 @@ impl Rel {
         self
     }
 
-    pub fn inputs_mut(&mut self) -> Vec<&mut Rel> {
+    pub fn inputs_mut(&mut self) -> SmallVec<[&mut Rel; 2]> {
         match self {
-            Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } => vec![],
+            Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } => smallvec![],
             Rel::Map { input, .. }
             | Rel::Filter { input, .. }
             | Rel::Project { input, .. }
@@ -504,13 +529,21 @@ impl Rel {
             | Rel::TopK { input, .. }
             | Rel::Window { input, .. }
             | Rel::FlatMap { input, .. }
-            | Rel::Negate { input } => vec![input],
+            | Rel::Negate { input } => smallvec![input.as_mut()],
             Rel::Join { left, right, .. } | Rel::SetOp { left, right, .. } | Rel::Apply { left, right, .. } => {
-                vec![left, right]
+                smallvec![left.as_mut(), right.as_mut()]
             }
             Rel::UnionAll { inputs } => inputs.iter_mut().collect(),
-            Rel::Recursive { base, step, .. } => vec![base, step],
+            Rel::Recursive { base, step, .. } => smallvec![base.as_mut(), step.as_mut()],
         }
+    }
+
+    /// Transform each direct relational input, preserving this operator.
+    pub fn map_inputs(mut self, mut f: impl FnMut(Rel) -> crate::error::Result<Rel>) -> crate::error::Result<Rel> {
+        for input in self.inputs_mut() {
+            *input = f(std::mem::replace(input, Rel::empty(vec![])))?;
+        }
+        Ok(self)
     }
 
     /// Expressions held directly by this operator (not children).

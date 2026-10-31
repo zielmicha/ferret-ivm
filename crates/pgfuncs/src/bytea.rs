@@ -93,29 +93,7 @@ pub fn parse(s: &str) -> Result<Vec<u8>> {
         return Ok(out);
     }
 
-    // Traditional escaped style.
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c != b'\\' {
-            out.push(c);
-            i += 1;
-        } else if i + 3 < b.len()
-            && (b'0'..=b'3').contains(&b[i + 1])
-            && (b'0'..=b'7').contains(&b[i + 2])
-            && (b'0'..=b'7').contains(&b[i + 3])
-        {
-            out.push(((b[i + 1] - b'0') << 6) | ((b[i + 2] - b'0') << 3) | (b[i + 3] - b'0'));
-            i += 4;
-        } else if i + 1 < b.len() && b[i + 1] == b'\\' {
-            out.push(b'\\');
-            i += 2;
-        } else {
-            return Err(invalid_bytea_syntax());
-        }
-    }
-    Ok(out)
+    escape_decode(b)
 }
 
 /// Format a bytea value in the hex output format (`byteaout` with
@@ -131,11 +109,15 @@ pub fn format(b: &[u8]) -> String {
 /// Format a bytea value in the traditional escape output format (`byteaout`
 /// with `bytea_output = escape`).
 pub fn format_escape(b: &[u8]) -> String {
+    escape_encode(b, |c| !(0x20..=0x7e).contains(&c))
+}
+
+fn escape_encode(b: &[u8], octal: impl Fn(u8) -> bool) -> String {
     let mut out = String::with_capacity(b.len());
     for &c in b {
         if c == b'\\' {
             out.push_str("\\\\");
-        } else if !(0x20..=0x7e).contains(&c) {
+        } else if octal(c) {
             out.push('\\');
             out.push((b'0' + (c >> 6)) as char);
             out.push((b'0' + ((c >> 3) & 7)) as char);
@@ -297,26 +279,6 @@ fn base64_decode(src: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `esc_encode`: NUL and high-bit bytes become `\ooo`, backslash becomes
-/// `\\`, everything else (including other control characters) is copied.
-fn escape_encode(src: &[u8]) -> String {
-    let mut out: Vec<u8> = Vec::with_capacity(src.len());
-    for &c in src {
-        if c == 0 || c & 0x80 != 0 {
-            out.push(b'\\');
-            out.push(b'0' + (c >> 6));
-            out.push(b'0' + ((c >> 3) & 7));
-            out.push(b'0' + (c & 7));
-        } else if c == b'\\' {
-            out.push(b'\\');
-            out.push(b'\\');
-        } else {
-            out.push(c);
-        }
-    }
-    String::from_utf8(out).expect("ascii")
-}
-
 /// `esc_decode` (with the validation of `esc_dec_len`).
 fn escape_decode(src: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(src.len());
@@ -387,7 +349,8 @@ pub fn encode(b: &[u8], format: &str) -> Result<String> {
             String::from_utf8(out).expect("ascii")
         }
         Encoding::Base64 => base64_encode(b),
-        Encoding::Escape => escape_encode(b),
+        // esc_encode escapes NUL and high-bit bytes, preserving other controls.
+        Encoding::Escape => escape_encode(b, |c| c == 0 || c & 0x80 != 0),
     })
 }
 

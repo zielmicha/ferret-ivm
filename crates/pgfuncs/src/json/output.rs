@@ -68,13 +68,22 @@ fn open<W: Write + ?Sized>(out: &mut W, v: &Jsonb) -> fmt::Result {
     })
 }
 
-/// JsonbToCStringWorker(): compact (`indent == false`, jsonb_out) or
-/// jsonb_pretty layout.
-pub(crate) fn write_jsonb<W: Write + ?Sized>(out: &mut W, v: &Jsonb, indent: bool) -> fmt::Result {
+pub(crate) enum Layout {
+    Jsonb,
+    Pretty,
+    Compact,
+}
+
+/// JsonbToCStringWorker(), also used for compact SQL `json` output.
+pub(crate) fn write_jsonb<W: Write + ?Sized>(out: &mut W, v: &Jsonb, layout: Layout) -> fmt::Result {
     if !matches!(v, Jsonb::Array(_) | Jsonb::Object(_)) {
         return write_scalar(out, v);
     }
-    let sep = if indent { "," } else { ", " };
+    let (indent, sep, colon) = match layout {
+        Layout::Jsonb => (false, ", ", ": "),
+        Layout::Pretty => (true, ",", ": "),
+        Layout::Compact => (false, ",", ":"),
+    };
     open(out, v)?;
     let mut stack = vec![Frame { v, idx: 0 }];
     loop {
@@ -95,7 +104,7 @@ pub(crate) fn write_jsonb<W: Write + ?Sized>(out: &mut W, v: &Jsonb, indent: boo
                 add_indent(out, indent, level + 1)?;
                 if let Some(k) = key {
                     escape_json(out, k)?;
-                    out.write_str(": ")?;
+                    out.write_str(colon)?;
                 }
                 if matches!(c, Jsonb::Array(_) | Jsonb::Object(_)) {
                     open(out, c)?;

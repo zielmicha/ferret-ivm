@@ -12,15 +12,11 @@ pub fn optimize(rel: Rel) -> Result<Rel> {
     let rel = fold_all(rel)?;
     let rel = push(rel, vec![])?;
     let rel = prune_all(rel);
-    let rel = merge_projects(rel);
-    Ok(rel)
+    merge_projects(rel)
 }
 
-fn fold_all(mut rel: Rel) -> Result<Rel> {
-    for i in rel.inputs_mut() {
-        let t = std::mem::replace(i, Rel::unit());
-        *i = fold_all(t)?;
-    }
+fn fold_all(rel: Rel) -> Result<Rel> {
+    let mut rel = rel.map_inputs(fold_all)?;
     for e in rel.exprs_mut() {
         let t = std::mem::replace(e, Expr::bool(true));
         *e = t.fold()?;
@@ -73,7 +69,7 @@ fn finish(rel: Rel, preds: Vec<Expr>) -> Rel {
 }
 
 /// Push `preds` (over rel's output) as far down as possible.
-fn push(rel: Rel, preds: Vec<Expr>) -> Result<Rel> {
+fn push(rel: Rel, mut preds: Vec<Expr>) -> Result<Rel> {
     // constant-false predicate: keep (can't drop the subtree's schema)
     match rel {
         Rel::Filter { input, preds: p } => {
@@ -124,18 +120,16 @@ fn push(rel: Rel, preds: Vec<Expr>) -> Result<Rel> {
             let input = push(*input, down)?;
             Ok(finish(Rel::Aggregate { input: Box::new(input), group, aggs }, up))
         }
-        Rel::Distinct { input } => {
-            let input = push(*input, preds)?;
-            Ok(Rel::Distinct { input: Box::new(input) })
-        }
-        Rel::UnionAll { inputs } => {
-            let inputs = inputs.into_iter().map(|i| push(i, preds.clone())).collect::<Result<Vec<_>>>()?;
-            Ok(Rel::UnionAll { inputs })
-        }
-        Rel::SetOp { op, all, left, right } => {
-            let left = push(*left, preds.clone())?;
-            let right = push(*right, preds)?;
-            Ok(Rel::SetOp { op, all, left: Box::new(left), right: Box::new(right) })
+        Rel::Distinct { .. } | Rel::Negate { .. } | Rel::UnionAll { .. } | Rel::SetOp { .. } => {
+            let mut remaining = match &rel {
+                Rel::UnionAll { inputs } => inputs.len(),
+                Rel::SetOp { .. } => 2,
+                _ => 1,
+            };
+            rel.map_inputs(|input| {
+                remaining -= 1;
+                push(input, if remaining == 0 { std::mem::take(&mut preds) } else { preds.clone() })
+            })
         }
         Rel::TopK { input, group, order, limit, offset, with_ties } => {
             let (down, up): (Vec<Expr>, Vec<Expr>) =
@@ -159,23 +153,8 @@ fn push(rel: Rel, preds: Vec<Expr>) -> Result<Rel> {
             let input = push(*input, down)?;
             Ok(finish(Rel::FlatMap { input: Box::new(input), funcs, out, ordinality }, up))
         }
-        Rel::Negate { input } => {
-            let input = push(*input, preds)?;
-            Ok(Rel::Negate { input: Box::new(input) })
-        }
-        Rel::Recursive { id, base, step, distinct, columns } => {
-            let base = push(*base, vec![])?;
-            let step = push(*step, vec![])?;
-            Ok(finish(Rel::Recursive { id, base: Box::new(base), step: Box::new(step), distinct, columns }, preds))
-        }
-        other @ (Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } | Rel::Apply { .. }) => {
-            let other = match other {
-                Rel::Apply { left, right, kind } => {
-                    Rel::Apply { left: Box::new(push(*left, vec![])?), right: Box::new(push(*right, vec![])?), kind }
-                }
-                o => o,
-            };
-            Ok(finish(other, preds))
+        Rel::Get { .. } | Rel::Values { .. } | Rel::RecRef { .. } | Rel::Apply { .. } | Rel::Recursive { .. } => {
+            Ok(finish(rel.map_inputs(|input| push(input, vec![]))?, preds))
         }
     }
 }
@@ -309,12 +288,8 @@ fn push_join(left: Rel, right: Rel, mut kind: JoinKind, on: Vec<Expr>, preds: Ve
 }
 
 /// Merge stacked projections and drop identity projections.
-fn merge_projects(mut rel: Rel) -> Rel {
-    for i in rel.inputs_mut() {
-        let t = std::mem::replace(i, Rel::unit());
-        *i = merge_projects(t);
-    }
-    match rel {
+fn merge_projects(rel: Rel) -> Result<Rel> {
+    Ok(match rel.map_inputs(merge_projects)? {
         Rel::Project { input, cols } => {
             // columns copied by a Map are columns of its input
             let (input, cols) = match *input {
@@ -336,21 +311,12 @@ fn merge_projects(mut rel: Rel) -> Rel {
                 }
                 other => (Box::new(other), cols),
             };
-            let arity = input.arity();
-            if cols.len() == arity && cols.iter().enumerate().all(|(i, c)| i == *c) {
-                return *input;
-            }
-            match *input {
-                Rel::Project { input: inner, cols: c0 } => {
-                    Rel::Project { input: inner, cols: cols.iter().map(|c| c0[*c]).collect() }
-                }
-                other => Rel::Project { input: Box::new(other), cols },
-            }
+            input.project(cols)
         }
         Rel::Filter { input, preds } if preds.is_empty() => *input,
         Rel::Filter { input, preds } if preds.iter().all(|p| matches!(p, Expr::Literal(Datum::Bool(true), _))) => *input,
         other => other,
-    }
+    })
 }
 
 // ---------------------------------------------------------------- pruning
@@ -481,27 +447,15 @@ fn prune(rel: Rel, demand: &BTreeSet<usize>) -> (Rel, ColMap) {
             let m = jm[..arity].to_vec();
             (Rel::Join { left: Box::new(left), right: Box::new(right), kind, on }, m)
         }
-        Rel::Aggregate { input, group, aggs } => {
+        Rel::Aggregate { input, group, mut aggs } => {
             let mut need: BTreeSet<usize> = group.iter().copied().collect();
-            for a in &aggs {
-                need.extend(a.args.iter().copied());
-                need.extend(a.filter);
-                need.extend(a.order.iter().map(|k| k.col));
-            }
+            need.extend(aggs.iter().flat_map(AggCall::columns));
             let (input, im) = prune(*input, &need);
             let at = |c: usize| im[c].expect("aggregate input dropped");
             let group = group.iter().map(|c| at(*c)).collect();
-            let aggs = aggs
-                .into_iter()
-                .map(|mut a| {
-                    a.args = a.args.iter().map(|c| at(*c)).collect();
-                    a.filter = a.filter.map(at);
-                    for k in &mut a.order {
-                        k.col = at(k.col);
-                    }
-                    a
-                })
-                .collect();
+            for a in &mut aggs {
+                a.remap(&at);
+            }
             (Rel::Aggregate { input: Box::new(input), group, aggs }, identity(arity))
         }
         Rel::TopK { input, group, order, limit, offset, with_ties } => {
@@ -514,28 +468,16 @@ fn prune(rel: Rel, demand: &BTreeSet<usize>) -> (Rel, ColMap) {
             let order = order.iter().map(|k| SortKey { col: at(k.col), spec: k.spec }).collect();
             (Rel::TopK { input: Box::new(input), group, order, limit, offset, with_ties }, m)
         }
-        Rel::Window { input, funcs } => {
+        Rel::Window { input, mut funcs } => {
             let n = input.arity();
             let mut need: BTreeSet<usize> = demand.iter().copied().filter(|c| *c < n).collect();
-            for f in &funcs {
-                need.extend(f.args.iter().copied());
-                need.extend(f.partition.iter().copied());
-                need.extend(f.order.iter().map(|k| k.col));
-            }
+            need.extend(funcs.iter().flat_map(WindowCall::columns));
             let (input, im) = prune(*input, &need);
             let n2 = input.arity();
             let at = |c: usize| im[c].expect("window input dropped");
-            let funcs = funcs
-                .into_iter()
-                .map(|mut f| {
-                    f.args = f.args.iter().map(|c| at(*c)).collect();
-                    f.partition = f.partition.iter().map(|c| at(*c)).collect();
-                    for k in &mut f.order {
-                        k.col = at(k.col);
-                    }
-                    f
-                })
-                .collect();
+            for f in &mut funcs {
+                f.remap(&at);
+            }
             let m = (0..arity).map(|c| if c < n { im[c] } else { Some(n2 + c - n) }).collect();
             (Rel::Window { input: Box::new(input), funcs }, m)
         }

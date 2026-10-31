@@ -131,8 +131,10 @@ proptest! {
         let p = Jsonb::parse(&t).unwrap();
         prop_assert_eq!(p.to_string(), t.clone());
         prop_assert!(p == a);
-        let q = Jsonb::parse(&a.to_pretty()).unwrap();
-        prop_assert_eq!(q.to_string(), t);
+        for text in [a.to_pretty(), a.to_compact()] {
+            let q = Jsonb::parse(&text).unwrap();
+            prop_assert_eq!(q.to_string(), t.clone());
+        }
     }
 
     #[test]
@@ -148,6 +150,22 @@ proptest! {
     fn contains_reflexive(a in jsonb()) {
         prop_assert!(a.contains(&a));
     }
+}
+
+#[test]
+fn normalize_sorts_nested_objects_and_keeps_last_duplicate() {
+    let value = Jsonb::Object(vec![
+        ("z".into(), Jsonb::Bool(false)),
+        ("a".into(), Jsonb::Null),
+        ("z".into(), Jsonb::Array(vec![Jsonb::Object(vec![
+            ("bb".into(), Jsonb::Null),
+            ("a".into(), Jsonb::Bool(false)),
+            ("a".into(), Jsonb::Bool(true)),
+        ])])),
+    ]).normalize();
+    assert_eq!(value.to_string(), r#"{"a": null, "z": [{"a": true, "bb": null}]}"#);
+    assert_eq!(value.to_compact(), r#"{"a":null,"z":[{"a":true,"bb":null}]}"#);
+    assert_eq!(value.clone().normalize(), value);
 }
 
 #[test]
@@ -185,6 +203,7 @@ fn deep_values_stack_safety() {
             for d in &docs {
                 let v = Jsonb::parse(d).unwrap();
                 let s = v.to_string();
+                assert_eq!(v.to_compact(), *d);
                 let p = v.to_pretty();
                 let c = v.clone();
                 assert!(v == c);

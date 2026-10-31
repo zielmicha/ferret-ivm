@@ -139,6 +139,37 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Rows retained by a partial consumer remain charged; errors release
+    /// the remaining chunks and terminate the iterator.
+    #[test]
+    fn query_rows_hold_charges_until_consumed() {
+        use crate::coord::api::RowStream;
+        use crate::types::Datum;
+
+        let meter = Meter::new();
+        let (tx, rest) = bounded(meter.clone(), Box::new(|| false));
+        tx.send(vec![vec![Datum::Int8(2)], vec![Datum::Int8(3)]], 200);
+        tx.fail(SqlError::internal("failed read"));
+        let mut rows = RowStream::new(Chunk::new(vec![vec![Datum::Int8(1)]], meter.charge(100)), Some(rest));
+        assert_eq!(rows.next().unwrap().unwrap(), vec![Datum::Int8(1)]);
+        assert_eq!(meter.used(), 300);
+        for n in [2, 3] {
+            assert_eq!(rows.next().unwrap().unwrap(), vec![Datum::Int8(n)]);
+            assert_eq!(meter.used(), 200);
+        }
+        assert_eq!(rows.next().unwrap().unwrap_err().message, "failed read");
+        assert_eq!(meter.used(), 0);
+        assert!(rows.next().is_none());
+
+        // A completed portal may retain the iterator indefinitely, with
+        // no receiver to replace its exhausted final chunk.
+        let mut rows = RowStream::new(Chunk::new(vec![vec![Datum::Int8(4)]], meter.charge(100)), None);
+        assert_eq!(rows.next().unwrap().unwrap(), vec![Datum::Int8(4)]);
+        assert_eq!(meter.used(), 100);
+        assert!(rows.next().is_none());
+        assert_eq!(meter.used(), 0);
+    }
+
     /// A producer waits for its consumer with a bounded number of chunks
     /// in flight, each counted until the consumer drops it; it stops when
     /// the consumer goes away or when told to.

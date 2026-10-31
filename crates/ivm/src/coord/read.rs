@@ -19,7 +19,7 @@ fn col(name: &str, ty: SqlType) -> ResultColumn {
 fn text_rows(columns: &[&str], rows: Vec<Vec<String>>) -> ExecResult {
     ExecResult::Query {
         columns: columns.iter().map(|c| col(c, SqlType::Text)).collect(),
-        rows: rows.into_iter().map(|r| r.into_iter().map(Datum::text_owned).collect()).collect(),
+        rows: rows.into_iter().map(|r| r.into_iter().map(Datum::text_owned).collect()).collect::<Vec<Row>>().into(),
     }
 }
 
@@ -65,10 +65,8 @@ const RESULT_CHUNK_BYTES: usize = 256 << 10;
 const INLINE_RESULT_ROWS: usize = super::reader::INLINE_READ_ENTRIES as usize;
 const INLINE_RESULT_BYTES: usize = 8 << 20;
 
-/// Answers a read with its rows in chunks: a result of one chunk as
-/// `ExecResult::Query` (an error before it is complete fails the
-/// statement), a larger one as `ExecResult::Rows`, whose first chunk is in
-/// the reply and the rest follow (an error then ends the rows). Chunks are
+/// Answers a read with its rows in chunks. An error before the first full
+/// chunk fails the statement; afterwards it ends the rows. Chunks are
 /// counted in the memory of the outputs until the session drops them. Off
 /// the engine thread (`streaming`) a chunk is sent as soon as it is full,
 /// the reader waiting for the session to take it (`coord::stream`); on it,
@@ -135,46 +133,42 @@ impl ChunkedReply {
             None => {
                 let (tx, rest) = super::stream::bounded(self.meter.clone(), self.stop.take().expect("a streaming reply"));
                 self.rest = Some(tx);
-                let rows = RowStream { first: Some(super::stream::Chunk::new(chunk, self.meter.charge(mem))), rest };
+                let rows = RowStream::new(Chunk::new(chunk, self.meter.charge(mem)), Some(rest));
                 let reply = self.reply.take().expect("a reply");
-                Ok(reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows })).is_ok())
+                Ok(reply.send(Ok(ExecResult::Query { columns: std::mem::take(&mut self.columns), rows })).is_ok())
             }
         }
     }
 
     /// The reply channel back (a read on the engine thread that goes on
     /// elsewhere; it sent nothing).
-    pub(crate) fn abandon(mut self) -> Sender<Result<ExecResult>> {
-        self.reply.take().expect("a reply that was not sent")
+    pub(crate) fn abandon(self) -> Sender<Result<ExecResult>> {
+        self.reply.expect("a reply that was not sent")
     }
 
     /// The end of the rows, or the error that ends them.
     pub(crate) fn finish(mut self, r: Result<()>) {
-        if let Some(tx) = self.rest.take() {
+        if let Some(tx) = self.rest {
             match r {
                 Ok(()) if !self.chunk.is_empty() => {
-                    tx.send(std::mem::take(&mut self.chunk), self.mem);
+                    tx.send(self.chunk, self.mem);
                 }
                 Ok(()) => {}
                 Err(e) => tx.fail(e),
             }
             return;
         }
-        let reply = self.reply.take().expect("a reply");
-        let mut kept = std::mem::take(&mut self.kept);
-        if kept.is_empty() {
-            let _ = reply.send(r.map(|()| ExecResult::Query { columns: std::mem::take(&mut self.columns), rows: std::mem::take(&mut self.chunk) }));
+        let reply = self.reply.expect("a reply");
+        if self.kept.is_empty() {
+            let _ = reply.send(r.map(|()| ExecResult::Query { columns: self.columns, rows: self.chunk.into() }));
             return;
         }
-        let (first, mem) = kept.remove(0);
-        let mut end = Ok(());
-        match r {
-            Ok(()) if !self.chunk.is_empty() => kept.push((std::mem::take(&mut self.chunk), self.mem)),
-            Ok(()) => {}
-            Err(e) => end = Err(e),
+        let (first, mem) = self.kept.remove(0);
+        if r.is_ok() && !self.chunk.is_empty() {
+            self.kept.push((self.chunk, self.mem));
         }
-        let rows = RowStream { first: Some(super::stream::Chunk::new(first, self.meter.charge(mem))), rest: super::stream::ready(&self.meter, kept, end) };
-        let _ = reply.send(Ok(ExecResult::Rows { columns: std::mem::take(&mut self.columns), rows }));
+        let rows = RowStream::new(Chunk::new(first, self.meter.charge(mem)), Some(super::stream::ready(&self.meter, self.kept, r)));
+        let _ = reply.send(Ok(ExecResult::Query { columns: self.columns, rows }));
     }
 }
 
@@ -624,46 +618,18 @@ impl Engine {
             Statement::Select { query, .. } => {
                 let mut b = crate::sql::Binder::new(&self.catalog).with_params(params);
                 let bq = b.bind_query(query)?;
-                let types = bq.column_types();
-                let cols = bq
-                    .names
-                    .iter()
-                    .take(bq.visible)
-                    .zip(types)
-                    .map(|(n, t)| ResultColumn { name: n.clone(), ty: t.ty, typmod: t.typmod })
-                    .collect();
                 // still unknown: the session describes them as text but
                 // keeps binding their values as untyped literals
                 let ptypes = b.params.iter().map(|p| p.ty.clone()).collect();
-                Ok((cols, ptypes))
+                Ok((result_columns(&bq), ptypes))
             }
             Statement::Sql(s) => {
                 // count parameters used by DML
-                let text = s.to_string();
-                let mut max = 0;
-                let b = text.as_bytes();
-                let mut i = 0;
-                while i < b.len() {
-                    if b[i] == b'$' {
-                        let mut j = i + 1;
-                        while j < b.len() && b[j].is_ascii_digit() {
-                            j += 1;
-                        }
-                        if let Ok(n) = text[i + 1..j].parse::<usize>() {
-                            max = max.max(n);
-                        }
-                        i = j;
-                    } else {
-                        i += 1;
-                    }
-                }
+                let max = crate::sql::parser::max_param_index(&s.to_string());
                 let ptypes = (0..max).map(|k| params.get(k).map(|p| p.ty.clone()).unwrap_or(SqlType::Unknown)).collect();
                 Ok((vec![], ptypes))
             }
-            Statement::Show(_) | Statement::Explain { .. } => {
-                // executed eagerly by the session; columns are reported then
-                Ok((vec![], vec![]))
-            }
+            // SHOW and EXPLAIN are executed eagerly by the session.
             _ => Ok((vec![], vec![])),
         }
     }
@@ -783,7 +749,7 @@ impl Engine {
             }
             ShowKind::Gsn => ExecResult::Query {
                 columns: vec![col("gsn", SqlType::Int8)],
-                rows: vec![vec![Datum::Int8(self.processed as i64)]],
+                rows: vec![vec![Datum::Int8(self.processed as i64)]].into(),
             },
             ShowKind::Columns(name) => {
                 let Some(o) = self.catalog.by_name(&name) else {

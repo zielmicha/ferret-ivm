@@ -325,6 +325,27 @@ fn float4_arithmetic_with_other_numbers_is_float8() {
         column_types(&h, q),
         vec!["double precision", "double precision", "double precision", "real", "double precision", "double precision", "double precision", "double precision", "real"]
     );
+    for (ty, large, small) in [("float4", "3e38", "1e-38"), ("float8", "1e308", "1e-300")] {
+        for (lhs, op, rhs, error) in [
+            (large, "+", large, "value out of range: overflow"),
+            (large, "*", "2", "value out of range: overflow"),
+            (large, "/", small, "value out of range: overflow"),
+            (small, "*", small, "value out of range: underflow"),
+            (small, "/", large, "value out of range: underflow"),
+            ("1", "/", "0", "division by zero"),
+            ("Infinity", "/", "0", "division by zero"),
+        ] {
+            let q = format!("SELECT '{lhs}'::{ty} {op} '{rhs}'::{ty}");
+            assert_eq!(try_rows(&h, &q).unwrap_err(), error, "{q}");
+        }
+        assert_eq!(
+            rows(&h, &format!(
+                "SELECT 1::{ty} - 1::{ty}, 0::{ty} * 1::{ty}, 1::{ty} / 'Infinity'::{ty}, \
+                 'Infinity'::{ty} + 1::{ty}, 'NaN'::{ty} / 0::{ty}, 'Infinity'::{ty} - 'Infinity'::{ty}"
+            )),
+            vec!["0|0|0|Infinity|NaN|NaN"]
+        );
+    }
     running.shutdown();
 }
 

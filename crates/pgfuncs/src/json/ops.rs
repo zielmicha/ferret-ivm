@@ -260,23 +260,15 @@ pub(crate) fn concat(a: &Jsonb, b: &Jsonb) -> Jsonb {
             pairs.extend(y.iter().cloned());
             Jsonb::Object(normalize_pairs(pairs))
         }
-        (Jsonb::Object(_), _) => {
-            let mut elems = Vec::with_capacity(1 + root_count(b));
-            elems.push(a.clone());
-            elems.extend(root_elems(b).iter().cloned());
-            Jsonb::Array(elems)
-        }
-        (_, Jsonb::Object(_)) => {
-            let mut elems = Vec::with_capacity(1 + root_count(a));
-            elems.extend(root_elems(a).iter().cloned());
-            elems.push(b.clone());
-            Jsonb::Array(elems)
-        }
         _ => {
-            let mut elems = Vec::with_capacity(root_count(a) + root_count(b));
-            elems.extend(root_elems(a).iter().cloned());
-            elems.extend(root_elems(b).iter().cloned());
-            Jsonb::Array(elems)
+            // Every non-array operand becomes a single array element.
+            fn elems(v: &Jsonb) -> &[Jsonb] {
+                match v {
+                    Jsonb::Array(a) => a,
+                    other => std::slice::from_ref(other),
+                }
+            }
+            Jsonb::Array(elems(a).iter().chain(elems(b)).cloned().collect())
         }
     }
 }

@@ -205,6 +205,7 @@ fn describe_infers_parameter_types() {
         ("SELECT $1::date + 1, $2 || 'x', $3 + 1, $4", vec![1082, 25, 23, 25]),
         ("SELECT id FROM t ORDER BY id LIMIT $1", vec![20]),
         ("SELECT id FROM t WHERE s LIKE $1 AND a IN ($2, 3)", vec![25, 23]),
+        ("UPDATE t SET s = '$9' WHERE id = $1", vec![25]),
     ] {
         c.parse("s", sql, &[]);
         c.describe_stmt("s");

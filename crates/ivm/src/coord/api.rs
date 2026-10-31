@@ -93,57 +93,88 @@ impl IntoIterator for SharedRows {
     }
 }
 
-pub enum ExecResult {
-    Query { columns: Vec<ResultColumn>, rows: Vec<Row> },
-    /// The rows of a query larger than one chunk, handed over as the engine
-    /// finds them (`EngineHandle::execute` collects them into `Query`).
-    Rows { columns: Vec<ResultColumn>, rows: RowStream },
+/// A statement result, with collected rows by default. Sessions consume
+/// `StreamingResult` so that large queries stay bounded in memory.
+pub enum ExecResult<R = Vec<Row>> {
+    Query { columns: Vec<ResultColumn>, rows: R },
     Command { tag: String },
     Subscribe { columns: Vec<ResultColumn>, rx: Receiver<SubEvent>, cancel: Arc<AtomicBool>, progress: bool },
 }
 
-/// Rows of a query result in chunks, sent as they are found (by a reader
-/// thread, which waits for the session to take them; see `coord::stream`);
-/// an error ends them. Dropping the stream ends the read at its next chunk.
+pub type StreamingResult = ExecResult<RowStream>;
+
+/// Query rows, whether already available or arriving in bounded chunks.
+/// The current chunk stays charged while a consumer (including a suspended
+/// portal) holds it. Dropping the rows stops the reader at its next chunk.
 pub struct RowStream {
-    pub(crate) first: Option<Chunk<Vec<Row>>>,
-    pub(crate) rest: Chunks<Vec<Row>>,
+    chunk: std::vec::IntoIter<Row>,
+    _charge: Charge,
+    rest: Option<Chunks<Vec<Row>>>,
+}
+
+impl From<Vec<Row>> for RowStream {
+    fn from(rows: Vec<Row>) -> Self {
+        Self::new(Chunk::new(rows, Charge::none()), None)
+    }
 }
 
 impl RowStream {
-    /// The next chunk; None after the last.
-    pub fn next_chunk(&mut self) -> Option<Result<Chunk<Vec<Row>>>> {
-        match self.first.take() {
-            Some(c) => Some(Ok(c)),
-            None => self.rest.next(),
-        }
+    pub(crate) fn new(first: Chunk<Vec<Row>>, rest: Option<Chunks<Vec<Row>>>) -> Self {
+        let (rows, charge) = first.into_parts();
+        Self { chunk: rows.into_iter(), _charge: charge, rest }
     }
 
-    /// All the rows.
-    pub fn collect(mut self) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        while let Some(c) = self.next_chunk() {
-            rows.extend(c?.into_parts().0);
+    /// Collect the rows, reusing the first chunk's allocation.
+    pub fn collect(self) -> Result<Vec<Row>> {
+        let mut rows: Vec<Row> = self.chunk.collect();
+        if let Some(rest) = self.rest {
+            for chunk in rest {
+                rows.extend(chunk?.into_parts().0);
+            }
         }
         Ok(rows)
     }
 }
 
-impl ExecResult {
-    /// A streamed result collected into `Query`.
-    pub fn collected(self) -> Result<ExecResult> {
-        match self {
-            ExecResult::Rows { columns, rows } => Ok(ExecResult::Query { columns, rows: rows.collect()? }),
-            other => Ok(other),
+impl Iterator for RowStream {
+    type Item = Result<Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.chunk.next() {
+                return Some(Ok(row));
+            }
+            // IntoIter keeps the Vec allocation even after its last row.
+            self.chunk = Vec::new().into_iter();
+            self._charge = Charge::none();
+            match self.rest.as_mut()?.next() {
+                Some(Ok(chunk)) => {
+                    let (rows, charge) = chunk.into_parts();
+                    (self.chunk, self._charge) = (rows.into_iter(), charge);
+                }
+                end => {
+                    self.rest = None;
+                    return end.and_then(Result::err).map(Err);
+                }
+            }
         }
     }
 }
 
-impl std::fmt::Debug for ExecResult {
+impl StreamingResult {
+    pub fn collected(self) -> Result<ExecResult> {
+        Ok(match self {
+            ExecResult::Query { columns, rows } => ExecResult::Query { columns, rows: rows.collect()? },
+            ExecResult::Command { tag } => ExecResult::Command { tag },
+            ExecResult::Subscribe { columns, rx, cancel, progress } => ExecResult::Subscribe { columns, rx, cancel, progress },
+        })
+    }
+}
+
+impl<R> std::fmt::Debug for ExecResult<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecResult::Query { columns, rows } => write!(f, "Query({} cols, {} rows)", columns.len(), rows.len()),
-            ExecResult::Rows { columns, .. } => write!(f, "Rows({} cols, streamed)", columns.len()),
+            ExecResult::Query { columns, .. } => write!(f, "Query({} cols)", columns.len()),
             ExecResult::Command { tag } => write!(f, "Command({tag})"),
             ExecResult::Subscribe { .. } => write!(f, "Subscribe"),
         }
@@ -193,7 +224,7 @@ pub enum Request {
         vars: SessionVars,
         /// Logged external responses (e.g. discovered source schemas).
         extra: String,
-        reply: Sender<Result<ExecResult>>,
+        reply: Sender<Result<StreamingResult>>,
     },
     /// Result columns and parameter types of a statement, without running it.
     Describe { stmt: Box<Statement>, params: Vec<ParamSlot>, reply: Sender<Result<(Vec<ResultColumn>, Vec<SqlType>)>> },

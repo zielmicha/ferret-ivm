@@ -24,7 +24,8 @@ use crate::sql::parser::Statement;
 use crate::sql::plan::Rel;
 use crate::sql::ParamSlot;
 use crate::sql_bail;
-use crate::types::{Datum, Row, SqlType};
+use crate::types::{Datum, Row};
+use crate::types::encoding::{key_bytes, literal_matches};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast;
 
@@ -63,33 +64,6 @@ impl Touched {
             (Some(a), Some(Some(b))) => a.iter().any(|k| b.contains(k)),
         })
     }
-}
-
-/// Canonical encoding of primary key values (as lookups by key use them).
-fn key_bytes(key: &[Datum]) -> Vec<u8> {
-    let mut b = Vec::new();
-    for k in key {
-        crate::types::encoding::encode_key(k, Default::default(), &mut b);
-    }
-    b
-}
-
-/// Does a literal compared with a column of type `t` encode as that
-/// column's values do? (As for index ranges of reads.)
-fn literal_of_type(d: &Datum, t: &SqlType) -> bool {
-    matches!(
-        (d, t),
-        (Datum::Int2(_), SqlType::Int2)
-            | (Datum::Int4(_), SqlType::Int4)
-            | (Datum::Int8(_), SqlType::Int8)
-            | (Datum::Text(_), SqlType::Text | SqlType::Varchar | SqlType::Bpchar | SqlType::Name)
-            | (Datum::Numeric(_), SqlType::Numeric)
-            | (Datum::Date(_), SqlType::Date)
-            | (Datum::Timestamp(_), SqlType::Timestamp)
-            | (Datum::TimestampTz(_), SqlType::TimestampTz)
-            | (Datum::Uuid(_), SqlType::Uuid)
-            | (Datum::Bool(_), SqlType::Bool)
-    )
 }
 
 impl Engine {
@@ -194,7 +168,7 @@ impl Engine {
                 }
             };
             match ch {
-                TableChange::Upsert { row, .. } => w.add_key(*t, key_bytes(&pk.iter().map(|c| row[*c].clone()).collect::<Vec<_>>())),
+                TableChange::Upsert { row, .. } => w.add_key(*t, key_bytes(pk.iter().map(|c| &row[*c]))),
                 TableChange::Delete { key } => w.add_key(*t, key_bytes(key)),
                 _ => w.add_all(*t),
             }
@@ -253,7 +227,7 @@ impl Engine {
                     return None;
                 }
                 match (&call.args[0], &call.args[1]) {
-                    (Expr::Column(x), Expr::Literal(d, _)) | (Expr::Literal(d, _), Expr::Column(x)) if *x == c && literal_of_type(d, ty) => Some(d.clone()),
+                    (Expr::Column(x), Expr::Literal(d, _)) | (Expr::Literal(d, _), Expr::Column(x)) if *x == c && literal_matches(d, ty) => Some(d.clone()),
                     _ => None,
                 }
             })?;
@@ -359,13 +333,7 @@ impl Engine {
                 changes.push((id, TableChange::Insert { row: full }));
             } else {
                 let key: Vec<Datum> = def.pk.iter().map(|c| full[*c].clone()).collect();
-                let kb = {
-                    let mut b = Vec::new();
-                    for k in &key {
-                        crate::types::encoding::encode_key(k, Default::default(), &mut b);
-                    }
-                    b
-                };
+                let kb = key_bytes(&key);
                 if !seen.insert(kb) || self.stored_row(id, &key)?.is_some() {
                     if do_nothing {
                         continue;

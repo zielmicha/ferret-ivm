@@ -109,17 +109,15 @@ pub(crate) fn normalize_pairs(mut pairs: Vec<(String, Jsonb)>) -> Vec<(String, J
         return pairs;
     }
     pairs.sort_by(|a, b| key_cmp(&a.0, &b.0));
-    let mut out: Vec<(String, Jsonb)> = Vec::with_capacity(pairs.len());
-    for p in pairs {
-        if let Some(last) = out.last_mut()
-            && last.0 == p.0
-        {
-            *last = p;
-            continue;
+    pairs.dedup_by(|next, kept| {
+        if next.0 != kept.0 {
+            return false;
         }
-        out.push(p);
-    }
-    out
+        // dedup_by retains the earlier slot; put the last value there.
+        std::mem::swap(next, kept);
+        true
+    });
+    pairs
 }
 
 fn check_string_len(len: usize) -> Result<()> {
@@ -463,7 +461,7 @@ fn rebuild(root: &Jsonb, strip_nulls: bool) -> Jsonb {
 /// jsonb_out: `{"a": 1, "b": [1, 2]}`
 impl std::fmt::Display for Jsonb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        output::write_jsonb(f, self, false)
+        output::write_jsonb(f, self, output::Layout::Jsonb)
     }
 }
 
@@ -481,7 +479,14 @@ impl Jsonb {
     /// jsonb_pretty
     pub fn to_pretty(&self) -> String {
         let mut s = String::new();
-        let _ = output::write_jsonb(&mut s, self, true);
+        let _ = output::write_jsonb(&mut s, self, output::Layout::Pretty);
+        s
+    }
+
+    /// JSON text with compact separators, as used by SQL `to_json`.
+    pub fn to_compact(&self) -> String {
+        let mut s = String::new();
+        let _ = output::write_jsonb(&mut s, self, output::Layout::Compact);
         s
     }
 
@@ -646,65 +651,19 @@ impl Jsonb {
 
     /// Re-establishes the object-key invariant recursively (for values
     /// constructed by hand); iterative.
-    pub fn normalize(self) -> Jsonb {
-        enum Src {
-            Arr(std::vec::IntoIter<Jsonb>),
-            Obj(std::vec::IntoIter<(String, Jsonb)>),
-        }
-        fn open(
-            v: Jsonb,
-            key: Option<String>,
-        ) -> std::result::Result<(Src, RbDst, Option<String>), Jsonb> {
-            match v {
-                Jsonb::Array(a) => {
-                    let n = a.len();
-                    Ok((
-                        Src::Arr(a.into_iter()),
-                        RbDst::Arr(Vec::with_capacity(n)),
-                        key,
-                    ))
+    pub fn normalize(mut self) -> Jsonb {
+        let mut stack = vec![&mut self];
+        while let Some(value) = stack.pop() {
+            match value {
+                Jsonb::Array(elems) => stack.extend(elems.iter_mut()),
+                Jsonb::Object(pairs) => {
+                    *pairs = normalize_pairs(std::mem::take(pairs));
+                    stack.extend(pairs.iter_mut().map(|(_, value)| value));
                 }
-                Jsonb::Object(p) => {
-                    let n = p.len();
-                    Ok((
-                        Src::Obj(p.into_iter()),
-                        RbDst::Obj(Vec::with_capacity(n)),
-                        key,
-                    ))
-                }
-                scalar => Err(scalar),
+                _ => {}
             }
         }
-        let mut stack = match open(self, None) {
-            Ok(f) => vec![f],
-            Err(scalar) => return scalar,
-        };
-        loop {
-            let top = stack.last_mut().unwrap();
-            let next = match &mut top.0 {
-                Src::Arr(it) => it.next().map(|v| (None, v)),
-                Src::Obj(it) => it.next().map(|(k, v)| (Some(k), v)),
-            };
-            match next {
-                Some((key, child @ (Jsonb::Array(_) | Jsonb::Object(_)))) => {
-                    if let Ok(f) = open(child, key) {
-                        stack.push(f);
-                    }
-                }
-                Some((key, scalar)) => top.1.push(key, scalar),
-                None => {
-                    let (_, dst, key) = stack.pop().unwrap();
-                    let built = match dst {
-                        RbDst::Arr(a) => Jsonb::Array(a),
-                        RbDst::Obj(p) => Jsonb::Object(normalize_pairs(p)),
-                    };
-                    match stack.last_mut() {
-                        None => return built,
-                        Some(parent) => parent.1.push(key, built),
-                    }
-                }
-            }
-        }
+        self
     }
 
     /// `?`: top-level object key or string array element (a string scalar

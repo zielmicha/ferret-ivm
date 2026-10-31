@@ -19,7 +19,7 @@ use crate::error::{codes, Result, SqlError};
 use crate::log::{LogRecord, LogWriter};
 use crate::sql::plan::ObjectId;
 use crate::storage::{Env, EnvOptions, Gsn, TreeId};
-use api::*;
+use api::{StreamingResult as ExecResult, *};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use rustc_hash::FxHashMap;
 use seq::{SeqMsg, Sequencer};
@@ -304,8 +304,8 @@ impl EngineHandle {
         }
     }
 
-    /// Run a statement; a streamed result (`ExecResult::Rows`) is collected.
-    pub fn execute(&self, stmt: crate::sql::parser::Statement, params: Vec<crate::sql::ParamSlot>, vars: SessionVars, extra: String) -> Result<ExecResult> {
+    /// Run a statement, collecting its query rows.
+    pub fn execute(&self, stmt: crate::sql::parser::Statement, params: Vec<crate::sql::ParamSlot>, vars: SessionVars, extra: String) -> Result<api::ExecResult> {
         let (tx, rx) = bounded(1);
         self.tx
             .send(EngineMsg::Request(Request::Execute { stmt: Box::new(stmt), params, vars, extra, reply: tx }))
@@ -317,7 +317,7 @@ impl EngineHandle {
     /// while the statement runs or waits): the request is then marked
     /// `gone` in its session's interrupts, so that the engine drops it if
     /// it is still waiting (a parked read), and the call fails with
-    /// IO_ERROR. A query's rows may come streamed (`ExecResult::Rows`).
+    /// IO_ERROR. Query rows arrive as a stream, kept in bounded memory.
     pub fn execute_while(
         &self,
         stmt: crate::sql::parser::Statement,

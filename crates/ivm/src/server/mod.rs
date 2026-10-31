@@ -1,11 +1,10 @@
 //! PostgreSQL wire protocol server: simple and extended query protocols,
 //! streaming SUBSCRIBE (as rows or COPY), cancellation.
 
-use crate::coord::api::{ExecResult, Interrupts, ResultColumn, RowStream, SessionVars, SubEvent};
+use crate::coord::api::{Interrupts, ResultColumn, RowStream, SessionVars, StreamingResult as ExecResult, SubEvent};
 use crate::coord::{EngineHandle, EngineMsg};
 use crate::error::{codes, Result, SqlError};
 use crate::listen::{Listener, Stream};
-use crate::memory::Charge;
 use crate::sql::parser::{parse_statement, split_statements, AsOf, ShowKind, Statement, SubscribeTarget};
 use crate::sql::ParamSlot;
 use crate::types::text::{format_datum, parse_datum, recv_datum, send_datum};
@@ -95,42 +94,7 @@ struct Portal {
     params: Vec<ParamSlot>,
     result_formats: Vec<i16>,
     /// Remaining rows of a partially fetched (or exhausted) result.
-    pending: Option<(Vec<ResultColumn>, PortalRows)>,
-}
-
-/// The rows of a portal's result not sent yet.
-struct PortalRows {
-    chunk: std::vec::IntoIter<Row>,
-    /// The chunk's memory in the budget, held while the portal holds it.
-    _charge: Charge,
-    /// The chunks still to come (a streamed result).
-    stream: Option<RowStream>,
-    interrupts: Arc<Interrupts>,
-}
-
-impl PortalRows {
-    fn next(&mut self) -> Option<Result<Row>> {
-        loop {
-            if let Some(r) = self.chunk.next() {
-                return Some(Ok(r));
-            }
-            match self.stream.as_mut()?.next_chunk() {
-                Some(Ok(c)) => {
-                    let (rows, charge) = c.into_parts();
-                    (self.chunk, self._charge) = (rows.into_iter(), charge);
-                }
-                Some(Err(e)) => {
-                    self.stream = None;
-                    return Some(Err(e));
-                }
-                None => {
-                    self.stream = None;
-                    // (a reader stopped by a cancel ends the rows early)
-                    return self.interrupts.cancelled().then(|| Err(crate::coord::stream::cancelled()));
-                }
-            }
-        }
-    }
+    pending: Option<(Vec<ResultColumn>, RowStream)>,
 }
 
 struct Session {
@@ -545,7 +509,7 @@ impl Session {
                     self.settings.get(&name).map(|v| {
                         Ok(ExecResult::Query {
                             columns: vec![ResultColumn { name: name.clone(), ty: SqlType::Text, typmod: -1 }],
-                            rows: vec![vec![Datum::text(v)]],
+                            rows: vec![vec![Datum::text(v)]].into(),
                         })
                     })
                 }
@@ -554,7 +518,7 @@ impl Session {
             Statement::Show(ShowKind::Variable(v)) => self.settings.get(&v.replace(' ', "_")).map(|val| {
                 Ok(ExecResult::Query {
                     columns: vec![ResultColumn { name: v.clone(), ty: SqlType::Text, typmod: -1 }],
-                    rows: vec![vec![Datum::text(val)]],
+                    rows: vec![vec![Datum::text(val)]].into(),
                 })
             }),
             _ => None,
@@ -667,15 +631,13 @@ impl Session {
 
     fn source_def(&mut self, name: &str) -> Result<(String, String, Option<Vec<String>>)> {
         // read through SHOW SOURCES + catalog via a query against the engine
-        let q = parse_statement(&format!("SHOW CREATE VIEW {name}"))?;
-        let _ = q;
         let r = self.engine.execute(
             Statement::Show(ShowKind::CreateView(name.to_string())),
             vec![],
             self.vars.clone(),
             String::new(),
         )?;
-        let ExecResult::Query { rows, .. } = r else { return Err(SqlError::internal("unexpected result")) };
+        let crate::coord::api::ExecResult::Query { rows, .. } = r else { return Err(SqlError::internal("unexpected result")) };
         let sql = rows.first().and_then(|r| r.get(1)).and_then(|d| d.as_str()).unwrap_or("").to_string();
         match parse_statement(&sql)? {
             Statement::CreateSource { conninfo, publication, tables, .. } => Ok((conninfo, publication, tables)),
@@ -721,67 +683,50 @@ impl Session {
     /// Send a result. Returns false if the statement ended with an error
     /// that aborts the rest of a multi-statement query.
     fn send_result(&mut self, res: ExecResult, formats: &[i16], describe: bool) -> Result<bool> {
-        match res {
+        let result = match res {
             ExecResult::Command { tag } => {
                 if tag.is_empty() {
                     self.out.empty_query_response();
                 } else {
                     self.out.command_complete(&tag);
                 }
-                Ok(true)
+                Ok(())
             }
-            ExecResult::Query { columns, rows } => {
+            ExecResult::Query { columns, mut rows } => {
                 if describe {
                     self.row_description(&columns, formats);
                 }
-                let n = rows.len();
-                for r in rows {
-                    self.data_row(&r, &columns, formats)?;
-                }
-                self.out.command_complete(&format!("SELECT {n}"));
-                Ok(true)
-            }
-            // rows sent as the engine finds them (an error ends them)
-            ExecResult::Rows { columns, mut rows } => {
-                if describe {
-                    self.row_description(&columns, formats);
-                }
-                let mut n = 0;
-                while let Some(chunk) = rows.next_chunk() {
-                    let chunk = match chunk {
-                        Ok(c) => c,
-                        Err(e) => {
-                            self.error(&e);
-                            return Ok(false);
-                        }
-                    };
-                    for r in chunk.iter() {
-                        self.data_row(r, &columns, formats)?;
-                        n += 1;
-                    }
-                }
-                // (a reader stopped by a cancel ends the rows early)
-                if self.interrupts.cancelled() {
-                    self.error(&crate::coord::stream::cancelled());
-                    return Ok(false);
-                }
-                self.out.command_complete(&format!("SELECT {n}"));
-                Ok(true)
+                self.send_rows(&mut rows, &columns, formats, usize::MAX).map(|n| self.out.command_complete(&format!("SELECT {n}")))
             }
             ExecResult::Subscribe { columns, rx, cancel, progress } => {
                 let r = self.stream_subscription(&columns, rx, &cancel, progress, formats, describe);
                 self.writer.get_mut().on_stall = None;
                 cancel.store(true, Ordering::Release);
-                match r {
-                    Ok(()) => Ok(true),
-                    Err(e) if e.code == codes::IO_ERROR => Err(e),
-                    Err(e) => {
-                        self.error(&e);
-                        Ok(false)
-                    }
-                }
+                r
+            }
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(e) if e.code == codes::IO_ERROR => Err(e),
+            Err(e) => {
+                self.error(&e);
+                Ok(false)
             }
         }
+    }
+
+    /// Send up to `limit` rows, retaining the rest for a later Execute.
+    fn send_rows(&mut self, rows: &mut RowStream, columns: &[ResultColumn], formats: &[i16], limit: usize) -> Result<usize> {
+        let mut sent = 0;
+        for row in rows.take(limit) {
+            self.data_row(&row?, columns, formats)?;
+            sent += 1;
+        }
+        // A cancelled reader can close the channel without an error chunk.
+        if sent < limit && self.interrupts.cancelled() {
+            return Err(crate::coord::stream::cancelled());
+        }
+        Ok(sent)
     }
 
     fn row_description(&mut self, columns: &[ResultColumn], formats: &[i16]) {
@@ -1094,37 +1039,22 @@ impl Session {
             self.pending_copy = matches!(stmt, Statement::Subscribe { copy: true, .. });
             let res = self.run_statement(stmt, portal.params.clone())?;
             match res {
-                ExecResult::Query { columns, rows } => {
-                    let rows = PortalRows { chunk: rows.into_iter(), _charge: Charge::none(), stream: None, interrupts: self.interrupts.clone() };
-                    portal.pending = Some((columns, rows))
-                }
-                ExecResult::Rows { columns, rows } => {
-                    let rows = PortalRows { chunk: Vec::new().into_iter(), _charge: Charge::none(), stream: Some(rows), interrupts: self.interrupts.clone() };
-                    portal.pending = Some((columns, rows))
-                }
+                ExecResult::Query { columns, rows } => portal.pending = Some((columns, rows)),
                 other => {
                     self.send_result(other, &portal.result_formats, false)?;
                     return Ok(());
                 }
             }
         }
-        let formats = portal.result_formats.clone();
         let (cols, rows) = portal.pending.as_mut().unwrap();
         let limit = if max_rows <= 0 { usize::MAX } else { max_rows as usize };
-        let mut sent = 0;
-        while sent < limit
-            && let Some(r) = rows.next()
-        {
-            let r = match r {
-                Ok(r) => r,
-                Err(e) => {
-                    self.portals.insert(name.to_string(), portal);
-                    return Err(e);
-                }
-            };
-            self.data_row(&r, cols, &formats)?;
-            sent += 1;
-        }
+        let sent = match self.send_rows(rows, cols, &portal.result_formats, limit) {
+            Ok(sent) => sent,
+            Err(e) => {
+                self.portals.insert(name.to_string(), portal);
+                return Err(e);
+            }
+        };
         // as in PostgreSQL: suspended whenever max_rows rows were sent, and
         // the count is that of this Execute; an exhausted portal stays (until
         // Close or the end of the transaction) and yields no more rows

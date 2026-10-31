@@ -257,6 +257,13 @@ fn add_months_tm(tm: &mut Tm, months: i32) -> Result<()> {
 
 /// timestamp_pl_interval()
 pub fn timestamp_pl_interval(ts: Timestamp, span: Interval) -> Result<Timestamp> {
+    timestamp_add_interval(ts, span, None)
+}
+
+/// Calendar arithmetic is shared by timestamp and timestamptz. A zone is
+/// resolved again after each calendar step, so months and days cross DST
+/// in local time while the final microseconds remain elapsed time.
+fn timestamp_add_interval(ts: Timestamp, span: Interval, zone: Option<&ZoneRef>) -> Result<Timestamp> {
     if interval_is_nobegin(&span) {
         if ts == DT_NOEND {
             return Err(timestamp_out_of_range());
@@ -273,27 +280,29 @@ pub fn timestamp_pl_interval(ts: Timestamp, span: Interval) -> Result<Timestamp>
         return Ok(ts);
     }
     let mut timestamp = ts;
-    if span.months != 0 {
-        let (mut tm, fsec) = timestamp2tm(timestamp)?;
-        add_months_tm(&mut tm, span.months)?;
-        timestamp = tm2timestamp(&tm, fsec, None)?;
-    }
-    if span.days != 0 {
-        let (mut tm, fsec) = timestamp2tm(timestamp)?;
-        let julian = date2j(tm.year, tm.mon, tm.mday);
-        let julian = match julian.checked_add(span.days) {
-            Some(j) if j >= 0 => j,
-            _ => return Err(timestamp_out_of_range()),
+    for (amount, months) in [(span.months, true), (span.days, false)] {
+        if amount == 0 {
+            continue;
+        }
+        let (mut tm, fsec) = match zone {
+            Some(z) => {
+                let tt = timestamp2tm_tz(timestamp, z)?;
+                (tt.tm, tt.fsec)
+            }
+            None => timestamp2tm(timestamp)?,
         };
-        let (y, m, d) = j2date(julian);
-        tm.year = y;
-        tm.mon = m;
-        tm.mday = d;
-        timestamp = tm2timestamp(&tm, fsec, None)?;
+        if months {
+            add_months_tm(&mut tm, amount)?;
+        } else {
+            let julian = date2j(tm.year, tm.mon, tm.mday).checked_add(amount)
+                .filter(|j| *j >= if zone.is_some() { -1 } else { 0 })
+                .ok_or_else(timestamp_out_of_range)?;
+            (tm.year, tm.mon, tm.mday) = j2date(julian);
+        }
+        let offset = zone.map(|z| tz::determine_offset(&mut tm, z));
+        timestamp = tm2timestamp(&tm, fsec, offset)?;
     }
-    timestamp = timestamp
-        .checked_add(span.micros)
-        .ok_or_else(timestamp_out_of_range)?;
+    timestamp = timestamp.checked_add(span.micros).ok_or_else(timestamp_out_of_range)?;
     if !is_valid_timestamp(timestamp) {
         return Err(timestamp_out_of_range());
     }
@@ -308,21 +317,7 @@ fn interval_negate(iv: &Interval) -> Result<Interval> {
     if interval_is_noend(iv) {
         return Ok(INTERVAL_NOBEGIN);
     }
-    let r = Interval {
-        micros: 0i64
-            .checked_sub(iv.micros)
-            .ok_or_else(interval_out_of_range)?,
-        days: 0i32
-            .checked_sub(iv.days)
-            .ok_or_else(interval_out_of_range)?,
-        months: 0i32
-            .checked_sub(iv.months)
-            .ok_or_else(interval_out_of_range)?,
-    };
-    if interval_not_finite(&r) {
-        return Err(interval_out_of_range());
-    }
-    Ok(r)
+    checked_interval(iv.months.checked_neg(), iv.days.checked_neg(), iv.micros.checked_neg())
 }
 
 pub fn timestamp_mi_interval(ts: Timestamp, span: Interval) -> Result<Timestamp> {
@@ -335,51 +330,7 @@ pub(crate) fn timestamptz_pl_interval_zone(
     span: Interval,
     zone: &ZoneRef,
 ) -> Result<TimestampTz> {
-    if interval_is_nobegin(&span) {
-        if ts == DT_NOEND {
-            return Err(timestamp_out_of_range());
-        }
-        return Ok(DT_NOBEGIN);
-    }
-    if interval_is_noend(&span) {
-        if ts == DT_NOBEGIN {
-            return Err(timestamp_out_of_range());
-        }
-        return Ok(DT_NOEND);
-    }
-    if timestamp_not_finite(ts) {
-        return Ok(ts);
-    }
-    let mut timestamp = ts;
-    if span.months != 0 {
-        let tt = timestamp2tm_tz(timestamp, zone)?;
-        let mut tm = tt.tm;
-        add_months_tm(&mut tm, span.months)?;
-        let tzo = tz::determine_offset(&mut tm, zone);
-        timestamp = tm2timestamp(&tm, tt.fsec, Some(tzo))?;
-    }
-    if span.days != 0 {
-        let tt = timestamp2tm_tz(timestamp, zone)?;
-        let mut tm = tt.tm;
-        let julian = date2j(tm.year, tm.mon, tm.mday);
-        let julian = match julian.checked_add(span.days) {
-            Some(j) if j >= -1 => j,
-            _ => return Err(timestamp_out_of_range()),
-        };
-        let (y, m, d) = j2date(julian);
-        tm.year = y;
-        tm.mon = m;
-        tm.mday = d;
-        let tzo = tz::determine_offset(&mut tm, zone);
-        timestamp = tm2timestamp(&tm, tt.fsec, Some(tzo))?;
-    }
-    timestamp = timestamp
-        .checked_add(span.micros)
-        .ok_or_else(timestamp_out_of_range)?;
-    if !is_valid_timestamp(timestamp) {
-        return Err(timestamp_out_of_range());
-    }
-    Ok(timestamp)
+    timestamp_add_interval(ts, span, Some(zone))
 }
 
 pub fn timestamptz_pl_interval(t: TimestampTz, iv: Interval, tz: &TimeZone) -> Result<TimestampTz> {
@@ -478,20 +429,11 @@ pub fn time_mi_time(a: Time, b: Time) -> Interval {
 // interval arithmetic
 // ---------------------------------------------------------------------------
 
-fn finite_interval_pl(a: &Interval, b: &Interval) -> Result<Interval> {
+fn checked_interval(months: Option<i32>, days: Option<i32>, micros: Option<i64>) -> Result<Interval> {
     let r = Interval {
-        months: a
-            .months
-            .checked_add(b.months)
-            .ok_or_else(interval_out_of_range)?,
-        days: a
-            .days
-            .checked_add(b.days)
-            .ok_or_else(interval_out_of_range)?,
-        micros: a
-            .micros
-            .checked_add(b.micros)
-            .ok_or_else(interval_out_of_range)?,
+        months: months.ok_or_else(interval_out_of_range)?,
+        days: days.ok_or_else(interval_out_of_range)?,
+        micros: micros.ok_or_else(interval_out_of_range)?,
     };
     if interval_not_finite(&r) {
         return Err(interval_out_of_range());
@@ -499,25 +441,12 @@ fn finite_interval_pl(a: &Interval, b: &Interval) -> Result<Interval> {
     Ok(r)
 }
 
+fn finite_interval_pl(a: &Interval, b: &Interval) -> Result<Interval> {
+    checked_interval(a.months.checked_add(b.months), a.days.checked_add(b.days), a.micros.checked_add(b.micros))
+}
+
 fn finite_interval_mi(a: &Interval, b: &Interval) -> Result<Interval> {
-    let r = Interval {
-        months: a
-            .months
-            .checked_sub(b.months)
-            .ok_or_else(interval_out_of_range)?,
-        days: a
-            .days
-            .checked_sub(b.days)
-            .ok_or_else(interval_out_of_range)?,
-        micros: a
-            .micros
-            .checked_sub(b.micros)
-            .ok_or_else(interval_out_of_range)?,
-    };
-    if interval_not_finite(&r) {
-        return Err(interval_out_of_range());
-    }
-    Ok(r)
+    checked_interval(a.months.checked_sub(b.months), a.days.checked_sub(b.days), a.micros.checked_sub(b.micros))
 }
 
 /// interval_pl()
@@ -576,8 +505,6 @@ fn tsround(j: f64) -> f64 {
 
 /// interval_mul()
 pub fn interval_mul(span: Interval, factor: f64) -> Result<Interval> {
-    let orig_month = span.months;
-    let orig_day = span.days;
     if factor.is_nan() {
         return Err(interval_out_of_range());
     }
@@ -602,51 +529,11 @@ pub fn interval_mul(span: Interval, factor: f64) -> Result<Interval> {
             INTERVAL_NOEND
         });
     }
-    let mut result = Interval::default();
-    let rd = span.months as f64 * factor;
-    if rd.is_nan() || !float8_fits_in_int32(rd) {
-        return Err(interval_out_of_range());
-    }
-    result.months = rd as i32;
-    let rd = span.days as f64 * factor;
-    if rd.is_nan() || !float8_fits_in_int32(rd) {
-        return Err(interval_out_of_range());
-    }
-    result.days = rd as i32;
-    let month_remainder_days =
-        tsround((orig_month as f64 * factor - result.months as f64) * DAYS_PER_MONTH as f64);
-    let mut sec_remainder = tsround(
-        (orig_day as f64 * factor - result.days as f64 + month_remainder_days
-            - (month_remainder_days as i32) as f64)
-            * SECS_PER_DAY as f64,
-    );
-    if sec_remainder.abs() >= SECS_PER_DAY as f64 {
-        let extra = (sec_remainder / SECS_PER_DAY as f64) as i32;
-        result.days = result
-            .days
-            .checked_add(extra)
-            .ok_or_else(interval_out_of_range)?;
-        sec_remainder -= extra as f64 * SECS_PER_DAY as f64;
-    }
-    result.days = result
-        .days
-        .checked_add(month_remainder_days as i32)
-        .ok_or_else(interval_out_of_range)?;
-    let rd = rint(span.micros as f64 * factor + sec_remainder * USECS_PER_SEC as f64);
-    if rd.is_nan() || !float8_fits_in_int64(rd) {
-        return Err(interval_out_of_range());
-    }
-    result.micros = rd as i64;
-    if interval_not_finite(&result) {
-        return Err(interval_out_of_range());
-    }
-    Ok(result)
+    scale_interval(span, |x| x * factor)
 }
 
 /// interval_div()
 pub fn interval_div(span: Interval, factor: f64) -> Result<Interval> {
-    let orig_month = span.months;
-    let orig_day = span.days;
     if factor == 0.0 {
         return Err(Error::new(DIVISION_BY_ZERO, "division by zero"));
     }
@@ -663,21 +550,27 @@ pub fn interval_div(span: Interval, factor: f64) -> Result<Interval> {
             Ok(span)
         };
     }
+    scale_interval(span, |x| x / factor)
+}
+
+/// Scale the finite components, carrying fractional months into days and
+/// fractional days into microseconds with PostgreSQL's rounding rules.
+fn scale_interval(span: Interval, scale: impl Fn(f64) -> f64) -> Result<Interval> {
     let mut result = Interval::default();
-    let rd = span.months as f64 / factor;
-    if rd.is_nan() || !float8_fits_in_int32(rd) {
+    let months = scale(span.months as f64);
+    if months.is_nan() || !float8_fits_in_int32(months) {
         return Err(interval_out_of_range());
     }
-    result.months = rd as i32;
-    let rd = span.days as f64 / factor;
-    if rd.is_nan() || !float8_fits_in_int32(rd) {
+    result.months = months as i32;
+    let days = scale(span.days as f64);
+    if days.is_nan() || !float8_fits_in_int32(days) {
         return Err(interval_out_of_range());
     }
-    result.days = rd as i32;
+    result.days = days as i32;
     let month_remainder_days =
-        tsround((orig_month as f64 / factor - result.months as f64) * DAYS_PER_MONTH as f64);
+        tsround((months - result.months as f64) * DAYS_PER_MONTH as f64);
     let mut sec_remainder = tsround(
-        (orig_day as f64 / factor - result.days as f64 + month_remainder_days
+        (days - result.days as f64 + month_remainder_days
             - (month_remainder_days as i32) as f64)
             * SECS_PER_DAY as f64,
     );
@@ -693,7 +586,7 @@ pub fn interval_div(span: Interval, factor: f64) -> Result<Interval> {
         .days
         .checked_add(month_remainder_days as i32)
         .ok_or_else(interval_out_of_range)?;
-    let rd = rint(span.micros as f64 / factor + sec_remainder * USECS_PER_SEC as f64);
+    let rd = rint(scale(span.micros as f64) + sec_remainder * USECS_PER_SEC as f64);
     if rd.is_nan() || !float8_fits_in_int64(rd) {
         return Err(interval_out_of_range());
     }
@@ -1528,30 +1421,15 @@ pub fn overlaps<T: Ord + Copy>(
     ts2: Option<T>,
     te2: Option<T>,
 ) -> Option<bool> {
-    let (ts1, te1) = match (ts1, te1) {
+    let ordered = |start, end| Some(match (start, end) {
         (None, None) => return None,
         (None, Some(e)) => (e, None),
         (Some(s), None) => (s, None),
-        (Some(s), Some(e)) => {
-            if s > e {
-                (e, Some(s))
-            } else {
-                (s, Some(e))
-            }
-        }
-    };
-    let (ts2, te2) = match (ts2, te2) {
-        (None, None) => return None,
-        (None, Some(e)) => (e, None),
-        (Some(s), None) => (s, None),
-        (Some(s), Some(e)) => {
-            if s > e {
-                (e, Some(s))
-            } else {
-                (s, Some(e))
-            }
-        }
-    };
+        (Some(s), Some(e)) if s > e => (e, Some(s)),
+        (Some(s), Some(e)) => (s, Some(e)),
+    });
+    let (ts1, te1) = ordered(ts1, te1)?;
+    let (ts2, te2) = ordered(ts2, te2)?;
     if ts1 > ts2 {
         let te2 = te2?;
         if ts1 < te2 {

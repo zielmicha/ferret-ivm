@@ -779,31 +779,17 @@ fn to_jsonb(a: &Datum) -> Result<Datum> {
 }
 fn to_json(a: &Datum) -> Result<Datum> {
     let j = datum_to_jsonb(a)?;
-    Ok(Datum::Json(Arc::from(json_text(&j).as_str())))
+    Ok(Datum::Json(Arc::from(j.to_compact().as_str())))
 }
 /// array_to_json(a [, pretty]): pretty puts line feeds between the
 /// elements of the outermost dimension
 fn array_to_json(args: &[Datum]) -> Result<Datum> {
     let j = datum_to_jsonb(&args[0])?;
     let text = match (&j, args.get(1).and_then(|d| d.as_bool())) {
-        (Jsonb::Array(v), Some(true)) => format!("[{}]", v.iter().map(json_text).collect::<Vec<_>>().join(",\n ")),
-        _ => json_text(&j),
+        (Jsonb::Array(v), Some(true)) => format!("[{}]", v.iter().map(Jsonb::to_compact).collect::<Vec<_>>().join(",\n ")),
+        _ => j.to_compact(),
     };
     Ok(Datum::Json(Arc::from(text.as_str())))
-}
-/// json (not jsonb) text rendering: compact separators like PG's json output functions.
-pub(crate) fn json_text(j: &Jsonb) -> String {
-    match j {
-        Jsonb::Array(v) => format!("[{}]", v.iter().map(json_text).collect::<Vec<_>>().join(",")),
-        Jsonb::Object(kv) => format!(
-            "{{{}}}",
-            kv.iter()
-                .map(|(k, v)| format!("{}:{}", pgfuncs::json::escape_string(k), json_text(v)))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        other => other.to_string(),
-    }
 }
 fn build_object_pairs(args: &[Datum]) -> Result<Vec<(String, Jsonb)>> {
     if args.len() % 2 != 0 {
@@ -832,7 +818,7 @@ fn json_build_object(args: &[Datum]) -> Result<Datum> {
     let pairs = build_object_pairs(args)?;
     let body = pairs
         .iter()
-        .map(|(k, v)| format!("{} : {}", pgfuncs::json::escape_string(k), json_text(v)))
+        .map(|(k, v)| format!("{} : {}", pgfuncs::json::escape_string(k), v.to_compact()))
         .collect::<Vec<_>>()
         .join(", ");
     Ok(Datum::Json(Arc::from(format!("{{{body}}}").as_str())))
@@ -847,11 +833,11 @@ fn jsonb_build_array(args: &[Datum]) -> Result<Datum> {
 fn json_build_array(args: &[Datum]) -> Result<Datum> {
     let mut v = Vec::with_capacity(args.len());
     for a in args {
-        v.push(json_text(&datum_to_jsonb(a)?));
+        v.push(datum_to_jsonb(a)?.to_compact());
     }
     Ok(Datum::Json(Arc::from(format!("[{}]", v.join(", ")).as_str())))
 }
-fn path_args(args: &[Datum]) -> Option<Vec<String>> {
+fn path_args(args: &[Datum]) -> Option<Vec<&str>> {
     let mut out = Vec::new();
     for a in args {
         match a {
@@ -861,7 +847,7 @@ fn path_args(args: &[Datum]) -> Option<Vec<String>> {
                     out.push(e?);
                 }
             }
-            other => out.push(as_text(other).into_owned()),
+            other => out.push(s(other)),
         }
     }
     Some(out)
@@ -871,20 +857,17 @@ pub(super) fn jsonb_extract_path(a: &Datum, path: &[Datum], text: bool) -> Resul
         return Ok(Datum::Null);
     }
     let Some(p) = path_args(path) else { return Ok(Datum::Null) };
-    let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
-    Ok(jsonb_result(jsonb(a).get_path(&refs), text))
+    Ok(jsonb_result(jsonb(a).get_path(&p), text))
 }
 fn jsonb_set(args: &[Datum]) -> Result<Datum> {
     let Some(p) = path_args(&args[1..2]) else { return Ok(Datum::Null) };
-    let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
     let create = args.get(3).and_then(|d| d.as_bool()).unwrap_or(true);
-    Ok(Datum::jsonb(jsonb(&args[0]).set(&refs, jsonb(&args[2]).clone(), create)?))
+    Ok(Datum::jsonb(jsonb(&args[0]).set(&p, jsonb(&args[2]).clone(), create)?))
 }
 fn jsonb_insert(args: &[Datum]) -> Result<Datum> {
     let Some(p) = path_args(&args[1..2]) else { return Ok(Datum::Null) };
-    let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
     let after = args.get(3).and_then(|d| d.as_bool()).unwrap_or(false);
-    Ok(Datum::jsonb(jsonb(&args[0]).insert(&refs, jsonb(&args[2]).clone(), after)?))
+    Ok(Datum::jsonb(jsonb(&args[0]).insert(&p, jsonb(&args[2]).clone(), after)?))
 }
 // SQL/JSON path. Values of type jsonpath are their canonical text; parsed
 // paths are cached per thread.
@@ -977,8 +960,7 @@ fn array_position(args: &[Datum]) -> Result<Datum> {
     }
     let lb = x.dims.first().map(|d| d.0).unwrap_or(1);
     for (k, e) in x.elems.iter().enumerate() {
-        let hit = if args[1].is_null() { e.is_null() } else { !e.is_null() && e.sql_eq(&args[1]) };
-        if hit {
+        if e.sql_eq(&args[1]) {
             return Ok(Datum::Int4(lb + k as i32));
         }
     }
@@ -1006,7 +988,7 @@ fn array_remove(args: &[Datum]) -> Result<Datum> {
     let elems: Vec<Datum> = x
         .elems
         .iter()
-        .filter(|e| if args[1].is_null() { !e.is_null() } else { e.is_null() || !e.sql_eq(&args[1]) })
+        .filter(|e| !e.sql_eq(&args[1]))
         .cloned()
         .collect();
     Ok(Datum::array(ArrayValue::new_1d(x.elem_type.clone(), elems)))
@@ -1019,10 +1001,7 @@ fn array_replace(args: &[Datum]) -> Result<Datum> {
     let elems: Vec<Datum> = x
         .elems
         .iter()
-        .map(|e| {
-            let hit = if args[1].is_null() { e.is_null() } else { !e.is_null() && e.sql_eq(&args[1]) };
-            if hit { args[2].clone() } else { e.clone() }
-        })
+        .map(|e| if e.sql_eq(&args[1]) { args[2].clone() } else { e.clone() })
         .collect();
     Ok(Datum::array(ArrayValue { elem_type: x.elem_type.clone(), dims: x.dims.clone(), elems }))
 }

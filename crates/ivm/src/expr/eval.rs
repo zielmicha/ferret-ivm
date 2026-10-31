@@ -83,12 +83,7 @@ impl Expr {
             }
             Expr::IsDistinct(a, b, negated) => {
                 let (x, y) = (a.eval(row)?, b.eval(row)?);
-                let distinct = match (x.is_null(), y.is_null()) {
-                    (true, true) => false,
-                    (true, false) | (false, true) => true,
-                    _ => !x.sql_eq(&y),
-                };
-                Ok(Datum::Bool(distinct != *negated))
+                Ok(Datum::Bool(x.sql_eq(&y) == *negated))
             }
             Expr::Case(c) => {
                 for (w, t) in &c.whens {
@@ -110,7 +105,7 @@ impl Expr {
             Expr::NullIf(a, b) => {
                 let x = a.eval(row)?;
                 let y = b.eval(row)?;
-                if !x.is_null() && !y.is_null() && x.sql_eq(&y) { Ok(Datum::Null) } else { Ok(x) }
+                if x.sql_eq(&y) { Ok(Datum::Null) } else { Ok(x) }
             }
             Expr::Greatest(v, _) | Expr::Least(v, _) => {
                 let want = if matches!(self, Expr::Greatest(..)) { Ordering::Greater } else { Ordering::Less };

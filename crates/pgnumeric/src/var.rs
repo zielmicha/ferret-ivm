@@ -375,10 +375,21 @@ pub(crate) fn cmp_var(var1: &Var, var2: &Var) -> i32 {
 
 /// add_abs: |var1| + |var2| (sign of result is left POS; caller sets it).
 pub(crate) fn add_abs(var1: &Var, var2: &Var) -> Var {
+    add_sub_abs::<false>(var1, var2)
+}
+
+/// sub_abs: |var1| - |var2|; requires |var1| >= |var2|.
+pub(crate) fn sub_abs(var1: &Var, var2: &Var) -> Var {
+    add_sub_abs::<true>(var1, var2)
+}
+
+/// The operation is fixed at compile time; each digit loop retains its own
+/// carry/borrow arithmetic while sharing alignment and result construction.
+fn add_sub_abs<const SUB: bool>(var1: &Var, var2: &Var) -> Var {
     let var1ndigits = var1.nd();
     let var2ndigits = var2.nd();
 
-    let res_weight = max(var1.weight, var2.weight) + 1;
+    let res_weight = if SUB { var1.weight } else { max(var1.weight, var2.weight) + 1 };
     let res_dscale = max(var1.dscale, var2.dscale);
 
     // Note: here we are figuring rscale in base-NBASE digits
@@ -403,9 +414,12 @@ pub(crate) fn add_abs(var1: &Var, var2: &Var) -> Var {
             carry += var1.dig(i1);
         }
         if i2 >= 0 && i2 < var2ndigits {
-            carry += var2.dig(i2);
+            carry += if SUB { -var2.dig(i2) } else { var2.dig(i2) };
         }
-        if carry >= NBASE {
+        if SUB && carry < 0 {
+            res_digits[i] = (carry + NBASE) as i16;
+            carry = -1;
+        } else if !SUB && carry >= NBASE {
             res_digits[i] = (carry - NBASE) as i16;
             carry = 1;
         } else {
@@ -414,57 +428,6 @@ pub(crate) fn add_abs(var1: &Var, var2: &Var) -> Var {
         }
     }
     debug_assert_eq!(carry, 0);
-
-    let mut result = Numeric {
-        sign: NUMERIC_POS,
-        weight: res_weight,
-        dscale: res_dscale,
-        digits: res_digits,
-    };
-    strip_var(&mut result);
-    result
-}
-
-/// sub_abs: |var1| - |var2|; requires |var1| >= |var2|.
-pub(crate) fn sub_abs(var1: &Var, var2: &Var) -> Var {
-    let var1ndigits = var1.nd();
-    let var2ndigits = var2.nd();
-
-    let res_weight = var1.weight;
-    let res_dscale = max(var1.dscale, var2.dscale);
-
-    let rscale1 = var1ndigits - var1.weight - 1;
-    let rscale2 = var2ndigits - var2.weight - 1;
-    let res_rscale = max(rscale1, rscale2);
-
-    let mut res_ndigits = res_rscale + res_weight + 1;
-    if res_ndigits <= 0 {
-        res_ndigits = 1;
-    }
-
-    let mut res_digits: Digits = smallvec![0; res_ndigits as usize];
-
-    let mut i1 = res_rscale + var1.weight + 1;
-    let mut i2 = res_rscale + var2.weight + 1;
-    let mut borrow = 0i32;
-    for i in (0..res_ndigits as usize).rev() {
-        i1 -= 1;
-        i2 -= 1;
-        if i1 >= 0 && i1 < var1ndigits {
-            borrow += var1.dig(i1);
-        }
-        if i2 >= 0 && i2 < var2ndigits {
-            borrow -= var2.dig(i2);
-        }
-        if borrow < 0 {
-            res_digits[i] = (borrow + NBASE) as i16;
-            borrow = -1;
-        } else {
-            res_digits[i] = borrow as i16;
-            borrow = 0;
-        }
-    }
-    debug_assert_eq!(borrow, 0);
 
     let mut result = Numeric {
         sign: NUMERIC_POS,
@@ -1017,62 +980,7 @@ pub(crate) fn div_var_fast(var1: &Var, var2: &Var, rscale: i32, round: bool) -> 
 /// div_var_int: divide by ival * NBASE^ival_weight (ival a nonzero 32-bit
 /// integer).
 pub(crate) fn div_var_int(var: &Var, ival: i32, ival_weight: i32, rscale: i32, round: bool) -> Var {
-    debug_assert!(ival != 0);
-    let var_ndigits = var.nd();
-
-    if var_ndigits == 0 {
-        return var_zero(rscale);
-    }
-
-    let res_sign = if var.sign == NUMERIC_POS {
-        if ival > 0 { NUMERIC_POS } else { NUMERIC_NEG }
-    } else if ival > 0 {
-        NUMERIC_NEG
-    } else {
-        NUMERIC_POS
-    };
-    let res_weight = var.weight - ival_weight;
-    let mut res_ndigits = res_weight + 1 + (rscale + DEC_DIGITS - 1) / DEC_DIGITS;
-    res_ndigits = max(res_ndigits, 1);
-    if round {
-        res_ndigits += 1;
-    }
-
-    let rn = res_ndigits as usize;
-    let vn = var_ndigits as usize;
-    let mut res_digits: Digits = smallvec![0; rn];
-
-    let divisor = ival.unsigned_abs();
-    if divisor <= u32::MAX / NBASE as u32 {
-        let mut carry: u32 = 0;
-        for i in 0..rn {
-            carry = carry * NBASE as u32 + if i < vn { var.digits[i] as u32 } else { 0 };
-            res_digits[i] = (carry / divisor) as i16;
-            carry %= divisor;
-        }
-    } else {
-        let divisor = divisor as u64;
-        let mut carry: u64 = 0;
-        for i in 0..rn {
-            carry = carry * NBASE as u64 + if i < vn { var.digits[i] as u64 } else { 0 };
-            res_digits[i] = (carry / divisor) as i16;
-            carry %= divisor;
-        }
-    }
-
-    let mut result = Numeric {
-        sign: res_sign,
-        weight: res_weight,
-        dscale: 0,
-        digits: res_digits,
-    };
-    if round {
-        round_var(&mut result, rscale);
-    } else {
-        trunc_var(&mut result, rscale);
-    }
-    strip_var(&mut result);
-    result
+    div_var_int64(var, i64::from(ival), ival_weight, rscale, round)
 }
 
 /// div_var_int64: divide by ival * NBASE^ival_weight (ival a nonzero 64-bit
@@ -1110,7 +1018,16 @@ pub(crate) fn div_var_int64(
     let mut res_digits: Digits = smallvec![0; rn];
 
     let divisor = ival.unsigned_abs();
-    if divisor <= u64::MAX / NBASE as u64 {
+    // Use the narrowest carry that holds a base-NBASE digit step.
+    if divisor <= (u32::MAX / NBASE as u32) as u64 {
+        let divisor = divisor as u32;
+        let mut carry: u32 = 0;
+        for i in 0..rn {
+            carry = carry * NBASE as u32 + if i < vn { var.digits[i] as u32 } else { 0 };
+            res_digits[i] = (carry / divisor) as i16;
+            carry %= divisor;
+        }
+    } else if divisor <= u64::MAX / NBASE as u64 {
         let mut carry: u64 = 0;
         for i in 0..rn {
             carry = carry * NBASE as u64 + if i < vn { var.digits[i] as u64 } else { 0 };

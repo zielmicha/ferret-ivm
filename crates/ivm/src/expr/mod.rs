@@ -17,7 +17,7 @@ pub fn builtins_datum_to_jsonb(d: &Datum) -> crate::error::Result<pgfuncs::json:
 
 /// `json` (not jsonb) text rendering of a jsonb value.
 pub fn json_text(j: &pgfuncs::json::Jsonb) -> String {
-    builtins::json_text(j)
+    j.to_compact()
 }
 
 /// Text form of any datum (as used by `||` and concat()).

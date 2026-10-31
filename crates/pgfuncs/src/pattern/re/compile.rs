@@ -894,26 +894,7 @@ impl<'a> Parser<'a> {
                     return self.retv(tok(b'('), 1);
                 }
                 ')' => return self.retv(tok(b')'), c),
-                '[' => {
-                    if self.have(6)
-                        && self.pat[self.now] == b'[' as u32
-                        && self.pat[self.now + 1] == b':' as u32
-                        && (self.pat[self.now + 2] == b'<' as u32 || self.pat[self.now + 2] == b'>' as u32)
-                        && self.pat[self.now + 3] == b':' as u32
-                        && self.pat[self.now + 4] == b']' as u32
-                        && self.pat[self.now + 5] == b']' as u32
-                    {
-                        let c2 = self.pat[self.now + 2];
-                        self.now += 6;
-                        return self.ret(if c2 == b'<' as u32 { tok(b'<') } else { tok(b'>') });
-                    }
-                    self.lexcon = L_BRACK;
-                    if self.next1(b'^') {
-                        self.now += 1;
-                        return self.retv(tok(b'['), 0);
-                    }
-                    return self.retv(tok(b'['), 1);
-                }
+                '[' => return self.lexbracket(),
                 '.' => return self.ret(tok(b'.')),
                 '^' => return self.ret(tok(b'^')),
                 '$' => return self.ret(tok(b'$')),
@@ -933,6 +914,28 @@ impl<'a> Parser<'a> {
             }
             return self.lexescape();
         }
+    }
+
+    /// Bracket opening shared by the basic and extended regex lexers.
+    fn lexbracket(&mut self) -> bool {
+        if self.have(6)
+            && self.pat[self.now] == b'[' as u32
+            && self.pat[self.now + 1] == b':' as u32
+            && (self.pat[self.now + 2] == b'<' as u32 || self.pat[self.now + 2] == b'>' as u32)
+            && self.pat[self.now + 3] == b':' as u32
+            && self.pat[self.now + 4] == b']' as u32
+            && self.pat[self.now + 5] == b']' as u32
+        {
+            let c2 = self.pat[self.now + 2];
+            self.now += 6;
+            return self.ret(if c2 == b'<' as u32 { tok(b'<') } else { tok(b'>') });
+        }
+        self.lexcon = L_BRACK;
+        if self.next1(b'^') {
+            self.now += 1;
+            return self.retv(tok(b'['), 0);
+        }
+        self.retv(tok(b'['), 1)
     }
 
     fn lexescape(&mut self) -> bool {
@@ -1072,26 +1075,7 @@ impl<'a> Parser<'a> {
                 }
                 return self.retv(tok(b'*'), 1);
             }
-            '[' => {
-                if self.have(6)
-                    && self.pat[self.now] == b'[' as u32
-                    && self.pat[self.now + 1] == b':' as u32
-                    && (self.pat[self.now + 2] == b'<' as u32 || self.pat[self.now + 2] == b'>' as u32)
-                    && self.pat[self.now + 3] == b':' as u32
-                    && self.pat[self.now + 4] == b']' as u32
-                    && self.pat[self.now + 5] == b']' as u32
-                {
-                    let c2 = self.pat[self.now + 2];
-                    self.now += 6;
-                    return self.ret(if c2 == b'<' as u32 { tok(b'<') } else { tok(b'>') });
-                }
-                self.lexcon = L_BRACK;
-                if self.next1(b'^') {
-                    self.now += 1;
-                    return self.retv(tok(b'['), 0);
-                }
-                return self.retv(tok(b'['), 1);
-            }
+            '[' => return self.lexbracket(),
             '.' => return self.ret(tok(b'.')),
             '^' => {
                 if self.lasttype == EMPTY {

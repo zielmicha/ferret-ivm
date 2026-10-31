@@ -368,7 +368,8 @@ impl Datum {
         }
     }
 
-    /// SQL equality of two non-null values (`=` semantics).
+    /// Equality under SQL ordering, including NULL = NULL (as in grouping
+    /// and array searches). SQL `=` callers handle NULL propagation separately.
     pub fn sql_eq(&self, other: &Datum) -> bool {
         self.sql_cmp(other) == Ordering::Equal
     }

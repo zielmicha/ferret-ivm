@@ -384,13 +384,19 @@ impl<'a> Binder<'a> {
         Ok(Expr::Call(Box::new(crate::expr::Call { func: res.func, args: vec![l, r], ret: res.ret })))
     }
 
-    fn make_call(&mut self, name: &str, args: Vec<Expr>, types: Vec<SqlType>) -> Result<Expr> {
-        let res = resolve(name, &types)?;
-        let mut out = Vec::with_capacity(args.len());
-        for ((a, t), target) in args.into_iter().zip(types).zip(res.arg_types.iter()) {
-            out.push(self.coerce(a, &t, target, CastContext::Implicit, name)?);
+    /// Apply a resolved signature without cloning argument expression trees.
+    fn coerce_args<'t>(&mut self, args: &mut [Expr], types: &[SqlType], targets: impl IntoIterator<Item = &'t SqlType>, what: &str) -> Result<()> {
+        for ((arg, from), to) in args.iter_mut().zip(types).zip(targets) {
+            let e = std::mem::replace(arg, Expr::null(SqlType::Unknown));
+            *arg = self.coerce(e, from, to, CastContext::Implicit, what)?;
         }
-        Ok(Expr::Call(Box::new(crate::expr::Call { func: res.func, args: out, ret: res.ret })))
+        Ok(())
+    }
+
+    fn make_call(&mut self, name: &str, mut args: Vec<Expr>, types: Vec<SqlType>) -> Result<Expr> {
+        let res = resolve(name, &types)?;
+        self.coerce_args(&mut args, &types, &res.arg_types, name)?;
+        Ok(Expr::Call(Box::new(crate::expr::Call { func: res.func, args, ret: res.ret })))
     }
 
     pub(crate) fn bind_expr(&mut self, e: &ast::Expr, ctx: &Ctx) -> Result<Expr> {
@@ -494,7 +500,7 @@ impl<'a> Binder<'a> {
             }
             E::InList { expr, list, negated } => {
                 let reg = std::iter::once(&**expr).chain(list.iter()).find_map(reg_cast).map(|(k, _)| k);
-                let (x, items) = match &reg {
+                let (x, mut items) = match &reg {
                     Some(kind) => {
                         // reg* values compare as OIDs; when every other item
                         // is a reg* value or an untyped literal, the common
@@ -525,16 +531,13 @@ impl<'a> Binder<'a> {
                 // make sure "=" exists for the type
                 resolve("=", &[t.clone(), t.clone()])?;
                 let mut x = self.coerce(x, &types[0], &t, CastContext::Implicit, "IN")?;
-                let mut out = Vec::with_capacity(items.len());
-                for (i, it) in items.into_iter().enumerate() {
-                    out.push(self.coerce(it, &types[i + 1], &t, CastContext::Implicit, "IN")?);
-                }
+                self.coerce_args(&mut items, &types[1..], std::iter::repeat(&t), "IN")?;
                 if t == SqlType::Bpchar {
                     // compared without trailing spaces
                     x = bpchar_to_text(x);
-                    out = out.into_iter().map(bpchar_to_text).collect();
+                    items = items.into_iter().map(bpchar_to_text).collect();
                 }
-                Ok(Expr::InList(Box::new(x), out, *negated))
+                Ok(Expr::InList(Box::new(x), items, *negated))
             }
             E::InSubquery { expr, subquery, negated } => self.bind_in_subquery(expr, subquery, *negated, ctx),
             E::Exists { subquery, negated } => {
@@ -802,11 +805,8 @@ impl<'a> Binder<'a> {
                 }
                 let types: Vec<SqlType> = elems.iter().map(|x| self.ty_of(x, ctx)).collect();
                 let t = if types.is_empty() { SqlType::Text } else { common_type(&types, "ARRAY")? };
-                let mut out = Vec::with_capacity(elems.len());
-                for (x, xt) in elems.into_iter().zip(types) {
-                    out.push(self.coerce(x, &xt, &t, CastContext::Implicit, "ARRAY")?);
-                }
-                Ok(Expr::Array(out, t))
+                self.coerce_args(&mut elems, &types, std::iter::repeat(&t), "ARRAY")?;
+                Ok(Expr::Array(elems, t))
             }
             E::CompoundFieldAccess { root, access_chain } => {
                 // leading `.name` accesses on an identifier form a qualified column
@@ -1266,11 +1266,8 @@ impl<'a> Binder<'a> {
             t @ (SqlType::Timestamp | SqlType::TimestampTz | SqlType::Time) => t,
             other => sql_bail!(codes::UNDEFINED_FUNCTION, "function overlaps({other}, {other}, {other}, {other}) does not exist"),
         };
-        let mut args = Vec::with_capacity(4);
-        for (e, et) in ends.into_iter().zip(&types) {
-            args.push(self.coerce(e, et, &t, CastContext::Implicit, "OVERLAPS")?);
-        }
-        self.make_call("overlaps", args, vec![t.clone(), t.clone(), t.clone(), t])
+        self.coerce_args(&mut ends, &types, std::iter::repeat(&t), "OVERLAPS")?;
+        self.make_call("overlaps", ends, vec![t.clone(), t.clone(), t.clone(), t])
     }
 
     /// Row comparison: fields compare left to right and the first unequal
@@ -1465,21 +1462,13 @@ impl<'a> Binder<'a> {
         order.push(types[types.len() - 1].clone());
         order.extend(types[..types.len() - 1].iter().cloned());
         let t = common_type(&order, "CASE")?;
-        let mut coerced = Vec::with_capacity(results.len());
-        for (r, rt) in results.into_iter().zip(types) {
-            coerced.push(self.coerce(r, &rt, &t, CastContext::Implicit, "CASE")?);
-        }
-        let else_ = coerced.pop().unwrap();
-        Ok(Expr::Case(Box::new(CaseExpr { whens: whens.into_iter().zip(coerced).collect(), else_, ty: t })))
+        self.coerce_args(&mut results, &types, std::iter::repeat(&t), "CASE")?;
+        let else_ = results.pop().unwrap();
+        Ok(Expr::Case(Box::new(CaseExpr { whens: whens.into_iter().zip(results).collect(), else_, ty: t })))
     }
 
     pub(crate) fn bind_subquery(&mut self, q: &ast::Query, ctx: &Ctx) -> Result<Rel> {
-        self.outer.push(ctx.scope.clone());
-        let saved_ctes = self.ctes.clone();
-        let r = self.bind_query(q);
-        self.ctes = saved_ctes;
-        self.outer.pop();
-        Ok(r?.into_rel())
+        Ok(self.with_outer_scope(Some(ctx.scope), |b| b.bind_query(q))?.into_rel())
     }
 
     // ------------------------------------------------------------------ functions
@@ -1506,12 +1495,7 @@ impl<'a> Binder<'a> {
     /// ARRAY(subquery): the subquery's single column as an array, in its
     /// ORDER BY order (empty, not NULL, when it returns no rows).
     fn bind_array_subquery(&mut self, q: &ast::Query, ctx: &Ctx) -> Result<Expr> {
-        self.outer.push(ctx.scope.clone());
-        let saved_ctes = self.ctes.clone();
-        let r = self.bind_query(q);
-        self.ctes = saved_ctes;
-        self.outer.pop();
-        let bq = r?;
+        let bq = self.with_outer_scope(Some(ctx.scope), |b| b.bind_query(q))?;
         if bq.visible != 1 {
             sql_bail!(codes::SYNTAX_ERROR, "subquery must return only one column");
         }
@@ -1614,14 +1598,11 @@ impl<'a> Binder<'a> {
                 if name != "coalesce" {
                     resolve("<", &[t.clone(), t.clone()])?;
                 }
-                let mut out = Vec::with_capacity(bound.len());
-                for (b, bt) in bound.into_iter().zip(types) {
-                    out.push(self.coerce(b, &bt, &t, CastContext::Implicit, &name)?);
-                }
+                self.coerce_args(&mut bound, &types, std::iter::repeat(&t), &name)?;
                 return Ok(match name.as_str() {
-                    "coalesce" => Expr::Coalesce(out, t),
-                    "greatest" => Expr::Greatest(out, t),
-                    _ => Expr::Least(out, t),
+                    "coalesce" => Expr::Coalesce(bound, t),
+                    "greatest" => Expr::Greatest(bound, t),
+                    _ => Expr::Least(bound, t),
                 });
             }
             "nullif" => {
@@ -1832,9 +1813,7 @@ impl<'a> Binder<'a> {
             }
             ("string_agg", 2) => {
                 let t = if types[0] == SqlType::Bytea { SqlType::Bytea } else { SqlType::Text };
-                for i in 0..2 {
-                    bound[i] = self.coerce(bound[i].clone(), &types[i], &t, CastContext::Implicit, name)?;
-                }
+                self.coerce_args(&mut bound, &types, std::iter::repeat(&t), name)?;
                 (A::StringAgg, t)
             }
             ("array_agg", 1) => {
@@ -2249,9 +2228,7 @@ impl<'a> Binder<'a> {
                     SqlType::TimestampTz | SqlType::Date => SqlType::TimestampTz,
                     other => sql_bail!(codes::UNDEFINED_FUNCTION, "function generate_series({other}) does not exist"),
                 };
-                for i in 0..2 {
-                    bound[i] = self.coerce(bound[i].clone(), &types[i], &t, CastContext::Implicit, "generate_series")?;
-                }
+                self.coerce_args(&mut bound[..2], &types[..2], std::iter::repeat(&t), name)?;
                 if bound.len() == 3 {
                     let st = if matches!(t, SqlType::Timestamp | SqlType::TimestampTz) { SqlType::Interval } else { t.clone() };
                     bound[2] = self.coerce(bound[2].clone(), &types[2], &st, CastContext::Implicit, "generate_series")?;
@@ -2286,9 +2263,7 @@ impl<'a> Binder<'a> {
             }
             ("jsonb_path_query" | "jsonb_path_query_tz", 4) => {
                 let tys = [SqlType::Jsonb, SqlType::JsonPath, SqlType::Jsonb, SqlType::Bool];
-                for (i, t) in tys.iter().enumerate() {
-                    bound[i] = self.coerce(bound[i].clone(), &types[i], t, CastContext::Implicit, name)?;
-                }
+                self.coerce_args(&mut bound, &types, &tys, name)?;
                 (
                     TableFunc::JsonbPathQuery { tz: name.ends_with("_tz") },
                     vec![ColumnType::new(SqlType::Jsonb).not_null()],
@@ -2296,15 +2271,11 @@ impl<'a> Binder<'a> {
                 )
             }
             ("regexp_split_to_table", 2 | 3) => {
-                for i in 0..bound.len() {
-                    bound[i] = self.coerce(bound[i].clone(), &types[i], &SqlType::Text, CastContext::Implicit, name)?;
-                }
+                self.coerce_args(&mut bound, &types, std::iter::repeat(&SqlType::Text), name)?;
                 (TableFunc::RegexpSplitToTable, vec![ColumnType::new(SqlType::Text).not_null()], vec!["regexp_split_to_table".into()])
             }
             ("regexp_matches", 2 | 3) => {
-                for i in 0..bound.len() {
-                    bound[i] = self.coerce(bound[i].clone(), &types[i], &SqlType::Text, CastContext::Implicit, name)?;
-                }
+                self.coerce_args(&mut bound, &types, std::iter::repeat(&SqlType::Text), name)?;
                 (
                     TableFunc::RegexpMatches,
                     vec![ColumnType::new(SqlType::Array(Box::new(SqlType::Text))).not_null()],
@@ -2429,41 +2400,18 @@ impl<'a> Binder<'a> {
         // arguments may reference columns to the left (implicitly LATERAL);
         // with nothing on the left, references go to enclosing queries at
         // their usual depth
-        let pushed = left_scope.is_some();
-        if let Some(ls) = left_scope {
-            self.outer.push(ls.clone());
-        }
         let empty = Scope::default();
-        let mut bound = Vec::new();
-        let mut err = None;
-        if JSONPATH_FUNCS.contains(&name) {
-            match self.bind_jsonpath_args(name, args, &mut |b, e| b.bind_expr(e, &Ctx::plain(&empty, "FROM"))) {
-                Ok(b) => bound = b,
-                Err(e) => err = Some(e),
+        let ctx = Ctx::plain(&empty, "FROM");
+        let bound = self.with_outer_scope(left_scope, |b| {
+            if JSONPATH_FUNCS.contains(&name) {
+                return b.bind_jsonpath_args(name, args, &mut |b, e| b.bind_expr(e, &ctx));
             }
-        }
-        for a in args.iter().filter(|_| !JSONPATH_FUNCS.contains(&name)) {
-            match a {
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => match self.bind_expr(e, &Ctx::plain(&empty, "FROM")) {
-                    Ok(b) => bound.push(b),
-                    Err(e) => {
-                        err = Some(e);
-                        break;
-                    }
-                },
-                _ => {
-                    err = Some(SqlError::unsupported("unsupported table function argument"));
-                    break;
-                }
-            }
-        }
-        if pushed {
-            self.outer.pop();
-        }
-        if let Some(e) = err {
-            return Err(e);
-        }
-        let lateral = pushed && bound.iter().any(|b| b.has_outer());
+            args.iter().map(|a| match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => b.bind_expr(e, &ctx),
+                _ => Err(SqlError::unsupported("unsupported table function argument")),
+            }).collect::<Result<Vec<_>>>()
+        })?;
+        let lateral = left_scope.is_some() && bound.iter().any(|b| b.has_outer());
         let types: Vec<SqlType> = bound.iter().map(|b| b.ty(&[])).collect();
         // unnest(a, b, ...): one unnest per array, zipped (as ROWS FROM)
         let calls: Vec<ResolvedTableFunc> = if name == "unnest" && bound.len() > 1 {

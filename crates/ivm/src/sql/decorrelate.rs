@@ -58,7 +58,7 @@ pub fn decorrelate(rel: Rel) -> Result<Rel> {
 // Phase 1: subquery expressions -> Apply
 
 fn extract(rel: Rel) -> Result<Rel> {
-    let rel = map_inputs(rel, extract)?;
+    let rel = rel.map_inputs(extract)?;
     match rel {
         Rel::Filter { input, preds } => {
             if !preds.iter().any(|p| p.has_subquery()) {
@@ -131,14 +131,6 @@ fn extract(rel: Rel) -> Result<Rel> {
     }
 }
 
-fn map_inputs(mut rel: Rel, f: fn(Rel) -> Result<Rel>) -> Result<Rel> {
-    for i in rel.inputs_mut() {
-        let taken = std::mem::replace(i, Rel::unit());
-        *i = f(taken)?;
-    }
-    Ok(rel)
-}
-
 fn semi_apply(input: Rel, sq: SubqueryExpr, negated: bool) -> Result<Rel> {
     let right = extract(sq.rel)?;
     let (lhs, null_aware) = match sq.kind {
@@ -169,21 +161,14 @@ fn lift_into_applies(input: Rel, exprs: Vec<Expr>) -> Result<(Rel, Vec<Expr>)> {
 
 /// Shift Column refs >= n by `k` except those marked as apply columns
 /// (encoded as usize::MAX - j during lifting).
-fn shift_map_refs(e: Expr, n: usize, k: usize) -> Expr {
-    match e {
-        Expr::Column(c) if c >= usize::MAX / 2 => Expr::Column(n + (usize::MAX - c)),
-        Expr::Column(c) if c >= n => Expr::Column(c + k),
-        mut other => {
-            if let Expr::Subquery(_) = other {
-                return other;
-            }
-            for ch in other.children_mut() {
-                let t = std::mem::replace(ch, Expr::null(SqlType::Unknown));
-                *ch = shift_map_refs(t, n, k);
-            }
-            other
-        }
-    }
+fn shift_map_refs(mut e: Expr, n: usize, k: usize) -> Expr {
+    e.rewrite(&mut |e| match e {
+        Expr::Column(c) if *c >= usize::MAX / 2 => Some(Expr::Column(n + (usize::MAX - c))),
+        Expr::Column(c) if *c >= n => Some(Expr::Column(c + k)),
+        Expr::Subquery(_) => Some(e.clone()),
+        _ => None,
+    });
+    e
 }
 
 fn lift_expr(e: Expr, input: Rel, n: usize, added: usize) -> Result<(Expr, Rel, usize)> {
@@ -236,7 +221,7 @@ fn lift_expr(e: Expr, input: Rel, n: usize, added: usize) -> Result<(Expr, Rel, 
 // Phase 2: Apply -> joins
 
 fn remove_applies(rel: Rel) -> Result<Rel> {
-    let rel = map_inputs(rel, remove_applies)?;
+    let rel = rel.map_inputs(remove_applies)?;
     match rel {
         Rel::Apply { left, right, kind } => apply_to_join(*left, *right, kind),
         other => Ok(other),
@@ -561,15 +546,14 @@ fn push_dep(rel: Rel, d: &Rel, k: usize, dpos: &BTreeMap<usize, usize>) -> Resul
     if !rel.has_outer_refs(1) {
         return Ok(Rel::Join { left: Box::new(d.clone()), right: Box::new(rel), kind: JoinKind::Inner, on: vec![] });
     }
-    let keep_d = |n: usize| -> Vec<usize> { (0..k).chain(k..k + n).collect() };
     Ok(match rel {
-        Rel::Filter { input, preds } => {
-            let i2 = push_dep(*input, d, k, dpos)?;
-            Rel::Filter { input: Box::new(i2), preds: preds.iter().map(|p| rw(p, k, dpos)).collect() }
-        }
-        Rel::Map { input, exprs } => {
-            let i2 = push_dep(*input, d, k, dpos)?;
-            Rel::Map { input: Box::new(i2), exprs: exprs.iter().map(|e| rw(e, k, dpos)).collect() }
+        Rel::Filter { .. } | Rel::Map { .. } | Rel::FlatMap { .. }
+        | Rel::Distinct { .. } | Rel::UnionAll { .. } | Rel::SetOp { .. } | Rel::Negate { .. } => {
+            let mut rel = rel.map_inputs(|input| push_dep(input, d, k, dpos))?;
+            for e in rel.exprs_mut() {
+                *e = rw(e, k, dpos);
+            }
+            rel
         }
         Rel::Project { input, cols } => {
             let i2 = push_dep(*input, d, k, dpos)?;
@@ -645,23 +629,17 @@ fn push_dep(rel: Rel, d: &Rel, k: usize, dpos: &BTreeMap<usize, usize>) -> Resul
                 }
             }
         }
-        Rel::Aggregate { input, group, aggs } => {
+        Rel::Aggregate { input, group, mut aggs } => {
             let scalar = group.is_empty();
             let i2 = push_dep(*input, d, k, dpos)?;
             let mut g2: Vec<usize> = (0..k).collect();
             g2.extend(group.iter().map(|g| g + k));
-            let aggs2: Vec<AggCall> = aggs
-                .iter()
-                .map(|a| AggCall {
-                    args: a.args.iter().map(|x| x + k).collect(),
-                    filter: a.filter.map(|x| x + k),
-                    order: a.order.iter().map(|o| SortKey { col: o.col + k, spec: o.spec }).collect(),
-                    ..a.clone()
-                })
-                .collect();
-            let na = aggs2.len();
-            let empty_zero: Vec<bool> = aggs2.iter().map(|a| a.func.empty_is_zero()).collect();
-            let grouped = Rel::Aggregate { input: Box::new(i2), group: g2, aggs: aggs2 };
+            for a in &mut aggs {
+                a.remap(&|c| c + k);
+            }
+            let na = aggs.len();
+            let empty_zero: Vec<bool> = aggs.iter().map(|a| a.func.empty_is_zero()).collect();
+            let grouped = Rel::Aggregate { input: Box::new(i2), group: g2, aggs };
             if !scalar {
                 grouped
             } else {
@@ -685,7 +663,6 @@ fn push_dep(rel: Rel, d: &Rel, k: usize, dpos: &BTreeMap<usize, usize>) -> Resul
                 m.project(proj)
             }
         }
-        Rel::Distinct { input } => Rel::Distinct { input: Box::new(push_dep(*input, d, k, dpos)?) },
         Rel::TopK { input, group, order, limit, offset, with_ties } => {
             let i2 = push_dep(*input, d, k, dpos)?;
             let mut g2: Vec<usize> = (0..k).collect();
@@ -699,46 +676,20 @@ fn push_dep(rel: Rel, d: &Rel, k: usize, dpos: &BTreeMap<usize, usize>) -> Resul
                 with_ties,
             }
         }
-        Rel::Window { input, funcs } => {
+        Rel::Window { input, mut funcs } => {
             let i2 = push_dep(*input, d, k, dpos)?;
-            let funcs2 = funcs
-                .iter()
-                .map(|f| {
-                    let mut partition: Vec<usize> = (0..k).collect();
-                    partition.extend(f.partition.iter().map(|p| p + k));
-                    WindowCall {
-                        args: f.args.iter().map(|a| a + k).collect(),
-                        partition,
-                        order: f.order.iter().map(|o| SortKey { col: o.col + k, spec: o.spec }).collect(),
-                        ..f.clone()
-                    }
-                })
-                .collect();
-            Rel::Window { input: Box::new(i2), funcs: funcs2 }
-        }
-        Rel::UnionAll { inputs } => {
-            Rel::UnionAll { inputs: inputs.into_iter().map(|i| push_dep(i, d, k, dpos)).collect::<Result<_>>()? }
-        }
-        Rel::SetOp { op, all, left, right } => Rel::SetOp {
-            op,
-            all,
-            left: Box::new(push_dep(*left, d, k, dpos)?),
-            right: Box::new(push_dep(*right, d, k, dpos)?),
-        },
-        Rel::Negate { input } => Rel::Negate { input: Box::new(push_dep(*input, d, k, dpos)?) },
-        Rel::FlatMap { input, mut funcs, out, ordinality } => {
-            let i2 = push_dep(*input, d, k, dpos)?;
-            for f in funcs.iter_mut() {
-                f.args = f.args.iter().map(|a| rw(a, k, dpos)).collect();
+            for f in &mut funcs {
+                f.remap(&|c| c + k);
+                f.partition.splice(..0, 0..k);
             }
-            Rel::FlatMap { input: Box::new(i2), funcs, out, ordinality }
+            Rel::Window { input: Box::new(i2), funcs }
         }
         Rel::Values { rows, columns } => {
             let n = columns.len();
             let mut branches = Vec::new();
             for r in rows {
                 let exprs: Vec<Expr> = r.iter().map(|e| rw_outer_only(e, 0, dpos)).collect();
-                branches.push(d.clone().map(exprs).project(keep_d(n).iter().map(|c| if *c < k { *c } else { *c }).collect()));
+                branches.push(d.clone().map(exprs).project((0..k + n).collect()));
             }
             if branches.is_empty() {
                 let mut cols = d.schema();

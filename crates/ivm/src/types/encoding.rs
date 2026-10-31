@@ -42,6 +42,33 @@ impl Default for SortSpec {
     }
 }
 
+/// Canonical encoding of a sequence of values, for equality and ascending keys.
+pub(crate) fn key_bytes<'a>(vals: impl IntoIterator<Item = &'a Datum>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in vals {
+        encode_key(v, SortSpec::ASC, &mut out);
+    }
+    out
+}
+
+/// Is a literal exactly of a key column's type (so that its key encoding
+/// orders and compares like the column's values)?
+pub(crate) fn literal_matches(d: &Datum, t: &SqlType) -> bool {
+    matches!(
+        (d, t),
+        (Datum::Int2(_), SqlType::Int2)
+            | (Datum::Int4(_), SqlType::Int4)
+            | (Datum::Int8(_), SqlType::Int8)
+            | (Datum::Text(_), SqlType::Text | SqlType::Varchar | SqlType::Bpchar | SqlType::Name)
+            | (Datum::Numeric(_), SqlType::Numeric)
+            | (Datum::Date(_), SqlType::Date)
+            | (Datum::Timestamp(_), SqlType::Timestamp)
+            | (Datum::TimestampTz(_), SqlType::TimestampTz)
+            | (Datum::Uuid(_), SqlType::Uuid)
+            | (Datum::Bool(_), SqlType::Bool)
+    )
+}
+
 /// Append the canonical key encoding of `d`.
 pub fn encode_key(d: &Datum, spec: SortSpec, out: &mut Vec<u8>) {
     if d.is_null() {

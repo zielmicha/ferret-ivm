@@ -39,15 +39,6 @@ fn int_binop(a: &Datum, b: &Datum, name: &str, op: fn(i64, i64) -> Option<i64>) 
     }
 }
 
-fn int_add(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_binop(a, b, "+", |x, y| x.checked_add(y))
-}
-fn int_sub(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_binop(a, b, "-", |x, y| x.checked_sub(y))
-}
-fn int_mul(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_binop(a, b, "*", |x, y| x.checked_mul(y))
-}
 fn int_div(a: &Datum, b: &Datum) -> Result<Datum> {
     if b.as_i64() == Some(0) {
         return Err(div_zero());
@@ -59,15 +50,6 @@ pub(super) fn int_mod(a: &Datum, b: &Datum) -> Result<Datum> {
         return Err(div_zero());
     }
     int_binop(a, b, "%", |x, y| if y == -1 { Some(0) } else { x.checked_rem(y) })
-}
-fn int_and(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_binop(a, b, "&", |x, y| Some(x & y))
-}
-fn int_or(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_binop(a, b, "|", |x, y| Some(x | y))
-}
-fn int_xor(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_binop(a, b, "#", |x, y| Some(x ^ y))
 }
 
 fn int_shift(a: &Datum, b: &Datum, left: bool) -> Result<Datum> {
@@ -82,12 +64,6 @@ fn int_shift(a: &Datum, b: &Datum, left: bool) -> Result<Datum> {
         Datum::Int8(x) => Datum::Int8(if left { x.wrapping_shl(s) } else { x.wrapping_shr(s) }),
         _ => return Err(internal("<<", a, b)),
     })
-}
-fn int_shl(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_shift(a, b, true)
-}
-fn int_shr(a: &Datum, b: &Datum) -> Result<Datum> {
-    int_shift(a, b, false)
 }
 
 fn int_neg(a: &Datum) -> Result<Datum> {
@@ -119,11 +95,26 @@ pub fn underflow() -> SqlError {
     SqlError::new(codes::NUMERIC_VALUE_OUT_OF_RANGE, "value out of range: underflow")
 }
 
-pub fn f8_check(r: f64, a: f64, b: f64, zero_ok: bool) -> Result<f64> {
-    if r.is_infinite() && !a.is_infinite() && !b.is_infinite() {
+/// Compute in the operands' native precision, with PostgreSQL's overflow,
+/// underflow and division-by-zero rules shared by real and double precision.
+fn float_arithmetic<F: num_traits::Float>(x: F, y: F, op: char) -> Result<F> {
+    let zero = F::zero();
+    let r = match op {
+        '+' => x + y,
+        '-' => x - y,
+        '*' => x * y,
+        '/' => {
+            if y == zero && !x.is_nan() {
+                return Err(div_zero());
+            }
+            x / y
+        }
+        _ => unreachable!(),
+    };
+    if r.is_infinite() && !x.is_infinite() && !(y.is_infinite() && op != '/') {
         return Err(overflow());
     }
-    if !zero_ok && r == 0.0 && a != 0.0 && b != 0.0 {
+    if r == zero && x != zero && ((op == '*' && y != zero) || (op == '/' && !y.is_infinite())) {
         return Err(underflow());
     }
     Ok(r)
@@ -131,84 +122,13 @@ pub fn f8_check(r: f64, a: f64, b: f64, zero_ok: bool) -> Result<f64> {
 
 fn float_binop(a: &Datum, b: &Datum, op: char) -> Result<Datum> {
     match (a, b) {
-        (Datum::Float8(x), Datum::Float8(y)) => {
-            let (x, y) = (*x, *y);
-            Ok(Datum::Float8(match op {
-                '+' => f8_check(x + y, x, y, true)?,
-                '-' => f8_check(x - y, x, y, true)?,
-                '*' => f8_check(x * y, x, y, false)?,
-                '/' => {
-                    if y == 0.0 && !x.is_nan() {
-                        return Err(div_zero());
-                    }
-                    let r = x / y;
-                    if r.is_infinite() && !x.is_infinite() {
-                        return Err(overflow());
-                    }
-                    if r == 0.0 && x != 0.0 && !y.is_infinite() {
-                        return Err(underflow());
-                    }
-                    r
-                }
-                _ => unreachable!(),
-            }))
-        }
-        (Datum::Float4(x), Datum::Float4(y)) => {
-            let (x, y) = (*x, *y);
-            let r = match op {
-                '+' => x + y,
-                '-' => x - y,
-                '*' => x * y,
-                '/' => {
-                    if y == 0.0 && !x.is_nan() {
-                        return Err(div_zero());
-                    }
-                    x / y
-                }
-                _ => unreachable!(),
-            };
-            if r.is_infinite() && !x.is_infinite() && !(y.is_infinite() && op != '/') {
-                return Err(overflow());
-            }
-            if r == 0.0 && x != 0.0 && ((op == '*' && y != 0.0) || (op == '/' && !y.is_infinite())) {
-                return Err(underflow());
-            }
-            Ok(Datum::Float4(r))
+        (Datum::Float4(x), Datum::Float4(y)) => float_arithmetic(*x, *y, op).map(Datum::Float4),
+        // Mixed float4/float8 operations use double precision (float48pl etc.).
+        (Datum::Float4(_) | Datum::Float8(_), Datum::Float4(_) | Datum::Float8(_)) => {
+            float_arithmetic(a.as_f64().unwrap(), b.as_f64().unwrap(), op).map(Datum::Float8)
         }
         _ => Err(internal("float op", a, b)),
     }
-}
-fn float_add(a: &Datum, b: &Datum) -> Result<Datum> {
-    float_binop(a, b, '+')
-}
-fn float_sub(a: &Datum, b: &Datum) -> Result<Datum> {
-    float_binop(a, b, '-')
-}
-fn float_mul(a: &Datum, b: &Datum) -> Result<Datum> {
-    float_binop(a, b, '*')
-}
-fn float_div(a: &Datum, b: &Datum) -> Result<Datum> {
-    float_binop(a, b, '/')
-}
-/// float4 op float8 / float8 op float4 (float48pl etc.): computed in double
-/// precision.
-fn float48_binop(a: &Datum, b: &Datum, op: char) -> Result<Datum> {
-    match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => float_binop(&Datum::Float8(x), &Datum::Float8(y), op),
-        _ => Err(internal("float op", a, b)),
-    }
-}
-fn float48_add(a: &Datum, b: &Datum) -> Result<Datum> {
-    float48_binop(a, b, '+')
-}
-fn float48_sub(a: &Datum, b: &Datum) -> Result<Datum> {
-    float48_binop(a, b, '-')
-}
-fn float48_mul(a: &Datum, b: &Datum) -> Result<Datum> {
-    float48_binop(a, b, '*')
-}
-fn float48_div(a: &Datum, b: &Datum) -> Result<Datum> {
-    float48_binop(a, b, '/')
 }
 fn float_neg(a: &Datum) -> Result<Datum> {
     Ok(match a {
@@ -254,27 +174,6 @@ pub fn float8_pow(a: &Datum, b: &Datum) -> Result<Datum> {
 
 fn num(a: &Datum) -> &Numeric {
     a.as_numeric().expect("numeric operand")
-}
-fn num_add(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).add(num(b))?))
-}
-fn num_sub(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).sub(num(b))?))
-}
-fn num_mul(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).mul(num(b))?))
-}
-fn num_div(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).div(num(b))?))
-}
-fn num_mod(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).rem(num(b))?))
-}
-fn num_pow(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).pow(num(b))?))
-}
-fn num_neg(a: &Datum) -> Result<Datum> {
-    Ok(Datum::numeric(num(a).neg()))
 }
 
 // ---------------------------------------------------------------- comparison
@@ -375,31 +274,7 @@ pub fn regex(pattern: &str, flags: &str) -> Result<Arc<pgfuncs::pattern::Regex>>
 fn like_op(a: &Datum, b: &Datum, ci: bool) -> Result<bool> {
     pgfuncs::pattern::LikePattern::new_lenient(b.as_str().unwrap(), Some('\\'), ci).try_matches(a.as_str().unwrap()).map_err(Into::into)
 }
-fn like_match(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(like_op(a, b, false)?))
-}
-fn ilike_match(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(like_op(a, b, true)?))
-}
-fn like_nmatch(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(!like_op(a, b, false)?))
-}
-fn ilike_nmatch(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(!like_op(a, b, true)?))
-}
 
-fn re_match(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(regex(b.as_str().unwrap(), "")?.is_match(a.as_str().unwrap())))
-}
-fn re_imatch(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(regex(b.as_str().unwrap(), "i")?.is_match(a.as_str().unwrap())))
-}
-fn re_nmatch(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(!regex(b.as_str().unwrap(), "")?.is_match(a.as_str().unwrap())))
-}
-fn re_nimatch(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(!regex(b.as_str().unwrap(), "i")?.is_match(a.as_str().unwrap())))
-}
 
 // ---------------------------------------------------------------- date/time
 
@@ -534,11 +409,12 @@ pub fn jsonb(d: &Datum) -> &Jsonb {
     }
 }
 
-pub fn text_array(d: &Datum) -> Vec<Option<String>> {
-    match d {
-        Datum::Array(a) => a.elems.iter().map(|e| e.as_str().map(|s| s.to_string())).collect(),
-        _ => vec![],
-    }
+pub fn text_array(d: &Datum) -> impl Iterator<Item = Option<&str>> {
+    let elems = match d {
+        Datum::Array(a) => a.elems.as_slice(),
+        _ => &[],
+    };
+    elems.iter().map(Datum::as_str)
 }
 
 pub(super) fn jsonb_result(j: Option<&Jsonb>, text: bool) -> Datum {
@@ -564,30 +440,11 @@ fn jsonb_get(a: &Datum, b: &Datum, text: bool) -> Result<Datum> {
     };
     Ok(jsonb_result(v, text))
 }
-fn path_strs(d: &Datum) -> Option<Vec<String>> {
-    text_array(d).into_iter().collect()
-}
-fn jsonb_contains(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(jsonb(a).contains(jsonb(b))))
-}
-fn jsonb_contained(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(jsonb(b).contains(jsonb(a))))
-}
-fn jsonb_exists(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::Bool(jsonb(a).exists(b.as_str().unwrap())))
-}
 fn jsonb_exists_any(a: &Datum, b: &Datum) -> Result<Datum> {
-    let keys: Vec<String> = text_array(b).into_iter().flatten().collect();
-    let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    Ok(Datum::Bool(jsonb(a).exists_any(&refs)))
+    Ok(Datum::Bool(text_array(b).flatten().any(|key| jsonb(a).exists(key))))
 }
 fn jsonb_exists_all(a: &Datum, b: &Datum) -> Result<Datum> {
-    let keys: Vec<String> = text_array(b).into_iter().flatten().collect();
-    let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    Ok(Datum::Bool(jsonb(a).exists_all(&refs)))
-}
-fn jsonb_concat(a: &Datum, b: &Datum) -> Result<Datum> {
-    Ok(Datum::jsonb(jsonb(a).concat(jsonb(b))))
+    Ok(Datum::Bool(text_array(b).flatten().all(|key| jsonb(a).exists(key))))
 }
 fn jsonb_delete(a: &Datum, b: &Datum) -> Result<Datum> {
     let j = jsonb(a);
@@ -596,8 +453,8 @@ fn jsonb_delete(a: &Datum, b: &Datum) -> Result<Datum> {
         Datum::Int4(i) => j.delete_index(*i as i64)?,
         Datum::Array(_) => {
             let mut cur = j.clone();
-            for k in text_array(b).into_iter().flatten() {
-                cur = cur.delete_key(&k)?;
+            for k in text_array(b).flatten() {
+                cur = cur.delete_key(k)?;
             }
             cur
         }
@@ -605,9 +462,8 @@ fn jsonb_delete(a: &Datum, b: &Datum) -> Result<Datum> {
     }))
 }
 fn jsonb_delete_path(a: &Datum, b: &Datum) -> Result<Datum> {
-    let Some(p) = path_strs(b) else { return Ok(Datum::Null) };
-    let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
-    Ok(Datum::jsonb(jsonb(a).delete_path(&refs)?))
+    let Some(path) = text_array(b).collect::<Option<Vec<_>>>() else { return Ok(Datum::Null) };
+    Ok(Datum::jsonb(jsonb(a).delete_path(&path)?))
 }
 fn json_get(a: &Datum, b: &Datum, text: bool) -> Result<Datum> {
     let s = a.as_str().unwrap();
@@ -636,9 +492,6 @@ fn array_contains(a: &Datum, b: &Datum) -> Result<Datum> {
     let (x, y) = (array_of(a), array_of(b));
     Ok(Datum::Bool(y.elems.iter().all(|e| !e.is_null() && x.elems.iter().any(|f| !f.is_null() && f.sql_eq(e)))))
 }
-fn array_contained(a: &Datum, b: &Datum) -> Result<Datum> {
-    array_contains(b, a)
-}
 fn array_overlap(a: &Datum, b: &Datum) -> Result<Datum> {
     let (x, y) = (array_of(a), array_of(b));
     Ok(Datum::Bool(y.elems.iter().any(|e| !e.is_null() && x.elems.iter().any(|f| !f.is_null() && f.sql_eq(e)))))
@@ -649,26 +502,26 @@ fn array_overlap(a: &Datum, b: &Datum) -> Result<Datum> {
 pub fn register(b: &mut Builder) {
     let ints = [T::Int2, T::Int4, T::Int8];
     for t in &ints {
-        b.op2("+", t.clone(), t.clone(), t.clone(), int_add);
-        b.op2("-", t.clone(), t.clone(), t.clone(), int_sub);
-        b.op2("*", t.clone(), t.clone(), t.clone(), int_mul);
+        b.op2("+", t.clone(), t.clone(), t.clone(), |a, b| int_binop(a, b, "+", i64::checked_add));
+        b.op2("-", t.clone(), t.clone(), t.clone(), |a, b| int_binop(a, b, "-", i64::checked_sub));
+        b.op2("*", t.clone(), t.clone(), t.clone(), |a, b| int_binop(a, b, "*", i64::checked_mul));
         b.op2("/", t.clone(), t.clone(), t.clone(), int_div);
         b.op2("%", t.clone(), t.clone(), t.clone(), int_mod);
-        b.op2("&", t.clone(), t.clone(), t.clone(), int_and);
-        b.op2("|", t.clone(), t.clone(), t.clone(), int_or);
-        b.op2("#", t.clone(), t.clone(), t.clone(), int_xor);
-        b.op2("<<", t.clone(), T::Int4, t.clone(), int_shl);
-        b.op2(">>", t.clone(), T::Int4, t.clone(), int_shr);
+        b.op2("&", t.clone(), t.clone(), t.clone(), |a, b| int_binop(a, b, "&", |x, y| Some(x & y)));
+        b.op2("|", t.clone(), t.clone(), t.clone(), |a, b| int_binop(a, b, "|", |x, y| Some(x | y)));
+        b.op2("#", t.clone(), t.clone(), t.clone(), |a, b| int_binop(a, b, "#", |x, y| Some(x ^ y)));
+        b.op2("<<", t.clone(), T::Int4, t.clone(), |a, b| int_shift(a, b, true));
+        b.op2(">>", t.clone(), T::Int4, t.clone(), |a, b| int_shift(a, b, false));
         b.op1("-", t.clone(), t.clone(), int_neg);
         b.op1("+", t.clone(), t.clone(), identity);
         b.op1("@", t.clone(), t.clone(), super::builtins::abs_any);
         b.op1("~", t.clone(), t.clone(), int_not);
     }
     for t in [T::Float4, T::Float8] {
-        b.op2("+", t.clone(), t.clone(), t.clone(), float_add);
-        b.op2("-", t.clone(), t.clone(), t.clone(), float_sub);
-        b.op2("*", t.clone(), t.clone(), t.clone(), float_mul);
-        b.op2("/", t.clone(), t.clone(), t.clone(), float_div);
+        b.op2("+", t.clone(), t.clone(), t.clone(), |a, b| float_binop(a, b, '+'));
+        b.op2("-", t.clone(), t.clone(), t.clone(), |a, b| float_binop(a, b, '-'));
+        b.op2("*", t.clone(), t.clone(), t.clone(), |a, b| float_binop(a, b, '*'));
+        b.op2("/", t.clone(), t.clone(), t.clone(), |a, b| float_binop(a, b, '/'));
         b.op1("-", t.clone(), t.clone(), float_neg);
         b.op1("+", t.clone(), t.clone(), identity);
         b.op1("@", t.clone(), t.clone(), super::builtins::abs_any);
@@ -677,19 +530,19 @@ pub fn register(b: &mut Builder) {
     // float4 op integer/numeric resolve to float8, as in PostgreSQL (no
     // cross-type comparisons: "=" operands must share a type)
     for (x, y) in [(T::Float4, T::Float8), (T::Float8, T::Float4)] {
-        b.op2("+", x.clone(), y.clone(), T::Float8, float48_add);
-        b.op2("-", x.clone(), y.clone(), T::Float8, float48_sub);
-        b.op2("*", x.clone(), y.clone(), T::Float8, float48_mul);
-        b.op2("/", x, y, T::Float8, float48_div);
+        b.op2("+", x.clone(), y.clone(), T::Float8, |a, b| float_binop(a, b, '+'));
+        b.op2("-", x.clone(), y.clone(), T::Float8, |a, b| float_binop(a, b, '-'));
+        b.op2("*", x.clone(), y.clone(), T::Float8, |a, b| float_binop(a, b, '*'));
+        b.op2("/", x, y, T::Float8, |a, b| float_binop(a, b, '/'));
     }
     b.op2("^", T::Float8, T::Float8, T::Float8, float8_pow);
-    b.op2("+", T::Numeric, T::Numeric, T::Numeric, num_add);
-    b.op2("-", T::Numeric, T::Numeric, T::Numeric, num_sub);
-    b.op2("*", T::Numeric, T::Numeric, T::Numeric, num_mul);
-    b.op2("/", T::Numeric, T::Numeric, T::Numeric, num_div);
-    b.op2("%", T::Numeric, T::Numeric, T::Numeric, num_mod);
-    b.op2("^", T::Numeric, T::Numeric, T::Numeric, num_pow);
-    b.op1("-", T::Numeric, T::Numeric, num_neg);
+    b.op2("+", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(num(a).add(num(b))?)));
+    b.op2("-", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(num(a).sub(num(b))?)));
+    b.op2("*", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(num(a).mul(num(b))?)));
+    b.op2("/", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(num(a).div(num(b))?)));
+    b.op2("%", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(num(a).rem(num(b))?)));
+    b.op2("^", T::Numeric, T::Numeric, T::Numeric, |a, b| Ok(Datum::numeric(num(a).pow(num(b))?)));
+    b.op1("-", T::Numeric, T::Numeric, |a| Ok(Datum::numeric(num(a).neg())));
     b.op1("+", T::Numeric, T::Numeric, identity);
     b.op1("@", T::Numeric, T::Numeric, super::builtins::abs_any);
 
@@ -739,16 +592,16 @@ pub fn register(b: &mut Builder) {
     b.op2p("||", P::T(T::Text), P::AnyNonArray, Ret::T(T::Text), textcat);
     b.op2p("||", P::AnyNonArray, P::T(T::Text), Ret::T(T::Text), textcat);
     b.op2("||", T::Bytea, T::Bytea, T::Bytea, byteacat);
-    b.op2("~~", T::Text, T::Text, T::Bool, like_match);
-    b.op2("~~*", T::Text, T::Text, T::Bool, ilike_match);
-    b.op2("!~~", T::Text, T::Text, T::Bool, like_nmatch);
-    b.op2("!~~*", T::Text, T::Text, T::Bool, ilike_nmatch);
+    b.op2("~~", T::Text, T::Text, T::Bool, |a, b| Ok(Datum::Bool(like_op(a, b, false)?)));
+    b.op2("~~*", T::Text, T::Text, T::Bool, |a, b| Ok(Datum::Bool(like_op(a, b, true)?)));
+    b.op2("!~~", T::Text, T::Text, T::Bool, |a, b| Ok(Datum::Bool(!like_op(a, b, false)?)));
+    b.op2("!~~*", T::Text, T::Text, T::Bool, |a, b| Ok(Datum::Bool(!like_op(a, b, true)?)));
     // character(n) matches with its padding (bpcharregexeq etc.)
     for t in [T::Text, T::Bpchar] {
-        b.op2("~", t.clone(), T::Text, T::Bool, re_match);
-        b.op2("~*", t.clone(), T::Text, T::Bool, re_imatch);
-        b.op2("!~", t.clone(), T::Text, T::Bool, re_nmatch);
-        b.op2("!~*", t, T::Text, T::Bool, re_nimatch);
+        b.op2("~", t.clone(), T::Text, T::Bool, |a, b| Ok(Datum::Bool(regex(b.as_str().unwrap(), "")?.is_match(a.as_str().unwrap()))));
+        b.op2("~*", t.clone(), T::Text, T::Bool, |a, b| Ok(Datum::Bool(regex(b.as_str().unwrap(), "i")?.is_match(a.as_str().unwrap()))));
+        b.op2("!~", t.clone(), T::Text, T::Bool, |a, b| Ok(Datum::Bool(!regex(b.as_str().unwrap(), "")?.is_match(a.as_str().unwrap()))));
+        b.op2("!~*", t, T::Text, T::Bool, |a, b| Ok(Datum::Bool(!regex(b.as_str().unwrap(), "i")?.is_match(a.as_str().unwrap()))));
     }
 
     // date/time
@@ -788,12 +641,12 @@ pub fn register(b: &mut Builder) {
     b.op2("->>", T::Jsonb, T::Int4, T::Text, |a, b| jsonb_get(a, b, true));
     b.op2("#>", T::Jsonb, text_arr.clone(), T::Jsonb, |a, b| super::builtins::jsonb_extract_path(a, std::slice::from_ref(b), false));
     b.op2("#>>", T::Jsonb, text_arr.clone(), T::Text, |a, b| super::builtins::jsonb_extract_path(a, std::slice::from_ref(b), true));
-    b.op2("@>", T::Jsonb, T::Jsonb, T::Bool, jsonb_contains);
-    b.op2("<@", T::Jsonb, T::Jsonb, T::Bool, jsonb_contained);
-    b.op2("?", T::Jsonb, T::Text, T::Bool, jsonb_exists);
+    b.op2("@>", T::Jsonb, T::Jsonb, T::Bool, |a, b| Ok(Datum::Bool(jsonb(a).contains(jsonb(b)))));
+    b.op2("<@", T::Jsonb, T::Jsonb, T::Bool, |a, b| Ok(Datum::Bool(jsonb(b).contains(jsonb(a)))));
+    b.op2("?", T::Jsonb, T::Text, T::Bool, |a, b| Ok(Datum::Bool(jsonb(a).exists(b.as_str().unwrap()))));
     b.op2("?|", T::Jsonb, text_arr.clone(), T::Bool, jsonb_exists_any);
     b.op2("?&", T::Jsonb, text_arr.clone(), T::Bool, jsonb_exists_all);
-    b.op2("||", T::Jsonb, T::Jsonb, T::Jsonb, jsonb_concat);
+    b.op2("||", T::Jsonb, T::Jsonb, T::Jsonb, |a, b| Ok(Datum::jsonb(jsonb(a).concat(jsonb(b)))));
     b.op2("-", T::Jsonb, T::Text, T::Jsonb, jsonb_delete);
     b.op2("-", T::Jsonb, T::Int4, T::Jsonb, jsonb_delete);
     b.op2("-", T::Jsonb, text_arr.clone(), T::Jsonb, jsonb_delete);
@@ -813,6 +666,6 @@ pub fn register(b: &mut Builder) {
     b.op2p("||", P::AnyElement, P::AnyArray, Ret::ArrayOfElem, super::builtins::array_prepend2);
     b.last().strict = false;
     b.op2p("@>", P::AnyArray, P::AnyArray, Ret::T(T::Bool), array_contains);
-    b.op2p("<@", P::AnyArray, P::AnyArray, Ret::T(T::Bool), array_contained);
+    b.op2p("<@", P::AnyArray, P::AnyArray, Ret::T(T::Bool), |a, b| array_contains(b, a));
     b.op2p("&&", P::AnyArray, P::AnyArray, Ret::T(T::Bool), array_overlap);
 }

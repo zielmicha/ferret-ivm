@@ -4,7 +4,7 @@
 
 use super::api::{json, ApiError};
 use super::AppState;
-use crate::coord::api::{ExecResult, Request, SessionVars};
+use crate::coord::api::{Request, SessionVars, StreamingResult as ExecResult};
 use crate::coord::EngineMsg;
 use crate::sql::parser::{split_statements, Statement};
 use crate::types::text::format_datum;
@@ -148,22 +148,12 @@ fn render(res: ExecResult, limit: usize) -> Result<QueryResponse, ApiError> {
         ..Default::default()
     };
     match res {
+        // Counted to the end, kept up to the limit.
         ExecResult::Query { columns, rows } => {
             let mut out = header(&columns);
             let mut bytes = 0usize;
-            for r in &rows {
-                add_row(&mut out, r, limit, &mut bytes);
-            }
-            Ok(out)
-        }
-        // (counted to the end, kept up to the limit)
-        ExecResult::Rows { columns, mut rows } => {
-            let mut out = header(&columns);
-            let mut bytes = 0usize;
-            while let Some(chunk) = rows.next_chunk() {
-                for r in chunk.map_err(statement_error)?.iter() {
-                    add_row(&mut out, r, limit, &mut bytes);
-                }
+            for row in rows {
+                add_row(&mut out, &row.map_err(statement_error)?, limit, &mut bytes);
             }
             Ok(out)
         }

@@ -17,7 +17,7 @@ use crate::expr::Expr;
 use crate::sql::plan::{JoinKind, Rel, SortKey};
 use crate::sql::BoundQuery;
 use crate::storage::{AggKind, Env, Summary};
-use crate::types::encoding::{self, SortSpec};
+use crate::types::encoding::{self, key_bytes, literal_matches, SortSpec};
 use crate::types::{Datum, Row, SqlType};
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
@@ -39,14 +39,6 @@ pub struct ExecCtx<'a> {
 }
 
 const MAX_RECURSION: usize = 1_000_000;
-
-fn key_bytes<'a>(vals: impl IntoIterator<Item = &'a Datum>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for v in vals {
-        encoding::encode_key(v, SortSpec::ASC, &mut out);
-    }
-    out
-}
 
 /// Canonical row encoding with fidelity (exact identity).
 fn row_identity(row: &[Datum]) -> Vec<u8> {
@@ -875,24 +867,6 @@ impl Cmp {
     }
 }
 
-/// Is a literal exactly of a key column's type (so that its key encoding
-/// orders and compares like the column's values)?
-fn literal_matches(d: &Datum, t: &SqlType) -> bool {
-    matches!(
-        (d, t),
-        (Datum::Int2(_), SqlType::Int2)
-            | (Datum::Int4(_), SqlType::Int4)
-            | (Datum::Int8(_), SqlType::Int8)
-            | (Datum::Text(_), SqlType::Text | SqlType::Varchar | SqlType::Bpchar | SqlType::Name)
-            | (Datum::Numeric(_), SqlType::Numeric)
-            | (Datum::Date(_), SqlType::Date)
-            | (Datum::Timestamp(_), SqlType::Timestamp)
-            | (Datum::TimestampTz(_), SqlType::TimestampTz)
-            | (Datum::Uuid(_), SqlType::Uuid)
-            | (Datum::Bool(_), SqlType::Bool)
-    )
-}
-
 /// Evaluate a dataflow Recursive node's definition against current state.
 pub fn eval_recursive(g: &Graph, env: &mut Env, p: &RecursivePlan) -> Result<Rows> {
     let sources = p.sources.clone();
@@ -1238,7 +1212,6 @@ struct OrderedRead<'r> {
     hi: Option<Vec<u8>>,
     layers: Vec<&'r Rel>,
 }
-
 
 /// Can the plan produce negative weights (which must cancel positive ones
 /// before the result is read)?

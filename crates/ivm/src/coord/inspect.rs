@@ -14,7 +14,7 @@ use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, Statement};
 use crate::sql_bail;
 use crate::storage::TreeResidency;
 use crate::types::text::format_datum;
-use crate::types::{ColumnType, Datum, Row};
+use crate::types::{ColumnType, Datum};
 use rustc_hash::FxHashSet;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1682,7 +1682,7 @@ impl Engine {
         let stmt = Statement::Explain { kind, target: ExplainTarget::Name(name.to_string()) };
         match self.execute(stmt, vec![], SessionVars::default(), String::new(), tx, &h)? {
             Some(ExecResult::Query { rows, .. }) => {
-                Ok(rows.iter().map(|r: &Row| r.iter().map(|d| cell(d).unwrap_or_default()).collect()).collect())
+                rows.map(|r| Ok(r?.iter().map(|d| cell(d).unwrap_or_default()).collect())).collect()
             }
             _ => Ok(vec![]),
         }

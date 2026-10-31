@@ -239,18 +239,24 @@ impl<'a> Binder<'a> {
         if !q.locks.is_empty() {
             sql_bail!(codes::FEATURE_NOT_SUPPORTED, "FOR UPDATE/SHARE is not supported");
         }
-        let pushed = match &q.with {
-            Some(w) => {
+        let depth = self.ctes.len();
+        let r = (|| {
+            if let Some(w) = &q.with {
                 self.bind_with(w)?;
-                true
             }
-            None => false,
-        };
-        let r = self.bind_query_body(q);
-        if pushed {
-            self.ctes.pop();
-        }
+            self.bind_query_body(q)
+        })();
+        self.ctes.truncate(depth);
         r
+    }
+
+    /// Bind in an enclosing query's scope, restoring it even on an error.
+    pub(crate) fn with_outer_scope<T>(&mut self, scope: Option<&Scope>, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let depth = self.outer.len();
+        self.outer.extend(scope.cloned());
+        let result = f(self);
+        self.outer.truncate(depth);
+        result
     }
 
     fn bind_with(&mut self, w: &ast::With) -> Result<()> {
@@ -1283,18 +1289,11 @@ impl<'a> Binder<'a> {
                 Ok((rel, scope, false))
             }
             ast::TableFactor::Derived { lateral, subquery, alias, .. } => {
-                if *lateral {
-                    let ls = left_scope.cloned().unwrap_or_default();
-                    self.outer.push(ls);
-                    let r = self.bind_query(subquery);
-                    self.outer.pop();
-                    let bq = r?;
-                    let (rel, scope) = self.derived(bq, alias.as_ref())?;
-                    return Ok((rel, scope, true));
-                }
-                let bq = self.bind_query(subquery)?;
+                let empty = Scope::default();
+                let outer = lateral.then_some(left_scope.unwrap_or(&empty));
+                let bq = self.with_outer_scope(outer, |b| b.bind_query(subquery))?;
                 let (rel, scope) = self.derived(bq, alias.as_ref())?;
-                Ok((rel, scope, false))
+                Ok((rel, scope, *lateral))
             }
             ast::TableFactor::NestedJoin { table_with_joins, alias } => {
                 let (rel, mut scope) = self.bind_table_with_joins(table_with_joins, None)?;

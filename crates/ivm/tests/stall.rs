@@ -127,7 +127,6 @@ fn requests_reading_a_hydrating_view_wait_for_it() {
         std::thread::spawn(move || match try_exec(&h2, &sql) {
             Ok(ExecResult::Query { rows, .. }) => rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect(),
             Ok(ExecResult::Command { tag }) => vec![tag],
-            Ok(ExecResult::Rows { .. }) => unreachable!("execute collects streamed rows"),
             Ok(ExecResult::Subscribe { rx, cancel, .. }) => {
                 // the snapshot, up to the first progress mark
                 let mut n = 0i64;
@@ -625,7 +624,7 @@ fn large_reads_do_not_hold_up_commits() {
     }
     let g0 = gsn(&h);
     let r0 = stats(&h).reads;
-    // the sessions take one chunk each, then wait for the gate
+    // the sessions take one row each, then wait for the gate
     let gate = std::sync::Arc::new(std::sync::RwLock::new(()));
     let held = gate.write().unwrap();
     let reads: Vec<_> = (0..6u64)
@@ -635,17 +634,15 @@ fn large_reads_do_not_hold_up_commits() {
                 let q = format!("SELECT id, g FROM wide WHERE id % 6 <> {k}");
                 let stmt = ivm::sql::parse_statement(&q).unwrap();
                 let res = h.execute_while(stmt, vec![], SessionVars::default(), String::new(), || true).unwrap();
-                let ExecResult::Rows { mut rows, .. } = res else { panic!("{q}: not streamed") };
-                let mut chunk = rows.next_chunk();
+                let ivm::coord::api::StreamingResult::Query { mut rows, .. } = res else { panic!("{q}: no rows") };
+                let first = rows.next().unwrap();
                 drop(gate.read().unwrap());
                 // (rows, sum of g)
                 let (mut count, mut sum) = (0u64, 0i64);
-                while let Some(c) = chunk {
-                    for r in c.unwrap().into_parts().0 {
-                        count += 1;
-                        sum += r[1].as_i64().unwrap();
-                    }
-                    chunk = rows.next_chunk();
+                for row in std::iter::once(first).chain(rows) {
+                    let row = row.unwrap();
+                    count += 1;
+                    sum += row[1].as_i64().unwrap();
                 }
                 (count, sum)
             })
