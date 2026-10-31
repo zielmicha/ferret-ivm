@@ -585,7 +585,7 @@ impl Engine {
         res
     }
 
-    /// A broken view built again (`repair_view`) is hydrated: it takes its
+    /// A broken view built again (`replace_view`) is hydrated: it takes its
     /// root's error records and its sinks start.
     fn finish_repair(&mut self, id: ObjectId) {
         self.take_root_errors(id);
@@ -685,22 +685,10 @@ impl Engine {
     /// Is a relation that `rel` reads still being hydrated (a view, or a
     /// table rebuilt after a schema change)?
     pub(crate) fn reads_hydrating(&self, rel: &crate::sql::Rel) -> bool {
-        fn walk(e: &Engine, r: &crate::sql::Rel) -> bool {
-            if let crate::sql::Rel::Get { id, .. } = r {
-                if let Some(v) = e.rt.views.get(id)
-                    && !e.graph.arr(v.arr).hydrated
-                {
-                    return true;
-                }
-                if let Some(n) = e.rt.tables.get(id)
-                    && !e.graph.node(*n).hydrated
-                {
-                    return true;
-                }
-            }
-            r.inputs().into_iter().any(|i| walk(e, i))
-        }
-        self.hydration.is_some() && walk(self, rel)
+        self.hydration.is_some() && rel.reads().any(|id| {
+            self.rt.views.get(&id).is_some_and(|v| !self.graph.arr(v.arr).hydrated)
+                || self.rt.tables.get(&id).is_some_and(|n| !self.graph.node(*n).hydrated)
+        })
     }
 
     /// Finish the hydration in progress once it has caught up (waiting for

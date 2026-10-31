@@ -4,37 +4,20 @@
 //! bugs that are still open). Randomized comparisons of views with their
 //! queries are in selfdiff.rs.
 
+mod common;
+use common::{exec, rows, start_in as start};
+
 use ivm::coord::api::{ExecResult, SessionVars, SubEvent};
 use ivm::coord::{self, EngineHandle};
 use ivm::log::LogRecord;
 use ivm::types::text::format_datum;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn tmpdir(name: &str) -> PathBuf {
     let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
     let d = PathBuf::from(base).join(format!("ivm-engine-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
-}
-
-fn start(dir: &Path) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
-    coord::start(cfg).expect("engine starts")
-}
-
-fn exec(h: &EngineHandle, sql: &str) -> ExecResult {
-    let stmt = ivm::sql::parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    h.execute(stmt, vec![], SessionVars::default(), String::new()).unwrap_or_else(|e| panic!("{sql}: {e}"))
-}
-
-/// Result rows as text, in result order.
-fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
-    match exec(h, sql) {
-        ExecResult::Query { rows, .. } => {
-            rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect()
-        }
-        other => panic!("{sql}: expected rows, got {other:?}"),
-    }
 }
 
 /// Log a clock tick at `secs` seconds after 2026-01-01 00:00:00 UTC.

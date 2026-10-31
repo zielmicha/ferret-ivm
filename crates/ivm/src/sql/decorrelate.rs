@@ -19,80 +19,28 @@ use std::collections::BTreeMap;
 /// Visit Outer(depth, col) references in `rel` (looking into nested
 /// subqueries and Apply right sides with increased depth) and replace them.
 pub fn map_outer_refs(rel: &mut Rel, depth: usize, f: &mut dyn FnMut(usize, &SqlType) -> Expr) {
-    fn in_expr(e: &mut Expr, depth: usize, f: &mut dyn FnMut(usize, &SqlType) -> Expr) {
-        match e {
-            Expr::Outer(d, c, t) if *d == depth => {
-                *e = f(*c, t);
-            }
-            Expr::Subquery(s) => {
-                map_outer_refs(&mut s.rel, depth + 1, f);
-                for c in e.children_mut() {
-                    in_expr(c, depth, f);
-                }
-            }
-            _ => {
-                for c in e.children_mut() {
-                    in_expr(c, depth, f);
-                }
-            }
+    rel.visit_exprs_scoped_mut(depth, &mut |e, depth| {
+        if let Expr::Outer(d, c, t) = e && *d == depth {
+            *e = f(*c, t);
+            return false;
         }
-    }
-    for e in rel.exprs_mut() {
-        in_expr(e, depth, f);
-    }
-    match rel {
-        Rel::Apply { left, right, .. } => {
-            map_outer_refs(left, depth, f);
-            map_outer_refs(right, depth + 1, f);
-        }
-        _ => {
-            for i in rel.inputs_mut() {
-                map_outer_refs(i, depth, f);
-            }
-        }
-    }
+        true
+    });
 }
 
 /// Decrement the depth of Outer refs deeper than `depth`.
 fn shift_outer_depth(rel: &mut Rel, depth: usize) {
-    fn in_expr(e: &mut Expr, depth: usize) {
-        match e {
-            Expr::Outer(d, _, _) if *d > depth => *d -= 1,
-            Expr::Subquery(s) => {
-                shift_outer_depth(&mut s.rel, depth + 1);
-                for c in e.children_mut() {
-                    in_expr(c, depth);
-                }
-            }
-            _ => {
-                for c in e.children_mut() {
-                    in_expr(c, depth);
-                }
-            }
-        }
-    }
-    for e in rel.exprs_mut() {
-        in_expr(e, depth);
-    }
-    match rel {
-        Rel::Apply { left, right, .. } => {
-            shift_outer_depth(left, depth);
-            shift_outer_depth(right, depth + 1);
-        }
-        _ => {
-            for i in rel.inputs_mut() {
-                shift_outer_depth(i, depth);
-            }
-        }
-    }
+    rel.visit_exprs_scoped_mut(depth, &mut |e, depth| {
+        if let Expr::Outer(d, _, _) = e && *d > depth { *d -= 1; }
+        true
+    });
 }
 
-/// Collect the outer columns referenced at `depth`.
+/// Collect the outer columns referenced at `depth`, without copying the plan.
 fn outer_cols(rel: &Rel, depth: usize, out: &mut BTreeMap<usize, SqlType>) {
-    let mut r = rel.clone();
-    map_outer_refs(&mut r, depth, &mut |c, t| {
-        out.insert(c, t.clone());
-        Expr::Outer(depth, c, t.clone())
+    rel.any_expr_scoped(depth, &mut |e, depth| {
+        if let Expr::Outer(d, c, t) = e && *d == depth { out.insert(*c, t.clone()); }
+        false
     });
 }
 
@@ -623,17 +571,11 @@ fn uncorrelated(left: Rel, right: Rel, kind: ApplyKind) -> Result<Rel> {
 
 /// Rewrite an expression of an operator whose input gained k leading D columns.
 fn rw(e: &Expr, k: usize, dpos: &BTreeMap<usize, usize>) -> Expr {
-    match e {
-        Expr::Column(i) => Expr::Column(i + k),
-        Expr::Outer(1, c, _) => Expr::Column(dpos[c]),
-        _ => {
-            let mut out = e.clone();
-            for ch in out.children_mut() {
-                *ch = rw(ch, k, dpos);
-            }
-            out
-        }
-    }
+    e.rewritten(&mut |e| match e {
+        Expr::Column(i) => Some(Expr::Column(i + k)),
+        Expr::Outer(1, c, _) => Some(Expr::Column(dpos[c])),
+        _ => None,
+    })
 }
 
 /// Push the dependent set D (k columns) through `rel`. The result's output is
@@ -842,16 +784,10 @@ fn push_dep(rel: Rel, d: &Rel, k: usize, dpos: &BTreeMap<usize, usize>) -> Resul
 
 /// Replace Outer(1, c) by Column(base + dpos[c]) leaving other columns alone.
 fn rw_outer_only(e: &Expr, base: usize, dpos: &BTreeMap<usize, usize>) -> Expr {
-    match e {
-        Expr::Outer(1, c, _) => Expr::Column(base + dpos[c]),
-        _ => {
-            let mut out = e.clone();
-            for ch in out.children_mut() {
-                *ch = rw_outer_only(ch, base, dpos);
-            }
-            out
-        }
-    }
+    e.rewritten(&mut |e| match e {
+        Expr::Outer(1, c, _) => Some(Expr::Column(base + dpos[c])),
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -915,18 +851,12 @@ fn lift_filters(rel: &Rel) -> Option<(Rel, Vec<Expr>, usize)> {
 
 /// Convert a lifted predicate into a join condition over [left, right].
 fn to_join_cond(e: &Expr, nl: usize) -> Expr {
-    match e {
-        Expr::Column(c) => Expr::Column(c + nl),
-        Expr::Outer(1, c, _) => Expr::Column(*c),
-        Expr::Outer(d, c, t) => Expr::Outer(d - 1, *c, t.clone()),
-        _ => {
-            let mut o = e.clone();
-            for ch in o.children_mut() {
-                *ch = to_join_cond(ch, nl);
-            }
-            o
-        }
-    }
+    e.rewritten(&mut |e| match e {
+        Expr::Column(c) => Some(Expr::Column(c + nl)),
+        Expr::Outer(1, c, _) => Some(Expr::Column(*c)),
+        Expr::Outer(d, c, t) => Some(Expr::Outer(d - 1, *c, t.clone())),
+        _ => None,
+    })
 }
 
 fn try_simple(left: &Rel, right: &Rel, kind: &ApplyKind) -> Result<Option<Rel>> {

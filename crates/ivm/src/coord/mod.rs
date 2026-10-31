@@ -88,6 +88,13 @@ pub struct Runtime {
     pub broken: BTreeMap<ObjectId, String>,
 }
 
+impl Runtime {
+    /// The current dataflow root of a table or materialized view.
+    pub(crate) fn node(&self, id: ObjectId) -> Option<NodeId> {
+        self.tables.get(&id).copied().or_else(|| self.views.get(&id).map(|v| v.node))
+    }
+}
+
 pub(crate) struct Subscription {
     pub node: NodeId,
     pub tx: Sender<SubEvent>,
@@ -710,14 +717,6 @@ impl Engine {
         &self,
         objects: &'a [crate::catalog::CatalogObject],
     ) -> Vec<(&'a crate::catalog::CatalogObject, Result<Vec<ObjectId>>)> {
-        fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
-            if let crate::sql::Rel::Get { id, .. } = r {
-                out.push(*id);
-            }
-            for i in r.inputs() {
-                gets(i, out);
-            }
-        }
         let mut pending: Vec<(&crate::catalog::CatalogObject, Result<Vec<ObjectId>>)> = Vec::new();
         for o in objects {
             let deps = match &o.kind {
@@ -726,7 +725,7 @@ impl Engine {
                     .and_then(|q| crate::sql::plan_stored_query(&self.catalog, &q))
                     .map(|bq| {
                         let mut ids = self.catalog.mentioned_views(&v.sql);
-                        gets(&bq.rel, &mut ids);
+                        ids.extend(bq.rel.reads());
                         ids
                     }),
                 _ => continue,
@@ -1540,17 +1539,7 @@ impl Engine {
         if self.rt.broken.is_empty() {
             return Ok(());
         }
-        fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
-            if let crate::sql::Rel::Get { id, .. } = r {
-                out.push(*id);
-            }
-            for i in r.inputs() {
-                gets(i, out);
-            }
-        }
-        let mut ids = Vec::new();
-        gets(rel, &mut ids);
-        match ids.into_iter().find_map(|id| self.broken_error(id)) {
+        match rel.reads().find_map(|id| self.broken_error(id)) {
             Some(e) => Err(e),
             None => Ok(()),
         }

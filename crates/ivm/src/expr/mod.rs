@@ -361,18 +361,27 @@ impl Expr {
         e
     }
 
-    /// Replace column references by expressions (substitution).
-    pub fn substitute(&self, cols: &[Expr]) -> Expr {
-        match self {
-            Expr::Column(i) => cols[*i].clone(),
-            _ => {
-                let mut e = self.clone();
-                for c in e.children_mut() {
-                    *c = c.substitute(cols);
-                }
-                e
+    /// Substitute matching subexpressions, without visiting their replacements
+    /// or crossing into subquery plans. Clone the original tree only once.
+    pub fn rewritten(&self, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Expr {
+        let mut e = self.clone();
+        e.rewrite(f);
+        e
+    }
+
+    pub fn rewrite(&mut self, f: &mut dyn FnMut(&Expr) -> Option<Expr>) {
+        if let Some(e) = f(self) {
+            *self = e;
+        } else {
+            for c in self.children_mut() {
+                c.rewrite(f);
             }
         }
+    }
+
+    /// Replace column references by expressions (substitution).
+    pub fn substitute(&self, cols: &[Expr]) -> Expr {
+        self.rewritten(&mut |e| e.as_column().map(|i| cols[i].clone()))
     }
 
     /// Whether the expression contains binder placeholders of the given kinds.
@@ -394,12 +403,7 @@ impl Expr {
 
     /// Whether evaluation is deterministic (no volatile/stable functions).
     pub fn is_deterministic(&self) -> bool {
-        if let Expr::Call(c) = self
-            && registry().funcs[c.func.0 as usize].volatility != Volatility::Immutable
-        {
-            return false;
-        }
-        self.children().iter().all(|c| c.is_deterministic())
+        !self.contains(&|e| matches!(e, Expr::Call(c) if registry().funcs[c.func.0 as usize].volatility != Volatility::Immutable))
     }
 
     /// Names of non-immutable functions used.
@@ -450,14 +454,7 @@ impl Expr {
 
     /// Replace now()-family calls by `f(kind)`.
     pub fn replace_now(&self, f: &dyn Fn(NowKind) -> Expr) -> Expr {
-        if let Some(k) = self.now_kind() {
-            return f(k);
-        }
-        let mut e = self.clone();
-        for c in e.children_mut() {
-            *c = c.replace_now(f);
-        }
-        e
+        self.rewritten(&mut |e| e.now_kind().map(f))
     }
 
     /// Replace now()-family calls by the clock reading `t` (timestamptz

@@ -113,19 +113,8 @@ impl Engine {
     /// Run a read that exceeded its budget on a reader thread, against the
     /// state it was planned in (the engine has applied nothing since).
     pub(crate) fn read_elsewhere(&mut self, bq: crate::sql::BoundQuery, vars: SessionVars, reply: Sender<Result<ExecResult>>) -> Result<()> {
-        fn gets(r: &crate::sql::Rel, out: &mut Vec<ObjectId>) {
-            if let crate::sql::Rel::Get { id, .. } = r {
-                out.push(*id);
-            }
-            for i in r.inputs() {
-                gets(i, out);
-            }
-        }
-        let mut ids = Vec::new();
-        gets(&bq.rel, &mut ids);
-        let objects: Vec<(ObjectId, NodeId)> = ids
-            .into_iter()
-            .filter_map(|id| self.rt.tables.get(&id).copied().or_else(|| self.rt.views.get(&id).map(|v| v.node)).map(|n| (id, n)))
+        let objects: Vec<(ObjectId, NodeId)> = bq.rel.reads()
+            .filter_map(|id| self.rt.node(id).map(|n| (id, n)))
             .collect();
         let graph = self.graph.fork_of(&objects.iter().map(|(_, n)| *n).collect::<Vec<_>>());
         let env = self.fork_env()?;

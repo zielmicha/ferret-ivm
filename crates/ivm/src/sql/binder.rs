@@ -1609,15 +1609,12 @@ fn type_name_for_alias(dt: &ast::DataType) -> Option<String> {
 
 /// Whether `rel` (or a subquery in it) reads the recursive relation `id`.
 fn rel_uses_recref(rel: &Rel, id: u64) -> bool {
-    fn expr_uses(e: &Expr, id: u64) -> bool {
-        match e {
-            Expr::Subquery(s) => rel_uses_recref(&s.rel, id) || e.children().iter().any(|c| expr_uses(c, id)),
-            _ => e.children().iter().any(|c| expr_uses(c, id)),
-        }
-    }
-    matches!(rel, Rel::RecRef { id: r, .. } if *r == id)
-        || rel.exprs().iter().any(|e| expr_uses(e, id))
-        || rel.inputs().iter().any(|i| rel_uses_recref(i, id))
+    rel.walk().any(|rel| {
+        matches!(rel, Rel::RecRef { id: r, .. } if *r == id)
+            || rel.exprs().iter().any(|e| {
+                e.contains(&|e| matches!(e, Expr::Subquery(s) if rel_uses_recref(&s.rel, id)))
+            })
+    })
 }
 
 /// Could `q` reference relation `name` (a cheap textual pre-check for
@@ -1710,30 +1707,20 @@ fn rewrite_post_agg(e: &Expr, group_fps: &[(Vec<u8>, usize)], ngroup: usize, abs
     }
 }
 
-fn replace_srf_refs(e: Expr, base: usize) -> Expr {
-    match e {
-        Expr::SrfRef(k, _) => Expr::Column(base + k),
-        mut other => {
-            for c in other.children_mut() {
-                let taken = std::mem::replace(c, Expr::null(SqlType::Unknown));
-                *c = replace_srf_refs(taken, base);
-            }
-            other
-        }
-    }
+fn replace_srf_refs(mut e: Expr, base: usize) -> Expr {
+    e.rewrite(&mut |e| match e {
+        Expr::SrfRef(k, _) => Some(Expr::Column(base + k)),
+        _ => None,
+    });
+    e
 }
 
-fn replace_window_refs(e: Expr, base: usize) -> Expr {
-    match e {
-        Expr::WindowRef(k, _) => Expr::Column(base + k),
-        mut other => {
-            for c in other.children_mut() {
-                let taken = std::mem::replace(c, Expr::null(SqlType::Unknown));
-                *c = replace_window_refs(taken, base);
-            }
-            other
-        }
-    }
+fn replace_window_refs(mut e: Expr, base: usize) -> Expr {
+    e.rewrite(&mut |e| match e {
+        Expr::WindowRef(k, _) => Some(Expr::Column(base + k)),
+        _ => None,
+    });
+    e
 }
 
 /// PostgreSQL's select_common_type: unknown inputs are ignored (all unknown:

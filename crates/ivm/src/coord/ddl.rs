@@ -522,35 +522,39 @@ impl Engine {
         let rel = bq.into_rel();
         // (a view over a broken one cannot be built either)
         self.check_broken(&rel)?;
-        let node_mark = self.graph.node_count();
-        let arr_mark = self.graph.arr_count();
-        let rt = &self.rt;
-        let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-        let lowered = {
-            let mut lw = Lowerer { g: &mut self.graph, env: &mut self.env, objects: &objects };
-            lw.lower(&rel).map(|l| lw.materialize(l))
-        };
-        let lowered = match lowered {
-            Ok(n) => n,
-            Err(e) => {
-                // what lowering created before it failed is unreferenced
-                self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-                return Err(e);
-            }
-        };
-        self.graph.retain_node(lowered);
-        let arr = match self.graph.node(lowered).arrangements.first().copied() {
-            Some(a) => a,
-            None => {
-                let schema = self.graph.node(lowered).schema.clone();
-                let full = Layout::full(&schema);
-                self.graph.add_arrangement(&mut self.env, lowered, full.key.clone(), full.specs.clone(), vec![])
-            }
-        };
-        self.graph.retain_arr(arr);
-        self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-        self.rt.views.insert(id, ViewRt { node: lowered, arr, errors: BTreeMap::new() });
+        let view = self.build_dataflow(&rel, |graph, env, node| {
+            let arr = match graph.node(node).arrangements.first().copied() {
+                Some(a) => a,
+                None => {
+                    let full = Layout::full(&graph.node(node).schema);
+                    graph.add_arrangement(env, node, full.key, full.specs, vec![])
+                }
+            };
+            graph.retain_arr(arr);
+            ViewRt { node, arr, errors: BTreeMap::new() }
+        })?;
+        self.rt.views.insert(id, view);
         Ok(())
+    }
+
+    /// Build and pin a materialized dataflow root, retaining any extra outputs
+    /// through `finish`. Failed builds and successful planning leftovers are
+    /// collected at the same boundary; existing shared fragments stay pinned.
+    pub(crate) fn build_dataflow<T>(
+        &mut self,
+        rel: &crate::sql::Rel,
+        finish: impl FnOnce(&mut Graph, &mut Env, NodeId) -> T,
+    ) -> Result<T> {
+        let (nodes, arrs) = (self.graph.node_count(), self.graph.arr_count());
+        let objects = |id| self.rt.node(id);
+        let mut lowerer = Lowerer { g: &mut self.graph, env: &mut self.env, objects: &objects };
+        let result = lowerer.lower(rel).map(|l| lowerer.materialize(l));
+        let result = result.map(|node| {
+            self.graph.retain_node(node);
+            finish(&mut self.graph, &mut self.env, node)
+        });
+        self.graph.gc_since(&mut self.env, nodes, arrs)?;
+        result
     }
 
     /// Definition (query text and output columns) of CREATE [MATERIALIZED]
@@ -837,10 +841,8 @@ impl Engine {
     /// get the change from the old to the new contents as of `gsn`, and the
     /// old version is released (`finish_replace`).
     fn replace_view(&mut self, gsn: Gsn, id: ObjectId, name: &str, sql: &str, def: ViewDef) -> Result<ExecResult> {
-        if self.rt.broken.contains_key(&id) {
-            return self.repair_view(gsn, id, name, sql, def);
-        }
-        let old = self.rt.views.remove(&id).expect("view runtime");
+        let old = self.rt.views.remove(&id);
+        assert!(old.is_some() || self.rt.broken.contains_key(&id), "view runtime");
         let old_cat = self.catalog.get(id).cloned();
         self.catalog.insert(CatalogObject {
             id,
@@ -851,11 +853,17 @@ impl Engine {
         });
         if let Err(e) = self.create_view_rt(id, &def.sql) {
             // roll back
-            self.rt.views.insert(id, old);
+            if let Some(old) = old {
+                self.rt.views.insert(id, old);
+            }
             if let Some(o) = old_cat {
                 self.catalog.insert(o);
             }
             return Err(e);
+        }
+        if old.is_none() {
+            self.rt.broken.remove(&id);
+            log::info!("materialized view {name} is maintained again");
         }
         // indexes on the view move to the new version (user replacements
         // are checked beforehand)
@@ -864,6 +872,11 @@ impl Engine {
             _ => vec![],
         };
         let old_index_arrs = self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
+        let Some(old) = old else {
+            // A broken view had no dataflow or index arrangements to release.
+            self.record_then.push(hydrate::Then::Repaired(id));
+            return Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() });
+        };
         // (by view: other views and ad hoc subscriptions may share the old
         // node) subscribers see the change from the old to the new
         // definition once it is hydrated: until then they get nothing
@@ -911,37 +924,6 @@ impl Engine {
         let consumers =
             same && (!sinks.is_empty() || self.subs.iter().any(|s| s.view == Some(id) && !s.cancel.load(std::sync::atomic::Ordering::Acquire)));
         self.record_then.push(hydrate::Then::Replaced(Box::new(hydrate::Replaced { id, old, old_index_arrs, same, sinks, consumers })));
-        Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
-    }
-
-    /// Build a broken materialized view (it has no dataflow) under a new or
-    /// re-planned definition: on success it is maintained again, its indexes
-    /// are rebuilt (or dropped with their columns) and its sinks start.
-    fn repair_view(&mut self, gsn: Gsn, id: ObjectId, name: &str, sql: &str, def: ViewDef) -> Result<ExecResult> {
-        let old_cat = self.catalog.get(id).cloned();
-        self.catalog.insert(CatalogObject {
-            id,
-            name: name.to_string(),
-            kind: ObjectKind::MaterializedView(def.clone()),
-            created_gsn: gsn,
-            create_sql: sql.to_string(),
-        });
-        if let Err(e) = self.create_view_rt(id, &def.sql) {
-            if let Some(o) = old_cat {
-                self.catalog.insert(o);
-            }
-            return Err(e);
-        }
-        self.rt.broken.remove(&id);
-        log::info!("materialized view {name} is maintained again");
-        let old_cols = match old_cat.as_ref().map(|o| &o.kind) {
-            Some(ObjectKind::MaterializedView(v)) => v.columns.clone(),
-            _ => vec![],
-        };
-        // (broken views have no index arrangements to release)
-        self.move_indexes(id, &format!("materialized view {name}"), &old_cols, &def.columns);
-        // its sinks start once it is hydrated (`finish_repair`)
-        self.record_then.push(hydrate::Then::Repaired(id));
         Ok(ExecResult::Command { tag: "CREATE MATERIALIZED VIEW".into() })
     }
 
@@ -1018,7 +1000,7 @@ impl Engine {
     }
 
     pub(crate) fn create_index_rt(&mut self, id: ObjectId, def: &IndexDef) -> Result<()> {
-        let node = match self.rt.tables.get(&def.on).copied().or_else(|| self.rt.views.get(&def.on).map(|v| v.node)) {
+        let node = match self.rt.node(def.on) {
             Some(n) => n,
             None => return Err(self.broken_error(def.on).unwrap_or_else(|| SqlError::internal("index target without dataflow"))),
         };
@@ -1250,16 +1232,16 @@ pub(crate) fn check_catalog_reads(bq: &crate::sql::BoundQuery) -> Result<()> {
 /// Reject non-deterministic functions in maintained views.
 pub(crate) fn check_deterministic(rel: &crate::sql::Rel) -> Result<()> {
     let mut bad = Vec::new();
-    fn walk(r: &crate::sql::Rel, bad: &mut Vec<&'static str>) -> Result<()> {
+    for r in rel.walk() {
         match r {
             // now() is allowed in temporal filters: the clock is a logged input
             crate::sql::Rel::Filter { preds, .. } => {
                 let (regular, temporal) = crate::dataflow::temporal::split(preds)?;
                 for e in &regular {
-                    e.nondeterministic_functions(bad);
+                    e.nondeterministic_functions(&mut bad);
                 }
                 for t in &temporal {
-                    t.other.nondeterministic_functions(bad);
+                    t.other.nondeterministic_functions(&mut bad);
                 }
             }
             _ => {
@@ -1269,16 +1251,11 @@ pub(crate) fn check_deterministic(rel: &crate::sql::Rel) -> Result<()> {
                             SqlError::new(codes::FEATURE_NOT_SUPPORTED, "now() is only supported in temporal filters of maintained views")
                         }));
                     }
-                    e.nondeterministic_functions(bad);
+                    e.nondeterministic_functions(&mut bad);
                 }
             }
         }
-        for i in r.inputs() {
-            walk(i, bad)?;
-        }
-        Ok(())
     }
-    walk(rel, &mut bad)?;
     if let Some(f) = bad.first() {
         return Err(SqlError::new(
             codes::FEATURE_NOT_SUPPORTED,

@@ -460,6 +460,25 @@ impl Rel {
         }
     }
 
+    /// This operator and its relational inputs, in preorder. Expression
+    /// subqueries are separate query scopes and are not traversed.
+    pub fn walk(&self) -> impl Iterator<Item = &Rel> {
+        let mut pending = vec![self];
+        std::iter::from_fn(move || {
+            let rel = pending.pop()?;
+            pending.extend(rel.inputs().into_iter().rev());
+            Some(rel)
+        })
+    }
+
+    /// Catalog relations read by the plan (including repeated references).
+    pub fn reads(&self) -> impl Iterator<Item = ObjectId> {
+        self.walk().filter_map(|rel| match rel {
+            Rel::Get { id, .. } => Some(*id),
+            _ => None,
+        })
+    }
+
     /// Replace now()-family calls everywhere by the clock reading `t`.
     pub fn bind_now(mut self, t: i64) -> Rel {
         for i in self.inputs_mut() {
@@ -529,31 +548,45 @@ impl Rel {
         }
     }
 
-    /// Whether this plan references columns of the query `depth` levels out
-    /// (Outer refs), looking through nested subqueries.
-    pub fn has_outer_refs(&self, depth: usize) -> bool {
-        fn expr_has(e: &Expr, depth: usize) -> bool {
-            match e {
-                Expr::Outer(d, _, _) => *d == depth,
-                Expr::Subquery(s) => {
-                    s.rel.has_outer_refs(depth + 1)
-                        || match &s.kind {
-                            SubqueryKind::In(l) => l.iter().any(|x| expr_has(x, depth)),
-                            SubqueryKind::AnyAll { lhs, .. } => expr_has(lhs, depth),
-                            _ => false,
-                        }
-                }
-                _ => e.children().iter().any(|c| expr_has(c, depth)),
+    /// Search expressions across nested query scopes. The callback receives
+    /// the depth of the starting scope; subqueries and Apply right inputs add one.
+    pub fn any_expr_scoped(&self, depth: usize, f: &mut dyn FnMut(&Expr, usize) -> bool) -> bool {
+        fn in_expr(e: &Expr, depth: usize, f: &mut dyn FnMut(&Expr, usize) -> bool) -> bool {
+            f(e, depth)
+                || matches!(e, Expr::Subquery(s) if s.rel.any_expr_scoped(depth + 1, f))
+                || e.children().iter().any(|c| in_expr(c, depth, f))
+        }
+        let apply = matches!(self, Rel::Apply { .. });
+        self.exprs().iter().any(|e| in_expr(e, depth, f))
+            || self.inputs().iter().enumerate().any(|(i, input)| {
+                input.any_expr_scoped(depth + usize::from(apply && i == 1), f)
+            })
+    }
+
+    /// Mutate expressions with the same scope rules as `any_expr_scoped`.
+    /// Returning false skips an expression's children, including its subquery.
+    pub fn visit_exprs_scoped_mut(&mut self, depth: usize, f: &mut dyn FnMut(&mut Expr, usize) -> bool) {
+        fn in_expr(e: &mut Expr, depth: usize, f: &mut dyn FnMut(&mut Expr, usize) -> bool) {
+            if !f(e, depth) { return; }
+            if let Expr::Subquery(s) = e {
+                s.rel.visit_exprs_scoped_mut(depth + 1, f);
+            }
+            for c in e.children_mut() {
+                in_expr(c, depth, f);
             }
         }
-        if self.exprs().iter().any(|e| expr_has(e, depth)) {
-            return true;
+        for e in self.exprs_mut() {
+            in_expr(e, depth, f);
         }
-        match self {
-            // the right side of an Apply sees the left side as one extra level
-            Rel::Apply { left, right, .. } => left.has_outer_refs(depth) || right.has_outer_refs(depth + 1),
-            _ => self.inputs().iter().any(|i| i.has_outer_refs(depth)),
+        let apply = matches!(self, Rel::Apply { .. });
+        for (i, input) in self.inputs_mut().into_iter().enumerate() {
+            input.visit_exprs_scoped_mut(depth + usize::from(apply && i == 1), f);
         }
+    }
+
+    /// Whether this plan references columns of the query `depth` levels out.
+    pub fn has_outer_refs(&self, depth: usize) -> bool {
+        self.any_expr_scoped(depth, &mut |e, depth| matches!(e, Expr::Outer(d, _, _) if *d == depth))
     }
 
     /// Indented plan rendering.

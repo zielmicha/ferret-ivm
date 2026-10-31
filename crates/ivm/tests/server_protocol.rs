@@ -6,28 +6,10 @@ use ivm::server::{self, ServerConfig};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::time::Duration;
 
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-proto-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
-
-/// A running engine whose data directory is removed at shutdown.
-struct Running {
-    engine: coord::Running,
-    dir: PathBuf,
-}
-
-impl Running {
-    fn shutdown(self) {
-        self.engine.shutdown();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
+mod common;
+use common::{Engine as Running, TempDir};
 
 /// Start an engine and a server on an ephemeral port.
 fn start(name: &str) -> (Running, u16) {
@@ -35,17 +17,14 @@ fn start(name: &str) -> (Running, u16) {
 }
 
 fn start_with(name: &str, configure: impl FnOnce(&mut coord::Config)) -> (Running, u16) {
-    let dir = tmpdir(name);
-    let mut cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
-    configure(&mut cfg);
-    let engine = coord::start(cfg).expect("engine starts");
+    let engine = Running::start_with(name, configure);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let h = engine.handle.clone();
     std::thread::spawn(move || {
         let _ = server::serve_listener(listener, ServerConfig::default(), h);
     });
-    (Running { engine, dir }, port)
+    (engine, port)
 }
 
 struct Conn {
@@ -672,7 +651,7 @@ fn error_code(msgs: &[Msg]) -> Option<String> {
 }
 
 fn stats(running: &Running) -> ivm::coord::inspect::EngineStats {
-    match running.engine.handle.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
+    match running.handle.inspect_wait(ivm::coord::inspect::InspectQuery::Stats, Duration::from_secs(10)).unwrap() {
         ivm::coord::inspect::InspectReply::Stats(s) => s,
         other => panic!("unexpected reply {other:?}"),
     }
@@ -703,7 +682,7 @@ fn waiting_reads_are_cancelled_and_dropped() {
     // given: none)
     let sql = "CREATE SOURCE s FROM POSTGRES CONNECTION 'host=127.0.0.1 port=1 connect_timeout=1' PUBLICATION 'p'";
     let stmt = ivm::sql::parse_statement(sql).unwrap();
-    running.engine.handle.execute(stmt, vec![], ivm::coord::api::SessionVars::default(), "[]".into()).unwrap();
+    running.handle.execute(stmt, vec![], ivm::coord::api::SessionVars::default(), "[]".into()).unwrap();
     let read = "SELECT 1 AS OF AT LEAST LSN '0/16B3748'";
     let (mut c, pid, secret) = connect_with_key(port);
     let mut b = read.as_bytes().to_vec();
@@ -859,22 +838,18 @@ fn large_results_are_streamed() {
 /// listener of the same server) and dropped when the client goes away.
 #[test]
 fn unix_domain_sockets() {
-    let dir = tmpdir("unix");
-    let sockets = tmpdir("unix-sockets");
-    std::fs::create_dir_all(&sockets).unwrap();
-    let path = sockets.join(".s.PGSQL.6875");
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
-    let engine = coord::start(cfg).expect("engine starts");
+    let sockets = TempDir::new("proto-unix-sockets");
+    let path = sockets.path().join(".s.PGSQL.6875");
+    let running = Running::start("proto-unix");
     let (unix, file) = ivm::listen::bind(path.to_str().unwrap()).unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = tcp.local_addr().unwrap().port();
-    let srv = server::Server::new(ServerConfig::default(), engine.handle.clone());
+    let srv = server::Server::new(ServerConfig::default(), running.handle.clone());
     for l in [unix, tcp.into()] {
         let srv = srv.clone();
         std::thread::spawn(move || srv.serve(l));
     }
-    let running = Running { engine, dir };
-    let cfg = pgproto::Config::parse(&format!("host={} port=6875 user=ivm", sockets.display())).unwrap();
+    let cfg = pgproto::Config::parse(&format!("host={} port=6875 user=ivm", sockets.path().display())).unwrap();
     let mut client = pgproto::Client::connect(&cfg).unwrap();
     client.simple_query("CREATE TABLE t (id int PRIMARY KEY)").unwrap();
     client.simple_query("INSERT INTO t VALUES (1), (2)").unwrap();
@@ -883,7 +858,7 @@ fn unix_domain_sockets() {
     // waiting_reads_are_cancelled_and_dropped)
     let sql = "CREATE SOURCE s FROM POSTGRES CONNECTION 'host=127.0.0.1 port=1 connect_timeout=1' PUBLICATION 'p'";
     let stmt = ivm::sql::parse_statement(sql).unwrap();
-    running.engine.handle.execute(stmt, vec![], ivm::coord::api::SessionVars::default(), "[]".into()).unwrap();
+    running.handle.execute(stmt, vec![], ivm::coord::api::SessionVars::default(), "[]".into()).unwrap();
     let read = b"SELECT 1 AS OF AT LEAST LSN '0/16B3748'\0";
     let s = UnixStream::connect(&path).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -900,5 +875,4 @@ fn unix_domain_sockets() {
     running.shutdown();
     drop(file);
     assert!(!path.exists(), "the socket file is removed");
-    let _ = std::fs::remove_dir_all(&sockets);
 }

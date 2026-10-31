@@ -9,12 +9,12 @@
 //! recursion, sorts) hold it.
 
 use crate::dataflow::agg::AggSpec;
-use crate::dataflow::ops::RecursivePlan;
+use crate::dataflow::ops::{RecursivePlan, setop_mult};
 use crate::dataflow::{consolidate, Graph, NodeId};
 use crate::error::{codes, Result, SqlError};
 use crate::expr::func::func_def;
 use crate::expr::Expr;
-use crate::sql::plan::{JoinKind, Rel, SetOpKind, SortKey};
+use crate::sql::plan::{JoinKind, Rel, SortKey};
 use crate::sql::BoundQuery;
 use crate::storage::{AggKind, Env, Summary};
 use crate::types::encoding::{self, SortSpec};
@@ -60,6 +60,8 @@ fn row_identity(row: &[Datum]) -> Vec<u8> {
 }
 
 impl<'a> ExecCtx<'a> {
+    /// Materialize blocking operators directly; collect all other operators
+    /// through the same streaming path used by reads.
     pub fn execute(&mut self, rel: &Rel) -> Result<Rows> {
         match rel {
             Rel::Get { id, name, .. } => {
@@ -75,46 +77,6 @@ impl<'a> ExecCtx<'a> {
                 }
                 Ok(out)
             }
-            Rel::Map { input, exprs } => {
-                let rows = self.execute(input)?;
-                let mut out = Vec::with_capacity(rows.len());
-                for (mut r, w) in rows {
-                    for e in exprs {
-                        let v = e.eval(&r)?;
-                        r.push(v);
-                    }
-                    out.push((r, w));
-                }
-                Ok(out)
-            }
-            Rel::Filter { input, preds } => {
-                if let Some(b) = base_access(rel)
-                    && let Some(rows) = self.scan_base(&b)?
-                {
-                    return Ok(rows);
-                }
-                let rows = self.execute(input)?;
-                let mut out = Vec::with_capacity(rows.len());
-                'rows: for (r, w) in rows {
-                    for p in preds {
-                        if !p.eval_pred(&r)? {
-                            continue 'rows;
-                        }
-                    }
-                    out.push((r, w));
-                }
-                Ok(out)
-            }
-            Rel::Project { input, cols } => {
-                if let Some(b) = base_access(rel)
-                    && let Some(rows) = self.scan_base(&b)?
-                {
-                    return Ok(rows);
-                }
-                let rows = self.execute(input)?;
-                Ok(rows.into_iter().map(|(r, w)| (cols.iter().map(|c| r[*c].clone()).collect(), w)).collect())
-            }
-            Rel::Join { left, right, kind, on } => self.join(left, right, *kind, on),
             Rel::Aggregate { input, group, aggs } => {
                 // (the input is aggregated as it is read, not collected)
                 let in_schema = input.schema();
@@ -167,24 +129,10 @@ impl<'a> ExecCtx<'a> {
                 }
                 let mut out = Vec::new();
                 for (row, a, b) in counts {
-                    let m = match (op, all) {
-                        (SetOpKind::Except, false) => (a > 0 && b <= 0) as i64,
-                        (SetOpKind::Except, true) => (a - b.max(0)).max(0),
-                        (SetOpKind::Intersect, false) => (a > 0 && b > 0) as i64,
-                        (SetOpKind::Intersect, true) => a.min(b).max(0),
-                        (SetOpKind::Union, false) => (a > 0 || b > 0) as i64,
-                        (SetOpKind::Union, true) => a + b,
-                    };
+                    let m = setop_mult(*op, *all, a, b);
                     if m > 0 {
                         out.push((row, m));
                     }
-                }
-                Ok(out)
-            }
-            Rel::UnionAll { inputs } => {
-                let mut out = Vec::new();
-                for i in inputs {
-                    out.extend(self.execute(i)?);
                 }
                 Ok(out)
             }
@@ -207,22 +155,18 @@ impl<'a> ExecCtx<'a> {
                 let schema = input.schema();
                 window(rows, funcs, &schema)
             }
-            Rel::FlatMap { input, funcs, ordinality, .. } => {
-                let rows = self.execute(input)?;
-                let mut out = Vec::new();
-                for (r, w) in rows {
-                    for extra in crate::dataflow::tablefunc::eval(funcs, &r, *ordinality)? {
-                        let mut row = r.clone();
-                        row.extend(extra);
-                        out.push((row, w));
-                    }
-                }
-                Ok(out)
-            }
             Rel::Recursive { id, base, step, distinct, .. } => self.recursive(*id, base, step, *distinct),
             Rel::RecRef { id, .. } => Ok(self.rec.get(id).cloned().unwrap_or_default()),
-            Rel::Negate { input } => Ok(self.execute(input)?.into_iter().map(|(r, w)| (r, -w)).collect()),
             Rel::Apply { .. } => Err(SqlError::internal("correlated subquery survived decorrelation")),
+            Rel::Map { .. } | Rel::Filter { .. } | Rel::Project { .. } | Rel::UnionAll { .. }
+            | Rel::Negate { .. } | Rel::FlatMap { .. } | Rel::Join { .. } => {
+                let mut rows = Vec::new();
+                self.stream(rel, &mut |row, weight| {
+                    rows.push((row, weight));
+                    Ok(true)
+                })?;
+                Ok(rows)
+            }
         }
     }
 
@@ -340,19 +284,9 @@ impl<'a> ExecCtx<'a> {
 
     /// Read a base relation (a table or materialized view) through its
     /// arrangements: an index range when the predicates allow one, and only
-    /// the columns the projection and the predicates need. None when the
-    /// relation has no arrangement to read.
-    fn scan_base(&mut self, b: &BaseAccess) -> Result<Option<Rows>> {
-        let mut out = Vec::new();
-        let r = self.scan_base_into(b, &mut |r, w| {
-            out.push((r, w));
-            Ok(true)
-        })?;
-        Ok(r.map(|_| out))
-    }
-
-    /// `scan_base`, handing the rows to `sink` as they are read. Whether the
-    /// scan ran to its end, or None when there is no arrangement to read.
+    /// the columns the projection and the predicates need. Hand rows to
+    /// `sink` as they are read; return whether the scan ran to its end, or
+    /// None when there is no arrangement to read.
     fn scan_base_into(&mut self, b: &BaseAccess, sink: &mut RowSink) -> Result<Option<bool>> {
         let Some(node) = (self.objects)(b.id) else { return Ok(None) };
         let (arr, lo_key, hi_key) = match self.index_range(node, &b.preds) {
@@ -410,8 +344,8 @@ impl<'a> ExecCtx<'a> {
     /// relations are read through their arrangements, and filters,
     /// projections, maps, set-returning functions, UNION ALL and the probe
     /// side of joins pass rows on as they come, so a read ends as soon as
-    /// `sink` has what it needs. Other operators compute their result first
-    /// (`execute`). Returns whether the read ran to its end.
+    /// `sink` has what it needs. Blocking operators compute their result first.
+    /// Returns whether the read ran to its end.
     pub fn stream(&mut self, rel: &Rel, sink: &mut RowSink) -> Result<bool> {
         if matches!(rel, Rel::Get { .. } | Rel::Filter { .. } | Rel::Project { .. })
             && let Some(b) = base_access(rel)
@@ -600,17 +534,7 @@ impl<'a> ExecCtx<'a> {
         Some(OrderedRead { base, arr, lo, hi, layers })
     }
 
-    fn join(&mut self, left: &Rel, right: &Rel, kind: JoinKind, on: &[Expr]) -> Result<Rows> {
-        let mut out = Vec::new();
-        self.join_into(left, right, kind, on, &mut |r, w| {
-            out.push((r, w));
-            Ok(true)
-        })?;
-        Ok(out)
-    }
-
-    /// `join`, handing the joined rows to `sink` as they are found; whether
-    /// it ran to its end.
+    /// Hand joined rows to `sink` as they are found; whether it ran to its end.
     fn join_into(&mut self, left: &Rel, right: &Rel, kind: JoinKind, on: &[Expr], sink: &mut RowSink) -> Result<bool> {
         let nl = left.arity();
         let nr = right.arity();
@@ -870,48 +794,32 @@ impl<'a> ExecCtx<'a> {
     }
 
     fn recursive(&mut self, id: u64, base: &Rel, step: &Rel, distinct: bool) -> Result<Rows> {
-        let mut base_rows = self.execute(base)?;
-        consolidate(&mut base_rows);
+        let mut produced = self.execute(base)?;
         let mut seen: FxHashMap<Vec<u8>, ()> = FxHashMap::default();
-        let mut result: Rows = Vec::new();
-        let mut working: Rows = Vec::new();
-        for (r, w) in base_rows {
-            if w <= 0 {
-                continue;
-            }
-            if distinct {
-                if seen.insert(row_key(&r), ()).is_none() {
-                    result.push((r.clone(), 1));
-                    working.push((r, 1));
+        let mut result = Vec::new();
+        let mut iters = 0;
+        loop {
+            // The seed and every recursive step enter the same fixed-point
+            // loop: consolidate, discard nonpositive rows, then deduplicate.
+            consolidate(&mut produced);
+            let mut working = Vec::new();
+            for (r, w) in produced {
+                if w <= 0 || (distinct && seen.insert(row_key(&r), ()).is_some()) {
+                    continue;
                 }
-            } else {
+                let w = if distinct { 1 } else { w };
                 result.push((r.clone(), w));
                 working.push((r, w));
             }
-        }
-        let mut iters = 0;
-        while !working.is_empty() {
+            if working.is_empty() {
+                break;
+            }
             iters += 1;
             if iters > MAX_RECURSION {
                 return Err(SqlError::new(codes::PROGRAM_LIMIT_EXCEEDED, "recursive query exceeded the iteration limit"));
             }
-            self.rec.insert(id, std::mem::take(&mut working));
-            let mut produced = self.execute(step)?;
-            consolidate(&mut produced);
-            for (r, w) in produced {
-                if w <= 0 {
-                    continue;
-                }
-                if distinct {
-                    if seen.insert(row_key(&r), ()).is_none() {
-                        result.push((r.clone(), 1));
-                        working.push((r, 1));
-                    }
-                } else {
-                    result.push((r.clone(), w));
-                    working.push((r, w));
-                }
-            }
+            self.rec.insert(id, working);
+            produced = self.execute(step)?;
         }
         self.rec.remove(&id);
         Ok(result)

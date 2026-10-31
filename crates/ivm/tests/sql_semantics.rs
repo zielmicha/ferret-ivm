@@ -3,45 +3,19 @@
 //! must produce errors rather than crash the engine.
 
 use ivm::coord::api::{ExecResult, SessionVars};
-use ivm::coord::{self, EngineHandle};
+use ivm::coord::EngineHandle;
 use ivm::types::text::format_datum;
-use std::path::PathBuf;
 
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-sql-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
+mod common;
+use common::{Engine, exec, rows};
 
-/// A running engine whose data directory is removed at shutdown.
-struct Running {
-    handle: EngineHandle,
-    engine: coord::Running,
-    dir: PathBuf,
-}
-
-impl Running {
-    fn shutdown(self) {
-        self.engine.shutdown();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn start(name: &str) -> Running {
-    let dir = tmpdir(name);
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
-    let engine = coord::start(cfg).expect("engine starts");
-    Running { handle: engine.handle.clone(), engine, dir }
+fn start(name: &str) -> Engine {
+    Engine::start(name)
 }
 
 fn try_exec(h: &EngineHandle, sql: &str) -> Result<ExecResult, String> {
     let stmt = ivm::sql::parse_statement(sql).map_err(|e| e.message)?;
     h.execute(stmt, vec![], SessionVars::default(), String::new()).map_err(|e| e.message)
-}
-
-fn exec(h: &EngineHandle, sql: &str) {
-    try_exec(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
 
 /// Result rows as `|`-separated text, in result order.
@@ -52,10 +26,6 @@ fn try_rows(h: &EngineHandle, sql: &str) -> Result<Vec<String>, String> {
         }
         other => panic!("{sql}: expected rows, got {other:?}"),
     }
-}
-
-fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
-    try_rows(h, sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
 }
 
 /// Result type names of a query, as pg_typeof would print them.

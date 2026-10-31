@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::catalog::ObjectKind;
-use crate::dataflow::lower::Lowerer;
 use crate::dataflow::NodeKind;
 use crate::exec::{ExecCtx, Rows};
 use crate::sql::parser::{AsOf, ExplainKind, ExplainTarget, ShowKind, Statement, SubscribeTarget};
@@ -239,7 +238,7 @@ impl Engine {
             self.record_dml_reads(rel);
         }
         let rt = &self.rt;
-        let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
+        let objects = |id| rt.node(id);
         let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, objects: &objects, rec: Default::default(), visited: 0 };
         ctx.execute(rel)
     }
@@ -253,24 +252,14 @@ impl Engine {
             return Err(SqlError::new(super::hydrate::HYDRATING, "a relation it reads is being hydrated"));
         }
         let rt = &self.rt;
-        let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
+        let objects = |id| rt.node(id);
         let mut ctx = ExecCtx { g: &self.graph, env: &mut self.env, objects: &objects, rec: Default::default(), visited: 0 };
         ctx.run_query(q, out)?;
         Ok(ctx.visited)
     }
 
     fn check_view_errors(&self, rel: &Rel) -> Result<()> {
-        fn gets(r: &Rel, out: &mut Vec<u64>) {
-            if let Rel::Get { id, .. } = r {
-                out.push(*id);
-            }
-            for i in r.inputs() {
-                gets(i, out);
-            }
-        }
-        let mut ids = Vec::new();
-        gets(rel, &mut ids);
-        for id in ids {
+        for id in rel.reads() {
             if let Some(v) = self.rt.views.get(&id)
                 && let Some(((code, msg), _)) = v.errors.iter().find(|(_, w)| **w > 0)
             {
@@ -293,16 +282,7 @@ impl Engine {
         if self.loading_tables().is_empty() {
             return loading;
         }
-        fn gets(r: &Rel, out: &mut Vec<u64>) {
-            if let Rel::Get { id, .. } = r {
-                out.push(*id);
-            }
-            for i in r.inputs() {
-                gets(i, out);
-            }
-        }
-        let mut ids = Vec::new();
-        gets(rel, &mut ids);
+        let mut ids: Vec<ObjectId> = rel.reads().collect();
         // views read their tables' current contents too
         let mut seen = std::collections::HashSet::new();
         while let Some(id) = ids.pop() {
@@ -319,7 +299,7 @@ impl Engine {
                     if let Ok(q) = crate::sql::parser::parse_single_query(&v.sql)
                         && let Ok(bq) = crate::sql::plan_stored_query(&self.catalog, &q)
                     {
-                        gets(&bq.rel, &mut ids);
+                        ids.extend(bq.rel.reads());
                     }
                 }
                 _ => {}
@@ -592,16 +572,8 @@ impl Engine {
                 self.check_broken(&bq.rel)?;
                 // what it reads: the relations of the plan, and the views
                 // (inlined in it) it reads them through
-                fn gets(r: &Rel, out: &mut Vec<ObjectId>) {
-                    if let Rel::Get { id, .. } = r {
-                        out.push(*id);
-                    }
-                    for i in r.inputs() {
-                        gets(i, out);
-                    }
-                }
                 let mut reads = self.catalog.references(&q.to_string()).unwrap_or_default();
-                gets(&bq.rel, &mut reads);
+                reads.extend(bq.rel.reads());
                 // and what the materialized views it reads read in turn: the
                 // subscription's dataflow is built on their current versions,
                 // so it ends when one of them is replaced or re-planned
@@ -611,24 +583,7 @@ impl Engine {
                 let names: Vec<String> = bq.names.iter().take(bq.visible).cloned().collect();
                 let types: Vec<ColumnType> = bq.column_types();
                 let rel = bq.into_rel();
-                let node_mark = self.graph.node_count();
-                let arr_mark = self.graph.arr_count();
-                let rt = &self.rt;
-                let objects = |oid: u64| -> Option<NodeId> { rt.tables.get(&oid).copied().or_else(|| rt.views.get(&oid).map(|v| v.node)) };
-                let lowered = {
-                    let mut lw = Lowerer { g: &mut self.graph, env: &mut self.env, objects: &objects };
-                    lw.lower(&rel).map(|l| lw.materialize(l))
-                };
-                let node = match lowered {
-                    Ok(n) => n,
-                    Err(e) => {
-                        // what lowering created before it failed is unreferenced
-                        self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
-                        return Err(e);
-                    }
-                };
-                self.graph.retain_node(node);
-                self.graph.gc_since(&mut self.env, node_mark, arr_mark)?;
+                let node = self.build_dataflow(&rel, |_, _, node| node)?;
                 let cols = names.into_iter().zip(types).map(|(n, t)| ResultColumn { name: n, ty: t.ty, typmod: t.typmod }).collect();
                 (node, Some(node), cols, reads)
             }

@@ -1,11 +1,8 @@
 //! Restarts: recovery of data directories whose catalog or checkpoint the
 //! current code no longer accepts as it is, and what survives a restart.
 
-use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::inspect::{InspectQuery, InspectReply};
-use ivm::coord::{self, EngineHandle};
-use ivm::error::SqlError;
-use ivm::types::text::format_datum;
+use ivm::coord;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,51 +14,8 @@ fn tmpdir(name: &str) -> PathBuf {
     d
 }
 
-fn start_in(dir: &Path) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
-    coord::start(cfg).expect("engine starts")
-}
-
-struct Engine {
-    running: coord::Running,
-    h: EngineHandle,
-}
-
-impl Engine {
-    fn start(dir: &Path) -> Engine {
-        let running = start_in(dir);
-        let h = running.handle.clone();
-        Engine { running, h }
-    }
-
-    fn shutdown(self) {
-        self.running.shutdown();
-    }
-
-    fn try_exec(&self, sql: &str) -> Result<ExecResult, SqlError> {
-        let stmt = ivm::sql::parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        self.h.execute(stmt, vec![], SessionVars::default(), String::new())
-    }
-
-    fn exec(&self, sql: &str) -> ExecResult {
-        self.try_exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
-    }
-
-    /// The error of a statement that must fail.
-    fn err(&self, sql: &str) -> SqlError {
-        match self.try_exec(sql) {
-            Ok(r) => panic!("{sql}: expected an error, got {r:?}"),
-            Err(e) => e,
-        }
-    }
-
-    fn rows(&self, sql: &str) -> Vec<String> {
-        match self.exec(sql) {
-            ExecResult::Query { rows, .. } => rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect(),
-            other => panic!("{sql}: expected rows, got {other:?}"),
-        }
-    }
-}
+mod common;
+use common::Engine;
 
 /// Give materialized view `name` of a checkpointed catalog a definition
 /// that no longer plans (as stricter code or catalog drift would).
@@ -82,7 +36,7 @@ fn break_view(dir: &Path, name: &str, sql: &str) {
 #[test]
 fn views_that_no_longer_plan_are_broken_not_fatal() {
     let dir = tmpdir("broken-views");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     e.exec("CREATE TABLE t (a int PRIMARY KEY, b int)");
     e.exec("INSERT INTO t VALUES (1, 10), (2, 20)");
     e.exec("CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t");
@@ -95,7 +49,7 @@ fn views_that_no_longer_plan_are_broken_not_fatal() {
     e.shutdown();
     break_view(&dir, "v", "SELECT a, nosuch FROM t");
 
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT a FROM ok ORDER BY a"), ["1", "2"]);
     e.exec("INSERT INTO t VALUES (3, 30)");
     assert_eq!(e.rows("SELECT a FROM ok ORDER BY a"), ["1", "2", "3"]);
@@ -128,11 +82,11 @@ fn views_that_no_longer_plan_are_broken_not_fatal() {
     let sinks = e.rows("SHOW SINKS");
     assert!(sinks.len() == 1 && sinks[0].starts_with("s|v|target|error: broken: materialized view \"v\" is broken"), "{sinks:?}");
     e.rows("SHOW ARRANGEMENTS");
-    match e.h.inspect_wait(InspectQuery::Errors, Duration::from_secs(10)).unwrap() {
+    match e.handle.inspect_wait(InspectQuery::Errors, Duration::from_secs(10)).unwrap() {
         InspectReply::Errors(d) => assert_eq!(d.broken.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["v", "vi", "w"]),
         other => panic!("unexpected reply {other:?}"),
     }
-    match e.h.inspect_wait(InspectQuery::Catalog, Duration::from_secs(10)).unwrap() {
+    match e.handle.inspect_wait(InspectQuery::Catalog, Duration::from_secs(10)).unwrap() {
         InspectReply::Catalog(c) => {
             let v = c.objects.iter().find(|o| o.name == "v").unwrap();
             assert_eq!(v.status.as_deref(), Some(format!("error: broken: {reason}").as_str()));
@@ -151,20 +105,20 @@ fn views_that_no_longer_plan_are_broken_not_fatal() {
     e.exec("INSERT INTO t VALUES (4, 40)");
     assert_eq!(e.rows("SELECT n FROM w"), ["4"]);
     e.shutdown();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT n FROM w"), ["4"]);
     e.exec("CHECKPOINT");
     e.shutdown();
 
     // DROP removes a broken view (with CASCADE, what reads it)
     break_view(&dir, "v", "SELECT a, nosuch FROM t");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.err("DROP MATERIALIZED VIEW v").code, "2BP01");
     e.exec("DROP MATERIALIZED VIEW v CASCADE");
     assert_eq!(e.rows("SELECT name FROM ivm.objects ORDER BY name"), ["ok", "t"]);
     assert_eq!(e.rows("SHOW SINKS"), Vec::<String>::new());
     e.shutdown();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT name FROM ivm.objects ORDER BY name"), ["ok", "t"]);
     assert_eq!(e.rows("SELECT a FROM ok ORDER BY a"), ["1", "2", "3", "4"]);
     e.shutdown();
@@ -180,7 +134,7 @@ fn views_that_no_longer_plan_are_broken_not_fatal() {
 fn indexes_follow_upstream_schema_changes() {
     use ivm::types::{Column, ColumnType, SqlType};
     let dir = tmpdir("schema-indexes");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     e.exec("CREATE TABLE t (id int PRIMARY KEY, a int, b text)");
     e.exec("INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y')");
     e.exec("CREATE INDEX ta ON t (a)");
@@ -190,7 +144,7 @@ fn indexes_follow_upstream_schema_changes() {
     let oid: u64 = e.rows("SELECT oid FROM ivm.objects WHERE name = 't'")[0].parse().unwrap();
     // as a source logs it: a was dropped upstream, b moved to position 1
     let columns = vec![Column::new("id", ColumnType::new(SqlType::Int4).not_null()), Column::new("b", ColumnType::new(SqlType::Text))];
-    e.h.log(ivm::log::LogRecord::Schema { source: 0, table: oid - 16384, columns, pk: vec![0] }).unwrap();
+    e.handle.log(ivm::log::LogRecord::Schema { source: 0, table: oid - 16384, columns, pk: vec![0] }).unwrap();
     assert_eq!(e.rows("SELECT * FROM t ORDER BY id"), ["1|x", "2|y"]);
     let state = |e: &Engine| (e.rows("SHOW INDEXES"), e.rows("SHOW ARRANGEMENTS").into_iter().map(|r| r.split('|').skip(2).collect::<Vec<_>>().join("|")).collect::<Vec<_>>());
     let expected = (
@@ -201,14 +155,14 @@ fn indexes_follow_upstream_schema_changes() {
     e.exec("INSERT INTO t VALUES (3, 'z')");
     e.shutdown();
     // replayed from the log, then from a checkpoint
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT * FROM t ORDER BY id"), ["1|x", "2|y", "3|z"]);
     let (indexes, arrangements) = state(&e);
     assert_eq!(indexes, expected.0);
     assert_eq!(arrangements.len(), 3, "{arrangements:?}");
     e.exec("CHECKPOINT");
     e.shutdown();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(state(&e).0, expected.0);
     assert_eq!(e.rows("SELECT * FROM t WHERE b = 'z'"), ["3|z"]);
     e.shutdown();
@@ -221,10 +175,10 @@ fn indexes_follow_upstream_schema_changes() {
 #[test]
 fn now_is_the_last_tick_after_a_restart() {
     let dir = tmpdir("now-restart");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     let tick = |e: &Engine, secs: i64| {
         let base = 1_767_225_600_000_000i64; // 2026-01-01T00:00:00Z in Unix microseconds
-        e.h.log(ivm::log::LogRecord::Tick { micros: base + secs * 1_000_000 }).unwrap();
+        e.handle.log(ivm::log::LogRecord::Tick { micros: base + secs * 1_000_000 }).unwrap();
     };
     e.exec("CREATE TABLE t (id int PRIMARY KEY)");
     tick(&e, 10);
@@ -233,13 +187,13 @@ fn now_is_the_last_tick_after_a_restart() {
     assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:20+00|1"]);
     e.exec("CHECKPOINT");
     e.shutdown();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:20+00|1"]);
     tick(&e, 30);
     e.exec("INSERT INTO t VALUES (2)");
     // (replayed from the log after the restart's checkpoint)
-    e.running.crash();
-    let e = Engine::start(&dir);
+    e.crash();
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT now(), count(*) FROM t"), ["2026-01-01 00:00:30+00|2"]);
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -265,7 +219,7 @@ fn files(dir: &Path) -> Vec<(String, u64)> {
 #[test]
 fn a_store_without_its_manifest_is_refused_untouched() {
     let dir = tmpdir("manifest");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     e.exec("CREATE TABLE t (id int PRIMARY KEY)");
     e.exec("INSERT INTO t VALUES (1), (2)");
     e.exec("CHECKPOINT");
@@ -290,7 +244,7 @@ fn a_store_without_its_manifest_is_refused_untouched() {
     assert_eq!(files(&store), before);
     // restored, nothing was lost
     std::fs::write(store.join("MANIFEST"), &manifest).unwrap();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT count(*) FROM t"), ["2"]);
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -305,7 +259,7 @@ fn a_store_without_its_manifest_is_refused_untouched() {
 #[test]
 fn replacements_check_only_the_views_reading_the_replaced_one() {
     let dir = tmpdir("replace-checks");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     e.exec("CREATE TABLE t (a int PRIMARY KEY, b int)");
     e.exec("INSERT INTO t VALUES (1, 10)");
     e.exec("CREATE MATERIALIZED VIEW old AS SELECT a, 0 AS p FROM t");
@@ -316,7 +270,7 @@ fn replacements_check_only_the_views_reading_the_replaced_one() {
     e.shutdown();
     // as an earlier version would have stored it
     break_view(&dir, "old", "SELECT a, pg_backend_pid() AS p FROM t");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT a, p > 0 FROM old"), ["1|t"]);
     e.exec("CREATE OR REPLACE VIEW unrelated AS SELECT 2 AS x");
     assert_eq!(e.rows("SELECT x FROM unrelated"), ["2"]);
@@ -404,7 +358,7 @@ fn check_format1(e: &Engine, app: &serde_json::Value) {
     }
     want.sort();
     assert_eq!(want.len(), 3);
-    match e.h.inspect_wait(InspectQuery::Errors, Duration::from_secs(10)).unwrap() {
+    match e.handle.inspect_wait(InspectQuery::Errors, Duration::from_secs(10)).unwrap() {
         InspectReply::Errors(d) => {
             let mut got: Vec<String> = d.views.iter().map(|v| format!("{}|{}|{}|{}", v.name, v.code, v.message, v.count)).collect();
             got.sort();
@@ -416,7 +370,7 @@ fn check_format1(e: &Engine, app: &serde_json::Value) {
     assert_eq!(e.err("SELECT * FROM s").message, "value out of range: overflow");
     assert_eq!(e.rows("SHOW VIEWS"), ["m|materialized|2|2|ok", "s|materialized|1|1|ok", "pv|virtual|||", "late|materialized|4|0|ok"]);
     // the source's resume point and state, the pending slot drop
-    match e.h.inspect_wait(InspectQuery::Sources, Duration::from_secs(10)).unwrap() {
+    match e.handle.inspect_wait(InspectQuery::Sources, Duration::from_secs(10)).unwrap() {
         InspectReply::Sources(d) => {
             let src = &d.sources[0];
             assert_eq!((d.sources.len(), src.name.as_str()), (1, "src"));
@@ -426,7 +380,7 @@ fn check_format1(e: &Engine, app: &serde_json::Value) {
         }
         other => panic!("unexpected reply {other:?}"),
     }
-    let drops: Vec<(String, String)> = e.h.shared.slot_drops.lock().iter().map(|d| (d.conninfo.clone(), d.slot.clone())).collect();
+    let drops: Vec<(String, String)> = e.handle.shared.slot_drops.lock().iter().map(|d| (d.conninfo.clone(), d.slot.clone())).collect();
     assert_eq!(drops, [(s(&app["slot_drops"][0]["conninfo"]), "fixture_src2".to_string())]);
     assert_eq!(e.rows("SELECT * FROM up ORDER BY id"), ["1|a", "2|b", "3|c"]);
     // the clock (its last tick), and the rows (the index's histories
@@ -453,14 +407,14 @@ fn format1_data_directories_are_migrated() {
     let dir = tmpdir("format1");
     copy_dir(Path::new(FORMAT1), &dir);
     assert!(!dir.join("FORMAT").exists());
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     check_format1(&e, &app);
     assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
     e.shutdown();
     let header = checkpoint_state(&dir);
     assert!(header[0] == 2 && header.len() < 16, "{header:?}");
 
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     check_format1(&e, &app);
     // the error state is complete: a view created over m's dataflow starts
     // with its error records, and the errors retract with their rows
@@ -472,7 +426,7 @@ fn format1_data_directories_are_migrated() {
     e.exec("DELETE FROM r WHERE k = 2");
     assert_eq!(e.rows("SELECT * FROM s ORDER BY g"), ["1|3e+38", "2|1"]);
     e.shutdown();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT * FROM m2 ORDER BY n"), ["10", "30"]);
     assert_eq!(e.rows("SELECT * FROM s ORDER BY g"), ["1|3e+38", "2|1"]);
     assert_eq!(e.rows("SELECT count(*) FROM ivm.catalog_history"), ["13"]);
@@ -490,20 +444,20 @@ fn a_crash_during_migration_migrates_again() {
     let dir = tmpdir("format1-crash");
     copy_dir(Path::new(FORMAT1), &dir);
     let manifest = std::fs::read(dir.join("store/MANIFEST")).unwrap();
-    Engine::start(&dir).shutdown();
+    Engine::open(&dir).shutdown();
     // before the commit: the format-1 manifest, with the migration's
     // record torn
     let mut torn = manifest.clone();
     torn.extend_from_slice(&[0x40, 0, 0, 0, 1, 2, 3, 4, 5]);
     std::fs::write(dir.join("store/MANIFEST"), &torn).unwrap();
     std::fs::remove_file(dir.join("FORMAT")).unwrap();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     check_format1(&e, &app);
     e.shutdown();
     assert_eq!(checkpoint_state(&dir)[0], 2);
     // after the commit
     std::fs::remove_file(dir.join("FORMAT")).unwrap();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     check_format1(&e, &app);
     e.shutdown();
     assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
@@ -587,7 +541,7 @@ fn data_directories_with_histories_open() {
     assert!(kinds.contains_key(&1) && kinds.contains_key(&3) && !kinds.contains_key(&4), "the fixture's node kinds: {kinds:?}");
     let tags = metadata_tags(&dir);
     assert!(tags.contains(&6) && !tags.contains(&13) && tags.iter().filter(|t| **t == 9).count() > 1, "the fixture's metadata: {tags:?}");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     let check = |e: &Engine| {
         assert_eq!(e.rows("SELECT count(*), sum(id) FROM t"), ["720|324000"]);
         assert_eq!(e.rows("SELECT * FROM c"), ["720|324000|x"]);
@@ -602,7 +556,7 @@ fn data_directories_with_histories_open() {
     assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
     let tags = metadata_tags(&dir);
     assert!(!tags.contains(&6) && tags.contains(&13) && tags.iter().filter(|t| **t == 9).count() == 1, "metadata after the first checkpoint: {tags:?}");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     check(&e);
     // every leaf of t changes
     e.exec("UPDATE t SET v = v || '!' WHERE id % 2 = 0");
@@ -611,7 +565,7 @@ fn data_directories_with_histories_open() {
     e.shutdown();
     let kinds = node_kinds(&dir);
     assert!(kinds.contains_key(&4) && kinds.contains_key(&2), "node kinds written: {kinds:?}");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(e.rows("SELECT v FROM t WHERE id IN (2, 3) ORDER BY id"), ["v2!", "w3"]);
     e.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -638,7 +592,7 @@ fn all_files(dir: &Path) -> Vec<(PathBuf, u64)> {
 #[test]
 fn newer_formats_are_refused_untouched() {
     let dir = tmpdir("format-newer");
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     assert_eq!(std::fs::read_to_string(dir.join("FORMAT")).unwrap(), "2\n");
     e.exec("CREATE TABLE t (id int PRIMARY KEY)");
     e.shutdown();
@@ -678,7 +632,7 @@ const WINDOW_REVISION: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/w
 /// The storage tree of each named object's index (a materialized view's
 /// result), from the web UI's snapshot of the dataflow.
 fn index_trees(e: &Engine) -> std::collections::BTreeMap<String, u64> {
-    match e.h.inspect_wait(InspectQuery::Dataflow, Duration::from_secs(10)).unwrap() {
+    match e.handle.inspect_wait(InspectQuery::Dataflow, Duration::from_secs(10)).unwrap() {
         InspectReply::Dataflow(d) => {
             assert!(!d.truncated);
             d.objects
@@ -720,7 +674,7 @@ fn revised_window_operators_are_rebuilt() {
             assert_eq!(got, want, "{view} {when}");
         }
     };
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     check(&e, "at the first start");
     // (ntile's buckets from each partition's first argument, 3 and 2)
     assert_eq!(e.rows("SELECT n, c FROM nc WHERE g = 1 ORDER BY n"), ["1|22", "2|22"]);
@@ -747,7 +701,7 @@ fn revised_window_operators_are_rebuilt() {
     }
     e.exec("CHECKPOINT");
     e.shutdown();
-    let e = Engine::start(&dir);
+    let e = Engine::open(&dir);
     check(&e, "after another restart");
     e.exec("UPDATE w SET a = 5 WHERE id = 5");
     check(&e, "after the last change");

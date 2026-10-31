@@ -72,6 +72,37 @@ mod tests {
     }
 
     #[test]
+    fn correlated_scopes_and_substitution_boundaries() {
+        use crate::expr::{Expr, SubqueryExpr, SubqueryKind};
+        use crate::types::SqlType;
+        let outer = |depth, col| Expr::Outer(depth, col, SqlType::Int4);
+        let sq = Expr::Subquery(Box::new(SubqueryExpr {
+            kind: SubqueryKind::In(vec![outer(2, 3)]),
+            rel: Rel::unit().map(vec![outer(3, 4), outer(2, 5)]),
+            ty: SqlType::Bool,
+        }));
+        let mut rel = Rel::Apply {
+            left: Box::new(Rel::unit().map(vec![outer(1, 0)])),
+            right: Box::new(Rel::unit().map(vec![outer(2, 1), outer(1, 2), sq])),
+            kind: plan::ApplyKind::Lateral { left_outer: false },
+        };
+        let mut seen = Vec::new();
+        rel.any_expr_scoped(1, &mut |e, depth| {
+            if let Expr::Outer(d, c, _) = e && *d == depth { seen.push(*c); }
+            false
+        });
+        assert_eq!(seen, [0, 1, 4, 3]);
+        // Replace references to this scope, leaving references to inner scopes alone.
+        decorrelate::map_outer_refs(&mut rel, 1, &mut |col, _| Expr::Column(col));
+        assert!(!rel.has_outer_refs(1));
+        assert!(rel.has_outer_refs(0));
+        // Substitution must not substitute the columns of its own replacements.
+        let e = Expr::And(vec![Expr::Column(0), Expr::Column(1)]);
+        let Expr::And(args) = e.substitute(&[Expr::Column(1), Expr::Column(0)]) else { panic!() };
+        assert!(matches!(args.as_slice(), [Expr::Column(1), Expr::Column(0)]));
+    }
+
+    #[test]
     fn stored_definitions_tolerate_parameter_placeholders() {
         let Statement::Select { query, .. } = parse_statement("SELECT $1 AS x").unwrap() else { panic!() };
         let err = plan_query(&NoRelations, &query, vec![]).unwrap_err();

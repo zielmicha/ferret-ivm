@@ -1,9 +1,11 @@
 //! Recovery and durability regression tests through the public API (no
 //! PostgreSQL needed).
 
+mod common;
+use common::{exec, rows, start_in as start};
+
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::{self, EngineHandle};
-use ivm::types::text::format_datum;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,25 +14,6 @@ fn tmpdir(name: &str) -> PathBuf {
     let d = PathBuf::from(base).join(format!("ivm-recovery-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
-}
-
-fn start(dir: &PathBuf) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.clone(), sync: false, tick: None, ..Default::default() };
-    coord::start(cfg).expect("engine starts")
-}
-
-fn exec(h: &EngineHandle, sql: &str) -> ExecResult {
-    let stmt = ivm::sql::parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    h.execute(stmt, vec![], SessionVars::default(), String::new()).unwrap_or_else(|e| panic!("{sql}: {e}"))
-}
-
-fn rows(h: &EngineHandle, sql: &str) -> Vec<String> {
-    match exec(h, sql) {
-        ExecResult::Query { rows, .. } => {
-            rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect()
-        }
-        other => panic!("{sql}: expected rows, got {other:?}"),
-    }
 }
 
 /// CREATE OR REPLACE keeps a view's object id, so a replaced view can read

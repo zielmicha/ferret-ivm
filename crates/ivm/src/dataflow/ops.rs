@@ -562,7 +562,8 @@ fn distinct_snapshot(g: &Graph, env: &mut Env, arr: ArrId, out: &mut SnapOut) ->
 
 // ---------------------------------------------------------------- set operations
 
-fn setop_mult(op: SetOpKind, all: bool, a: i64, b: i64) -> i64 {
+/// Output multiplicity shared by incremental and batch set operations.
+pub(crate) fn setop_mult(op: SetOpKind, all: bool, a: i64, b: i64) -> i64 {
     match (op, all) {
         (SetOpKind::Except, false) => (a > 0 && b <= 0) as i64,
         (SetOpKind::Except, true) => (a - b.max(0)).max(0),

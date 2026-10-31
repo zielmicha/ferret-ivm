@@ -3,86 +3,17 @@
 
 use ivm::coord::api::{ExecResult, SessionVars};
 use ivm::coord::inspect::{InspectQuery, InspectReply};
-use ivm::coord::{self, EngineHandle};
-use ivm::error::SqlError;
 use ivm::log::LogRecord;
-use ivm::types::text::format_datum;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-fn tmpdir(name: &str) -> PathBuf {
-    let base = std::env::var("IVM_TEST_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    let d = PathBuf::from(base).join(format!("ivm-ddl-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
-}
-
-/// A running engine whose data directory is removed at shutdown.
-struct Engine {
-    running: coord::Running,
-    dir: PathBuf,
-    h: EngineHandle,
-}
+mod common;
+use common::Engine;
 
 impl Engine {
-    fn start(name: &str) -> Engine {
-        let dir = tmpdir(name);
-        let running = start_in(&dir);
-        let h = running.handle.clone();
-        Engine { running, dir, h }
+    fn err_pair(&self, sql: &str) -> (String, String) {
+        let e = self.err(sql);
+        (e.code, e.message)
     }
-
-    /// Stop and start again on the same data directory.
-    fn restart(self) -> Engine {
-        let Engine { running, dir, .. } = self;
-        running.shutdown();
-        let running = start_in(&dir);
-        let h = running.handle.clone();
-        Engine { running, dir, h }
-    }
-
-    fn shutdown(self) {
-        self.running.shutdown();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-
-    fn try_exec(&self, sql: &str) -> Result<ExecResult, SqlError> {
-        let stmt = ivm::sql::parse_statement(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        self.h.execute(stmt, vec![], SessionVars::default(), String::new())
-    }
-
-    fn exec(&self, sql: &str) -> ExecResult {
-        self.try_exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
-    }
-
-    /// The error of a statement that must fail: (SQLSTATE, message).
-    fn err(&self, sql: &str) -> (String, String) {
-        match self.try_exec(sql) {
-            Ok(r) => panic!("{sql}: expected an error, got {r:?}"),
-            Err(e) => (e.code, e.message),
-        }
-    }
-
-    /// Result rows as text, in result order.
-    fn rows(&self, sql: &str) -> Vec<String> {
-        match self.exec(sql) {
-            ExecResult::Query { rows, .. } => rows.iter().map(|r| r.iter().map(format_datum).collect::<Vec<_>>().join("|")).collect(),
-            other => panic!("{sql}: expected rows, got {other:?}"),
-        }
-    }
-
-    /// Result column names.
-    fn columns(&self, sql: &str) -> Vec<String> {
-        match self.exec(sql) {
-            ExecResult::Query { columns, .. } => columns.into_iter().map(|c| c.name).collect(),
-            other => panic!("{sql}: expected rows, got {other:?}"),
-        }
-    }
-}
-
-fn start_in(dir: &Path) -> coord::Running {
-    let cfg = coord::Config { data_dir: dir.to_path_buf(), sync: false, tick: None, ..Default::default() };
-    coord::start(cfg).expect("engine starts")
 }
 
 fn err(code: &str, msg: &str) -> (String, String) {
@@ -95,15 +26,15 @@ fn err(code: &str, msg: &str) -> (String, String) {
 fn a_table_has_at_most_one_primary_key() {
     let e = Engine::start("two-pks");
     assert_eq!(
-        e.err("CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)"),
+        e.err_pair("CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)"),
         err("42P16", "multiple primary keys for table \"t\" are not allowed")
     );
     assert_eq!(
-        e.err("CREATE TABLE t (a int PRIMARY KEY, b int, PRIMARY KEY (b))"),
+        e.err_pair("CREATE TABLE t (a int PRIMARY KEY, b int, PRIMARY KEY (b))"),
         err("42P16", "multiple primary keys for table \"t\" are not allowed")
     );
-    assert_eq!(e.err("CREATE TABLE t (a int, PRIMARY KEY (a, a))"), err("42701", "column \"a\" appears twice in primary key constraint"));
-    assert_eq!(e.err("CREATE TABLE t (a int, PRIMARY KEY (b))"), err("42703", "column \"b\" named in key does not exist"));
+    assert_eq!(e.err_pair("CREATE TABLE t (a int, PRIMARY KEY (a, a))"), err("42701", "column \"a\" appears twice in primary key constraint"));
+    assert_eq!(e.err_pair("CREATE TABLE t (a int, PRIMARY KEY (b))"), err("42703", "column \"b\" named in key does not exist"));
     // nothing was created by the failed statements
     e.exec("CREATE TABLE t (a int, b int, PRIMARY KEY (b, a))");
     assert_eq!(e.rows("SHOW COLUMNS FROM t"), ["a|integer|false|true", "b|integer|false|true"]);
@@ -119,8 +50,8 @@ fn view_column_lists() {
     let e = Engine::start("view-columns");
     e.exec("CREATE TABLE base (a int PRIMARY KEY, b int, c int)");
     e.exec("INSERT INTO base VALUES (1, 2, 3)");
-    assert_eq!(e.err("CREATE VIEW v (x, y, z, w) AS SELECT a, b, c FROM base"), err("42601", "CREATE VIEW specifies more column names than columns"));
-    assert_eq!(e.err("CREATE MATERIALIZED VIEW m (x, y, z, w) AS SELECT a, b, c FROM base"), err("42601", "too many column names were specified"));
+    assert_eq!(e.err_pair("CREATE VIEW v (x, y, z, w) AS SELECT a, b, c FROM base"), err("42601", "CREATE VIEW specifies more column names than columns"));
+    assert_eq!(e.err_pair("CREATE MATERIALIZED VIEW m (x, y, z, w) AS SELECT a, b, c FROM base"), err("42601", "too many column names were specified"));
     assert_eq!(e.rows("SELECT count(*) FROM pg_class WHERE relname IN ('v', 'm')"), ["0"]);
     e.exec("CREATE VIEW v (x) AS SELECT a, b, c FROM base");
     e.exec("CREATE MATERIALIZED VIEW m (x, y) AS SELECT a, b, c FROM base");
@@ -155,17 +86,17 @@ fn sink_keys_are_validated() {
     e.exec("CREATE TABLE t (a int PRIMARY KEY, b text, j json, jp jsonpath[], c bpchar, cs bpchar[], c3 char(3), c3s char(3)[], n numeric, iv interval[])");
     e.exec("CREATE VIEW v AS SELECT a FROM t");
     let sink = |from: &str, key: &str| format!("CREATE SINK s FROM {from} INTO POSTGRES CONNECTION 'host=127.0.0.1 port=1' TABLE 'target' KEY ({key})");
-    assert_eq!(e.err(&sink("t", "a, nope")), err("42703", "sink key column \"nope\" does not exist in \"t\""));
-    assert_eq!(e.err(&sink("t", "b, a, b")), err("42701", "column \"b\" appears twice in the sink key"));
-    assert_eq!(e.err(&sink("t", "j")), err("0A000", "sink key column \"j\" has type json, which cannot be part of a primary key"));
-    assert_eq!(e.err(&sink("t", "jp")), err("0A000", "sink key column \"jp\" has type jsonpath[], which cannot be part of a primary key"));
+    assert_eq!(e.err_pair(&sink("t", "a, nope")), err("42703", "sink key column \"nope\" does not exist in \"t\""));
+    assert_eq!(e.err_pair(&sink("t", "b, a, b")), err("42701", "column \"b\" appears twice in the sink key"));
+    assert_eq!(e.err_pair(&sink("t", "j")), err("0A000", "sink key column \"j\" has type json, which cannot be part of a primary key"));
+    assert_eq!(e.err_pair(&sink("t", "jp")), err("0A000", "sink key column \"jp\" has type jsonpath[], which cannot be part of a primary key"));
     let spaces = |c: &str, ty: &str| {
         err("0A000", &format!("sink key column \"{c}\" has type {ty}, whose values differing only in trailing spaces would be one key in the target"))
     };
-    assert_eq!(e.err(&sink("t", "a, c")), spaces("c", "bpchar"));
-    assert_eq!(e.err(&sink("t", "cs")), spaces("cs", "bpchar[]"));
-    assert_eq!(e.err(&sink("v", "a")), err("42809", "sink source \"v\" must be a table or materialized view"));
-    assert_eq!(e.err(&sink("nope", "a")), err("42P01", "relation \"nope\" does not exist"));
+    assert_eq!(e.err_pair(&sink("t", "a, c")), spaces("c", "bpchar"));
+    assert_eq!(e.err_pair(&sink("t", "cs")), spaces("cs", "bpchar[]"));
+    assert_eq!(e.err_pair(&sink("v", "a")), err("42809", "sink source \"v\" must be a table or materialized view"));
+    assert_eq!(e.err_pair(&sink("nope", "a")), err("42P01", "relation \"nope\" does not exist"));
     // rejected before anything was logged
     assert_eq!(e.rows("SHOW SINKS"), Vec::<String>::new());
     assert_eq!(e.rows("SELECT count(*) FROM ivm.catalog_history"), ["2"]);
@@ -188,7 +119,7 @@ fn dropping_a_relation_drops_its_indexes() {
     let arrangements = e.rows("SHOW ARRANGEMENTS").len();
     // the view, not the (older) index, is what holds the table back
     let stmt = ivm::sql::parse_statement("DROP TABLE t").unwrap();
-    let er = e.h.execute(stmt, vec![], SessionVars::default(), String::new()).unwrap_err();
+    let er = e.handle.execute(stmt, vec![], SessionVars::default(), String::new()).unwrap_err();
     assert_eq!((er.code.as_str(), er.detail.as_deref()), ("2BP01", Some("materialized view m depends on table t")));
     e.exec("DROP MATERIALIZED VIEW m");
     assert_eq!(e.rows("SHOW INDEXES"), ["t_b|t|[1]"]);
@@ -217,9 +148,9 @@ fn multi_name_drop_is_atomic() {
     let objects = |e: &Engine| e.rows("SELECT name FROM ivm.objects ORDER BY name");
     let before = history(&e);
     // errors leave every object in place and record nothing
-    assert_eq!(e.err("DROP VIEW b, a, nosuch"), err("42P01", "view \"nosuch\" does not exist"));
-    assert_eq!(e.err("DROP VIEW b, t"), err("42809", "\"t\" is not a view"));
-    assert_eq!(e.err("DROP VIEW a").0, "2BP01");
+    assert_eq!(e.err_pair("DROP VIEW b, a, nosuch"), err("42P01", "view \"nosuch\" does not exist"));
+    assert_eq!(e.err_pair("DROP VIEW b, t"), err("42809", "\"t\" is not a view"));
+    assert_eq!(e.err_pair("DROP VIEW a").0, "2BP01");
     assert_eq!(objects(&e), ["a", "b", "t"]);
     assert_eq!(history(&e), before);
     e.exec("DROP VIEW a, b");
@@ -271,14 +202,14 @@ fn legacy_definitions_with_placeholders() {
     e.exec("CREATE VIEW pv AS SELECT a, b FROM t");
     // statements as an earlier version logged them
     for sql in ["CREATE MATERIALIZED VIEW lv AS SELECT a FROM pv WHERE b = $1 OR a > 1", "CREATE VIEW lpv AS SELECT a FROM t WHERE a > $1 OR a = 1"] {
-        e.h.log(LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() }).unwrap();
+        e.handle.log(LogRecord::Ddl { req: 0, sql: sql.into(), extra: String::new() }).unwrap();
     }
     assert_eq!(e.rows("SELECT a FROM lv ORDER BY a"), ["2", "3"]);
     assert_eq!(e.rows("SELECT a FROM lpv"), ["1"]);
     // new statements still reject placeholders
-    assert_eq!(e.err("CREATE VIEW nv AS SELECT a FROM t WHERE a > $1").0, "42P02");
+    assert_eq!(e.err_pair("CREATE VIEW nv AS SELECT a FROM t WHERE a > $1").0, "42P02");
     assert!(!e.rows("EXPLAIN PLAN FOR VIEW lv").is_empty());
-    match e.h.inspect_wait(InspectQuery::Object { name: "lv".into(), sample: 0 }, Duration::from_secs(10)).unwrap() {
+    match e.handle.inspect_wait(InspectQuery::Object { name: "lv".into(), sample: 0 }, Duration::from_secs(10)).unwrap() {
         InspectReply::Object(d) => {
             assert_eq!(d.problems, Vec::<String>::new());
             assert!(d.plan.is_some());
